@@ -34,8 +34,10 @@ class Flag<T> internal constructor(
  * The set of declared flags.
  *
  * Registration is global and eager: a flag exists from the moment its declaring object is
- * loaded, so anything that enumerates flags must first touch the objects that declare them.
- * [requireLoaded] exists for that.
+ * loaded, so anything that enumerates flags must first make sure the declaring objects are
+ * loaded. Naming them one by one does not survive a module being added — the JVM entry points
+ * use `FlagDiscovery` to find them by convention instead, and [requireLoaded] is left for the
+ * bootstrap case (loading the flags that decide how discovery runs) and for tests.
  */
 object Flags {
     private val registered = LinkedHashMap<String, Flag<*>>()
@@ -46,7 +48,8 @@ object Flags {
 
     /**
      * Forces [holders] to initialise so their flags are registered. Enumerating flags without
-     * this silently reports a subset, which would make `config list` lie about what exists.
+     * this — or without discovery having run — silently reports a subset, which would make
+     * `config list` lie about what exists.
      */
     fun requireLoaded(vararg holders: Any) {
         holders.forEach { it.hashCode() }
