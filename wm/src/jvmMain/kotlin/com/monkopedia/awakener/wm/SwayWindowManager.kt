@@ -2,6 +2,10 @@ package com.monkopedia.awakener.wm
 
 import com.monkopedia.awakener.config.Config
 import com.monkopedia.awakener.config.ConfigStore
+import com.monkopedia.awakener.registry.AgentId
+import com.monkopedia.awakener.registry.BindingStore
+import com.monkopedia.awakener.registry.SurfaceKey
+import com.monkopedia.awakener.registry.asIdentity
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
@@ -20,15 +24,41 @@ import kotlinx.coroutines.yield
 class SwayWindowManager(
     private val connect: () -> SwayConnection,
     private val store: ConfigStore,
+    /**
+     * Where bindings actually live. Previously an in-memory map, which made every binding a
+     * fact about this process rather than about the desktop — the agent was forgotten the
+     * moment awakener restarted, taking its accumulated model with it.
+     */
+    private val registry: BindingStore,
     private val scope: CoroutineScope,
 ) : WindowManager {
     private val commands: SwayConnection by lazy { connect() }
-    private val bindings = mutableMapOf<SurfaceId, AgentId>()
 
     private val config: Config get() = store.config.value
 
     suspend fun tree(): Node =
         swayJson.decodeFromString(commands.request(I3Ipc.Request.GET_TREE))
+
+    /**
+     * The durable key for a live window, or null if the window has gone.
+     *
+     * The whole translation from compositor handle to durable identity happens here and nowhere
+     * else, which is what keeps `:registry` from ever learning what a `con_id` is.
+     */
+    suspend fun keyFor(surface: SurfaceId): SurfaceKey? =
+        surfaces().firstOrNull { it.id == surface }
+            ?.let { SurfaceKey.of(it.descriptor, config) }
+
+    /**
+     * Resolve-or-mint for [surface]: the agent a hotkey invocation should raise.
+     *
+     * Minting on first *invocation* rather than on first sighting is the design's rule — a
+     * trigger on window creation would spawn an agent for every window glanced at and closed.
+     */
+    suspend fun bind(surface: SurfaceId): AgentId {
+        val key = keyFor(surface) ?: error("no such surface: ${surface.raw}")
+        return registry.bind(key).agent
+    }
 
     /**
      * Every window that is not a dock. The dock mark is the discriminator, because a dock is
@@ -41,7 +71,8 @@ class SwayWindowManager(
             .map { Surface(SurfaceId(it.id), it.appId, it.name, it.pid) }
     }
 
-    override suspend fun resolve(surface: SurfaceId): AgentId? = bindings[surface]
+    override suspend fun resolve(surface: SurfaceId): AgentId? =
+        keyFor(surface)?.let { registry.resolve(it)?.agent }
 
     override suspend fun attach(
         surface: SurfaceId,
@@ -49,7 +80,8 @@ class SwayWindowManager(
         dock: DockSpec,
     ): DockHandle {
         val cfg = config
-        check(tree().find(surface.raw) != null) { "no such surface: ${surface.raw}" }
+        val key = keyFor(surface)
+        check(key != null && tree().find(surface.raw) != null) { "no such surface: ${surface.raw}" }
 
         // Focus first: sway's split applies to the focused container, and the dock has to land
         // inside this surface's tab rather than wherever focus happened to be.
@@ -73,8 +105,10 @@ class SwayWindowManager(
         }
         run("[con_id=${dockId.raw}] resize set width ${cfg[WmFlags.dockSizePpt]} ppt")
 
-        bindings[surface] = agent
-        val handle = SwayDockHandle(surface, agent, dockId)
+        // Recorded after the dock is standing, so a failed attach does not leave a durable
+        // binding to an agent that has no panel.
+        val bound = registry.bind(key, agent.asIdentity())
+        val handle = SwayDockHandle(surface, bound.agent, dockId, key)
         if (cfg[WmFlags.restoreFocusAfterAttach]) handle.settleFocus()
         return handle
     }
@@ -123,7 +157,10 @@ class SwayWindowManager(
             val mark = node.marks.firstOrNull { it.startsWith(prefix) } ?: return@forEach
             val boundTo = mark.removePrefix(prefix).toLongOrNull() ?: return@forEach
             if (boundTo !in live) {
-                SwayDockHandle(SurfaceId(boundTo), AgentId(""), SurfaceId(node.id)).detach()
+                // No key: the surface is already gone, so there is nothing left to derive one
+                // from. Reaping a dock is a window-tree repair and never touches the registry.
+                SwayDockHandle(SurfaceId(boundTo), AgentId(""), SurfaceId(node.id), key = null)
+                    .detach()
             }
         }
     }
@@ -155,6 +192,8 @@ class SwayWindowManager(
         override val surface: SurfaceId,
         override val agent: AgentId,
         override val dockId: SurfaceId,
+        /** Captured at attach time — by detach the window may be gone and underivable. */
+        private val key: SurfaceKey?,
     ) : DockHandle {
         override suspend fun focus() = run("[con_id=${dockId.raw}] focus")
 
@@ -179,7 +218,7 @@ class SwayWindowManager(
             val root = tree()
             val parent = root.parentOf(dockId.raw)
             if (root.find(dockId.raw) != null) run("[con_id=${dockId.raw}] kill")
-            bindings.remove(surface)
+            if (cfg[WmFlags.forgetBindingOnDetach] && key != null) registry.unbind(key)
 
             if (!cfg[WmFlags.normalizeContainerOnDetach]) return
             // sway does not collapse a split container back down when it drops to one child,

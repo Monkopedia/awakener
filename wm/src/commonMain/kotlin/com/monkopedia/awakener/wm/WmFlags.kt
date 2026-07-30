@@ -65,6 +65,15 @@ object WmFlags {
             "split containers, and a leftover one silently swallows the next window opened.",
     )
 
+    val forgetBindingOnDetach = Flags.boolean(
+        "wm.dock.forget_binding_on_detach",
+        false,
+        "Drop the surface's durable binding when its dock is torn down. Off by default because " +
+            "the design's memory model says the written-down residue outlives the window — " +
+            "closing a panel is not the user saying they want a different agent. Turn it on to " +
+            "make a dock's lifetime the agent's lifetime.",
+    )
+
     val restingFocus = Flags.enum(
         "wm.focus.resting",
         RestingFocus.APP,

@@ -1,5 +1,7 @@
 package com.monkopedia.awakener.wm
 
+import com.monkopedia.awakener.registry.AgentId
+import com.monkopedia.awakener.registry.SurfaceDescriptor
 import kotlinx.coroutines.flow.Flow
 
 /** A window that can have an agent bound to it. Docks are excluded by construction. */
@@ -8,13 +10,23 @@ data class Surface(
     val appId: String?,
     val title: String?,
     val pid: Int?,
-)
+) {
+    /**
+     * The compositor-agnostic facts `:registry` keys a durable binding on.
+     *
+     * [id] is deliberately absent: sway mints a fresh `con_id` every time a window maps, so a
+     * binding keyed on it would be forgotten at the next login — which is the exact failure the
+     * registry exists to prevent.
+     */
+    val descriptor: SurfaceDescriptor get() = SurfaceDescriptor(appId, title, pid)
+}
 
+/**
+ * A live compositor handle. Valid only for as long as the window is mapped; anything that has
+ * to survive a restart uses `SurfaceKey` instead.
+ */
 @JvmInline
 value class SurfaceId(val raw: Long)
-
-@JvmInline
-value class AgentId(val raw: String)
 
 /** How to bring a dock into being for a surface. */
 data class DockSpec(
@@ -74,6 +86,12 @@ interface DockHandle : AutoCloseable {
 interface WindowManager {
     suspend fun surfaces(): List<Surface>
 
+    /**
+     * The agent bound to [surface], or null if this is a Drab.
+     *
+     * Answered from the durable registry, so it resolves the same way after a reboot as it did
+     * before one — a window is looked up by what outlives it, not by its compositor handle.
+     */
     suspend fun resolve(surface: SurfaceId): AgentId?
 
     suspend fun attach(surface: SurfaceId, agent: AgentId, dock: DockSpec): DockHandle

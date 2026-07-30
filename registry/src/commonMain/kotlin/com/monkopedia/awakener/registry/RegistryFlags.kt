@@ -1,0 +1,147 @@
+package com.monkopedia.awakener.registry
+
+import com.monkopedia.awakener.config.Flags
+
+/** What makes two windows "the same surface" for the purpose of a durable binding. */
+enum class WindowIdentity {
+    /** One Lifeless per application. Stable across restarts, which is the point of persisting. */
+    APP_ID,
+
+    /**
+     * One Lifeless per window title. Splits a multi-window app (an editor per project, a
+     * terminal per host) but is only as stable as the app's titles — a title that carries a
+     * dirty marker or a line number will mint a new agent every time it changes.
+     */
+    APP_ID_AND_TITLE,
+
+    /**
+     * One Lifeless per running window instance. Deliberately *not* stable across restarts: pids
+     * are recycled, so this is the "give me a fresh agent per launch" setting, useful when the
+     * accumulated model would be noise.
+     */
+    APP_ID_AND_PID,
+}
+
+/** Where an agent id comes from when a surface is first bound. */
+enum class AgentIdSource {
+    /**
+     * Ask the `spanreed` CLI. Authoritative by construction: the id comes from the same code
+     * the Lifeless session will run when it starts up with this `SPANREED_AGENT_NAME`, so the
+     * two cannot disagree. Costs one subprocess per mint.
+     */
+    SPANREED,
+
+    /**
+     * Apply spanreed's documented override rule (`agent-<name>`) locally. No subprocess, and it
+     * works with spanreed absent — but it pins a documented behaviour rather than reading it,
+     * so it drifts silently if spanreed ever changes the rule.
+     */
+    DERIVED,
+}
+
+/** When the bindings file is written. */
+enum class WritePolicy {
+    /** Persist on every change. A crash then cannot lose a binding. */
+    EVERY_CHANGE,
+
+    /** Persist only on an explicit flush. Fewer writes; a crash loses whatever is unflushed. */
+    ON_FLUSH,
+}
+
+/** What binding an already-bound surface does. */
+enum class RebindPolicy {
+    /** Keep the existing agent. Stability across restarts is the entire point of this layer. */
+    KEEP,
+
+    /** Take the newly supplied agent, abandoning the old one's accumulated residue. */
+    REPLACE,
+}
+
+/** How a surface's durable residue is laid out on disk. */
+enum class ResidueLayout {
+    /** One file per surface, `<slug>.md`. Simplest thing that stays readable by hand. */
+    PER_KEY_FILE,
+
+    /** One directory per surface, so distillation can write several artifacts side by side. */
+    PER_KEY_DIR,
+}
+
+/**
+ * Runtime switches for the durable binding layer.
+ *
+ * Each of these is a place where two behaviours are defensible and the answer depends on how
+ * Jason actually works, not on a fact about the system — so both are built and the default is
+ * whichever would otherwise have been hard-coded.
+ */
+object RegistryFlags {
+    val storePath = Flags.string(
+        "registry.store.path",
+        "",
+        "Path to the bindings file. Empty means \$XDG_STATE_HOME/awakener/bindings.json.",
+    )
+
+    val writePolicy = Flags.enum(
+        "registry.store.write_policy",
+        WritePolicy.EVERY_CHANGE,
+        "When the bindings file is written. Every change is durable against a crash; on-flush " +
+            "batches writes for a caller that binds many surfaces at once.",
+    )
+
+    val windowIdentity = Flags.enum(
+        "registry.key.window_identity",
+        WindowIdentity.APP_ID,
+        "What makes two windows the same surface. Per-app is stable across restarts; per-title " +
+            "splits a multi-window app but inherits that app's title churn.",
+    )
+
+    val agentNamePrefix = Flags.string(
+        "registry.agent.name_prefix",
+        "lifeless-",
+        "Prefix for the SPANREED_AGENT_NAME minted for a surface. These names show up in " +
+            "`spanreed list`, so the prefix is what keeps Lifelesses distinguishable from " +
+            "human-driven sessions.",
+    )
+
+    val agentIdSource = Flags.enum(
+        "registry.agent.id_source",
+        AgentIdSource.SPANREED,
+        "Where a new agent id comes from: the spanreed CLI, or spanreed's documented rule " +
+            "applied locally without a subprocess.",
+    )
+
+    val spanreedCommand = Flags.string(
+        "registry.agent.spanreed_command",
+        "spanreed",
+        "The spanreed executable. spanreed's CLI is its public contract; its registry file and " +
+            "lockfile are not, so this is the only way awakener is allowed to reach the bus.",
+    )
+
+    val registerOnMint = Flags.boolean(
+        "registry.agent.register_on_mint",
+        false,
+        "Mirror a freshly minted Lifeless into spanreed's registry at bind time. Off by " +
+            "default because spanreed keys liveness on pid + pid_start, so an entry registered " +
+            "under awakener's own pid would claim a liveness the Lifeless does not yet have.",
+    )
+
+    val rebindPolicy = Flags.enum(
+        "registry.binding.rebind_policy",
+        RebindPolicy.KEEP,
+        "What binding an already-bound surface does. Keeping is what makes the agent survive a " +
+            "restart at all; replacing abandons the residue accumulated under the old id.",
+    )
+
+    val residueDir = Flags.string(
+        "registry.residue.dir",
+        "",
+        "Directory holding each surface's distilled residue. Empty means a `residue` " +
+            "directory beside the bindings file.",
+    )
+
+    val residueLayout = Flags.enum(
+        "registry.residue.layout",
+        ResidueLayout.PER_KEY_FILE,
+        "One markdown file per surface, or one directory per surface. The directory form " +
+            "leaves room for distillation to emit more than a single artifact.",
+    )
+}
