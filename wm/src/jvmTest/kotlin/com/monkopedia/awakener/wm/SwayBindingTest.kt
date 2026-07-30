@@ -410,8 +410,8 @@ class SwayBindingTest {
             assertEquals(
                 0,
                 minted,
-                "the second surface's attach finished while the first one's mint was still in " +
-                    "flight, which it could not have done if the mint were inside the lock",
+                "the second surface's attach must not have to wait for the first one's mint: " +
+                    "a mint completed before it returned, so the subprocess is inside the lock",
             )
             minting.await()
         }

@@ -39,7 +39,6 @@ class SwayWindowManager(
     private val config: Config get() = store.config.value
 
     private val treeEditLock = Mutex()
-    private val editor = TreeEdit()
 
     /**
      * Runs [edit] with exclusive use of the window tree.
@@ -52,11 +51,17 @@ class SwayWindowManager(
      * dock to a different surface's tab. Both leave one node carrying two marks or an unmarked
      * panel beside it, which is the failure [DockIdentity] exists to fix arriving by another route.
      *
-     * Why a receiver and not a lock each caller remembers to take: [TreeEdit.run] is the only way
-     * to issue a sway command anywhere in this class, and it is reachable only as this block's
-     * receiver. Serialisation is therefore not a convention a newly added public method can
-     * forget — to focus, split, mark, move or kill anything at all, it has to be in here. Held as
-     * a convention it was forgotten three separate times, once per entry point that exists.
+     * Why a receiver and not a lock each caller remembers to take: [TreeEdit] is constructed
+     * *inside* the critical section and nowhere else, so there is no long-lived receiver in scope
+     * for the rest of the class to call through. A tree edit therefore cannot be written
+     * unserialised **by accident** — the obvious way to focus, split, mark, move or kill anything
+     * is to be in here. Held as a plain convention it was forgotten three separate times, once per
+     * entry point that exists.
+     *
+     * What this is not: a guarantee. `treeEdit { this }` still smuggles the receiver out, and
+     * [commands] and [connect] stay in scope for the whole class, so a determined author can still
+     * drive sway unlocked. The claim is only that doing so takes deliberate effort rather than
+     * inattention.
      *
      * Two things are deliberately *outside*. Reads ([tree] and everything built on it) never take
      * the lock, so enumerating surfaces does not queue behind an attach that is waiting on a dock
@@ -68,13 +73,14 @@ class SwayWindowManager(
      * section needs — `settleFocus`, called from the end of `attach`, in particular.
      */
     private suspend fun <T> treeEdit(edit: suspend TreeEdit.() -> T): T =
-        treeEditLock.withLock { editor.edit() }
+        treeEditLock.withLock { TreeEdit().edit() }
 
     /**
      * The only way to change the tree. See [treeEdit] for why it is a receiver.
      *
-     * Everything here assumes the lock is held, which is exactly what being reachable only
-     * through [treeEdit] guarantees.
+     * Everything here assumes the lock is held. Constructing it is [treeEdit]'s job alone: do not
+     * hold an instance in a field or return one out of the block, because either puts the receiver
+     * back in scope where a caller can reach it with no lock at all.
      */
     private inner class TreeEdit {
         suspend fun run(command: String) {
