@@ -15,19 +15,26 @@ one agent bound to one surface, **Breath** is the resource spent to animate one,
 **Command** is its standing instruction, a **Drab** is an unbound window, and a **Returned**
 is the ephemeral per-task coordinator.
 
-## Status: design settled, no code yet
+## Verification
 
-As of 2026-07-30 the repo holds documentation only. **There is still no build system and no
-CI**, so the anti-invention rule from the original scaffolding still applies in full:
+**The system JDK on kaladin is 8. Every Gradle command must pin 21:**
 
-- **Do not invent build/test commands.** There is no `./gradlew` here yet. If you need to
-  verify something and there is no documented way to do it, say so — "I could not verify X
-  because the repo defines no build" is a legitimate result. Replace this section with the
-  real verification commands in the same change that introduces the build.
-- **Zero check-runs is the expected state**, not "pending". There is no `.github/workflows/`
-  at all, so no `check_suite` will ever arrive. Never wait on one.
-- **A triage or code-health pass with no source is a clean no-op**, not a prompt to
-  manufacture findings.
+```sh
+JAVA_HOME=/usr/lib/jvm/java-21-openjdk ./gradlew build
+```
+
+That is the full autonomous check — it compiles both modules and runs all tests, including
+the `:wm` integration suite against a real headless sway.
+
+- **`AWAKENER_REQUIRE_SWAY=1` is mandatory for any run whose result you intend to report.**
+  Without it, a machine lacking `sway`/`foot` *skips* the window-management tests and still
+  reports success. With it, missing tools fail the build. CI sets it.
+- **Confirm tests actually ran** before calling a run green — read
+  `*/build/test-results/jvmTest/*.xml` and check the counts. "BUILD SUCCESSFUL" alone does not
+  distinguish a passing suite from a skipped one.
+- `:wm` needs a live compositor, so "no automated test for this window behaviour" is not the
+  defect it would be elsewhere — but a PR must say what it exercised and against which sway
+  version.
 
 ## Stack (decided 2026-07-30 by Jason)
 
@@ -71,6 +78,24 @@ conversation, not a local workaround.
 - **No Waydroid and no binder module** (`binder_linux` absent). Test 1 (occlusion lifecycle)
   is gated on a DKMS kernel module on Jason's daily driver, so it is not something to set up
   autonomously.
+
+## Flags first (owner directive, 2026-07-30)
+
+**Behaviour goes behind a runtime flag, not a constant.** Jason's time is the scarce resource,
+not tokens: he wants to try alternatives against a running system without a rebuild and
+without a round-trip through you. So when you find yourself choosing between two plausible
+behaviours, *build both and add the switch* rather than asking which he wants.
+
+- Declare flags in a `*Flags` object via `com.monkopedia.awakener.config.Flags`. Each carries
+  its own default and a description, which is what makes `awakener-config list`
+  self-documenting instead of a hand-maintained list that drifts.
+- Defaults must be the behaviour you would have hard-coded, so an unconfigured system is
+  correct.
+- `:config` reloads on file change, so a flag flip applies to a live daemon. Never cache a
+  flag value across an operation that could span a reload — read it from the snapshot.
+- A snapshot is total: a bad value degrades to that flag's default and is reported through
+  `Config.problems`. The config file gets hand-edited against a running desktop, so a typo
+  must not take the process down.
 
 ## Working agreements
 
