@@ -53,6 +53,10 @@ Planned module boundaries, from `docs/design.md`:
 - `:pairing-mcp` — read-on-demand surface tools, via the official Kotlin MCP SDK.
 - `:chrome` — CDP client; needs a dedicated Chrome profile, because anything that can reach
   the debugging port can drive a logged-in browser.
+- `:cli` — entry points that need the whole flag set (`awakener-config`), and **the only
+  module allowed to depend on every other one**. That dependency is what puts every
+  flag-declaring class on one classpath; a `main` in a module that cannot see them enumerates
+  an empty registry and reports that those flags do not exist.
 
 **Talk to spanreed through its CLI, never through its files.** `spanreed` exposes
 `register` / `send` / `recv` / `list` / `name` / `focus` / `status` / `conjoin` as a
@@ -65,12 +69,17 @@ conversation, not a local workaround.
 
 ## Environment (verified 2026-07-30 — re-check before relying on it)
 
-- **kaladin** — this repo's host. Headless: no `/dev/dri`, no seat, no compositor. Cannot
-  run anything needing a display.
+- **kaladin** — this repo's host. Headless: no `/dev/dri`, no seat, no compositor. Cannot run
+  anything needing a display. **`sudo` here is passwordless**, so installing a tool you need
+  is your call to make, not something to ask Jason for. `sway`, `foot`, `chromium`, `jq` and
+  `qemu` are already present. **No KVM**: the kernel reports
+  `SVM disabled (by BIOS) in MSR_VM_CR`, so virtualisation is a firmware setting no amount of
+  `modprobe` will fix, and VM work runs under TCG at roughly 10-20x slowdown.
+  `kernel.dmesg_restrict=1`, so read kernel messages with `journalctl -k`, not `dmesg`.
 - **adolin** — the desktop, and awakener's actual target. GPU, active seat0, running
   **GNOME Shell**. `google-chrome-stable` and `xorg-xwayland` installed. Reachable by
   passwordless ssh from kaladin, but **sudo there requires a password** — Jason runs
-  installs himself.
+  installs on adolin himself.
 - **No tabbed WM is installed on either host.** The dock design depends on i3/sway tree
   semantics, so it has nowhere to run for real yet. `WLR_BACKENDS=headless sway` gives a
   genuine sway tree drivable entirely over ssh via `swaymsg` — that is how structural probes
@@ -89,6 +98,12 @@ behaviours, *build both and add the switch* rather than asking which he wants.
 - Declare flags in a `*Flags` object via `com.monkopedia.awakener.config.Flags`. Each carries
   its own default and a description, which is what makes `awakener-config list`
   self-documenting instead of a hand-maintained list that drifts.
+- **The name and the package are load-bearing**: `FlagDiscovery` finds declaring classes by
+  scanning the classpath for `com.monkopedia.awakener.**` classes whose name ends in `Flags`,
+  and `:cli` depends on every module in the build. Give it a prefix — a class named exactly
+  `Flags` is the registry itself and is skipped. Follow the convention and a new module's
+  flags show up in `list` with no registration step anywhere; deviate and they are invisible
+  until someone names the class in `config.flags.declarations`.
 - Defaults must be the behaviour you would have hard-coded, so an unconfigured system is
   correct.
 - `:config` reloads on file change, so a flag flip applies to a live daemon. Never cache a

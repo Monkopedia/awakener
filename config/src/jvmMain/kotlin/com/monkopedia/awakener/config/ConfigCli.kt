@@ -1,13 +1,16 @@
 package com.monkopedia.awakener.config
 
 import kotlin.io.path.Path
-import kotlin.system.exitProcess
 import kotlinx.coroutines.runBlocking
 
 /**
  * `awakener-config` — inspect and change flags without a rebuild or a restart.
  *
  * The daemon watches the same file, so a `set` here takes effect in a running awakener.
+ *
+ * The commands live here, next to the config machinery, but the entry point lives in `:cli`:
+ * this module cannot see the modules that declare flags, so a `main` here would enumerate an
+ * empty registry and report that none of them exist.
  */
 object ConfigCli {
     fun defaultPath() = Path(
@@ -79,10 +82,4 @@ object ConfigCli {
         out("usage: awakener-config [list | get <key> | set <key> <value> | unset <key>]")
         return 2
     }
-}
-
-fun main(args: Array<String>) {
-    Flags.requireLoaded()
-    val store = FileConfigStore(ConfigCli.defaultPath())
-    exitProcess(ConfigCli.run(args, store, ::println))
 }

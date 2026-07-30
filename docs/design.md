@@ -156,10 +156,14 @@ everything can't tell gist from noise.
 
 ## Open — resolve before building on them
 
-1. **Waydroid freeform lifecycle.** Does an occluded-but-open window stay *resumed*? Android
-   10+ multi-window supports multiple resumed activities, but if Waydroid pauses occluded
-   apps their hierarchy goes stale and background work dies in this substrate too. **Test
-   this first — it gates the Waydroid plan.**
+1. ~~**Waydroid freeform lifecycle.**~~ **RESOLVED 2026-07-30** — occluded windows stay
+   RESUMED, and Android never learns it was occluded at all, so the Waydroid plan stands. See
+   `docs/findings/2026-07-30-waydroid-occlusion-probe.md`. The real lifecycle cliffs turn out
+   to be *window close* (the Android task is destroyed) and *all windows closed* (Waydroid
+   freezes the whole container by default), both of which belong to attach/detach discipline
+   rather than to the compositor abstraction. Re-confirm on a real GPU before relying on it:
+   the probe ran under software rendering, which cannot rule out buffer back-pressure from a
+   gbm-backed Waydroid.
 2. **Focus contention for native non-Waydroid apps.** Input injection goes to the focused
    surface. Either the agent steals focus mid-sentence or the app needs a second headless
    instance, which many apps refuse. Probably per-app tiering, not a general solution.
