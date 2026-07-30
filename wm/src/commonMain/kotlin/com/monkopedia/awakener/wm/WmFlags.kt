@@ -8,6 +8,23 @@ enum class DockSide { LEFT, RIGHT }
 /** What a tab is left focused on once dock interaction ends. */
 enum class RestingFocus { APP, DOCK }
 
+/** How `attach` works out which tree node is the dock it just spawned. */
+enum class DockIdentity {
+    /**
+     * The node that was not there before. `attach` records the dock-shaped windows standing at
+     * the moment of the spawn and takes the one that appears afterwards. Costs the dock program
+     * nothing, which is why it is the default — a panel binary that takes no `app_id` argument
+     * still works.
+     */
+    NEW_NODE,
+
+    /**
+     * A dock `app_id` minted per surface, so the criteria that match it can never be ambiguous.
+     * Requires the dock command to accept the name — see [DockSpec.APP_ID_PLACEHOLDER].
+     */
+    PER_SURFACE_APP_ID,
+}
+
 /** What happens to a dock whose bound surface has gone away. */
 enum class OrphanPolicy {
     /** Tear the dock down with its surface. */
@@ -42,6 +59,18 @@ object WmFlags {
         true,
         "Focus the dock as soon as it appears. Right for a hotkey invocation (you are about " +
             "to type at the agent), wrong for a dock created proactively for a surface.",
+    )
+
+    val dockIdentity = Flags.enum(
+        "wm.dock.identity",
+        DockIdentity.NEW_NODE,
+        "How attach tells the dock it just spawned from the docks already standing. Every dock " +
+            "is the same panel program and so reports the same app_id, which is no identifier " +
+            "at all. NEW_NODE takes whichever node appeared, and asks nothing of the dock " +
+            "program. PER_SURFACE_APP_ID makes the name itself unique, which additionally " +
+            "scopes the no_focus rule to one dock instead of to every dock ever spawned — at " +
+            "the cost of requiring the dock command to accept the name, and of one permanent " +
+            "no_focus rule per attach, since sway cannot revoke one.",
     )
 
     val dockMarkPrefix = Flags.string(

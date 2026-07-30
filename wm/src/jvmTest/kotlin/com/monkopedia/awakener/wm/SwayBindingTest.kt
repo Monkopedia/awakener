@@ -249,6 +249,65 @@ class SwayBindingTest {
         assertEquals(1, minted, "a surface that is already bound must not cost a second mint")
     }
 
+    /**
+     * In production every dock is the same panel program, so every dock reports the same
+     * `app_id`. Matching the spawned dock on `app_id` alone therefore resolved every attach
+     * after the first to the *first* dock's node: both marks landed on one window, the dock
+     * that had actually just spawned was left unmarked and unmanaged, and `detach()` tore down
+     * the other surface's panel.
+     */
+    @Test
+    fun `two surfaces docked by the same program get their own dock`() = swayTest {
+        val app1 = openSurface("aw-app1")
+        val app2 = openSurface("aw-app2")
+
+        val dock1 = wm.attach(app1, dockFor("aw-dock"), AgentId("agent-1"))
+        val dock2 = wm.attach(app2, dockFor("aw-dock"), AgentId("agent-2"))
+
+        assertTrue(
+            dock1.dockId != dock2.dockId,
+            "the second attach must resolve to the dock it just spawned (${dock2.dockId.raw}) " +
+                "and not to the first one (${dock1.dockId.raw})",
+        )
+        assertEquals(listOf(markFor(app1)), marksOf(dock1.dockId), "one mark per dock")
+        assertEquals(listOf(markFor(app2)), marksOf(dock2.dockId), "one mark per dock")
+        assertEquals(
+            setOf(app1.raw, dock1.dockId.raw),
+            assertNotNull(tabHolding(app1)).children.map { it.id }.toSet(),
+            "each dock shares a tab with the surface it was attached to",
+        )
+        assertEquals(
+            setOf(app2.raw, dock2.dockId.raw),
+            assertNotNull(tabHolding(app2)).children.map { it.id }.toSet(),
+            "each dock shares a tab with the surface it was attached to",
+        )
+
+        dock1.detach()
+        awaitGone(dock1.dockId)
+
+        assertNotNull(
+            wm.tree().find(dock2.dockId.raw),
+            "detaching one surface's dock must leave the other surface's dock standing",
+        )
+        assertEquals(listOf(markFor(app2)), marksOf(dock2.dockId), "and still bound to its own")
+    }
+
+    /** The alternative identity scheme: unique by construction, at the cost of a dock argument. */
+    @Test
+    fun `per-surface app_id is switchable on`() = swayTest {
+        store.put(WmFlags.dockIdentity, DockIdentity.PER_SURFACE_APP_ID)
+        val app1 = openSurface("aw-app1")
+        val app2 = openSurface("aw-app2")
+
+        val dock1 = wm.attach(app1, dockFor("aw-dock"), AgentId("agent-1"))
+        val dock2 = wm.attach(app2, dockFor("aw-dock"), AgentId("agent-2"))
+
+        assertEquals("aw-dock-${app1.raw}", appIdOf(dock1.dockId))
+        assertEquals("aw-dock-${app2.raw}", appIdOf(dock2.dockId))
+        assertEquals(listOf(markFor(app1)), marksOf(dock1.dockId), "one mark per dock")
+        assertEquals(listOf(markFor(app2)), marksOf(dock2.dockId), "one mark per dock")
+    }
+
     // -- helpers ------------------------------------------------------------------------
 
     private fun swayTest(body: suspend () -> Unit) {
@@ -273,7 +332,19 @@ class SwayBindingTest {
         return SurfaceId(assertNotNull(awaitWindow(appId), "window '$appId' never appeared"))
     }
 
-    private fun dockFor(appId: String) = DockSpec(appId, sway.windowCommand(appId))
+    private fun dockFor(appId: String) =
+        DockSpec(appId, sway.windowCommand(DockSpec.APP_ID_PLACEHOLDER))
+
+    private fun markFor(surface: SurfaceId) =
+        "${WmFlags.dockMarkPrefix.default}${surface.raw}"
+
+    private suspend fun marksOf(dock: SurfaceId): List<String>? = wm.tree().find(dock.raw)?.marks
+
+    private suspend fun appIdOf(dock: SurfaceId): String? = wm.tree().find(dock.raw)?.appId
+
+    /** The tab a surface lives in — the workspace child that contains it. */
+    private suspend fun tabHolding(surface: SurfaceId): Node? =
+        wm.tree().workspace("1")?.children?.firstOrNull { it.find(surface.raw) != null }
 
     private suspend fun dockId(appId: String): Long =
         assertNotNull(wm.tree().windows.firstOrNull { it.appId == appId }).id

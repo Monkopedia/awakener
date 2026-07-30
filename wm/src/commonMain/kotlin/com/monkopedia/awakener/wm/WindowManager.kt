@@ -31,14 +31,26 @@ value class SurfaceId(val raw: Long)
 /** How to bring a dock into being for a surface. */
 data class DockSpec(
     /**
-     * The `app_id` the dock window will report. It must be predictable *before* the window
-     * exists, because sway matches focus rules at map time — this is what makes
-     * [WmFlags.dockFocusOnMap] expressible at all.
+     * The `app_id` the dock window will report, or under
+     * [DockIdentity.PER_SURFACE_APP_ID] the prefix it is derived from. It must be predictable
+     * *before* the window exists, because sway matches focus rules at map time — this is what
+     * makes [WmFlags.dockFocusOnMap] expressible at all.
+     *
+     * It is emphatically *not* an identifier: every dock is the same panel program, so all of
+     * them report the same `app_id` unless [WmFlags.dockIdentity] says otherwise.
      */
     val appId: String,
-    /** Command sway runs to produce the dock window. */
+    /**
+     * Command sway runs to produce the dock window. Any occurrence of [APP_ID_PLACEHOLDER] is
+     * replaced with the `app_id` this dock is expected to report, which is how a dock program
+     * gets told the per-surface name under [DockIdentity.PER_SURFACE_APP_ID].
+     */
     val command: String,
-)
+) {
+    companion object {
+        const val APP_ID_PLACEHOLDER = "{app_id}"
+    }
+}
 
 sealed interface SurfaceChange {
     val id: SurfaceId

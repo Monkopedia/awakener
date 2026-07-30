@@ -70,6 +70,19 @@ class SwayWindowManager(
     ): DockHandle {
         val cfg = config
         val key = keyFor(surface) ?: error("no such surface: ${surface.raw}")
+        val identity = cfg[WmFlags.dockIdentity]
+        val appId = when (identity) {
+            DockIdentity.NEW_NODE -> dock.appId
+            DockIdentity.PER_SURFACE_APP_ID -> "${dock.appId}-${surface.raw}"
+        }
+        if (identity == DockIdentity.PER_SURFACE_APP_ID) {
+            check(dock.command.contains(DockSpec.APP_ID_PLACEHOLDER)) {
+                "wm.dock.identity=PER_SURFACE_APP_ID needs the dock command to carry " +
+                    "'${DockSpec.APP_ID_PLACEHOLDER}', or the dock reports '${dock.appId}' like " +
+                    "every other dock and the name is no identifier; command was: ${dock.command}"
+            }
+        }
+        val command = dock.command.replace(DockSpec.APP_ID_PLACEHOLDER, appId)
 
         // Focus first: sway's split applies to the focused container, and the dock has to land
         // inside this surface's tab rather than wherever focus happened to be.
@@ -79,12 +92,17 @@ class SwayWindowManager(
         // Must precede the exec — sway evaluates focus rules when the window maps, so issuing
         // this afterwards would be too late to prevent the steal.
         if (!cfg[WmFlags.dockFocusOnMap]) {
-            run("""no_focus [app_id="${dock.appId}"]""")
+            run("""no_focus [app_id="$appId"]""")
         }
 
-        run("exec ${dock.command}")
-        val dockNode = awaitWindow(dock.appId)
-            ?: error("dock '${dock.appId}' never appeared; command was: ${dock.command}")
+        // Taken after the no_focus rule and before the exec, so it is exactly the set of docks
+        // that were already standing. Matching the spawned dock on app_id alone would resolve to
+        // whichever of them sway happens to list first, since in production every dock is the
+        // same panel program and they all report the same name.
+        val standing = tree().windows.filter { it.appId == appId }.map { it.id }.toSet()
+        run("exec $command")
+        val dockNode = awaitWindow(appId, standing)
+            ?: error("dock '$appId' never appeared; command was: $command")
         val dockId = SurfaceId(dockNode.id)
 
         run("""[con_id=${dockId.raw}] mark --add ${cfg[WmFlags.dockMarkPrefix]}${surface.raw}""")
@@ -164,20 +182,24 @@ class SwayWindowManager(
     }
 
     /**
-     * Waits for a window with [appId] to appear.
+     * Waits for a window with [appId] that is not one of [standing] to appear.
      *
      * Polls rather than listening for the `new` event so that [attach] does not depend on
      * [WmFlags.eventsEnabled]; attaching a dock has to keep working with events off.
      */
-    private suspend fun awaitWindow(appId: String, timeoutMs: Long = WINDOW_WAIT_MS): Node? =
-        withTimeoutOrNull(timeoutMs) {
-            while (true) {
-                tree().windows.firstOrNull { it.appId == appId }?.let { return@withTimeoutOrNull it }
-                yield()
-            }
-            @Suppress("UNREACHABLE_CODE")
-            null
+    private suspend fun awaitWindow(
+        appId: String,
+        standing: Set<Long>,
+        timeoutMs: Long = WINDOW_WAIT_MS,
+    ): Node? = withTimeoutOrNull(timeoutMs) {
+        while (true) {
+            tree().windows.firstOrNull { it.appId == appId && it.id !in standing }
+                ?.let { return@withTimeoutOrNull it }
+            yield()
         }
+        @Suppress("UNREACHABLE_CODE")
+        null
+    }
 
     private inner class SwayDockHandle(
         override val surface: SurfaceId,
