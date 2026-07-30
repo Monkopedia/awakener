@@ -1,6 +1,7 @@
 package com.monkopedia.awakener.config
 
 import java.io.File
+import java.net.URI
 import java.util.jar.JarFile
 
 /**
@@ -10,9 +11,9 @@ import java.util.jar.JarFile
  * A flag exists from the moment its declaring object is class-loaded, and the modules that
  * declare flags depend on `:config` rather than the other way round — so `:config` cannot name
  * them, and an entry point that forgets to name one silently under-reports. Discovery is by
- * convention instead: any class under [PACKAGE] whose name ends in [SUFFIX], anywhere on the
- * classpath. A module added by someone who has never read this file is covered, provided it
- * follows the convention its three predecessors already follow.
+ * convention instead: any class under [PACKAGE] whose name ends in [SUFFIX] and is not [Flags]
+ * itself, anywhere on the classpath. A module added by someone who has never read this file is
+ * covered, provided it follows the convention its three predecessors already follow.
  *
  * Loading is idempotent — the JVM runs a class initialiser once — so calling this twice does
  * not trip [Flags]' duplicate-key check.
@@ -73,7 +74,7 @@ object FlagDiscovery {
                     entry.isDirectory -> found += entry.classesUnderPackage()
                     // Anything else on a classpath is not ours to open, and complaining about
                     // it would put noise in front of the warnings that mean something.
-                    entry.isArchive -> found += entry.scanJar(pending)
+                    entry.isArchive -> found += entry.scanJar(pending, problems)
                 }
             }.onFailure { problems += "$entry could not be read: $it" }
         }
@@ -87,18 +88,53 @@ object FlagDiscovery {
         val root = resolve(PACKAGE)
         if (!root.isDirectory) return emptyList()
         return root.walkTopDown()
-            .filter { it.isFile && it.name.endsWith(DECLARING) }
+            .filter { it.isFile && declares(it.name) }
             .map { it.relativeTo(this).path.removeSuffix(CLASS_EXT).replace(File.separatorChar, '.') }
             .toList()
     }
 
-    private fun File.scanJar(pending: ArrayDeque<File>): List<String> = JarFile(this).use { jar ->
+    private fun File.scanJar(
+        pending: ArrayDeque<File>,
+        problems: MutableList<String>,
+    ): List<String> = JarFile(this).use { jar ->
         jar.manifest?.mainAttributes?.getValue("Class-Path")?.split(" ")
             ?.filter { it.isNotEmpty() }
-            ?.forEach { pending += parentFile?.resolve(it) ?: File(it) }
+            ?.forEach { entry ->
+                val target = manifestEntry(entry)
+                when {
+                    target == null ->
+                        problems += "$this: Class-Path entry '$entry' is not a local file"
+                    !target.exists() ->
+                        problems += "$this: Class-Path entry '$entry' points at $target, " +
+                            "which does not exist"
+                    else -> pending += target
+                }
+            }
         jar.entries().asSequence()
-            .filter { it.name.startsWith("$PACKAGE/") && it.name.endsWith(DECLARING) }
+            .filter { it.name.startsWith("$PACKAGE/") && declares(it.name.substringAfterLast('/')) }
             .map { it.name.removeSuffix(CLASS_EXT).replace('/', '.') }
             .toList()
+    }
+
+    /** [Flags] itself matches the suffix exactly but declares nothing, so it is not a declarer. */
+    private fun declares(fileName: String) =
+        fileName.endsWith(DECLARING) && fileName != DECLARING
+
+    /**
+     * A `Class-Path` entry is a URL resolved against the jar's own URL, not a filesystem path.
+     * Gradle writes each one as `jar.parentFile.toURI().relativize(entry.toURI()).rawPath`
+     * (`ManifestUtil.constructRelativeClasspathUri`) — the *encoded* path — so a single space
+     * anywhere above the build directory would turn a path-based read into silence. Entries no
+     * URI parser accepts are still tried as paths, because tools that emit them exist and losing
+     * their flags would be the same failure from the other side.
+     *
+     * @return null when the entry names something that is not a local file, such as an `http:`
+     * URL, which discovery has no way to open.
+     */
+    private fun File.manifestEntry(entry: String): File? {
+        val uri = runCatching { toURI().resolve(URI(entry)) }.getOrNull()
+            ?: return absoluteFile.parentFile?.resolve(entry) ?: File(entry)
+        if (uri.scheme != "file") return null
+        return runCatching { File(uri) }.getOrNull()
     }
 }

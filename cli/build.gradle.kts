@@ -15,7 +15,7 @@ kotlin {
 
     sourceSets {
         commonMain.dependencies {
-            siblingModules.forEach { api(project(it)) }
+            siblingModules.forEach { implementation(project(it)) }
         }
         jvmTest.dependencies {
             implementation(kotlin("test"))

@@ -56,11 +56,14 @@ object Flags {
     }
 
     private fun <T> register(flag: Flag<T>): Flag<T> {
-        val clash = registered.put(flag.key, flag)
-        require(clash == null) {
+        // Checked before the store is touched: discovery catches a failing class initialiser and
+        // reports it, so a registration that put first would leave the rejected flag behind a
+        // mere warning — and `list` would then print the loser's default under the winner's key.
+        require(flag.key !in registered) {
             "duplicate flag key '${flag.key}' — keys are the config file's schema, so a " +
                 "collision would make one of the two flags silently unsettable"
         }
+        registered[flag.key] = flag
         return flag
     }
 

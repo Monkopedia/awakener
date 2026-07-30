@@ -95,7 +95,8 @@ behaviours, *build both and add the switch* rather than asking which he wants.
   self-documenting instead of a hand-maintained list that drifts.
 - **The name and the package are load-bearing**: `FlagDiscovery` finds declaring classes by
   scanning the classpath for `com.monkopedia.awakener.**` classes whose name ends in `Flags`,
-  and `:cli` depends on every module in the build. Follow the convention and a new module's
+  and `:cli` depends on every module in the build. Give it a prefix — a class named exactly
+  `Flags` is the registry itself and is skipped. Follow the convention and a new module's
   flags show up in `list` with no registration step anywhere; deviate and they are invisible
   until someone names the class in `config.flags.declarations`.
 - Defaults must be the behaviour you would have hard-coded, so an unconfigured system is
