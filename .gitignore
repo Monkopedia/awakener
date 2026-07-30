@@ -4,3 +4,6 @@ local.properties
 .idea/
 *.iml
 .kotlin/
+
+# Agent worktrees live inside the repo; never commit one.
+.claude/worktrees/
