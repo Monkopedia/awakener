@@ -105,6 +105,28 @@ class SurfaceKeyTest {
         assertEquals(SurfaceKey.Window(SurfaceKey.UNIDENTIFIED), nameless)
     }
 
+    /**
+     * A title churns — it carries the open document, a dirty marker, a line number — so keying
+     * on it orphans the residue accumulated under the old title. The alternative collapses every
+     * app_id-less window onto one agent, which is why it is a flag rather than a fix.
+     */
+    @Test
+    fun `the title fallback can be switched off for something that does not churn`() {
+        val config = InMemoryConfigStore()
+            .put(RegistryFlags.missingAppId, MissingAppId.UNIDENTIFIED)
+            .config.value
+
+        assertEquals(
+            SurfaceKey.Window(SurfaceKey.UNIDENTIFIED),
+            SurfaceKey.of(SurfaceDescriptor(null, "Some X11 App", 5), config),
+        )
+        assertEquals(
+            SurfaceKey.Window("firefox"),
+            SurfaceKey.of(SurfaceDescriptor("firefox", "Some X11 App", 5), config),
+            "a window that does report an app_id is untouched by the flag",
+        )
+    }
+
     private fun identity(value: WindowIdentity): Config =
         InMemoryConfigStore().put(RegistryFlags.windowIdentity, value).config.value
 }

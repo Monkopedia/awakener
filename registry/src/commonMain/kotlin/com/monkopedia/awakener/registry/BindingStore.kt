@@ -62,9 +62,6 @@ interface BindingStore {
     /** Forgets a binding. Returns whether there was one. Does not delete residue. */
     suspend fun unbind(key: SurfaceKey): Boolean
 
-    /** Persists anything outstanding under [WritePolicy.ON_FLUSH]. A no-op otherwise. */
-    suspend fun flush()
-
     /**
      * Where this surface's distilled residue lives.
      *

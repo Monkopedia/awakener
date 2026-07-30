@@ -39,13 +39,20 @@ enum class AgentIdSource {
     DERIVED,
 }
 
-/** When the bindings file is written. */
-enum class WritePolicy {
-    /** Persist on every change. A crash then cannot lose a binding. */
-    EVERY_CHANGE,
+/** What a window that reports no `app_id` — an xwayland window, usually — is keyed on. */
+enum class MissingAppId {
+    /**
+     * The window title. Keeps such windows separable, but a title is not durable: it churns with
+     * the document, the tab, or a dirty marker, and each new title orphans the residue the old
+     * one accumulated.
+     */
+    TITLE,
 
-    /** Persist only on an explicit flush. Fewer writes; a crash loses whatever is unflushed. */
-    ON_FLUSH,
+    /**
+     * A single fixed key. Every window with no `app_id` shares one agent — coarse, but the
+     * residue under it stops being abandoned every time a title changes.
+     */
+    UNIDENTIFIED,
 }
 
 /** What binding an already-bound surface does. */
@@ -80,18 +87,19 @@ object RegistryFlags {
         "Path to the bindings file. Empty means \$XDG_STATE_HOME/awakener/bindings.json.",
     )
 
-    val writePolicy = Flags.enum(
-        "registry.store.write_policy",
-        WritePolicy.EVERY_CHANGE,
-        "When the bindings file is written. Every change is durable against a crash; on-flush " +
-            "batches writes for a caller that binds many surfaces at once.",
-    )
-
     val windowIdentity = Flags.enum(
         "registry.key.window_identity",
         WindowIdentity.APP_ID,
         "What makes two windows the same surface. Per-app is stable across restarts; per-title " +
             "splits a multi-window app but inherits that app's title churn.",
+    )
+
+    val missingAppId = Flags.enum(
+        "registry.key.missing_app_id",
+        MissingAppId.TITLE,
+        "What a window reporting no app_id is keyed on. The title keeps such windows separable " +
+            "but churns, orphaning residue on every retitle; the fixed key is stable but puts " +
+            "every unidentified window on one agent.",
     )
 
     val agentNamePrefix = Flags.string(

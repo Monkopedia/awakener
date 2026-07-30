@@ -93,11 +93,15 @@ sealed interface SurfaceKey {
          */
         fun of(descriptor: SurfaceDescriptor, config: Config): SurfaceKey {
             descriptor.origin?.takeIf { it.isNotBlank() }?.let { return Origin(it) }
-            // An xwayland window can report no app_id at all; its title is the only durable
-            // thing left. Falling back keeps the "every surface gets an agent" invariant rather
-            // than dropping such windows on the floor.
+            // An xwayland window can report no app_id at all. Both ways out are lossy — the
+            // title is separable but churns, the fixed key is stable but collapses every such
+            // window onto one agent — so it is [RegistryFlags.missingAppId]'s call. Either way
+            // the window gets a key, rather than being dropped on the floor.
             val appId = descriptor.appId?.takeIf { it.isNotBlank() }
-                ?: descriptor.title?.takeIf { it.isNotBlank() }
+                ?: when (config[RegistryFlags.missingAppId]) {
+                    MissingAppId.TITLE -> descriptor.title?.takeIf { it.isNotBlank() }
+                    MissingAppId.UNIDENTIFIED -> null
+                }
                 ?: UNIDENTIFIED
             return when (config[RegistryFlags.windowIdentity]) {
                 WindowIdentity.APP_ID -> Window(appId)

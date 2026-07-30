@@ -32,7 +32,12 @@ fun AgentId.asIdentity(): AgentIdentity = AgentIdentity(this, raw.removePrefix("
 
 /** Mints the durable identity for a surface that has never been bound before. */
 fun interface AgentIdentities {
-    suspend fun mint(key: SurfaceKey): AgentIdentity
+    /**
+     * @param residuePath where this surface's residue will live, supplied by the store rather
+     * than recomputed, because the store is the authority on that — one opened over an explicit
+     * path does not agree with what the flags alone would say.
+     */
+    suspend fun mint(key: SurfaceKey, residuePath: String): AgentIdentity
 }
 
 /**
@@ -52,7 +57,7 @@ fun spanreedNameFor(key: SurfaceKey, prefix: String): String = prefix + key.slug
 class DerivedAgentIdentities(private val config: () -> Config) : AgentIdentities {
     constructor(store: ConfigStore) : this({ store.config.value })
 
-    override suspend fun mint(key: SurfaceKey): AgentIdentity {
+    override suspend fun mint(key: SurfaceKey, residuePath: String): AgentIdentity {
         val name = spanreedNameFor(key, config()[RegistryFlags.agentNamePrefix])
         return AgentIdentity(AgentId("agent-$name"), name)
     }

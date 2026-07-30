@@ -32,8 +32,11 @@ class SpanreedCliTest {
             response
         },
         ownPid = { 4321L },
-        residuePathFor = { _, key -> "/state/residue/${key.slug}.md" },
     )
+
+    /** The store is what knows where residue lives, so the caller supplies it. */
+    private suspend fun SpanreedCli.mint(key: SurfaceKey) =
+        mint(key, "/state/residue/${key.slug}.md")
 
     @Test
     fun `minting asks spanreed for the id under the surface's agent name`() = runTest {

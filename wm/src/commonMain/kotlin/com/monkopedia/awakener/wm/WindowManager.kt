@@ -94,7 +94,17 @@ interface WindowManager {
      */
     suspend fun resolve(surface: SurfaceId): AgentId?
 
-    suspend fun attach(surface: SurfaceId, agent: AgentId, dock: DockSpec): DockHandle
+    /**
+     * Stands a dock up beside [surface] and records the binding it is standing for.
+     *
+     * @param agent the agent to bind, or null — the hotkey case — to use whatever this surface
+     * is already bound to, minting a Lifeless if it is still a Drab.
+     * @return a handle whose [DockHandle.agent] is the agent actually bound, which under
+     * `registry.binding.rebind_policy=KEEP` is **not** necessarily the one passed in: a caller
+     * holding a stale agent must not be able to strand the residue accumulated under the
+     * existing one.
+     */
+    suspend fun attach(surface: SurfaceId, dock: DockSpec, agent: AgentId? = null): DockHandle
 
     val changes: Flow<SurfaceChange>
 }

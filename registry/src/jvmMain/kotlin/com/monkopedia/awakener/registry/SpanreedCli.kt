@@ -2,6 +2,7 @@ package com.monkopedia.awakener.registry
 
 import com.monkopedia.awakener.config.Config
 import com.monkopedia.awakener.config.ConfigStore
+import java.io.InputStream
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -19,21 +20,78 @@ fun interface CommandRunner {
     fun run(command: List<String>, environment: Map<String, String>): ProcessResult
 }
 
-/** Runs commands as real subprocesses. */
-object ProcessCommandRunner : CommandRunner {
-    private const val TIMEOUT_SECONDS = 10L
-
+/**
+ * Runs commands as real subprocesses.
+ *
+ * Every call here is on the hotkey path — the default [AgentIdSource] shells out to mint an
+ * identity, and `attach` awaits it — so the contract is that [run] returns within [timeoutMs]
+ * whatever the child does.
+ *
+ * @param timeoutMs how long the child gets before it is killed. A parameter rather than a
+ * constant so a test can prove the timeout fires without spending the production budget waiting.
+ */
+class ProcessCommandRunner(private val timeoutMs: Long = DEFAULT_TIMEOUT_MS) : CommandRunner {
     override fun run(command: List<String>, environment: Map<String, String>): ProcessResult {
         val process = ProcessBuilder(command)
             .apply { environment().putAll(environment) }
             .start()
-        val stdout = process.inputStream.bufferedReader().readText()
-        val stderr = process.errorStream.bufferedReader().readText()
-        if (!process.waitFor(TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+        // Nothing awakener runs is fed on stdin, and a child that reads it would otherwise wait
+        // forever for input that is never coming.
+        process.outputStream.close()
+        // Both pipes are drained concurrently, and the clock runs while they drain. Reading
+        // stdout to EOF first deadlocks the moment the child writes more than a pipe buffer
+        // (~64 KiB) to stderr: it blocks on that write, so it never closes stdout, so the read
+        // never returns — and a timeout applied *after* the reads can then never fire. A
+        // spanreed that logs a stack trace is enough to hit it.
+        val stdout = Drain(process.inputStream)
+        val stderr = Drain(process.errorStream)
+        if (!process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) {
             process.destroyForcibly()
-            return ProcessResult(-1, stdout, "timed out after ${TIMEOUT_SECONDS}s")
+            // Killing the child closes its pipes, which is what lets the drains finish.
+            process.waitFor()
+            return ProcessResult(TIMED_OUT, stdout.collect(), "timed out after ${timeoutMs}ms")
         }
-        return ProcessResult(process.exitValue(), stdout, stderr)
+        return ProcessResult(process.exitValue(), stdout.collect(), stderr.collect())
+    }
+
+    /**
+     * Reads one pipe on its own thread into a buffer the caller can take at any point.
+     *
+     * Partial rather than all-or-nothing on purpose: a child's exit does not close a pipe a
+     * grandchild inherited, so the collecting side has to be able to stop waiting and still keep
+     * what arrived — an unbounded wait here would put back exactly the unbounded call above.
+     */
+    private class Drain(stream: InputStream) {
+        private val text = StringBuilder()
+
+        private val thread = Thread {
+            val reader = stream.bufferedReader()
+            val chunk = CharArray(DEFAULT_BUFFER_SIZE)
+            runCatching {
+                while (true) {
+                    val read = reader.read(chunk)
+                    if (read < 0) break
+                    synchronized(text) { text.appendRange(chunk, 0, read) }
+                }
+            }
+        }.apply {
+            name = "awakener-subprocess-drain"
+            isDaemon = true
+            start()
+        }
+
+        fun collect(): String {
+            thread.join(DRAIN_GRACE_MS)
+            return synchronized(text) { text.toString() }
+        }
+    }
+
+    private companion object {
+        const val DEFAULT_TIMEOUT_MS = 10_000L
+        const val DRAIN_GRACE_MS = 1_000L
+
+        /** Distinguishable from any real exit code, which is 0..255. */
+        const val TIMED_OUT = -1
     }
 }
 
@@ -48,11 +106,8 @@ object ProcessCommandRunner : CommandRunner {
  */
 class SpanreedCli(
     private val configStore: ConfigStore,
-    private val runner: CommandRunner = ProcessCommandRunner,
+    private val runner: CommandRunner = ProcessCommandRunner(),
     private val ownPid: () -> Long = { ProcessHandle.current().pid() },
-    private val residuePathFor: (Config, SurfaceKey) -> String = { config, key ->
-        RegistryPaths.residueLocation(config, RegistryPaths.storePath(config), key).toString()
-    },
 ) : AgentIdentities {
     private val config: Config get() = configStore.config.value
 
@@ -63,7 +118,7 @@ class SpanreedCli(
      * one prefix while asking spanreed for an id under another would produce a binding whose
      * two halves disagree forever.
      */
-    override suspend fun mint(key: SurfaceKey): AgentIdentity {
+    override suspend fun mint(key: SurfaceKey, residuePath: String): AgentIdentity {
         val cfg = config
         val name = spanreedNameFor(key, cfg[RegistryFlags.agentNamePrefix])
         val id = when (cfg[RegistryFlags.agentIdSource]) {
@@ -71,7 +126,7 @@ class SpanreedCli(
             AgentIdSource.SPANREED -> AgentId(agentId(cfg, name))
         }
         val identity = AgentIdentity(id, name)
-        if (cfg[RegistryFlags.registerOnMint]) register(key, identity)
+        if (cfg[RegistryFlags.registerOnMint]) register(identity, residuePath)
         return identity
     }
 
@@ -93,38 +148,35 @@ class SpanreedCli(
     /**
      * Mirrors a Lifeless into spanreed's registry.
      *
-     * `--working-dir` gets the residue location, which is as close to a working directory as a
-     * surface has and makes `spanreed list` point at the written-down model when an agent gets
-     * something wrong. Note the known gap: spanreed keys liveness on `pid` + `pid_start`, so an
-     * entry registered under awakener's pid outlives the Lifeless it describes — which is why
-     * [RegistryFlags.registerOnMint] defaults off.
+     * `--working-dir` gets [residuePath], which is as close to a working directory as a surface
+     * has and makes `spanreed list` point at the written-down model when an agent gets something
+     * wrong. It is passed in rather than recomputed from the flags because the store is the
+     * authority on where its own residue lives — a store opened over an explicit path would
+     * otherwise be registered against a location nothing ever writes to. Note the known gap:
+     * spanreed keys liveness on `pid` + `pid_start`, so an entry registered under awakener's pid
+     * outlives the Lifeless it describes — which is why [RegistryFlags.registerOnMint] defaults
+     * off.
      */
-    suspend fun register(key: SurfaceKey, identity: AgentIdentity): ProcessResult {
-        val cfg = config
-        return exec(
-            cfg,
-            listOf(
-                "register",
-                "--agent-id", identity.id.raw,
-                "--name", identity.spanreedName,
-                "--working-dir", residuePathFor(cfg, key),
-                "--pid", ownPid().toString(),
-            ),
-            identity.spanreedName,
-        )
-    }
-
-    /** Every registered agent, as raw JSON. Used to tell a live Lifeless from a remembered one. */
-    suspend fun list(): ProcessResult = exec(config, listOf("list"), name = null)
+    suspend fun register(identity: AgentIdentity, residuePath: String): ProcessResult = exec(
+        config,
+        listOf(
+            "register",
+            "--agent-id", identity.id.raw,
+            "--name", identity.spanreedName,
+            "--working-dir", residuePath,
+            "--pid", ownPid().toString(),
+        ),
+        identity.spanreedName,
+    )
 
     private suspend fun exec(
         config: Config,
         args: List<String>,
-        name: String?,
+        name: String,
     ): ProcessResult = withContext(Dispatchers.IO) {
         runner.run(
             listOf(config[RegistryFlags.spanreedCommand]) + args,
-            name?.let { mapOf("SPANREED_AGENT_NAME" to it) } ?: emptyMap(),
+            mapOf("SPANREED_AGENT_NAME" to name),
         )
     }
 }

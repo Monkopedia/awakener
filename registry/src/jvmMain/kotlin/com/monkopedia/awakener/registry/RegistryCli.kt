@@ -16,7 +16,7 @@ import kotlinx.coroutines.runBlocking
  */
 object RegistryCli {
     fun run(args: Array<String>, store: FileBindingStore, out: (String) -> Unit): Int {
-        store.loadError.value?.let {
+        store.loadError?.let {
             out("error: $it")
             out("refusing to write until this is resolved; move the file aside to start over")
             return 1

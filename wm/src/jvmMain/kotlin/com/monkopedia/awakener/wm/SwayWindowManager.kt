@@ -50,17 +50,6 @@ class SwayWindowManager(
             ?.let { SurfaceKey.of(it.descriptor, config) }
 
     /**
-     * Resolve-or-mint for [surface]: the agent a hotkey invocation should raise.
-     *
-     * Minting on first *invocation* rather than on first sighting is the design's rule — a
-     * trigger on window creation would spawn an agent for every window glanced at and closed.
-     */
-    suspend fun bind(surface: SurfaceId): AgentId {
-        val key = keyFor(surface) ?: error("no such surface: ${surface.raw}")
-        return registry.bind(key).agent
-    }
-
-    /**
      * Every window that is not a dock. The dock mark is the discriminator, because a dock is
      * a genuine tree node and is otherwise indistinguishable from a surface needing an agent.
      */
@@ -76,12 +65,11 @@ class SwayWindowManager(
 
     override suspend fun attach(
         surface: SurfaceId,
-        agent: AgentId,
         dock: DockSpec,
+        agent: AgentId?,
     ): DockHandle {
         val cfg = config
-        val key = keyFor(surface)
-        check(key != null && tree().find(surface.raw) != null) { "no such surface: ${surface.raw}" }
+        val key = keyFor(surface) ?: error("no such surface: ${surface.raw}")
 
         // Focus first: sway's split applies to the focused container, and the dock has to land
         // inside this surface's tab rather than wherever focus happened to be.
@@ -106,8 +94,11 @@ class SwayWindowManager(
         run("[con_id=${dockId.raw}] resize set width ${cfg[WmFlags.dockSizePpt]} ppt")
 
         // Recorded after the dock is standing, so a failed attach does not leave a durable
-        // binding to an agent that has no panel.
-        val bound = registry.bind(key, agent.asIdentity())
+        // binding to an agent that has no panel. A null agent is the hotkey case: the registry
+        // resolves the surface's existing Lifeless or mints one, which is the only moment an
+        // identity is ever minted — a trigger on window creation would spawn an agent for every
+        // window glanced at and closed.
+        val bound = registry.bind(key, agent?.asIdentity())
         val handle = SwayDockHandle(surface, bound.agent, dockId, key)
         if (cfg[WmFlags.restoreFocusAfterAttach]) handle.settleFocus()
         return handle

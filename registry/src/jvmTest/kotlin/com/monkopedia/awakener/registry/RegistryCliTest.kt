@@ -14,7 +14,7 @@ import kotlinx.coroutines.test.runTest
 class RegistryCliTest {
     private val dir = createTempDirectory("awakener-registry-cli")
     private val config = InMemoryConfigStore()
-    private val identities = AgentIdentities { key ->
+    private val identities = AgentIdentities { key, _ ->
         AgentIdentity(AgentId("agent-${key.slug}"), key.slug)
     }
     private val out = mutableListOf<String>()

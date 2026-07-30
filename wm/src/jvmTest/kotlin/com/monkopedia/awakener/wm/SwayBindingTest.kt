@@ -31,6 +31,7 @@ class SwayBindingTest {
     private lateinit var wm: SwayWindowManager
     private lateinit var store: InMemoryConfigStore
     private lateinit var stateDir: Path
+    private var minted = 0
 
     private val enabled get() = SwayHarness.available()
 
@@ -47,11 +48,15 @@ class SwayBindingTest {
     /**
      * A real file-backed registry rather than an in-memory one, because the behaviour worth
      * testing here — a binding outliving the window it was made against — is exactly what an
-     * in-memory store would fake.
+     * in-memory store would fake. The minter is counted so that "did this attach mint a
+     * Lifeless" is observable; the real one shells out to spanreed, which a sway test must not.
      */
     private fun bindingStore() = FileBindingStore(
         configStore = store,
-        identities = DerivedAgentIdentities(store),
+        identities = { key, residuePath ->
+            minted++
+            DerivedAgentIdentities(store).mint(key, residuePath)
+        },
         path = stateDir.resolve("bindings.json"),
     )
 
@@ -68,7 +73,7 @@ class SwayBindingTest {
         val app1 = openSurface("aw-app1")
         val app2 = openSurface("aw-app2")
 
-        wm.attach(app1, AgentId("agent-1"), dockFor("aw-dock1"))
+        wm.attach(app1, dockFor("aw-dock1"), AgentId("agent-1"))
 
         val workspace = assertNotNull(wm.tree().workspace("1"))
         assertEquals(
@@ -90,7 +95,7 @@ class SwayBindingTest {
     @Test
     fun `surfaces excludes docks`() = swayTest {
         val app = openSurface("aw-app1")
-        wm.attach(app, AgentId("agent-1"), dockFor("aw-dock1"))
+        wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1"))
 
         val appIds = wm.surfaces().map { it.appId }
         assertEquals(listOf("aw-app1"), appIds, "the dock is a real tree node but not a surface")
@@ -105,7 +110,7 @@ class SwayBindingTest {
     fun `tab switch lands on the app, not the dock`() = swayTest {
         val app1 = openSurface("aw-app1")
         val app2 = openSurface("aw-app2")
-        wm.attach(app1, AgentId("agent-1"), dockFor("aw-dock1"))
+        wm.attach(app1, dockFor("aw-dock1"), AgentId("agent-1"))
 
         command("[con_id=${app2.raw}] focus")
         command("focus left")
@@ -118,7 +123,7 @@ class SwayBindingTest {
         store.put(WmFlags.restingFocus, RestingFocus.DOCK)
         val app1 = openSurface("aw-app1")
         val app2 = openSurface("aw-app2")
-        val handle = wm.attach(app1, AgentId("agent-1"), dockFor("aw-dock1"))
+        val handle = wm.attach(app1, dockFor("aw-dock1"), AgentId("agent-1"))
 
         command("[con_id=${app2.raw}] focus")
         command("focus left")
@@ -130,7 +135,7 @@ class SwayBindingTest {
     @Test
     fun `orphaned dock is reaped when its surface closes`() = swayTest {
         val app = openSurface("aw-app1")
-        val handle = wm.attach(app, AgentId("agent-1"), dockFor("aw-dock1"))
+        val handle = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1"))
 
         command("[con_id=${app.raw}] kill")
         awaitGone(app)
@@ -147,7 +152,7 @@ class SwayBindingTest {
     @Test
     fun `detaching normalises the container so later windows are not swallowed`() = swayTest {
         val app1 = openSurface("aw-app1")
-        val handle = wm.attach(app1, AgentId("agent-1"), dockFor("aw-dock1"))
+        val handle = wm.attach(app1, dockFor("aw-dock1"), AgentId("agent-1"))
         handle.detach()
 
         val newSurface = openSurface("aw-app3")
@@ -165,7 +170,7 @@ class SwayBindingTest {
     fun `container normalisation is switchable off`() = swayTest {
         store.put(WmFlags.normalizeContainerOnDetach, false)
         val app1 = openSurface("aw-app1")
-        val handle = wm.attach(app1, AgentId("agent-1"), dockFor("aw-dock1"))
+        val handle = wm.attach(app1, dockFor("aw-dock1"), AgentId("agent-1"))
         handle.detach()
 
         val tab = assertNotNull(wm.tree().workspace("1")).children.single()
@@ -185,7 +190,7 @@ class SwayBindingTest {
     @Test
     fun `a binding survives the window and the process that made it`() = swayTest {
         val app = openSurface("aw-app1")
-        wm.attach(app, AgentId("agent-1"), dockFor("aw-dock1"))
+        wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1"))
 
         command("[con_id=${app.raw}] kill")
         awaitGone(app)
@@ -204,7 +209,7 @@ class SwayBindingTest {
     @Test
     fun `detaching the dock leaves the binding standing`() = swayTest {
         val app = openSurface("aw-app1")
-        wm.attach(app, AgentId("agent-1"), dockFor("aw-dock1")).detach()
+        wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1")).detach()
 
         assertEquals(AgentId("agent-1"), wm.resolve(app), "the durable binding outlives the dock")
     }
@@ -213,7 +218,7 @@ class SwayBindingTest {
     fun `forgetting on detach is switchable on`() = swayTest {
         store.put(WmFlags.forgetBindingOnDetach, true)
         val app = openSurface("aw-app1")
-        wm.attach(app, AgentId("agent-1"), dockFor("aw-dock1")).detach()
+        wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1")).detach()
 
         assertNull(wm.resolve(app), "with the flag on, the dock's lifetime is the agent's")
     }
@@ -222,6 +227,26 @@ class SwayBindingTest {
     @Test
     fun `an unbound surface resolves to nothing`() = swayTest {
         assertNull(wm.resolve(openSurface("aw-app1")))
+    }
+
+    /**
+     * The hotkey path: nobody upstream holds an agent for a Drab, so attaching without one is
+     * what mints a Lifeless — and it is the only moment anything is minted, since a trigger on
+     * window creation would spawn an agent for every window glanced at and closed.
+     */
+    @Test
+    fun `attaching without an agent mints one and keeps it`() = swayTest {
+        val app = openSurface("aw-app1")
+        assertNull(wm.resolve(app), "a Drab to start with")
+
+        val handle = wm.attach(app, dockFor("aw-dock1"))
+
+        assertEquals(1, minted, "the surface had no agent, so one had to be minted")
+        assertEquals(handle.agent, wm.resolve(app), "and the mint is what the surface resolves to")
+
+        handle.detach()
+        wm.attach(app, dockFor("aw-dock2"))
+        assertEquals(1, minted, "a surface that is already bound must not cost a second mint")
     }
 
     // -- helpers ------------------------------------------------------------------------

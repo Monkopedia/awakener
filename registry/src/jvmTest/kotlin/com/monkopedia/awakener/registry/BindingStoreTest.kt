@@ -19,11 +19,15 @@ import kotlinx.coroutines.test.runTest
 class BindingStoreTest {
     private val dir = createTempDirectory("awakener-registry")
     private val config = InMemoryConfigStore()
+    /** Counts mints, so "did this surface get a *new* agent" is directly observable. */
     private var minted = 0
 
-    /** Counts mints, so "did this surface get a *new* agent" is directly observable. */
-    private val identities = AgentIdentities { key ->
+    /** The residue path the store handed the minter on the last mint. */
+    private var mintedAgainst: String? = null
+
+    private val identities = AgentIdentities { key, residuePath ->
         minted++
+        mintedAgainst = residuePath
         AgentIdentity(AgentId("agent-minted-$minted"), "minted-${key.slug}")
     }
 
@@ -90,15 +94,31 @@ class BindingStoreTest {
         assertNull(store().resolve(key), "and the removal reached the file")
     }
 
+    /**
+     * A binding is on disk before `bind` returns. There is no batching mode: with no daemon to
+     * own a flush point, a policy that deferred the write would mean bindings that are never
+     * written at all — the exact failure this module exists to prevent.
+     */
     @Test
-    fun `on-flush batches writes until asked`() = runTest {
-        config.put(RegistryFlags.writePolicy, WritePolicy.ON_FLUSH)
+    fun `a binding is on disk as soon as it is made`() = runTest {
         val store = store()
-        store.bind(SurfaceKey.Window("firefox"))
+        assertFalse(store.path.exists(), "nothing bound, nothing written")
 
-        assertFalse(store.path.exists(), "nothing should have been written yet")
-        store.flush()
+        store.bind(SurfaceKey.Window("firefox"))
         assertTrue(store.path.readText().contains("window:firefox"))
+    }
+
+    /**
+     * The store is the authority on where residue lives, not the flags: one opened over an
+     * explicit path must not hand a minter a location that nothing will ever write to.
+     */
+    @Test
+    fun `the minter is told the residue path this store will actually use`() = runTest {
+        val key = SurfaceKey.Window("firefox")
+        val store = store()
+        store.bind(key)
+
+        assertEquals(store.residueLocation(key), mintedAgainst)
     }
 
     /**
@@ -111,7 +131,7 @@ class BindingStoreTest {
         path.writeText("{ this is not json")
         val store = store("broken.json")
 
-        assertNotNull(store.loadError.value)
+        assertNotNull(store.loadError)
         store.bind(SurfaceKey.Window("firefox"))
         assertEquals("{ this is not json", path.readText(), "the unreadable file is left alone")
     }
@@ -122,8 +142,8 @@ class BindingStoreTest {
         path.writeText("""{"version": 99, "bindings": {}}""")
         val store = store("future.json")
 
-        assertNotNull(store.loadError.value)
-        assertTrue(store.loadError.value!!.contains("99"))
+        assertNotNull(store.loadError)
+        assertTrue(store.loadError.contains("99"))
     }
 
     /** Downgrading must not silently delete the bindings the newer build was using. */

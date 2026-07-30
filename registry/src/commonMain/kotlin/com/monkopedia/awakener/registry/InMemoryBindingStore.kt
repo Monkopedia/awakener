@@ -33,7 +33,9 @@ class InMemoryBindingStore(
     override suspend fun bind(key: SurfaceKey, agent: AgentIdentity?): Binding = lock.withLock {
         val now = clock()
         val existing = state.value[key]
-        val next = existing.merge(agent, config, now) { identities.mint(key) }
+        val next = existing.merge(agent, config, now) {
+            identities.mint(key, residueLocation(key))
+        }
         state.value = state.value + (key to next)
         next
     }
@@ -43,8 +45,6 @@ class InMemoryBindingStore(
         state.value = state.value - key
         had
     }
-
-    override suspend fun flush() = Unit
 
     override fun residueLocation(key: SurfaceKey): String =
         residueLeaf(key, config[RegistryFlags.residueLayout])

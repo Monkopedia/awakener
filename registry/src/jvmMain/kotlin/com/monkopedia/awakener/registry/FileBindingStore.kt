@@ -2,9 +2,11 @@ package com.monkopedia.awakener.registry
 
 import com.monkopedia.awakener.config.Config
 import com.monkopedia.awakener.config.ConfigStore
+import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
 import kotlin.io.path.createParentDirectories
 import kotlin.io.path.exists
 import kotlin.io.path.name
@@ -57,7 +59,7 @@ class FileBindingStore(
      * starting empty and overwriting — would re-mint every agent on the desktop and abandon
      * every residue file already on disk, which is the single worst thing this module can do.
      */
-    val loadError: StateFlow<String?> = MutableStateFlow(loaded.error).asStateFlow()
+    val loadError: String? = loaded.error
 
     /**
      * Entries whose key this build cannot interpret — a bindings file from a newer awakener that
@@ -68,8 +70,6 @@ class FileBindingStore(
 
     private val state = MutableStateFlow(loaded.bindings)
 
-    private var pendingWrite = false
-
     override val bindings: StateFlow<Map<SurfaceKey, Binding>> = state.asStateFlow()
 
     override suspend fun resolve(key: SurfaceKey): Binding? = state.value[key]
@@ -77,11 +77,13 @@ class FileBindingStore(
     override suspend fun bind(key: SurfaceKey, agent: AgentIdentity?): Binding {
         // Mint outside the lock: it can shell out to spanreed, and holding the write lock across
         // a subprocess would serialise every other surface behind one process spawn.
-        val identity = agent ?: state.value[key]?.identity ?: identities.mint(key)
+        val identity = agent
+            ?: state.value[key]?.identity
+            ?: identities.mint(key, residueLocation(key))
         return lock.withLock {
             val next = state.value[key].merge(identity, config, clock()) { identity }
             state.value = state.value + (key to next)
-            persist()
+            write(state.value)
             next
         }
     }
@@ -90,14 +92,9 @@ class FileBindingStore(
         val had = key in state.value
         if (had) {
             state.value = state.value - key
-            persist()
+            write(state.value)
         }
         had
-    }
-
-    override suspend fun flush() = lock.withLock {
-        if (pendingWrite) write(state.value)
-        pendingWrite = false
     }
 
     override fun residueLocation(key: SurfaceKey): String =
@@ -120,26 +117,24 @@ class FileBindingStore(
         location
     }
 
-    private fun persist() {
-        if (config[RegistryFlags.writePolicy] == WritePolicy.EVERY_CHANGE) {
-            write(state.value)
-            pendingWrite = false
-        } else {
-            pendingWrite = true
-        }
-    }
-
-    private fun write(bindings: Map<SurfaceKey, Binding>) {
-        if (loaded.error != null) return
+    /**
+     * Persists every change, on [Dispatchers.IO] because `bind` is on the hotkey path and a
+     * blocking write there would stall whatever dispatcher the caller invoked from.
+     */
+    private suspend fun write(bindings: Map<SurfaceKey, Binding>) = withContext(Dispatchers.IO) {
+        if (loaded.error != null) return@withContext
         val file = BindingsFile(
             bindings = bindings.mapKeys { (key, _) -> key.canonical } + loaded.unreadable,
         )
         path.createParentDirectories()
         val tmp = path.resolveSibling("${path.name}.tmp")
         Files.writeString(tmp, json.encodeToString(file))
+        // fsync before the rename, or the rename can land while the contents it points at are
+        // still in page cache: a power loss then leaves an empty file where the bindings were,
+        // which reads as "nothing is bound" and re-mints every agent on the desktop.
+        FileChannel.open(tmp, StandardOpenOption.WRITE).use { it.force(true) }
         // Atomic rename, same discipline as the config file: a concurrent reader sees the old
-        // bindings or the new ones, never a truncated file that would read as "nothing is bound"
-        // and cause every agent on the desktop to be re-minted.
+        // bindings or the new ones, never a truncated file.
         Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
     }
 
@@ -149,6 +144,11 @@ class FileBindingStore(
         val error: String?,
     )
 
+    /**
+     * Reads the file once, on the constructing thread. Deliberately not dispatched: construction
+     * is not a suspend context, and deferring it would make every read of a not-yet-loaded store
+     * racy. It is a one-time startup cost and never on the hotkey path.
+     */
     private fun load(): Loaded {
         if (!path.exists()) return Loaded(emptyMap(), emptyMap(), null)
         val parsed = try {
