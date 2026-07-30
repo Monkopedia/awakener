@@ -11,6 +11,9 @@ kotlin {
     sourceSets {
         commonMain.dependencies {
             api(project(":config"))
+            // The durable binding lives below the compositor layer, not inside it: `resolve`
+            // has to answer the same way after a reboot, and a con_id does not survive one.
+            api(project(":registry"))
         }
         jvmTest.dependencies {
             implementation(kotlin("test"))
