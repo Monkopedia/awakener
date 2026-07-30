@@ -141,5 +141,9 @@ From `docs/design.md`; these bind agent work here:
   owner.
 - **Commit style**: subject ≤ 70 chars, present tense; body explains *why*. Co-author
   trailer on agent commits.
+- **A reviewer must be explicitly spawned.** Opening a PR with `--reviewer` sets an inert
+  marker; nothing reviews a PR just because it exists. If a PR is sitting without a review,
+  ask "was a reviewer ever spawned?" before "did the reviewer die?" — the two are
+  indistinguishable from the outside and have opposite fixes.
 - Fleet-wide workflow rules (review tiers, triage classification, the code-health pass)
   live in `~/git/urithiru/workflows/` and apply here unless this file overrides them.
