@@ -69,12 +69,17 @@ conversation, not a local workaround.
 
 ## Environment (verified 2026-07-30 — re-check before relying on it)
 
-- **kaladin** — this repo's host. Headless: no `/dev/dri`, no seat, no compositor. Cannot
-  run anything needing a display.
+- **kaladin** — this repo's host. Headless: no `/dev/dri`, no seat, no compositor. Cannot run
+  anything needing a display. **`sudo` here is passwordless**, so installing a tool you need
+  is your call to make, not something to ask Jason for. `sway`, `foot`, `chromium`, `jq` and
+  `qemu` are already present. **No KVM**: the kernel reports
+  `SVM disabled (by BIOS) in MSR_VM_CR`, so virtualisation is a firmware setting no amount of
+  `modprobe` will fix, and VM work runs under TCG at roughly 10-20x slowdown.
+  `kernel.dmesg_restrict=1`, so read kernel messages with `journalctl -k`, not `dmesg`.
 - **adolin** — the desktop, and awakener's actual target. GPU, active seat0, running
   **GNOME Shell**. `google-chrome-stable` and `xorg-xwayland` installed. Reachable by
   passwordless ssh from kaladin, but **sudo there requires a password** — Jason runs
-  installs himself.
+  installs on adolin himself.
 - **No tabbed WM is installed on either host.** The dock design depends on i3/sway tree
   semantics, so it has nowhere to run for real yet. `WLR_BACKENDS=headless sway` gives a
   genuine sway tree drivable entirely over ssh via `swaymsg` — that is how structural probes
