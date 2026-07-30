@@ -67,6 +67,8 @@ sealed interface SurfaceChange {
  * working agreement holds the interface to three calls, and a handle returned by `attach` is
  * the natural owner of its own lifetime. It is not optional politeness — sway leaves both the
  * dock and its split container standing when a surface dies, so something must close this.
+ *
+ * Every method here is covered by [WindowManager]'s concurrency contract.
  */
 interface DockHandle : AutoCloseable {
     val surface: SurfaceId
@@ -94,6 +96,14 @@ interface DockHandle : AutoCloseable {
  * Deliberately tiny — `resolve`, `attach`, and change notification. Nothing above this may
  * learn which compositor is in use. [surfaces] is enumeration rather than a fourth behaviour:
  * it is how a caller obtains a [SurfaceId] to resolve in the first place.
+ *
+ * **Every call here, and every call on the [DockHandle]s it hands out, is safe to make
+ * concurrently.** Two hotkeys pressed at once are an ordinary case — one on a Drab, which
+ * attaches, and one on a bound surface, which focuses that surface's dock — and closing a handle
+ * already tears its dock down from whatever coroutine happens to run it. None of these is a
+ * single compositor operation, so an implementation owes callers whatever serialisation that
+ * takes: one hotkey landing in the middle of another must not be able to stand a dock up in
+ * somebody else's tab.
  */
 interface WindowManager {
     suspend fun surfaces(): List<Surface>
@@ -108,11 +118,6 @@ interface WindowManager {
 
     /**
      * Stands a dock up beside [surface] and records the binding it is standing for.
-     *
-     * Safe to call concurrently — two hotkeys pressed at once are an ordinary case, and closing
-     * a [DockHandle] already tears its dock down from whatever coroutine happens to run it.
-     * Standing a dock up is several compositor operations, so an implementation owes callers
-     * whatever serialisation that takes.
      *
      * @param agent the agent to bind, or null — the hotkey case — to use whatever this surface
      * is already bound to, minting a Lifeless if it is still a Drab.

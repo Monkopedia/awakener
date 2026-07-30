@@ -18,6 +18,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
@@ -34,6 +35,12 @@ class SwayBindingTest {
     private lateinit var store: InMemoryConfigStore
     private lateinit var stateDir: Path
     private var minted = 0
+
+    /**
+     * How long a mint takes. Zero everywhere but the one test that cares: the real minter is
+     * `SpanreedCli`, which shells out, and a test may not.
+     */
+    private var mintDelayMs = 0L
 
     private val enabled get() = SwayHarness.available()
 
@@ -56,6 +63,7 @@ class SwayBindingTest {
     private fun bindingStore() = FileBindingStore(
         configStore = store,
         identities = { key, residuePath ->
+            if (mintDelayMs > 0) delay(mintDelayMs)
             minted++
             DerivedAgentIdentities(store).mint(key, residuePath)
         },
@@ -342,6 +350,73 @@ class SwayBindingTest {
         )
     }
 
+    /**
+     * The third door into the same failure. `attach` spawns its dock with `exec`, and sway maps
+     * the new window into whatever container is focused *when it maps* — so a bare `focus` landing
+     * anywhere between `attach`'s own focus and the dock appearing hands the dock to a different
+     * surface's tab. `DockHandle.focus` is exactly that bare focus, and it is what a hotkey on an
+     * already-bound surface calls, so "two hotkeys at once" is one Drab and one bound surface just
+     * as readily as two Drabs.
+     */
+    @Test
+    fun `a focus during an attach does not land the dock in another surface's tab`() = swayTest {
+        val app1 = openSurface("aw-app1")
+        val app2 = openSurface("aw-app2")
+        val dock2 = wm.attach(app2, dockFor("aw-dock"), AgentId("agent-2"))
+
+        val dock1 = coroutineScope {
+            val attaching = async { wm.attach(app1, dockFor("aw-dock"), AgentId("agent-1")) }
+            // Once app1 is focused the attach is past its own focus and has not yet claimed a
+            // dock, which is the window a hotkey has to be safe in.
+            awaitFocused(app1)
+            dock2.focus()
+            attaching.await()
+        }
+
+        assertEquals(
+            setOf(app1.raw, dock1.dockId.raw),
+            assertNotNull(tabHolding(app1)).children.map { it.id }.toSet(),
+            "the dock attach just spawned belongs to app1's tab, not to wherever the focus went",
+        )
+        assertEquals(
+            setOf(app2.raw, dock2.dockId.raw),
+            assertNotNull(tabHolding(app2)).children.map { it.id }.toSet(),
+            "and app2's tab must not have adopted another surface's agent panel",
+        )
+    }
+
+    /**
+     * The hotkey path mints, and the production minter is `SpanreedCli` — a subprocess bounded
+     * only by a 10s timeout, twice over with `registry.register_on_mint` on. Serialising the
+     * compositor is worth one dock's map time; it is not worth a process spawn, which would park
+     * every other hotkey on the desktop behind one surface's agent being named. `:registry` made
+     * the same call one layer down — see the comment on `FileBindingStore.bind` — so the binding
+     * has to stay outside the tree section here too.
+     */
+    @Test
+    fun `an attach waiting on a mint does not hold up another surface's attach`() = swayTest {
+        mintDelayMs = MINT_DELAY_MS
+        val app1 = openSurface("aw-app1")
+        val app2 = openSurface("aw-app2")
+
+        coroutineScope {
+            // No agent: the hotkey case, and the only thing that ever mints.
+            val minting = async { wm.attach(app1, dockFor("aw-dock")) }
+            // Its dock is marked, so its tree work is done and it is now inside the mint.
+            awaitMarked(app1)
+
+            wm.attach(app2, dockFor("aw-dock"), AgentId("agent-2"))
+
+            assertEquals(
+                0,
+                minted,
+                "the second surface's attach finished while the first one's mint was still in " +
+                    "flight, which it could not have done if the mint were inside the lock",
+            )
+            minting.await()
+        }
+    }
+
     /** The alternative identity scheme: unique by construction, at the cost of a dock argument. */
     @Test
     fun `per-surface app_id is switchable on`() = swayTest {
@@ -405,6 +480,27 @@ class SwayBindingTest {
 
     private suspend fun focusedId(): Long? = wm.tree().windows.firstOrNull { it.focused }?.id
 
+    /** Waits until [surface]'s dock has been marked, which is the last of `attach`'s tree work. */
+    private suspend fun awaitMarked(surface: SurfaceId) {
+        assertNotNull(
+            withTimeoutOrNull(WAIT_MS) {
+                while (wm.tree().windows.none { markFor(surface) in it.marks }) yield()
+                true
+            },
+            "no dock was ever marked for ${surface.raw}",
+        )
+    }
+
+    private suspend fun awaitFocused(surface: SurfaceId) {
+        assertNotNull(
+            withTimeoutOrNull(WAIT_MS) {
+                while (focusedId() != surface.raw) yield()
+                true
+            },
+            "focus never reached ${surface.raw}",
+        )
+    }
+
     private suspend fun awaitWindow(appId: String): Long? = withTimeoutOrNull(WAIT_MS) {
         while (true) {
             wm.tree().windows.firstOrNull { it.appId == appId }?.let { return@withTimeoutOrNull it.id }
@@ -422,5 +518,8 @@ class SwayBindingTest {
 
     private companion object {
         const val WAIT_MS = 5_000L
+
+        /** Long enough that a second attach finishing inside it cannot be luck. */
+        const val MINT_DELAY_MS = 2_000L
     }
 }
