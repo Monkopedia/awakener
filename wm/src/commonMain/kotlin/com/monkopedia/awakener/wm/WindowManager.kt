@@ -109,6 +109,11 @@ interface WindowManager {
     /**
      * Stands a dock up beside [surface] and records the binding it is standing for.
      *
+     * Safe to call concurrently — two hotkeys pressed at once are an ordinary case, and closing
+     * a [DockHandle] already tears its dock down from whatever coroutine happens to run it.
+     * Standing a dock up is several compositor operations, so an implementation owes callers
+     * whatever serialisation that takes.
+     *
      * @param agent the agent to bind, or null — the hotkey case — to use whatever this surface
      * is already bound to, minting a Lifeless if it is still a Drab.
      * @return a handle whose [DockHandle.agent] is the agent actually bound, which under

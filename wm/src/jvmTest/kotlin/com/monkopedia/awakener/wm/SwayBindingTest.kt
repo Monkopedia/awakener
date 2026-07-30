@@ -15,7 +15,9 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
@@ -292,6 +294,54 @@ class SwayBindingTest {
         assertEquals(listOf(markFor(app2)), marksOf(dock2.dockId), "and still bound to its own")
     }
 
+    /**
+     * The same failure again, this time from two attaches overlapping rather than following one
+     * another. Nothing about this class was written under a single-threaded assumption —
+     * `attach` is a public `suspend fun` with no stated contract, `DockHandle.close()` already
+     * launches `detach()` on a scope, and orphan reaping is driven off the `changes` flow — so
+     * two hotkeys pressed together are an ordinary case. Unserialised, both attaches snapshot
+     * the standing docks before either `exec` lands and both then accept the first new node:
+     * one window carrying both marks, and the dock that really belongs to the second surface
+     * left unmarked and unmanaged. That is issue #2's symptom exactly, so identifying a dock by
+     * node is only true if `attach` owns the tree for the length of the snapshot.
+     */
+    @Test
+    fun `concurrent attaches by the same program get their own dock`() = swayTest {
+        val app1 = openSurface("aw-app1")
+        val app2 = openSurface("aw-app2")
+
+        val (dock1, dock2) = coroutineScope {
+            val first = async { wm.attach(app1, dockFor("aw-dock"), AgentId("agent-1")) }
+            val second = async { wm.attach(app2, dockFor("aw-dock"), AgentId("agent-2")) }
+            first.await() to second.await()
+        }
+
+        assertTrue(
+            dock1.dockId != dock2.dockId,
+            "concurrent attaches must resolve to the docks they each spawned, not both to " +
+                "${dock1.dockId.raw}",
+        )
+        assertEquals(
+            mapOf(
+                dock1.dockId.raw to listOf(markFor(app1)),
+                dock2.dockId.raw to listOf(markFor(app2)),
+            ),
+            docksOf("aw-dock"),
+            "every window the dock program produced must be exactly one surface's dock: a node " +
+                "carrying both marks, or an unmarked orphan panel beside it, is #2 back again",
+        )
+        assertEquals(
+            setOf(app1.raw, dock1.dockId.raw),
+            assertNotNull(tabHolding(app1)).children.map { it.id }.toSet(),
+            "interleaved focus/split must not land a dock in the other surface's tab",
+        )
+        assertEquals(
+            setOf(app2.raw, dock2.dockId.raw),
+            assertNotNull(tabHolding(app2)).children.map { it.id }.toSet(),
+            "interleaved focus/split must not land a dock in the other surface's tab",
+        )
+    }
+
     /** The alternative identity scheme: unique by construction, at the cost of a dock argument. */
     @Test
     fun `per-surface app_id is switchable on`() = swayTest {
@@ -339,6 +389,10 @@ class SwayBindingTest {
         "${WmFlags.dockMarkPrefix.default}${surface.raw}"
 
     private suspend fun marksOf(dock: SurfaceId): List<String>? = wm.tree().find(dock.raw)?.marks
+
+    /** Every window the dock program produced, against the marks it carries. */
+    private suspend fun docksOf(appId: String): Map<Long, List<String>> =
+        wm.tree().windows.filter { it.appId == appId }.associate { it.id to it.marks }
 
     private suspend fun appIdOf(dock: SurfaceId): String? = wm.tree().find(dock.raw)?.appId
 

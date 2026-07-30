@@ -12,6 +12,8 @@ import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
 
@@ -35,6 +37,27 @@ class SwayWindowManager(
     private val commands: SwayConnection by lazy { connect() }
 
     private val config: Config get() = store.config.value
+
+    /**
+     * Serialises the two multi-command tree edits. Neither is atomic in sway — both are a run of
+     * IPC round trips, and a coroutine can be descheduled at every one of them.
+     *
+     * [attach] is the reason it exists. Its snapshot of the docks already standing only
+     * identifies the window it is about to spawn if nothing else can `exec` between the snapshot
+     * and the claim; two overlapping attaches otherwise both take the first new node, leaving one
+     * window carrying both marks and a second, unmarked, unmanaged panel beside it. That is the
+     * same failure [DockIdentity] exists to fix, arriving by a different route, and it is not an
+     * exotic case: `attach` is public, `DockHandle.close` already launches `detach` on a scope,
+     * and orphan reaping runs off [changes].
+     *
+     * `detach` takes the same lock because its normalisation focuses the surviving child and
+     * issues `split none`. Landing that between `attach`'s own focus and `split horizontal` would
+     * put the new dock in whichever tab detach had just focused.
+     *
+     * A [Mutex] is not reentrant, so nothing invoked while it is held may take it —
+     * `settleFocus`, called at the end of `attach`, in particular.
+     */
+    private val treeEdit = Mutex()
 
     suspend fun tree(): Node =
         swayJson.decodeFromString(commands.request(I3Ipc.Request.GET_TREE))
@@ -67,19 +90,19 @@ class SwayWindowManager(
         surface: SurfaceId,
         dock: DockSpec,
         agent: AgentId?,
-    ): DockHandle {
+    ): DockHandle = treeEdit.withLock {
         val cfg = config
         val key = keyFor(surface) ?: error("no such surface: ${surface.raw}")
-        val identity = cfg[WmFlags.dockIdentity]
-        val appId = when (identity) {
+        val appId = when (cfg[WmFlags.dockIdentity]) {
             DockIdentity.NEW_NODE -> dock.appId
-            DockIdentity.PER_SURFACE_APP_ID -> "${dock.appId}-${surface.raw}"
-        }
-        if (identity == DockIdentity.PER_SURFACE_APP_ID) {
-            check(dock.command.contains(DockSpec.APP_ID_PLACEHOLDER)) {
-                "wm.dock.identity=PER_SURFACE_APP_ID needs the dock command to carry " +
-                    "'${DockSpec.APP_ID_PLACEHOLDER}', or the dock reports '${dock.appId}' like " +
-                    "every other dock and the name is no identifier; command was: ${dock.command}"
+            DockIdentity.PER_SURFACE_APP_ID -> {
+                check(dock.command.contains(DockSpec.APP_ID_PLACEHOLDER)) {
+                    "wm.dock.identity=PER_SURFACE_APP_ID needs the dock command to carry " +
+                        "'${DockSpec.APP_ID_PLACEHOLDER}', or the dock reports '${dock.appId}' " +
+                        "like every other dock and the name is no identifier; command was: " +
+                        dock.command
+                }
+                "${dock.appId}-${surface.raw}"
             }
         }
         val command = dock.command.replace(DockSpec.APP_ID_PLACEHOLDER, appId)
@@ -98,7 +121,8 @@ class SwayWindowManager(
         // Taken after the no_focus rule and before the exec, so it is exactly the set of docks
         // that were already standing. Matching the spawned dock on app_id alone would resolve to
         // whichever of them sway happens to list first, since in production every dock is the
-        // same panel program and they all report the same name.
+        // same panel program and they all report the same name. The snapshot only identifies
+        // anything because treeEdit keeps another attach from exec'ing before the claim.
         val standing = tree().windows.filter { it.appId == appId }.map { it.id }.toSet()
         run("exec $command")
         val dockNode = awaitWindow(appId, standing)
@@ -119,7 +143,7 @@ class SwayWindowManager(
         val bound = registry.bind(key, agent?.asIdentity())
         val handle = SwayDockHandle(surface, bound.agent, dockId, key)
         if (cfg[WmFlags.restoreFocusAfterAttach]) handle.settleFocus()
-        return handle
+        handle
     }
 
     override val changes: Flow<SurfaceChange> = callbackFlow {
@@ -226,17 +250,17 @@ class SwayWindowManager(
             if (tree().find(target.raw) != null) run("[con_id=${target.raw}] focus")
         }
 
-        override suspend fun detach() {
+        override suspend fun detach() = treeEdit.withLock {
             val cfg = config
             val root = tree()
             val parent = root.parentOf(dockId.raw)
             if (root.find(dockId.raw) != null) run("[con_id=${dockId.raw}] kill")
             if (cfg[WmFlags.forgetBindingOnDetach] && key != null) registry.unbind(key)
 
-            if (!cfg[WmFlags.normalizeContainerOnDetach]) return
+            if (!cfg[WmFlags.normalizeContainerOnDetach]) return@withLock
             // sway does not collapse a split container back down when it drops to one child,
             // and the leftover container silently adopts the next window opened in that tab.
-            val survivor = parent?.children?.firstOrNull { it.id != dockId.raw } ?: return
+            val survivor = parent?.children?.firstOrNull { it.id != dockId.raw } ?: return@withLock
             if (awaitGone(dockId) && tree().find(survivor.id) != null) {
                 run("[con_id=${survivor.id}] focus")
                 run("split none")
