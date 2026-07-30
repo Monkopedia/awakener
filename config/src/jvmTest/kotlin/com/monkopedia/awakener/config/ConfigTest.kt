@@ -77,6 +77,23 @@ class ConfigTest {
         }
     }
 
+    /**
+     * Refusing a registration has to mean it did not happen. Discovery loads declaring classes
+     * inside a `runCatching`, so a clash arrives as one warning line rather than a crash — and a
+     * registry left holding the *rejected* flag would then make `list` print the loser's default
+     * under the winner's key, which is exactly the quiet misreport flags exist to avoid.
+     */
+    @Test
+    fun `a refused duplicate leaves the registry untouched`() {
+        val kept = Flags.string("test.dup", "kept", "the declaration that got there first")
+        val before = Flags.all()
+        assertFailsWith<IllegalArgumentException> {
+            Flags.int("test.dup", -1, "the declaration that must not land")
+        }
+        assertEquals(kept, Flags.byKey("test.dup"), "the rejected flag replaced the accepted one")
+        assertEquals(before, Flags.all(), "the registry changed despite refusing the duplicate")
+    }
+
     @Test
     fun `enum parsing is case-insensitive and rejects unknown values`() {
         val store = InMemoryConfigStore()

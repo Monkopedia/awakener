@@ -82,6 +82,17 @@ class FileConfigStore(
         }
     }
 
+    /**
+     * Re-reads the file against the currently registered flags.
+     *
+     * The first snapshot is built while the store is being constructed, which is before flag
+     * discovery has run — so every key in it belongs to a flag that does not exist yet, and is
+     * reported as unknown. An entry point calls this once discovery is done.
+     */
+    fun reload() {
+        state.value = load()
+    }
+
     override suspend fun set(key: String, raw: String) {
         val flag = requireNotNull(Flags.byKey(key)) { "unknown flag '$key'" }
         val parsed = flag.parseRaw(raw)

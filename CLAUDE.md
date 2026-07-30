@@ -53,6 +53,10 @@ Planned module boundaries, from `docs/design.md`:
 - `:pairing-mcp` — read-on-demand surface tools, via the official Kotlin MCP SDK.
 - `:chrome` — CDP client; needs a dedicated Chrome profile, because anything that can reach
   the debugging port can drive a logged-in browser.
+- `:cli` — entry points that need the whole flag set (`awakener-config`), and **the only
+  module allowed to depend on every other one**. That dependency is what puts every
+  flag-declaring class on one classpath; a `main` in a module that cannot see them enumerates
+  an empty registry and reports that those flags do not exist.
 
 **Talk to spanreed through its CLI, never through its files.** `spanreed` exposes
 `register` / `send` / `recv` / `list` / `name` / `focus` / `status` / `conjoin` as a
@@ -89,6 +93,12 @@ behaviours, *build both and add the switch* rather than asking which he wants.
 - Declare flags in a `*Flags` object via `com.monkopedia.awakener.config.Flags`. Each carries
   its own default and a description, which is what makes `awakener-config list`
   self-documenting instead of a hand-maintained list that drifts.
+- **The name and the package are load-bearing**: `FlagDiscovery` finds declaring classes by
+  scanning the classpath for `com.monkopedia.awakener.**` classes whose name ends in `Flags`,
+  and `:cli` depends on every module in the build. Give it a prefix — a class named exactly
+  `Flags` is the registry itself and is skipped. Follow the convention and a new module's
+  flags show up in `list` with no registration step anywhere; deviate and they are invisible
+  until someone names the class in `config.flags.declarations`.
 - Defaults must be the behaviour you would have hard-coded, so an unconfigured system is
   correct.
 - `:config` reloads on file change, so a flag flip applies to a live daemon. Never cache a

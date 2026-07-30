@@ -34,8 +34,10 @@ class Flag<T> internal constructor(
  * The set of declared flags.
  *
  * Registration is global and eager: a flag exists from the moment its declaring object is
- * loaded, so anything that enumerates flags must first touch the objects that declare them.
- * [requireLoaded] exists for that.
+ * loaded, so anything that enumerates flags must first make sure the declaring objects are
+ * loaded. Naming them one by one does not survive a module being added — the JVM entry points
+ * use `FlagDiscovery` to find them by convention instead, and [requireLoaded] is left for the
+ * bootstrap case (loading the flags that decide how discovery runs) and for tests.
  */
 object Flags {
     private val registered = LinkedHashMap<String, Flag<*>>()
@@ -46,18 +48,22 @@ object Flags {
 
     /**
      * Forces [holders] to initialise so their flags are registered. Enumerating flags without
-     * this silently reports a subset, which would make `config list` lie about what exists.
+     * this — or without discovery having run — silently reports a subset, which would make
+     * `config list` lie about what exists.
      */
     fun requireLoaded(vararg holders: Any) {
         holders.forEach { it.hashCode() }
     }
 
     private fun <T> register(flag: Flag<T>): Flag<T> {
-        val clash = registered.put(flag.key, flag)
-        require(clash == null) {
+        // Checked before the store is touched: discovery catches a failing class initialiser and
+        // reports it, so a registration that put first would leave the rejected flag behind a
+        // mere warning — and `list` would then print the loser's default under the winner's key.
+        require(flag.key !in registered) {
             "duplicate flag key '${flag.key}' — keys are the config file's schema, so a " +
                 "collision would make one of the two flags silently unsettable"
         }
+        registered[flag.key] = flag
         return flag
     }
 
