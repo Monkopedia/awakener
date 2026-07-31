@@ -5,6 +5,7 @@ import com.monkopedia.awakener.registry.AgentId
 import com.monkopedia.awakener.registry.DerivedAgentIdentities
 import com.monkopedia.awakener.registry.FileBindingStore
 import java.nio.file.Path
+import kotlin.io.path.absolutePathString
 import kotlin.io.path.createTempDirectory
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
@@ -15,6 +16,7 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
@@ -22,6 +24,7 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
 
@@ -43,6 +46,14 @@ class SwayBindingTest {
      * `SpanreedCli`, which shells out, and a test may not.
      */
     private var mintDelayMs = 0L
+
+    /**
+     * Whether minting fails. The production minter shells out to spanreed, so this is the
+     * ordinary way `attach` fails *after* its dock is standing — and the only such failure a test
+     * can produce on demand, since every command `attach` sends between the map and the bind is
+     * one sway accepts.
+     */
+    private var mintFails = false
 
     /** Clients stopped by [freeze]. They have to be killed rather than asked to leave. */
     private val frozen = mutableListOf<Int>()
@@ -69,6 +80,7 @@ class SwayBindingTest {
         configStore = store,
         identities = { key, residuePath ->
             if (mintDelayMs > 0) delay(mintDelayMs)
+            check(!mintFails) { "the minter is unavailable" }
             minted++
             DerivedAgentIdentities(store).mint(key, residuePath)
         },
@@ -423,6 +435,93 @@ class SwayBindingTest {
         assertEquals(handle.dockId.raw, focusedId(), "the flag must actually change behaviour")
     }
 
+    /**
+     * #4. Suppressing focus with a `no_focus` rule spends compositor state that sway has no verb
+     * to take back, and under the default identity scheme every dock reports one `app_id` — so
+     * one attach with `wm.dock.focus_on_map` off suppressed focus for every dock afterwards, for
+     * the life of the sway session. The flag stopped meaning what it says after its first use.
+     *
+     * `wm.focus.restore_after_attach` is off throughout so that what is read at the end is where
+     * the map left focus, rather than where the resting-focus rule put it back.
+     */
+    @Test
+    fun `suppressing focus for one dock does not suppress it for the next`() = swayTest {
+        store.put(WmFlags.restoreFocusAfterAttach, false)
+        store.put(WmFlags.dockFocusOnMap, false)
+        val app1 = openSurface("aw-app1")
+
+        wm.attach(app1, dockFor("aw-dock"), AgentId("agent-1"))
+        assertEquals(
+            app1.raw,
+            focusedId(),
+            "the attach that asked for suppression still gets it — however it is achieved, the " +
+                "dock must not be left holding focus",
+        )
+
+        store.put(WmFlags.dockFocusOnMap, true)
+        val app2 = openSurface("aw-app2")
+        val second = wm.attach(app2, dockFor("aw-dock"), AgentId("agent-2"))
+
+        assertEquals(
+            second.dockId.raw,
+            focusedId(),
+            "and the next attach, made while the flag says to focus on map, has to actually " +
+                "get focus: a suppression the first attach cannot revoke poisons every dock " +
+                "after it for the rest of the session",
+        )
+    }
+
+    /**
+     * The combination that would otherwise leave the suppression flag suppressing nothing.
+     * `settleFocus` runs only under `wm.focus.restore_after_attach`, so with that off and the
+     * correction treated as part of resting focus, the dock would keep the focus it took on map —
+     * the one outcome `focus_on_map = false` was asked for. The correction belongs to the
+     * suppression instead, and runs regardless.
+     */
+    @Test
+    fun `the focus correction runs whatever restore_after_attach says`() = swayTest {
+        store.put(WmFlags.restoreFocusAfterAttach, false)
+        store.put(WmFlags.dockFocusOnMap, false)
+        val app = openSurface("aw-app1")
+
+        wm.attach(app, dockFor("aw-dock"), AgentId("agent-1"))
+
+        assertEquals(
+            app.raw,
+            focusedId(),
+            "restore_after_attach decides whether the resting-focus rule is applied at the end " +
+                "of an attach, not whether a transient steal is corrected",
+        )
+    }
+
+    /**
+     * The previous mechanism, kept reachable for anyone who would rather have no flicker than a
+     * revocable rule — with the cost that made it the wrong default kept reproducible in the same
+     * test, since a rule sway cannot revoke reaches every dock the criteria match.
+     */
+    @Test
+    fun `no_focus focus suppression is switchable on`() = swayTest {
+        store.put(WmFlags.dockFocusSuppression, FocusSuppression.NO_FOCUS_RULE)
+        store.put(WmFlags.restoreFocusAfterAttach, false)
+        store.put(WmFlags.dockFocusOnMap, false)
+        val app1 = openSurface("aw-app1")
+
+        wm.attach(app1, dockFor("aw-dock"), AgentId("agent-1"))
+        assertEquals(app1.raw, focusedId(), "the rule must actually suppress the map-time focus")
+
+        store.put(WmFlags.dockFocusOnMap, true)
+        val app2 = openSurface("aw-app2")
+        val second = wm.attach(app2, dockFor("aw-dock"), AgentId("agent-2"))
+
+        assertEquals(
+            app2.raw,
+            focusedId(),
+            "and this is what it costs: sway has no verb that takes the rule back, so under the " +
+                "shared app_id it goes on suppressing focus for a dock attached while the flag " +
+                "says to focus on map — dock ${second.dockId.raw} never gets it",
+        )
+    }
+
     /** Hazard 2: sway leaves the dock standing when its surface dies. */
     @Test
     fun `orphaned dock is reaped when its surface closes`() = swayTest {
@@ -617,6 +716,214 @@ class SwayBindingTest {
                 "container the dock left behind",
         )
         assertEquals(2, workspace.children.size, "two surfaces means two tabs")
+    }
+
+    /**
+     * The same hazard reached through the failure path, which is #6. `attach` splits the tab
+     * before it spawns anything, so a dock that never maps leaves the surface wrapped in a
+     * single-child split container that sway will not collapse — and the next window opened in
+     * that tab is swallowed into it.
+     *
+     * The failure is the dock program exiting without ever mapping a window, which is what a
+     * mistyped command or a panel binary that dies on startup looks like, and it is the failure
+     * mode `attach` was already reproduced on. It costs this test the full 5s map wait.
+     */
+    @Test
+    fun `a failed attach leaves the tab as it found it`() = swayTest {
+        val app1 = openSurface("aw-app1")
+        openSurface("aw-app2")
+        val before = assertNotNull(wm.tree().workspace("1")).children.map { it.id }
+
+        assertFailsWith<IllegalStateException>("a dock that never maps has to fail the attach") {
+            wm.attach(app1, DockSpec("aw-dock", "sh -c 'exit 1'"), AgentId("agent-1"))
+        }
+
+        assertEquals(
+            before,
+            assertNotNull(wm.tree().workspace("1")).children.map { it.id },
+            "the tab has to be the surface again: a leftover container is a new node, so its " +
+                "id shows up here in place of the one the surface had",
+        )
+
+        val later = openSurface("aw-app3")
+        val workspace = assertNotNull(wm.tree().workspace("1"))
+        assertTrue(
+            workspace.children.any { it.id == later.raw },
+            "and this is what the leftover costs — a window opened afterwards is swallowed " +
+                "into the container the failed attach left behind instead of becoming its own tab",
+        )
+        assertEquals(3, workspace.children.size, "three surfaces means three tabs")
+    }
+
+    /**
+     * The same leftover container, reached through the race rather than through a dock program
+     * that never maps at all — and this is the case the unwind exists for, not a corner of it.
+     *
+     * `attach` learns which node its dock is only when `awaitWindow` returns, so across the whole
+     * of the 5s map deadline it holds no record of a window it may already have spawned. A dock
+     * that maps as that deadline expires is therefore a window the unwind does not know exists:
+     * it is not killed, and the flatten that follows is refused on a container that has acquired
+     * a second child — #6 reinstated, on the failure path #6 was reproduced on.
+     *
+     * Deterministic rather than swept for. [SwayValve] holds the attach's first tree read after
+     * the exec until the dock has mapped *and* the deadline has passed, so the attach gives up at
+     * exactly the moment its dock is standing. The same state is reachable by sweeping `sleep`
+     * offsets across the deadline, which is how it was found, but it costs several runs an
+     * observation and the gap it aims at is under a millisecond wide.
+     */
+    @Test
+    fun `a dock that maps as the map deadline expires is still taken back down`() = swayTest {
+        SwayValve.open(sway.socket).use { valve ->
+            val manager = valved(valve)
+            val app = openSurface("aw-app1")
+            openSurface("aw-app2")
+            val before = assertNotNull(wm.tree().workspace("1")).children.map { it.id }
+            // The first tree read after the exec is `awaitWindow`'s first poll, so holding it
+            // holds the whole map wait: nothing the attach reads afterwards can tell it the dock
+            // arrived.
+            var execd = false
+            valve.holdNext { type, payload ->
+                if (type == I3Ipc.Request.RUN_COMMAND && payload.startsWith("exec ")) execd = true
+                execd && type == I3Ipc.Request.GET_TREE
+            }
+
+            coroutineScope {
+                val attaching = async {
+                    assertFailsWith<IllegalStateException>("the map deadline has to fail it") {
+                        manager.attach(app, dockFor("aw-dock"), AgentId("agent-1"))
+                    }
+                }
+                // Off the runBlocking thread: the attach's own continuations need it, and a
+                // blocking wait taken here would stop it ever reaching the exec.
+                withContext(Dispatchers.IO) { valve.awaitHeld(VALVE_WAIT_MS) }
+                assertNotNull(awaitWindow("aw-dock"), "the dock never mapped")
+                delay(PAST_MAP_DEADLINE_MS)
+                valve.release()
+                attaching.await()
+            }
+
+            assertEquals(
+                before,
+                assertNotNull(wm.tree().workspace("1")).children.map { it.id },
+                "the tab has to be the surface again: a leftover container is a new node, so " +
+                    "its id shows up here in place of the one the surface had",
+            )
+            assertEquals(
+                emptyList(),
+                wm.tree().windows.filter { it.appId == "aw-dock" }.map { it.id },
+                "and the dock goes with it — the attach spawned this window and merely failed " +
+                    "to identify it in time, which does not make it someone else's to leave",
+            )
+        }
+    }
+
+    /**
+     * The second half of that race, one round trip later. The unwind reads the tree, finds
+     * nothing, and the dock maps before the `split none` it sends next — so sway refuses the
+     * flatten, "Can only flatten a child container with no siblings", and the container stands.
+     *
+     * This is what a single re-read of the tree does not reach, and why the unwind makes two
+     * passes at the flatten rather than one: a refusal is itself the news that a window arrived,
+     * and the next pass is what takes it down. The valve holds the `split none` itself, so the
+     * dock lands between the read and the command on every run.
+     */
+    @Test
+    fun `a dock that maps as the unwind flattens the container is taken back down`() = swayTest {
+        SwayValve.open(sway.socket).use { valve ->
+            val manager = valved(valve)
+            val app = openSurface("aw-app1")
+            openSurface("aw-app2")
+            val before = assertNotNull(wm.tree().workspace("1")).children.map { it.id }
+            valve.holdNext { type, payload ->
+                type == I3Ipc.Request.RUN_COMMAND && payload == "split none"
+            }
+
+            coroutineScope {
+                val attaching = async {
+                    assertFailsWith<IllegalStateException>("the map deadline has to fail it") {
+                        manager.attach(app, slowDock("aw-dock"), AgentId("agent-1"))
+                    }
+                }
+                withContext(Dispatchers.IO) { valve.awaitHeld(VALVE_WAIT_MS) }
+                assertNotNull(awaitWindow("aw-dock"), "the dock never mapped")
+                valve.release()
+                attaching.await()
+            }
+
+            assertEquals(
+                before,
+                assertNotNull(wm.tree().workspace("1")).children.map { it.id },
+                "the flatten the arrival made sway refuse has to be tried again once the dock " +
+                    "is gone, or the leftover container stands",
+            )
+            assertEquals(
+                emptyList(),
+                wm.tree().windows.filter { it.appId == "aw-dock" }.map { it.id },
+                "and a dock that arrives while the unwind is working in the container is still " +
+                    "the unwind's to take down",
+            )
+        }
+    }
+
+    /**
+     * The other half of #6: a failure *after* the dock has mapped owes the window as well as the
+     * container. The binding is what fails here, and it is the realistic case rather than a
+     * contrived one — it is recorded outside the tree section because the minter shells out to
+     * spanreed, so it is the step of `attach` most likely to fail and the only one that can fail
+     * once sway has accepted everything else.
+     *
+     * It is also the one compensation that cannot run inside the section that built the dock,
+     * since that section ended before the bind began.
+     */
+    @Test
+    fun `a dock whose binding cannot be recorded is taken back down`() = swayTest {
+        val app = openSurface("aw-app1")
+        val before = assertNotNull(wm.tree().workspace("1")).children.map { it.id }
+        mintFails = true
+
+        assertFailsWith<IllegalStateException>("a bind that fails has to fail the attach") {
+            // No agent: the hotkey case, and the only path that mints.
+            wm.attach(app, dockFor("aw-dock"))
+        }
+
+        assertEquals(
+            emptyList(),
+            wm.tree().windows.filter { it.appId == "aw-dock" }.map { it.id },
+            "the dock is a window nothing holds a handle to and nothing is bound to, so an " +
+                "attach that could not finish owes it",
+        )
+        assertEquals(
+            before,
+            assertNotNull(wm.tree().workspace("1")).children.map { it.id },
+            "and the container it was spawned into goes with it",
+        )
+    }
+
+    /**
+     * The other half of the choice, for the same reason `OrphanPolicy.LEAVE` exists: when
+     * diagnosing, tree damage you can see beats tree damage that was tidied away. Driven from the
+     * bind failure rather than the map timeout because that is the shape where both compensations
+     * have something to leave standing.
+     */
+    @Test
+    fun `leaving the wreckage of a failed attach standing is switchable on`() = swayTest {
+        store.put(WmFlags.unwindFailedAttach, false)
+        val app = openSurface("aw-app1")
+        mintFails = true
+
+        assertFailsWith<IllegalStateException> { wm.attach(app, dockFor("aw-dock")) }
+
+        assertEquals(
+            1,
+            wm.tree().windows.count { it.appId == "aw-dock" },
+            "with the flag off the dock the attach spawned is left where it is",
+        )
+        assertEquals(
+            "splith",
+            assertNotNull(wm.tree().workspace("1")).children.single().layout,
+            "and so is the container it was spawned into — the hazard, kept reproducible on " +
+                "purpose",
+        )
     }
 
     @Test
@@ -900,6 +1207,22 @@ class SwayBindingTest {
     private fun dockFor(appId: String) =
         DockSpec(appId, sway.windowCommand(DockSpec.APP_ID_PLACEHOLDER))
 
+    /** A dock program whose window maps a second after `attach` has given up waiting for it. */
+    private fun slowDock(appId: String) =
+        DockSpec(appId, "sh -c 'sleep 6; exec ${sway.windowCommand(appId)}'")
+
+    /**
+     * A manager whose commands reach sway through [valve], so that a test can hold one of them.
+     * Its own manager rather than the shared one: the valve is a one-shot and the field manager
+     * is what the assertions read the tree with.
+     */
+    private fun valved(valve: SwayValve) = SwayWindowManager(
+        { SwayConnection.open(valve.socket.absolutePathString()) },
+        store,
+        bindingStore(),
+        scope,
+    )
+
     /**
      * [count] docks whose surfaces have gone — the tree shape Hazard 2 leaves behind. Every
      * surface is opened before any dock is attached so that each becomes its own tab, which keeps
@@ -1009,6 +1332,20 @@ class SwayBindingTest {
 
     private companion object {
         const val WAIT_MS = 5_000L
+
+        /**
+         * How long a valved test will wait for the request it means to hold. Longer than the map
+         * deadline itself, since the request it is after is often the one the attach sends after
+         * giving up.
+         */
+        const val VALVE_WAIT_MS = 15_000L
+
+        /**
+         * Held past `attach`'s 5s map wait, so that the deadline has certainly expired before the
+         * read it expired on is answered. The margin is slack, not a race: the answer cannot
+         * arrive until the valve lets it.
+         */
+        const val PAST_MAP_DEADLINE_MS = 5_200L
 
         /** Long enough that a second attach finishing inside it cannot be luck. */
         const val MINT_DELAY_MS = 2_000L

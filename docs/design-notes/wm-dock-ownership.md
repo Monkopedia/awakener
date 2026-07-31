@@ -448,8 +448,51 @@ accepted it — but worth knowing before someone invents a heartbeat.
 **Contract:** `attach` either returns a handle whose `detach()` owns everything the attach
 did, or it throws having left the **tree** as it found it — with the sole residue of a dock
 program that may still be in flight, which the claim below owns *if a collector exists to read
-the claim*, and which today stands unowned because none does (#18). No half-built container is
-ever observable to a caller.
+the claim*, and which today stands unowned because none does (#18) **and because no claim is
+filed either — see the amendment on that section**. No half-built container is ever observable
+to a caller.
+
+> **Amended 2026-07-31, with #6's fix for the map-deadline race: the boundary is the unwind's
+> last look at the tree, not the moment `awaitWindow` gave up.** A dock that has mapped by then
+> is killed like any other, *whether or not the attach ever identified it* — the node id is
+> assigned only once `awaitWindow` returns, so across the whole map deadline `attach` holds no
+> `con_id` for a window it may already have spawned, and the record that stands in for one is the
+> `app_id` + `standing` pair filed with the `exec`. Without that, the likeliest failure of all —
+> the deadline expiring, which is also when a slow dock is likeliest to be mapping — skips the
+> kill and then has its flatten refused on a container that has just acquired a second child,
+> which is #6 arriving through #6's own repair. Found in review by sweeping `sleep` offsets
+> across the deadline — 1 of 4 and 1 of 8 genuine timeouts — and since made deterministic; see
+> probe J6.
+
+That is why the container half is stated as an outcome and not as an invariant of the moment of
+failure: a `split none` is a command sway can refuse, and it refuses this one whenever a window
+arrives between the tree read that checked and the command that acted. The unwind therefore makes
+that check-and-flatten twice, since the refusal *is* the news that the dock arrived — see the
+narrowing under "The late dock".
+
+**The rule the race generalises to, since it was found twice:** *a compensation must not depend
+on a fact recorded on the far side of the round trip that created the thing it compensates.* The
+node id is the case above. The other is the `split horizontal` itself — its "I created a
+container" flag was set after the command's acknowledgement, so a cancellation landing on that
+acknowledgement left the container built and the unwind unaware of it, the same #6 leftover
+through a much narrower door. Both are fixed by recording *before* the command and rolling back
+only where sway's own rejection proves nothing happened; every other failure means the edit may
+have landed, and a compensation attempted against an edit that did not happen is cheap where an
+edit left standing is not. Audited across the rest of `attach`'s sequence, since the shape is
+worth more than the two instances: the reservation and the table entry are each recorded in the
+same non-suspending step as the thing they name, so there is no round trip for a failure to arrive
+inside, and the mark needs no record at all — it dies with the window the kill takes. Two others
+do have the shape, and neither is fixed the same way:
+
+- **the `no_focus` rule's record**, written after sway acknowledges it. A cancellation landing on
+  that acknowledgement installs a rule nothing remembers and the next attach issues a second —
+  #4's accumulation through a one-round-trip door. Left as it is *deliberately*, because the
+  polarity that helps everywhere else hurts here: a rule remembered but never installed suppresses
+  nothing, for every dock under that name, for the rest of the session, and no correction runs
+  under `NO_FOCUS_RULE` to notice. One redundant unrevocable rule is the cheaper residue, and it
+  suppresses exactly what the first already did.
+- **the registry bind**, which cannot be recorded before the call at all — see "What this does not
+  settle".
 
 That is deliberately narrower than "there is no third outcome", because there is one, and
 promising two is how it gets implemented away. Two things `attach` does are not tree edits and
@@ -461,7 +504,11 @@ are not revocable:
 `exec` returns `{"success": true}` and nothing else — no pid, no handle — so there is nothing
 to cancel it with. On the timeout path, which is the most likely attach failure and the one #6
 was reproduced on, the dock has not mapped, so there is nothing to `kill`, and nothing stops it
-mapping afterwards. Measured on sway 1.12 with the real dock shape — tabbed workspace,
+mapping afterwards. *(Amended 2026-07-31: "the dock has not mapped" is a fact about this probe
+run — its dock was told to map 4 s late against an unwind at 1.5 s — and is false in general. A
+dock is at its most likely to be mapping exactly as the deadline it overran expires, which is
+what the sweep across the deadline found and what the narrowing under "The late dock" now
+covers.)* Measured on sway 1.12 with the real dock shape — tabbed workspace,
 `split horizontal`, then an `exec` whose window maps after the attach gave up:
 
 ```
@@ -485,6 +532,32 @@ and the reservation that would have suppressed it is evicted by the unwind at ex
 moment it is still needed.
 
 ### The late dock: the reservation outlives the attach that filed it
+
+> **Amended 2026-07-31, in the PR that landed #6 and #4: none of this section is built.** The
+> reservation is released on both paths rather than converted, no claim is ever filed, and
+> `wm.dock.late_dock` was not introduced. #9 landed the table, the reservation and its
+> unconditional eviction (PR #23) and stopped there; #6 was assigned only the tree compensations
+> and did not widen to take it on, since a claim nothing reads is a flag whose default behaviour
+> cannot be exercised — which is the same argument that already set that default to `LEAVE`.
+> **So the third outcome is real and unowned**: a dock that maps after the unwind has finished
+> stands as an unmarked, untabled panel that `surfaces()` reports as bindable. What follows is
+> therefore the design for whoever builds the collector (#18), read as specification rather than
+> as a description of the code.
+>
+> **Narrowed 2026-07-31 in the same PR, and one line of the specification below is wrong.** The
+> tree evaluation this section prescribes for the claim is now done by the unwind itself, inside
+> the transaction, where it needs neither a claim nor a collector: the lock is still held and the
+> reservation is still live, so both exclusions a claim needs come free, and the search can be
+> narrowed further to the container the attach built. What is wrong is "**once** at filing time".
+> Measured through the built code (probe J6): a single evaluation at `awaitWindow`'s timeout
+> closes the gap between the last poll and that read, and leaves the *wider* half — the gap
+> between that read and the `split none` — through which a dock arrives, sway refuses the flatten
+> and the leftover container stands. Two evaluations close both, and two suffice: the dock program
+> maps one window, so it lands either before a pass's read (adopted), between that read and the
+> command (whose refusal is what sends the next pass looking), or after a flatten that has already
+> succeeded. Only the last is left, and it is a dock arriving as its own tab in a tab the unwind
+> has already restored. **So the third outcome is real but smaller than this section says**: a
+> dock that maps after the unwind's last look, not one that maps after `awaitWindow` gave up.
 
 On the failure path the reservation is **not** evicted. It is converted to a **claim** — same
 `app_id`, same `standing` set, deadline one further map timeout out.
@@ -548,6 +621,9 @@ What it costs, stated rather than designed around:
   which closes the millisecond-wide gap between `awaitWindow`'s timeout and the claim existing:
   `awaitWindow` polls the tree rather than the event stream, so a dock that maps inside that gap
   emits a `window::new` that no claim is there to read, and nothing re-reads it afterwards.
+  *(Amended: the unwind now does this itself and needs no claim to do it, and "once" is measurably
+  not enough — the gap has two halves and one read closes only the first. See the narrowing
+  above.)*
 - **With `wm.events.enabled = false` there is no event stream, so `RECLAIM` degrades to
   `LEAVE`** and the stray panel stands. That flag's description now owes three sentences, not
   one.
@@ -624,11 +700,11 @@ registry binding. On failure, each is compensated in reverse.
 |---|---|
 | registry `bind` | `unbind` — or, if `bind` is what failed, tear the dock down (below) |
 | resting focus / geometry / mark | none needed; they die with the window |
-| dock window | `kill`, then `awaitGone` |
+| dock window | `kill`, then `awaitGone` — **including one the attach never identified**, found by reading the container back against the `app_id` the `exec` reserved; see the narrowing under "The late dock" |
 | table entry | evict — *bookkeeping, always runs* |
-| reservation | convert to a claim, then evict when the claim resolves or expires — *bookkeeping, always runs* |
+| reservation | convert to a claim, then evict when the claim resolves or expires — *bookkeeping, always runs*. **As built: evicted outright, no claim** — see the amendment above |
 | focus suppression | **`REFOCUS_AFTER_MAP`: nothing to undo. `NO_FOCUS_RULE`: not undoable.** |
-| `split horizontal` | `split none` on the surviving child — the same normalisation `detach` already performs on the success path |
+| `split horizontal` | `split none` on the surviving child — the same normalisation `detach` already performs on the success path. **Up to twice on the unwind path**: sway refuses it on a container that has just acquired a second child, and that refusal is the news that the dock arrived after the read which checked |
 
 The container normalisation must be **one routine shared by unwind and `detach`**, not two.
 #6 is the failure path of a job the success path already does correctly, and duplicating it is
@@ -779,6 +855,26 @@ re-reading a config awakener does not own clears the set. So the design does not
   Transient steal **73–78 ms** over one persistent IPC connection across three runs, ≈96 ms
   when driven through separate `swaymsg` process spawns. No steal-back over a 3 s observation;
   focus rests on the app.
+
+  **Re-measured through the built code when #4 landed, and the number is much smaller: 1–2 ms.**
+  Same shape — a `window` subscription on its own connection, three runs on sway 1.12 —
+  but driven by `SwayWindowManager.attach` rather than by the probe's hand-written sequence:
+
+  ```
+    17ms new con=7 | 17ms focus con=7 | 18ms focus con=5   <- the correction
+    21ms new con=7 | 21ms focus con=7 | 22ms focus con=5
+    32ms new con=7 | 36ms focus con=7 | 38ms focus con=5
+  ```
+
+  The 73–78 ms above is a fact about the probe, not about awakener's client: `awaitWindow`
+  polls `get_tree` in a tight loop on a connection nothing else is using, so it sees the node
+  within a round trip of the map, and only three commands separate that from the correction.
+  `new` and `focus` land in the same millisecond on two of three runs and 4 ms apart on the
+  third, so the no-race finding holds unchanged. Focus rested on the app over a 1 s observation.
+  Recorded because this note's own convention is that sway behaving a certain way and awakener's
+  client behaving that way are separate facts — the flicker `REFOCUS_AFTER_MAP` costs is an
+  order of magnitude smaller than the argument for it assumed, which strengthens the default
+  rather than weakening it.
 - Under `NO_FOCUS_RULE`, `attach`'s unwind contract **explicitly excludes the rule**, and the
   flag description must say so. What can still be fixed is the *cumulative* half of #4: the
   table also remembers which `app_id`s already carry a rule, so a rule is issued at most once
@@ -797,7 +893,9 @@ re-reading a config awakener does not own clears the set. So the design does not
   both paths regardless; a leaked table entry or reservation is invisible in `get_tree` and
   blinds `surfaces()`, which is the opposite of what this flag is for. The description must say
   both halves.
-- `wm.dock.late_dock` = `RECLAIM` | `LEAVE`, **default `LEAVE`.** See "The late dock". The
+- `wm.dock.late_dock` = `RECLAIM` | `LEAVE`, **default `LEAVE`.** *(Specification, not built —
+  see the amendment on "The late dock". It is #18's, and the outcome it covers is now the
+  narrower one recorded there.)* See "The late dock". The
   description must state that `RECLAIM` kills a window `attach` never saw; that under `NEW_NODE`
   the residual predicate is the shared `app_id`, so it can reach a hand-launched window; and that
   it does nothing at all when `wm.events.enabled` is off **or while nothing collects `changes`,
@@ -865,7 +963,8 @@ needs the hotkey path, which does not exist yet. Do not force it into these flag
   hard-coded: `wm.dock.recognition`, `wm.dock.reap_evidence`, `wm.dock.pending_suppression`,
   `wm.dock.focus_suppression`, `wm.dock.unwind_failed_attach`, `wm.dock.late_dock`. **None of
   them gates bookkeeping**, which is the property that matters and the one an earlier draft got
-  wrong.
+  wrong. *(As built, five of the six exist. `wm.dock.late_dock` does not: it gates a claim
+  mechanism nothing builds and nothing could read — see the amendment on "The late dock".)*
 
   An earlier draft also claimed none of them "has an off-state that silently breaks a read path",
   and that is too strong. `wm.dock.recognition = MARK_ONLY` and `wm.dock.late_dock = LEAVE` both
@@ -907,6 +1006,10 @@ alongside #9**, and `late_dock` reconsidered once a collector exists. The order 
    failed attach; #6 then adds only the tree compensations, which are the part that actually
    needs to run under the lock. Each PR is self-consistent on `main` on its own.
 
+   **What landed:** #9 (PR #23) filed and evicted; it did not convert, and no claim exists. #6
+   added the tree compensations as assigned. The gap between them is the late dock, which is now
+   #18's along with the collector that would read a claim at all.
+
    Concretely, #9 adds a `try`/`finally` at the top of `attach` covering the bookkeeping only —
    which is allowed, and is not the "top-level `try`/`catch` unwind" the note rejects. See
    "Bookkeeping is not compensation" for why the rejection does not reach it.
@@ -923,7 +1026,10 @@ rewriting the same block twice. #4's mechanism is a step in #6's transaction.
 - **Over-*reach* under `NEW_NODE` + `RECLAIM`.** The same coarse predicate, but the cost is a
   window killed rather than hidden, and it lands on a user who did nothing but launch a panel
   by hand during a failed attach. This is why `wm.dock.late_dock` defaults to `LEAVE`; it is not
-  fixed, it is off. `PER_SURFACE_APP_ID` removes it by construction — the sharpest reason yet to
+  fixed, it is off. *(Prescriptive: that flag does not exist — see the amendment on "The late
+  dock". The unwind's own adoption is exposed to the same coarseness and is bounded instead: it
+  looks only inside the container this attach built, and only while the lock it took is still
+  held.)* `PER_SURFACE_APP_ID` removes it by construction — the sharpest reason yet to
   revisit that default, below.
 - **The mark's durability has two known holes, both open: #14 and #15.** The pinned predicate
   above (prefix + parseable `con_id`) closes the half of #15 that #9 would otherwise carry
@@ -933,6 +1039,16 @@ rewriting the same block twice. #4's mechanism is a step in #6's transaction.
 - **Nothing collects `changes` and nothing drives `reapOrphans` (#18).** The claim mechanism, and
   therefore Decision 2's "something outside the transaction finishes the job", is specified
   against an owner that does not exist yet. See "The third outcome has no owner".
+- **A cancelled `registry.bind` can leave a durable binding with no panel.** The third instance of
+  the late-recording shape above, and the one this layer cannot close. `bind` is deliberately
+  outside the tree section because it can shell out to spanreed; if the attach is cancelled while
+  that call is returning, the binding is written and its result never arrives, so `attach` unwinds
+  the dock and leaves the row. The compensation would be an `unbind` — but `bind` with a null
+  agent *resolves an existing Lifeless or mints one*, and which of the two it did is exactly the
+  fact that was lost, so an unconditional `unbind` would throw away a binding the attach did not
+  create. Closing it needs `:registry` to make the bind's outcome recoverable rather than only
+  returned; it is not `:wm`'s to fix, and the window is one cancellation landing on one
+  resumption.
 - **`no_focus` remains unrevocable, and so does an `exec` in flight.** Both are declared
   exceptions to Decision 2 rather than solved problems. `no_focus` is made non-default and
   non-cumulative; the late dock is reclaimed after the fact rather than prevented. Neither is
@@ -1033,3 +1149,28 @@ Through the real `SwayWindowManager` (`J*`):
   mark takes it off the first (`5 -> marks=[]`, `6 -> marks=[awakener_dock_999]`), which is #14
   at the sway level; and adding `awakener_dock_notes` to a real application window removed it
   from `surfaces()` entirely, which is #15.
+- **J5 — the `REFOCUS_AFTER_MAP` transient, as built.** Added when #4 landed: the real `attach`
+  under `wm.dock.focus_on_map=false`, watched on a `window` subscription over its own connection,
+  three runs. 1–2 ms of steal, `new` and `focus` in the same millisecond on two runs of three,
+  focus resting on the app after 1 s. See the amendment under the flag; the probe's 73–78 ms was
+  a fact about the probe's own command sequence.
+- **J6 — the map-deadline race, and how much of it one tree read closes.** Added when #6's fix
+  landed. Found in review of that fix by sweeping the dock command's `sleep` across the 5 s
+  deadline: 1 of 4 and 1 of 8 genuine timeouts left a `splith` container standing over the
+  surface and an unmarked dock beside it, because the unwind ran with no `con_id` for a window
+  that had just mapped. Reproducing it that way costs several runs an observation, so it was then
+  **pinned rather than swept**, by holding one IPC request on its way to sway until the dock has
+  mapped — `SwayValve` in the test source set, which both regression tests drive. Two placements,
+  each of which the valve makes a single run rather than a sweep:
+
+  1. the dock maps while the map wait is still outstanding — held request is `awaitWindow`'s
+     first poll, released 5.2 s later, so the deadline has certainly expired;
+  2. the dock maps between the unwind's tree read and the `split none` it sends next — held
+     request is that command.
+
+  Both are red against the unfixed transaction (3 runs, 3 × 2 failures, each
+  `expected:<[5, 6]> but was:<[7, 6]>` — node 7 being the leftover container in place of the
+  surface). **A single re-read at the timeout fixes the first and not the second**: measured by
+  building exactly that (`FLATTEN_PASSES = 1`) and running both, 2 runs, placement 1 green and
+  placement 2 red on each. Two check-and-flatten passes fix both, 2 runs green, and the whole
+  `SwayBindingTest` suite green with them.
