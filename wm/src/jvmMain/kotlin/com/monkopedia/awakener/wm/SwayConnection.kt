@@ -24,6 +24,15 @@ import kotlinx.serialization.json.Json
 class SwayConnection private constructor(private val channel: SocketChannel) : AutoCloseable {
     private val lock = Mutex()
 
+    /**
+     * Set before the socket is torn down, so that a read failing because *we* closed this
+     * connection is separable from one failing because the compositor went away. The socket
+     * itself cannot tell them apart — both arrive as an [IOException] on the blocked read — and
+     * they are the two endings [subscribe] has to report differently.
+     */
+    @Volatile
+    private var closedByCaller = false
+
     suspend fun request(type: Int, payload: String = ""): String = lock.withLock {
         withContext(Dispatchers.IO) {
             writeMessage(type, payload)
@@ -32,22 +41,40 @@ class SwayConnection private constructor(private val channel: SocketChannel) : A
     }
 
     /**
-     * Subscribes this connection to [events] and hands each raw payload to [onEvent] until the
-     * connection is closed. Blocks the calling coroutine; run it on its own connection.
+     * Subscribes this connection to [events] and hands each raw payload to [onEvent].
+     *
+     * Returns when the caller closes this connection, and throws [CompositorSessionEnded] when
+     * the compositor ends it instead. Blocks the calling coroutine; run it on its own connection.
+     *
+     * The distinction is the point. Both endings reach a blocked reader as an [IOException], and
+     * treating them alike — which this did, as "closed underneath us; a normal shutdown" — makes
+     * a dead compositor indistinguishable from a desktop on which nothing is happening. The
+     * second is the product's resting state; the first means every handle held above here
+     * describes a session that has stopped existing.
+     *
+     * [request] deliberately keeps no such rule: a reply sway had already written to the socket
+     * buffer arrives after the process is gone (measured, 6 of 6 with 5ms of slack), so "this
+     * request failed" and "the session is over" are separate events and only one of them is here.
      */
     suspend fun subscribe(events: List<String>, onEvent: suspend (kind: Int, payload: String) -> Unit) {
         withContext(Dispatchers.IO) {
-            writeMessage(I3Ipc.Request.SUBSCRIBE, Json.encodeToString(events))
-            val (_, ack) = readMessage()
+            // Null is the caller's own close(); anything else the socket does is the session
+            // ending. onEvent stays outside, so a callback's own failure is never reported as one.
+            fun <T> onSocket(io: () -> T): T? = try {
+                io()
+            } catch (broken: IOException) {
+                if (closedByCaller) null
+                else throw CompositorSessionEnded("sway closed the IPC socket", broken)
+            }
+
+            onSocket { writeMessage(I3Ipc.Request.SUBSCRIBE, Json.encodeToString(events)) }
+                ?: return@withContext
+            val (_, ack) = onSocket { readMessage() } ?: return@withContext
             check(swayJson.decodeFromString<CommandResult>(ack).success) {
                 "sway refused the event subscription: $ack"
             }
             while (channel.isOpen) {
-                val (type, payload) = try {
-                    readMessage()
-                } catch (e: IOException) {
-                    return@withContext // closed underneath us; a normal shutdown
-                }
+                val (type, payload) = onSocket { readMessage() } ?: return@withContext
                 if (I3Ipc.isEvent(type)) onEvent(I3Ipc.eventKind(type), payload)
             }
         }
@@ -75,7 +102,12 @@ class SwayConnection private constructor(private val channel: SocketChannel) : A
         return buffer.array()
     }
 
-    override fun close() = channel.close()
+    // The flag is set first on purpose: a reader blocked in readMessage wakes on the close, and
+    // it has to find the reason already recorded.
+    override fun close() {
+        closedByCaller = true
+        channel.close()
+    }
 
     companion object {
         /**

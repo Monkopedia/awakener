@@ -282,7 +282,15 @@ right and the cost of enforcing it is not zero. What it requires, concretely:
 > that as well as "clears the table in the same commit"** — the two are the same commit, because
 > a boundary that nothing can observe cannot be the trigger for discarding the table.
 
-That is filed as part of **#18**, which is where the collector itself is owed from.
+That was filed as part of **#18**, which is where the collector itself is owed from, and **the
+observation half of it has since landed as #20**: `subscribe` returns only when the caller closed
+the connection and throws `CompositorSessionEnded` otherwise, and `changes` closes its channel with
+that cause. Re-measured through the real `SwayWindowManager` the same way, the probe above now
+reads `collectorActive=false flowCompleted=false failed=CompositorSessionEnded` after the `SIGKILL`
+and is unchanged on an idle desktop. So the boundary is observable; **nothing observes it yet**,
+which is the rest of #18. Reporting death is not the same as reacting to it, and #20 deliberately
+did not build the reaction — discarding the table on that signal is still the reconnect owner's,
+in the commit that acquires the successor connection.
 
 On the command connection: it is `by lazy { connect() }` and learns only on next use, which is
 late. An earlier draft added "but never *wrong*: it cannot succeed against a dead socket", and
@@ -849,11 +857,11 @@ rewriting the same block twice. #4's mechanism is a step in #6's transaction.
 - **Reconnecting after a compositor restart** is not designed here. This note defines the
   session boundary and requires the table be discarded at it; it does not say how the manager
   acquires a successor connection, and today it does not try (`commands` is
-  `by lazy { connect() }`). Whoever adds reconnect owns three things, not two: acquiring the
-  successor connection, clearing the table, **and making the boundary observable at all** —
-  `subscribe` currently swallows the EOF and `changes` goes silent rather than closing. And
-  awakener's `SWAYSOCK` is itself stale across the boundary, since the default socket path
-  carries the compositor's pid. Filed as part of #18.
+  `by lazy { connect() }`). Whoever adds reconnect owns two things: acquiring the successor
+  connection, and clearing the table. The third — **making the boundary observable at all** —
+  landed as #20; `changes` now fails with `CompositorSessionEnded` where it used to go silent, so
+  the trigger exists and is unclaimed. And awakener's `SWAYSOCK` is itself stale across the
+  boundary, since the default socket path carries the compositor's pid. Filed as part of #18.
 - **Changing `wm.dock.mark_prefix` while docks are standing** orphans them permanently: the
   adoption scan will not find them and nothing else can. Sharp edge for the #9 implementer to
   at least document.
@@ -920,7 +928,8 @@ Through the real `SwayWindowManager` (`J*`):
 
 - **J1 — what a collector observes when the compositor dies.** Collect `changes`, `SIGKILL` sway,
   wait 2 s: `collectorActive=true flowCompleted=false failed=null`. The flow neither completes
-  nor fails; a collector cannot tell a dead compositor from an idle desktop.
+  nor fails; a collector cannot tell a dead compositor from an idle desktop. *(Fixed by #20,
+  which keeps J1 as a test — both states, since the idle one has to keep reading exactly this.)*
 - **J2 — the claim predicate against the ordinary retry.** A failed attach at stock defaults with
   the dock command `sh -c 'exit 1'`, then a normal attach. The second attach's own dock
   (`con_id=7`, `marks=[awakener_dock_5]`, in the table) satisfies the un-narrowed claim predicate
