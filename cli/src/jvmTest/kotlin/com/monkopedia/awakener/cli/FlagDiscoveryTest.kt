@@ -20,6 +20,12 @@ class FlagDiscoveryTest {
 
     @AfterTest
     fun cleanUp() {
+        // A directory staged unreadable would otherwise refuse the delete too, and the fixture
+        // would outlive the run. Top-down, so a directory is reopened before the walk lists it.
+        dir.toFile().walkTopDown().forEach {
+            it.setReadable(true, false)
+            it.setExecutable(true, false)
+        }
         dir.toFile().deleteRecursively()
     }
 
@@ -39,6 +45,26 @@ class FlagDiscoveryTest {
         assertEquals(first.loaded, second.loaded)
         assertEquals(countAfterFirst, Flags.all().size, "the second pass registered something new")
         assertEquals(emptyList(), first.problems + second.problems)
+    }
+
+    /**
+     * The registry is one class — `com.monkopedia.awakener.config.Flags` — and it is excluded for
+     * being that class. Excluding it by simple name excluded every class that shares the name,
+     * which no package has to ask permission for: a module holding one flag set calls the object
+     * `Flags`, and lost its flags with nothing in [FlagDiscovery.Report.problems] to say so.
+     * [com.monkopedia.awakener.futuremodule.Flags] is that shape, and it is referenced by nothing.
+     */
+    @Test
+    fun `a holder named Flags outside the config package declares flags`() {
+        val report = FlagDiscovery.discover(classPath = classPath)
+        assertTrue(
+            "com.monkopedia.awakener.futuremodule.Flags" in report.loaded,
+            "a declarer was dropped for sharing the registry's simple name: $report",
+        )
+        assertTrue(
+            "com.monkopedia.awakener.config.Flags" !in report.loaded,
+            "the registry itself was loaded as though it declared flags: $report",
+        )
     }
 
     @Test
@@ -222,21 +248,29 @@ class FlagDiscoveryTest {
      * And of the broken ones, the entry that could not be read at all has to say so rather than
      * be diagnosed. "It is not an archive" is a fact we never established — we never got to
      * look — and permissions are the one fault here an operator can actually fix, so naming the
-     * wrong one costs the fix as surely as silence would. True on both paths.
+     * wrong one costs the fix as surely as silence would. True on both paths, and true whether
+     * the permission that stops us is the jar's own or a directory's above it: the second shape
+     * used to be reported as "does not exist", about a real jar that is exactly where the
+     * manifest says it is.
+     *
+     * [unreadableEntries] rides along because the requirement is the same one and it is not
+     * really about archives: whatever an entry claims, a refused look leaves nothing true to
+     * say except which permission refused it.
      */
     @Test
-    fun `an archive that cannot be read is reported as unreadable, not as no archive`() {
-        val unreadable = brokenArchives().getValue("a .jar that cannot be read")
-        val reports = mapOf(
-            "top level" to FlagDiscovery.discover(classPath = unreadable.path),
-            "manifest" to
-                discoverThrough(dir.resolve("pathing.jar").toFile(), listOf(unreadable.path)),
-        )
-        for ((path, report) in reports) {
-            assertTrue(
-                report.problems.singleOrNull()?.contains("could not be read") == true,
-                "$path: an unreadable archive was not reported as unreadable: ${report.problems}",
+    fun `an entry that cannot be read is reported as unreadable, not as something else`() {
+        val pathingJar = dir.resolve("pathing.jar").toFile()
+        for ((shape, entry) in unreadableArchives() + unreadableEntries()) {
+            val reports = mapOf(
+                "top level" to FlagDiscovery.discover(classPath = entry.path),
+                "manifest" to discoverThrough(pathingJar, listOf(entry.path)),
             )
+            for ((path, report) in reports) {
+                assertTrue(
+                    report.problems.singleOrNull()?.contains("could not be read") == true,
+                    "$path: $shape was not reported as unreadable: ${report.problems}",
+                )
+            }
         }
     }
 
@@ -286,6 +320,36 @@ class FlagDiscoveryTest {
         assertTrue(
             report.problems.singleOrNull()?.contains("could not be read") == true,
             "an entry nothing could read said nothing: ${report.problems}",
+        )
+    }
+
+    /**
+     * And the cost of an entry that cannot be resolved is that entry, never its siblings. A
+     * `Class-Path` entry the platform's own filesystem will not accept — on Linux a NUL, which
+     * is what a `%00` becomes once the URI is decoded — used to throw out of the manifest loop,
+     * and [FlagDiscovery]'s handler is per *classpath* entry: the throw was charged to the
+     * pathing jar, so every remaining entry went with it and the message named a jar that read
+     * perfectly well. Both halves are the contract this module is for — the flags behind a good
+     * entry arrive, and nothing asserts a fact about a file nothing opened.
+     */
+    @Test
+    fun `an unusable manifest entry costs that entry and not its siblings`() {
+        val real = stagedArchive("siblings/real.jar")
+        val report = discoverThrough(
+            dir.resolve("pathing.jar").toFile(),
+            listOf("bad%00name.jar", real.path),
+        )
+        assertTrue(
+            "com.monkopedia.awakener.wm.WmFlags" in report.loaded,
+            "one unusable Class-Path entry cost its siblings as well: $report",
+        )
+        assertTrue(
+            report.problems.none { "pathing.jar could not be read" in it },
+            "the pathing jar read fine and was blamed anyway: ${report.problems}",
+        )
+        assertTrue(
+            report.problems.singleOrNull()?.contains("bad") == true,
+            "the entry that could not be used was not the one named: ${report.problems}",
         )
     }
 
@@ -395,12 +459,14 @@ class FlagDiscoveryTest {
             "an http: URL" to "http://elsewhere.invalid/wm.jar",
             "a jar: URL" to "jar:file:${jar.path}!/",
             "a relative path to nothing" to "gone/nowhere.jar",
+            "a path holding a character no filesystem accepts" to "bad%00name.jar",
             "an archive called .war" to stagedArchive("wm.war").path,
             "an archive with no extension" to stagedArchive("wm-no-extension").path,
             "a file that is not an archive" to
                 dir.resolve("notes.txt").toFile().apply { writeText("not an archive") }.path,
             "something that is neither file nor directory" to "/dev/null",
-        ) + (brokenArchives() + missingArchives()).mapValues { (_, file) -> file.path }
+        ) + (brokenArchives() + missingArchives() + unreadableEntries())
+            .mapValues { (_, file) -> file.path }
     }
 
     /**
@@ -414,25 +480,90 @@ class FlagDiscoveryTest {
      * it: it is not an archive that failed to be one, and the two must not collapse into one
      * message. It is also the one member of this family the top level may pass over in silence,
      * which is why it cannot be a row here.
+     *
+     * [unreadableArchives] is spliced in rather than listed, because those rows are real archives
+     * and the fault is only ever the permission — they need an assertion naming the message, not
+     * just the non-silence this corpus drives.
      */
     private fun brokenArchives(): Map<String, File> {
         val home = dir.resolve("broken").toFile()
         home.mkdirs()
-        val unreadable = stagedArchive("broken/unreadable.jar")
-        unreadable.setReadable(false, false)
-        assertTrue(
-            !unreadable.canRead(),
-            "$unreadable is still readable, so the permission case proves nothing — run as root?",
-        )
         return mapOf(
             "a zero-byte .jar" to File(home, "zero.jar").apply { writeBytes(ByteArray(0)) },
             "a .jar truncated past its header" to File(home, "truncated.jar")
                 .apply { writeBytes(byteArrayOf(0x50, 0x4B, 0x03, 0x04, 0x0A, 0x00)) },
             "a .jar that is not an archive at all" to
                 File(home, "text.jar").apply { writeText("not an archive") },
-            // A real archive, so the only thing standing between discovery and its flags is the
-            // permission — "it is not an archive" would be a statement of a fact not in evidence.
+        ) + unreadableArchives()
+    }
+
+    /**
+     * Real archives that discovery is not allowed to reach, by the two routes a permission can
+     * stop it: the jar's own mode, and a directory above it. Nothing here is malformed — the
+     * flags are inside, intact — so every diagnosis except the permission is a fact not in
+     * evidence, and "does not exist" is the one that sends an operator after a file that is
+     * exactly where it should be.
+     *
+     * The locked directory is reopened before it is staged into, so that calling this twice in
+     * one test builds the fixture rather than tripping over the previous call's lock.
+     */
+    private fun unreadableArchives(): Map<String, File> {
+        val unreadable = stagedArchive("unreadable/unreadable.jar")
+        unreadable.setReadable(false, false)
+        dir.resolve("locked").toFile().apply {
+            mkdirs()
+            setReadable(true, false)
+            setExecutable(true, false)
+        }
+        val behindLockedDirectory = stagedArchive("locked/inner.jar")
+        val locked = behindLockedDirectory.parentFile
+        locked.setReadable(false, false)
+        locked.setExecutable(false, false)
+        assertTrue(
+            !unreadable.canRead() && !behindLockedDirectory.exists(),
+            "the fixtures still grant access, so the permission cases prove nothing — run as root?",
+        )
+        return mapOf(
             "a .jar that cannot be read" to unreadable,
+            "a .jar behind a directory that cannot be read" to behindLockedDirectory,
+        )
+    }
+
+    /**
+     * The rest of the widening `a top-level entry that cannot be read is reported though it
+     * claims nothing` pins, kept as rows rather than as prose in a PR: neither of these is
+     * *named* as an archive, so on `main` — which decided by name and never opened anything —
+     * both were silently nothing. They are the two remaining ways the filesystem answers
+     * neither yes nor no: a mode that refuses the stat, and a link that resolves forever.
+     */
+    private fun unreadableEntries(): Map<String, File> {
+        val locked = dir.resolve("locked-package").toFile().apply {
+            setReadable(true, false)
+            setExecutable(true, false)
+        }
+        locked.resolve("com/monkopedia/awakener").mkdirs()
+        locked.setReadable(false, false)
+        locked.setExecutable(false, false)
+
+        val home = dir.resolve("loop").toFile().apply { mkdirs() }
+        val there = File(home, "there.jar")
+        val back = File(home, "back.jar")
+        listOf(there, back).forEach { Files.deleteIfExists(it.toPath()) }
+        Files.createSymbolicLink(there.toPath(), back.toPath())
+        Files.createSymbolicLink(back.toPath(), there.toPath())
+
+        assertTrue(
+            !locked.canRead(),
+            "$locked is still readable, so it proves nothing — run as root?",
+        )
+        assertTrue(
+            Files.readSymbolicLink(there.toPath()) == back.toPath() &&
+                Files.readSymbolicLink(back.toPath()) == there.toPath(),
+            "$there does not close a loop, so it proves nothing",
+        )
+        return mapOf(
+            "a directory holding the package that cannot be read" to locked,
+            "a symlink loop" to there,
         )
     }
 

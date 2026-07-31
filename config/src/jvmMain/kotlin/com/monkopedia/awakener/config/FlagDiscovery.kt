@@ -2,6 +2,9 @@ package com.monkopedia.awakener.config
 
 import java.io.File
 import java.net.URI
+import java.nio.file.Files
+import java.nio.file.NoSuchFileException
+import java.nio.file.attribute.BasicFileAttributes
 import java.util.jar.JarFile
 
 /**
@@ -23,6 +26,9 @@ object FlagDiscovery {
     private const val SUFFIX = "Flags"
     private const val CLASS_EXT = ".class"
     private const val DECLARING = "$SUFFIX$CLASS_EXT"
+
+    /** [Flags] itself, spelt the way a classpath entry holds it. See [declares]. */
+    private const val REGISTRY = "$PACKAGE/config/$DECLARING"
 
     /**
      * @param loaded fully-qualified names of the declaring classes that were initialised.
@@ -85,13 +91,13 @@ object FlagDiscovery {
                     // that classpath, not us — and a warning per entry would put noise in front
                     // of the ones that mean something. That silence is for the entry we looked
                     // at and recognised as nothing, and for the one there was nothing to look
-                    // at; an entry we could not read never reaches this arm, because [isArchive]
-                    // throws and the handler below names the fault. `main` was silent there too,
-                    // having decided by name and never opened it — reporting is the deliberate
-                    // widening, since a failed read is not a recognition and permission is a
-                    // fault an operator can fix. A manifest entry is the opposite case: a jar of
-                    // ours deliberately named it, so dropping it costs every flag behind it and
-                    // reads exactly like a module that declares none.
+                    // at; an entry whose stat or read was refused reaches the handler below
+                    // instead, because [isArchive] throws rather than answering. `main` was
+                    // silent there too, having decided by name and never opened it — reporting
+                    // is the deliberate widening, since a failed read is not a recognition and
+                    // permission is a fault an operator can fix. A manifest entry is the
+                    // opposite case: a jar of ours deliberately named it, so dropping it costs
+                    // every flag behind it and reads exactly like a module that declares none.
                     declaredBy != null -> problems += "$declaredBy points at $entry, which is " +
                         "neither a directory nor an archive"
                 }
@@ -119,13 +125,29 @@ object FlagDiscovery {
     )
 
     /**
+     * What the filesystem says this path is, or null when there is no such path.
+     *
+     * [File.isFile] and [File.isDirectory] answer `false` both for "it is not that" and for "the
+     * lookup was refused", so a jar under a directory the process cannot traverse read as one
+     * that is not there. [Files.readAttributes] separates them: a [NoSuchFileException] is the
+     * path being absent, and every other failure propagates into [scan]'s handler, which reports
+     * the fault it met instead of a fact about a file nothing managed to stat.
+     */
+    private fun File.attributes(): BasicFileAttributes? = try {
+        Files.readAttributes(toPath(), BasicFileAttributes::class.java)
+    } catch (_: NoSuchFileException) {
+        null
+    }
+
+    /**
      * Throws rather than answering `false` when the file cannot be read, because "we could not
      * look" is a different fact from "we looked and it is not an archive" — [scan] turns the
      * throw into the problem naming the real fault, which for a permission-denied entry is the
-     * only one an operator can act on.
+     * only one an operator can act on. The throw covers the stat as well as the read, so a jar
+     * behind an unreadable parent reports the permission rather than being read as absent.
      */
     private val File.isArchive: Boolean
-        get() = isFile && inputStream().use { it.readNBytes(4) }
+        get() = attributes()?.isRegularFile == true && inputStream().use { it.readNBytes(4) }
             .let { header -> ARCHIVE_HEADERS.any { it contentEquals header } }
 
     /** What the name claims, against what [ARCHIVE_HEADERS] establishes. */
@@ -139,14 +161,17 @@ object FlagDiscovery {
      * missing, which the manifest path already says and the top level has no standing to.
      */
     private val File.namedArchive: Boolean
-        get() = isFile && ARCHIVE_EXTENSIONS.any { extension.equals(it, ignoreCase = true) }
+        get() = attributes()?.isRegularFile == true &&
+            ARCHIVE_EXTENSIONS.any { extension.equals(it, ignoreCase = true) }
 
     private fun File.classesUnderPackage(): List<String> {
         val root = resolve(PACKAGE)
-        if (!root.isDirectory) return emptyList()
+        if (root.attributes()?.isDirectory != true) return emptyList()
         return root.walkTopDown()
-            .filter { it.isFile && declares(it.name) }
-            .map { it.relativeTo(this).path.removeSuffix(CLASS_EXT).replace(File.separatorChar, '.') }
+            .filter { it.isFile }
+            .map { it.relativeTo(this).path.replace(File.separatorChar, '/') }
+            .filter(::declares)
+            .map { it.removeSuffix(CLASS_EXT).replace('/', '.') }
             .toList()
     }
 
@@ -161,20 +186,41 @@ object FlagDiscovery {
                 val target = manifestEntry(entry)
                 when {
                     target == null -> problems += "$declaredBy is not a local file"
-                    !target.exists() ->
+                    // Confirmed absent, which [File.exists]'s `false` is not: that also covers a
+                    // file we were refused a look at, and a real jar under an unreadable parent
+                    // took this arm and was reported as missing. What we cannot resolve here is
+                    // queued instead, so the fault reported is the one [scan] establishes by
+                    // trying to open it.
+                    //
+                    // Contained, because [File.toPath] throws on a path the platform's own
+                    // filesystem refuses — on Linux a NUL, which is what a `%00` in an entry
+                    // becomes once the URI is decoded. [scan]'s handler is per *classpath*
+                    // entry, so a throw escaping here is charged to the pathing jar: it would
+                    // cost every sibling entry as well and name a jar that read perfectly well.
+                    // [manifestEntry] contains `URI` for the same reason.
+                    runCatching { Files.notExists(target.toPath()) }.getOrDefault(false) ->
                         problems += "$declaredBy points at $target, which does not exist"
                     else -> pending += Candidate(target, declaredBy)
                 }
             }
         jar.entries().asSequence()
-            .filter { it.name.startsWith("$PACKAGE/") && declares(it.name.substringAfterLast('/')) }
-            .map { it.name.removeSuffix(CLASS_EXT).replace('/', '.') }
+            .map { it.name }
+            .filter { it.startsWith("$PACKAGE/") && declares(it) }
+            .map { it.removeSuffix(CLASS_EXT).replace('/', '.') }
             .toList()
     }
 
-    /** [Flags] itself matches the suffix exactly but declares nothing, so it is not a declarer. */
-    private fun declares(fileName: String) =
-        fileName.endsWith(DECLARING) && fileName != DECLARING
+    /**
+     * Whether a class file at [path] — the slash-separated path a classpath entry holds it
+     * under — declares flags.
+     *
+     * [Flags] matches the suffix exactly and registers nothing, so it is excluded; the exclusion
+     * is by [REGISTRY], its whole path, because `Flags` is a simple name any package may mint.
+     * Comparing simple names dropped a `com.monkopedia.awakener.chrome.Flags` with nothing in
+     * [Report.problems] to say so — a module's flags gone, and `list` complete-looking without
+     * them.
+     */
+    private fun declares(path: String) = path.endsWith(DECLARING) && path != REGISTRY
 
     /**
      * A `Class-Path` entry is a URL resolved against the jar's own URL, not a filesystem path.
