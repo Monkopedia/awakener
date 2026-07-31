@@ -105,9 +105,11 @@ internal data class DockTableSnapshot(
  * Deliberately not persisted, and deliberately no longer lived than the IPC connection it was
  * built against. sway allocates `con_id`s from a counter that restarts with the compositor, so an
  * entry that outlived a sway restart would name whatever window happens to hold that id next.
- * Nothing here enforces that bound today. The boundary is now *observable* — #20 made `changes`
- * fail with `CompositorSessionEnded` where it used to go quiet — but nothing reacts to it, and
- * discarding this table on it belongs to whoever adds reconnect (#18).
+ * [discard] is that bound, and `SwayWindowManager`'s repair collector is what calls it: #20 made
+ * the boundary observable by failing `changes` with `CompositorSessionEnded`, and the collector is
+ * what reacts. Nothing here bounds the table by *time* — a manager whose events are switched off
+ * has no promptly-detecting connection and so no trigger at all, which is stated in
+ * `WmFlags.eventsEnabled` rather than worked around.
  *
  * Every mutation replaces the snapshot atomically, so [snapshot] blocks on nothing and enumeration
  * never queues behind an attach.
@@ -146,6 +148,35 @@ internal class DockTable {
      */
     fun recordFocusRule(appId: String) =
         state.update { it.copy(focusRules = it.focusRules + appId) }
+
+    /**
+     * Throws the whole table away — every field of it — because the session it described has
+     * ended.
+     *
+     * Discarded rather than repaired, and that is the whole of the rule. Every entry key is a
+     * `con_id`, and sway allocates those from a counter that restarts with the compositor: a fresh
+     * session hands out 5, 6, 7 again, densely and from the moment it starts. So a surviving entry
+     * does not merely go stale, it *collides* — measured across two sequential sway sessions under
+     * one client, session A's dock id was session B's browser — and a collision here hides a
+     * genuine window from enumeration for the life of the process. Neither of the table's own
+     * rules catches it: the tree veto is "table says dock, tree has no such node", and after a
+     * restart the tree does have a node at that id; the recognition union then makes it a false
+     * *positive*, which is the direction the union deliberately biases toward.
+     *
+     * The other two go for reasons of their own rather than by association. A reservation is keyed
+     * on `app_id` and so cannot collide, but it belongs to an attach that was talking to the dead
+     * compositor and can no longer complete. [DockTableSnapshot.focusRules] is the one field that
+     * records *sway's* state rather than awakener's, and it is exactly wrong across the boundary:
+     * a `no_focus` rule cannot outlive the compositor holding it, so keeping the record would
+     * suppress the next session's first attach from issuing one it genuinely needs.
+     *
+     * What this does not do is make the manager usable again: the connection its commands ride on
+     * is still the dead one. Emptying the table is the half of the boundary that is ours; acquiring
+     * a successor connection is reconnection, which is not designed (#33).
+     */
+    fun discard() {
+        state.update { DockTableSnapshot() }
+    }
 }
 
 /** What a node's marks say about the surface it is a dock for. */

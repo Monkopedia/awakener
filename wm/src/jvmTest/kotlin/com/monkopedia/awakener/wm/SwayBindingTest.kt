@@ -354,6 +354,10 @@ class SwayBindingTest {
      */
     @Test
     fun `a dock adopted after a restart is still reaped when its surface closes`() = swayTest {
+        // What is under test is the *restarted* manager's sweep, working from the mark alone. The
+        // manager that stood the dock up is still collecting close events on this scope and would
+        // otherwise reap it from its own table first, which would prove nothing about adoption.
+        store.put(WmFlags.sweepOnClose, false)
         val app = openSurface("aw-app1")
         val dock = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1")).dockId
 
@@ -587,6 +591,11 @@ class SwayBindingTest {
      */
     @Test
     fun `a failing teardown does not abandon the rest of the sweep`() = swayTest {
+        // This drives the sweep by hand and asserts on what one pass of it did, so the collector
+        // that now runs one per close event has to be out of the way — it would reap these orphans
+        // before the call below and leave it nothing to fail on. What the collector does with a
+        // failing sweep is SwayRepairTest's.
+        store.put(WmFlags.sweepOnClose, false)
         val stuck = openSurface("aw-app1")
         val clean = openSurface("aw-app2")
         val stuckDock = wm.attach(stuck, dockFor("aw-dock"), AgentId("agent-1"))
@@ -632,6 +641,9 @@ class SwayBindingTest {
      */
     @Test
     fun `a dock that will not die is reported and does not stop the sweep`() = swayTest {
+        // As above: one hand-driven pass is what is asserted on, down to the order the sweep walks
+        // the tree in, so the event-driven collector must not have run one first.
+        store.put(WmFlags.sweepOnClose, false)
         val wedged = openSurface("aw-app1")
         val clean = openSurface("aw-app2")
         val wedgedDock = wm.attach(wedged, dockFor("aw-dock"), AgentId("agent-1"))
@@ -658,8 +670,8 @@ class SwayBindingTest {
         assertTrue(
             wedgedDock.dockId.raw.toString() in failure.message.orEmpty(),
             "an aggregate over a sweep of N docks has to name the dock each failure came from " +
-                "or it is not diagnosable, and reapOrphans has no production caller yet to say " +
-                "it on its behalf; the message was: ${failure.message}",
+                "or it is not diagnosable, and the sweep's usual caller is a collector nobody " +
+                "is watching; the message was: ${failure.message}",
         )
         assertNotNull(
             wm.tree().find(wedgedDock.dockId.raw),
