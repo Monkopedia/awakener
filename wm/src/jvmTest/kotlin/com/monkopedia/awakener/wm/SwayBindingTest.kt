@@ -10,6 +10,7 @@ import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -150,9 +151,90 @@ class SwayBindingTest {
         command("[con_id=${app.raw}] kill")
         awaitGone(app)
         wm.reapOrphans()
-        awaitGone(handle.dockId)
 
+        // Deliberately not waiting for the dock here. sway acknowledges `kill` when it has asked
+        // the client to close, not when the window unmaps, and detach used to return on that
+        // acknowledgement — so a sweep reported a repair it had not yet made, and the next sweep
+        // (there is one per `close` event) found the same dock still in the tree and killed it
+        // again. Waiting here hid that: the dock was still standing on 70 runs out of 70 against
+        // the unfixed code, so this assertion is where the race stops being a matter of luck.
         assertNull(wm.tree().find(handle.dockId.raw), "the dock must not outlive its surface")
+    }
+
+    /**
+     * The same repair driven by several sweeps at once, which is the ordinary case rather than a
+     * contrived one: `reapOrphans` is driven off the `close` event, and closing a workspace's
+     * worth of windows emits a burst of them.
+     *
+     * Unfixed, each sweep killed a dock and returned while it was still standing, so the next
+     * sweep saw it in the tree and killed it a second time — and sway rejects criteria that match
+     * nothing, so whichever loser's command happened to land in the millisecond the window
+     * unmapped threw out of the middle of `reapOrphans`, leaving every orphan after it in that
+     * pass standing. That is a transient race turning into permanent tree damage, since the
+     * `close` that would have triggered the next sweep has already been and gone.
+     *
+     * Intermittent by nature, so it is repeated: one round of this shape failed on 44 of 70 runs
+     * against `main`, and the test as written on 20 of 20.
+     */
+    @Test
+    fun `concurrent reaps do not fight over the same dock`() = swayTest {
+        repeat(REAP_ROUNDS) {
+            val docks = orphans(ORPHANS_PER_ROUND)
+
+            coroutineScope {
+                List(ORPHANS_PER_ROUND) { async { wm.reapOrphans() } }.forEach { it.await() }
+            }
+
+            val root = wm.tree()
+            assertEquals(
+                emptyList(),
+                docks.filter { root.find(it.raw) != null },
+                "every orphan must be down by the time the sweeps return",
+            )
+        }
+    }
+
+    /**
+     * The consequence that actually matters. `reapOrphans` is the whole mechanism for Hazard 2,
+     * and it gets one shot per `close` event — so a teardown that throws partway through does not
+     * merely lose that dock, it strands every orphan the sweep had not reached yet, with nothing
+     * scheduled to come back for them.
+     *
+     * The failure here is a real sway rejection rather than an injected one: `split none` is
+     * refused on a child that still has siblings, so a tab holding two other windows besides the
+     * dock cannot be normalised. A user splitting a second window into a tab produces exactly
+     * that shape.
+     */
+    @Test
+    fun `a failing teardown does not abandon the rest of the sweep`() = swayTest {
+        val stuck = openSurface("aw-app1")
+        val clean = openSurface("aw-app2")
+        val stuckDock = wm.attach(stuck, dockFor("aw-dock"), AgentId("agent-1"))
+
+        // Two extra windows in the stuck dock's tab, so the container it leaves behind has more
+        // than one survivor and sway will refuse to flatten it.
+        command("[con_id=${stuck.raw}] focus")
+        val extra = openSurface("aw-app3")
+        command("[con_id=${extra.raw}] focus")
+        openSurface("aw-app4")
+
+        val cleanDock = wm.attach(clean, dockFor("aw-dock"), AgentId("agent-2"))
+        for (surface in listOf(stuck, clean)) {
+            command("[con_id=${surface.raw}] kill")
+            awaitGone(surface)
+        }
+
+        assertFailsWith<IllegalStateException>("a teardown that fails must still be reported") {
+            wm.reapOrphans()
+        }
+
+        val root = wm.tree()
+        assertNull(
+            root.find(cleanDock.dockId.raw),
+            "the orphan after the failing one must still have been reaped — abandoning the rest " +
+                "of the sweep is what turns one lost race into tree damage nothing repairs",
+        )
+        assertNull(root.find(stuckDock.dockId.raw), "and the failing dock itself is still down")
     }
 
     /**
@@ -460,6 +542,23 @@ class SwayBindingTest {
     private fun dockFor(appId: String) =
         DockSpec(appId, sway.windowCommand(DockSpec.APP_ID_PLACEHOLDER))
 
+    /**
+     * [count] docks whose surfaces have gone — the tree shape Hazard 2 leaves behind. Every
+     * surface is opened before any dock is attached so that each becomes its own tab, which keeps
+     * the orphans in sibling containers rather than nested inside one another.
+     */
+    private suspend fun orphans(count: Int): List<SurfaceId> {
+        val apps = (1..count).map { openSurface("aw-app$it") }
+        val docks = apps.map {
+            wm.attach(it, dockFor("aw-dock"), AgentId("agent-${it.raw}")).dockId
+        }
+        apps.forEach {
+            command("[con_id=${it.raw}] kill")
+            awaitGone(it)
+        }
+        return docks
+    }
+
     private fun markFor(surface: SurfaceId) =
         "${WmFlags.dockMarkPrefix.default}${surface.raw}"
 
@@ -521,5 +620,13 @@ class SwayBindingTest {
 
         /** Long enough that a second attach finishing inside it cannot be luck. */
         const val MINT_DELAY_MS = 2_000L
+
+        /**
+         * Shape of the concurrent-reap round. Six orphans swept by six sweeps is where the
+         * unfixed race became likely rather than rare — measured 11/20, 16/25 and 17/25 — and
+         * five rounds is what turns that into a test that fails every time it is run.
+         */
+        const val ORPHANS_PER_ROUND = 6
+        const val REAP_ROUNDS = 5
     }
 }
