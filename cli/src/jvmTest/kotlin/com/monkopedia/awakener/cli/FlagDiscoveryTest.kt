@@ -158,6 +158,136 @@ class FlagDiscoveryTest {
     }
 
     /**
+     * `Class-Path` entries are URLs, and a URL says nothing about the file it names — so a real
+     * archive called `.war`, or one with no extension at all, is a jar the JVM's own
+     * `URLClassPath` opens happily. Deciding by name dropped it, and dropped it in silence.
+     */
+    @Test
+    fun `a manifest classpath entry is followed whatever the archive is called`() {
+        val report = discoverThrough(
+            dir.resolve("pathing.jar").toFile(),
+            listOf(stagedArchive("wm.war").path, stagedArchive("wm-no-extension").path),
+        )
+        assertTrue(
+            "com.monkopedia.awakener.wm.WmFlags" in report.loaded,
+            "an archive not named .jar or .zip was dropped: $report",
+        )
+        assertEquals(emptyList(), report.problems)
+    }
+
+    /**
+     * And when the entry is not an archive at all there is nothing to follow — which still has
+     * to be said, because a jar deliberately named it and every flag behind it is now missing.
+     */
+    @Test
+    fun `a manifest classpath entry that is not an archive is reported`() {
+        val junk = dir.resolve("notes.txt").toFile().apply { writeText("not an archive") }
+        val report = discoverThrough(dir.resolve("pathing.jar").toFile(), listOf(junk.path))
+        assertEquals(emptyList(), report.loaded)
+        assertTrue(
+            report.problems.singleOrNull()?.contains("notes.txt") == true,
+            "an unusable Class-Path entry vanished instead of reporting: ${report.problems}",
+        )
+    }
+
+    /**
+     * The other half of that trade: the top-level classpath is the JVM's own, whatever is on it
+     * was not put there by a jar of ours, and a warning per entry would bury the ones that mean
+     * something. Silence there is deliberate, so pin it rather than let it drift into noise.
+     */
+    @Test
+    fun `a top-level classpath entry that is not an archive stays quiet`() {
+        val junk = dir.resolve("notes.txt").toFile().apply { writeText("not an archive") }
+        val report = FlagDiscovery.discover(classPath = junk.path)
+        assertEquals(FlagDiscovery.Report(emptyList(), emptyList()), report)
+    }
+
+    /**
+     * `file://localhost/…` is the authority form of a local path — the JVM's own `URLClassPath`
+     * accepts it — but `File(URI)` refuses any authority at all, so it was reported as "not a
+     * local file", which it plainly is.
+     */
+    @Test
+    fun `a file URL naming localhost resolves`() {
+        val entries = stagedUnder("lib").map { "file://localhost${it.path}" }
+        val report = discoverThrough(dir.resolve("pathing.jar").toFile(), entries)
+        assertTrue(
+            "com.monkopedia.awakener.wm.WmFlags" in report.loaded,
+            "a local path spelt with an authority was refused: $report",
+        )
+        assertEquals(emptyList(), report.problems)
+    }
+
+    /**
+     * A raw path through a directory called `odd#name` parses as a URI with a fragment, so the
+     * URI's own path is the entry cut short — a different file. The raw-path fallback is what
+     * the writer of an unencoded entry meant, and it beats reporting a local path as remote.
+     */
+    @Test
+    fun `a raw path containing a fragment character resolves`() {
+        val entries = stagedUnder("odd#name").map { it.path }
+        val report = discoverThrough(dir.resolve("pathing.jar").toFile(), entries)
+        assertTrue(
+            "com.monkopedia.awakener.wm.WmFlags" in report.loaded,
+            "a raw path containing '#' was dropped: $report",
+        )
+        assertEquals(emptyList(), report.problems)
+    }
+
+    /**
+     * The property, asserted as a property rather than case by case. `loaded=[], problems=[]`
+     * is the one outcome a caller cannot tell apart from "this module declares no flags", so no
+     * manifest entry may produce it: either the flags behind it arrive, or it says why not.
+     * A newly discovered corner belongs in [manifestCorpus], not in a test of its own.
+     */
+    @Test
+    fun `no manifest classpath entry is dropped in silence`() {
+        val pathingJar = dir.resolve("pathing.jar").toFile()
+        val silent = manifestCorpus()
+            .mapValues { (_, entry) -> discoverThrough(pathingJar, listOf(entry)) }
+            .filterValues { it.loaded.isEmpty() && it.problems.isEmpty() }
+        assertEquals(emptyMap(), silent, "these Class-Path entries vanished without a word")
+    }
+
+    /**
+     * Every shape of `Class-Path` entry known to reach this code. Each one either names the real
+     * `:wm` classpath or is unusable — none of them is legitimately empty, so a case reporting
+     * neither flags nor a problem has lost something.
+     */
+    private fun manifestCorpus(): Map<String, String> {
+        val jar = stagedUnder("lib").first()
+        return mapOf(
+            "an absolute file: URI" to jar.toURI().toString(),
+            "a percent-encoded relative path" to
+                dir.toFile().toURI().relativize(jar.toURI()).rawPath,
+            "a raw relative path" to jar.path,
+            "a path through a directory named with '#'" to stagedUnder("odd#name").first().path,
+            "a path through a directory named with '?'" to stagedUnder("odd?name").first().path,
+            "a path through a directory named with '%'" to stagedUnder("100%dir").first().path,
+            "a file: URL naming localhost" to "file://localhost${jar.path}",
+            "a file: URL naming another host" to "file://elsewhere.invalid${jar.path}",
+            "an http: URL" to "http://elsewhere.invalid/wm.jar",
+            "a jar: URL" to "jar:file:${jar.path}!/",
+            "a relative path to nothing" to "gone/nowhere.jar",
+            "an archive called .war" to stagedArchive("wm.war").path,
+            "an archive with no extension" to stagedArchive("wm-no-extension").path,
+            "a file that is not an archive" to
+                dir.resolve("notes.txt").toFile().apply { writeText("not an archive") }.path,
+            "something that is neither file nor directory" to "/dev/null",
+        )
+    }
+
+    /** The real `:wm` jar under a name that says nothing true about what is inside it. */
+    private fun stagedArchive(name: String): File {
+        val source = classPath.split(File.pathSeparator).map(::File)
+            .first { "/wm/build/" in it.path && it.isFile }
+        val staged = dir.resolve("archives").toFile().resolve(name)
+        staged.parentFile.mkdirs()
+        source.copyTo(staged, overwrite = true)
+        return staged
+    }
+
+    /**
      * Copies of the real `:wm` classpath entries, under a subdirectory whose name is what forces
      * the encoding. Copies rather than the originals because the entry format under test is
      * relative to the pathing jar, and the originals are not below it.

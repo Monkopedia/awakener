@@ -63,26 +63,46 @@ object FlagDiscovery {
      * launches test workers, and would otherwise be a place discovery quietly found nothing.
      */
     private fun scan(classPath: String, problems: MutableList<String>): List<String> {
-        val pending = ArrayDeque(classPath.split(File.pathSeparator).filter { it.isNotEmpty() }.map(::File))
+        val pending = ArrayDeque(
+            classPath.split(File.pathSeparator).filter(String::isNotEmpty).map { Candidate(File(it)) },
+        )
         val visited = mutableSetOf<String>()
         val found = LinkedHashSet<String>()
         while (pending.isNotEmpty()) {
-            val entry = pending.removeFirst()
+            val (entry, declaredBy) = pending.removeFirst()
             if (!visited.add(entry.absolutePath)) continue
             runCatching {
                 when {
                     entry.isDirectory -> found += entry.classesUnderPackage()
-                    // Anything else on a classpath is not ours to open, and complaining about
-                    // it would put noise in front of the warnings that mean something.
                     entry.isArchive -> found += entry.scanJar(pending, problems)
+                    // Anything else at the top level is not ours to open — the JVM was handed
+                    // that classpath, not us — and a warning per entry would put noise in front
+                    // of the ones that mean something. A manifest entry is the opposite case: a
+                    // jar of ours deliberately named it, so dropping it costs every flag behind
+                    // it and reads exactly like a module that declares none.
+                    declaredBy != null -> problems += "$declaredBy points at $entry, which is " +
+                        "neither a directory nor an archive"
                 }
             }.onFailure { problems += "$entry could not be read: $it" }
         }
         return found.toList()
     }
 
+    /** A classpath entry, and — when a jar manifest named it — how to say which one did. */
+    private data class Candidate(val file: File, val declaredBy: String? = null)
+
+    /**
+     * `PK` and a header type: an entry, an archive with no entries, or a spanned one. A
+     * `Class-Path` entry is a URL, and a URL says nothing about the file it names, so a `.war`
+     * or an extension-less jar is an archive the JVM's own `URLClassPath` opens — deciding by
+     * name would drop the flags inside it. Four bytes settle what the name cannot.
+     */
+    private val ARCHIVE_HEADERS = setOf("PK\u0003\u0004", "PK\u0005\u0006", "PK\u0007\u0008")
+
     private val File.isArchive: Boolean
-        get() = isFile && (extension.equals("jar", true) || extension.equals("zip", true))
+        get() = isFile &&
+            runCatching { inputStream().use { it.readNBytes(4) } }
+                .getOrNull()?.toString(Charsets.ISO_8859_1) in ARCHIVE_HEADERS
 
     private fun File.classesUnderPackage(): List<String> {
         val root = resolve(PACKAGE)
@@ -94,20 +114,19 @@ object FlagDiscovery {
     }
 
     private fun File.scanJar(
-        pending: ArrayDeque<File>,
+        pending: ArrayDeque<Candidate>,
         problems: MutableList<String>,
     ): List<String> = JarFile(this).use { jar ->
         jar.manifest?.mainAttributes?.getValue("Class-Path")?.split(" ")
             ?.filter { it.isNotEmpty() }
             ?.forEach { entry ->
+                val declaredBy = "$this: Class-Path entry '$entry'"
                 val target = manifestEntry(entry)
                 when {
-                    target == null ->
-                        problems += "$this: Class-Path entry '$entry' is not a local file"
+                    target == null -> problems += "$declaredBy is not a local file"
                     !target.exists() ->
-                        problems += "$this: Class-Path entry '$entry' points at $target, " +
-                            "which does not exist"
-                    else -> pending += target
+                        problems += "$declaredBy points at $target, which does not exist"
+                    else -> pending += Candidate(target, declaredBy)
                 }
             }
         jar.entries().asSequence()
@@ -128,13 +147,25 @@ object FlagDiscovery {
      * URI parser accepts are still tried as paths, because tools that emit them exist and losing
      * their flags would be the same failure from the other side.
      *
-     * @return null when the entry names something that is not a local file, such as an `http:`
-     * URL, which discovery has no way to open.
+     * @return null when the entry names something that is genuinely not a local file — an
+     * `http:` or `jar:` URL, or a `file:` URL on another host — which discovery cannot open.
      */
     private fun File.manifestEntry(entry: String): File? {
-        val uri = runCatching { toURI().resolve(URI(entry)) }.getOrNull()
-            ?: return absoluteFile.parentFile?.resolve(entry) ?: File(entry)
+        val uri = runCatching { toURI().resolve(URI(entry)) }.getOrNull() ?: return asPath(entry)
         if (uri.scheme != "file") return null
-        return runCatching { File(uri) }.getOrNull()
+        // `file://localhost/…` is a local path spelt with the authority the JVM's own
+        // `URLClassPath` accepts, but `File(URI)` refuses any authority at all.
+        uri.authority?.let { authority ->
+            val path = uri.path
+            return if (authority == "localhost" && path != null) File(path) else null
+        }
+        // What is left is a `file:` URI that is not a plain path: a `#` or `?` the writer left
+        // unencoded parses as a fragment or a query, which truncates the URI's own path to a
+        // different file. The raw path is what a writer of an unencoded entry meant, and it
+        // beats reporting a path that is in fact local as though it were remote.
+        return runCatching { File(uri) }.getOrNull() ?: asPath(entry)
     }
+
+    /** The entry read literally, relative to the jar that named it. */
+    private fun File.asPath(entry: String) = absoluteFile.parentFile?.resolve(entry) ?: File(entry)
 }
