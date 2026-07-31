@@ -6,11 +6,16 @@ import com.monkopedia.awakener.registry.AgentId
 import com.monkopedia.awakener.registry.BindingStore
 import com.monkopedia.awakener.registry.SurfaceKey
 import com.monkopedia.awakener.registry.asIdentity
+import kotlin.time.Duration.Companion.milliseconds
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.sync.Mutex
@@ -40,6 +45,110 @@ class SwayWindowManager(
     private val config: Config get() = store.config.value
 
     private val treeEditLock = Mutex()
+
+    /**
+     * The docks this process knows about. See [DockTable]; it is read on every enumeration, and
+     * written by [attach], by a teardown, and by [dockedTo] adopting a dock it found by mark.
+     */
+    private val docks = DockTable()
+
+    private val unparsedMarks = MutableStateFlow<Set<String>>(emptySet())
+
+    /**
+     * Marks under [WmFlags.dockMarkPrefix] whose suffix is not a `con_id`, as seen by every
+     * enumeration and every sweep this instance has run.
+     *
+     * Such a mark is a user's own — sway's mark namespace is one global, user-facing set — so the
+     * window keeps being enumerated and is named here instead of being silently hidden. Names
+     * accumulate for the lifetime of this instance and are never pruned, so a mark that has since
+     * been removed is still listed.
+     */
+    val unrecognisedDockMarks: StateFlow<Set<String>> = unparsedMarks.asStateFlow()
+
+    /** Whether awakener's own memory counts as evidence, or only what it wrote into the tree. */
+    private val Config.consultsTable: Boolean
+        get() = this[WmFlags.dockRecognition] == DockRecognition.MARK_OR_TABLE
+
+    /**
+     * The surface [node] is the dock for, or null if it is a window a caller may bind an agent to.
+     *
+     * The union of the two sources, because each is reliable in one direction only: the table is
+     * ahead of the mark during an attach — the mark lands a round trip after the window maps —
+     * and the mark is ahead of the table after an awakener restart, since it is what a standing
+     * dock still carries. A false negative is the expensive direction, so recognising by either
+     * is deliberate.
+     *
+     * **Recognising a dock from its mark records it.** Adoption has to materialise, not merely be
+     * answered: sway moves a dock mark to the next dock attached to the same surface (#14), so a
+     * union computed afresh on every read has nothing left once it does. Measured, two managers
+     * against one sway: attach, restart awakener, enumerate — correct either way — then attach a
+     * second dock to that surface, and a non-recording union hands the first agent panel back as
+     * a bindable surface. That is this note's expensive false negative arriving through the
+     * mechanism built to prevent it, and it is worse than the original: the panel is invisible to
+     * [reapOrphans] for the same reason, so nothing can take it down again.
+     *
+     * The mark is therefore read *before* the table is consulted rather than after. That costs a
+     * list scan on a hit and buys two things: an adopted entry, and a user's mark under the
+     * prefix being reported on a node that is already a known dock, which a table-first order
+     * made depend on when in a dock's life it was looked at.
+     *
+     * Writing on a read path is deliberate and is not a lock: [DockTable] is a compare-and-set
+     * over an immutable snapshot, the same one [unparsedMarks] already does two lines up. A
+     * concurrent `attach` that has just evicted a failed dock's entry can be immediately followed
+     * here by an adoption of that same node — correctly, since it is a node still wearing the
+     * mark, which is exactly what adoption is for.
+     *
+     * Reports rather than hides a mark under the prefix that does not parse: that is a user's
+     * mark on a genuine window, and treating it as a dock is what made such a window unreachable
+     * by every code path at once (#15).
+     *
+     * **What recording costs, stated where the recording happens.** It is one-way: a node
+     * recognised here stays recognised whatever its marks say afterwards. So the residual #15
+     * leaves — a user's own mark that happens to be the prefix plus a *live* `con_id` on a real
+     * window — stops being transient. Before this, `swaymsg unmark` handed the window straight
+     * back to enumeration; now it does not, and only `wm.dock.recognition=MARK_ONLY` or an
+     * awakener restart releases it. That is a window hidden, which is recoverable. It is not a
+     * window destroyed: [reapOrphans] does not kill on this recognition alone under the default
+     * [WmFlags.reapEvidence].
+     */
+    private fun dockedTo(node: Node, table: DockTableSnapshot, cfg: Config): SurfaceId? {
+        val reading = node.dockMark(cfg[WmFlags.dockMarkPrefix])
+        if (reading.unparsed.isNotEmpty()) unparsedMarks.update { it + reading.unparsed }
+        if (!cfg.consultsTable) return reading.surface
+        table.entries[node.id]?.let { return it.surface }
+        val adopted = reading.surface ?: return null
+        docks.record(SurfaceId(node.id), adopted, DockOrigin.ADOPTED)
+        return adopted
+    }
+
+    /**
+     * Whether [node] is a dock on evidence that exists *now*, rather than on a recognition
+     * [dockedTo] latched at some earlier read.
+     *
+     * The distinction only matters where the answer is destructive, which is [reapOrphans] and
+     * nowhere else — hiding a window on a stale recognition costs a hotkey that says "no such
+     * surface", and killing one costs the window. The note's own bar, set for `RECLAIM` and
+     * applying unchanged here: a user's window *is not recoverable at all*.
+     *
+     * Costs a second mark scan of the node, on the sweep's candidates only.
+     */
+    private fun currentlyADock(node: Node, table: DockTableSnapshot, cfg: Config): Boolean =
+        when (cfg[WmFlags.reapEvidence]) {
+            ReapEvidence.RECOGNITION -> true
+            ReapEvidence.CURRENT ->
+                node.dockMark(cfg[WmFlags.dockMarkPrefix]).surface != null ||
+                    table.entries[node.id]?.origin == DockOrigin.STOOD_UP
+        }
+
+    /**
+     * Whether an attach in flight has reserved the `app_id` [node] reports.
+     *
+     * Distinct from [dockedTo] because a reservation names no surface: it covers the window
+     * between the `exec` and the moment the dock is identified, which is before there is a
+     * `con_id` to bind to anything.
+     */
+    private fun reserved(node: Node, table: DockTableSnapshot, cfg: Config): Boolean =
+        cfg.consultsTable && table.reserves(node)
 
     /**
      * Runs [edit] with exclusive use of the window tree.
@@ -178,13 +287,26 @@ class SwayWindowManager(
             ?.let { SurfaceKey.of(it.descriptor, config) }
 
     /**
-     * Every window that is not a dock. The dock mark is the discriminator, because a dock is
-     * a genuine tree node and is otherwise indistinguishable from a surface needing an agent.
+     * Every window that is not a dock, since a dock is a genuine tree node and is otherwise
+     * indistinguishable from a surface needing an agent.
+     *
+     * Dock-ness is [dockedTo]'s union, plus the `app_id` of any attach still in flight. What that
+     * buys is the window this used to answer wrong: the mark lands a round trip after the dock
+     * maps, and a dock reported here is a dock `resolve` calls a Drab and a hotkey mints an agent
+     * for.
+     *
+     * Takes no lock and waits on nothing, so the tree it read may be a round trip out of date by
+     * the time this returns — that is the deliberate trade, since enumeration is the first thing
+     * a hotkey does and an attach holds the tree for as long as a dock takes to map.
      */
     override suspend fun surfaces(): List<Surface> {
-        val prefix = config[WmFlags.dockMarkPrefix]
-        return tree().windows
-            .filterNot { node -> node.marks.any { it.startsWith(prefix) } }
+        val cfg = config
+        val windows = tree().windows
+        // Read after the tree, not before: an attach that records its dock between the two reads
+        // is then covered by this snapshot, where the opposite order could see neither.
+        val table = docks.snapshot()
+        return windows
+            .filter { dockedTo(it, table, cfg) == null && !reserved(it, table, cfg) }
             .map { Surface(SurfaceId(it.id), it.appId, it.name, it.pid) }
     }
 
@@ -212,50 +334,83 @@ class SwayWindowManager(
         }
         val command = dock.command.replace(DockSpec.APP_ID_PLACEHOLDER, appId)
 
-        val dockId = treeEdit {
-            // Focus first: sway's split applies to the focused container, and the dock has to land
-            // inside this surface's tab rather than wherever focus happened to be.
-            focus(surface)
-            run("split horizontal")
+        // Bookkeeping, not compensation, which is why it is a `finally` around the whole method
+        // and is gated by no flag: a reservation left behind is invisible in `swaymsg -t get_tree`
+        // and hides every window under the dock's app_id for the life of the process, and a
+        // failed attach's table entry names a node nothing owns. Tree repair is a different job,
+        // done under the lock, and is not here (#6).
+        var reservation: DockReservation? = null
+        var recorded: SurfaceId? = null
+        var attached = false
+        try {
+            val dockId = treeEdit {
+                // Focus first: sway's split applies to the focused container, and the dock has to
+                // land inside this surface's tab rather than wherever focus happened to be.
+                focus(surface)
+                run("split horizontal")
 
-            // Must precede the exec — sway evaluates focus rules when the window maps, so issuing
-            // this afterwards would be too late to prevent the steal.
-            if (!cfg[WmFlags.dockFocusOnMap]) {
-                run("""no_focus [app_id="$appId"]""")
+                // Must precede the exec — sway evaluates focus rules when the window maps, so
+                // issuing this afterwards would be too late to prevent the steal.
+                if (!cfg[WmFlags.dockFocusOnMap]) {
+                    run("""no_focus [app_id="$appId"]""")
+                }
+
+                // Taken after the no_focus rule and before the exec, so it is exactly the set of
+                // docks that were already standing. Matching the spawned dock on app_id alone
+                // would resolve to whichever of them sway happens to list first, since in
+                // production every dock is the same panel program and they all report the same
+                // name. The snapshot only identifies anything because nothing else can exec
+                // before the claim.
+                val standing = tree().windows.filter { it.appId == appId }.map { it.id }.toSet()
+
+                // Filed before the window it describes can exist, which is the whole of it: a
+                // con_id is minted when the dock maps, so nothing keyed on one can cover the dock
+                // at the moment it becomes visible to a reader of the tree.
+                if (cfg[WmFlags.dockPendingSuppression]) {
+                    reservation = docks.reserve(appId, standing, WINDOW_WAIT_MS.milliseconds)
+                }
+                run("exec $command")
+                val dockNode = awaitWindow(appId, standing)
+                    ?: error("dock '$appId' never appeared; command was: $command")
+                val dockId = SurfaceId(dockNode.id)
+
+                // Before the mark, and this order is the fix: the mark is a round trip away and
+                // enumeration does not take this lock, so a reader landing in between would be
+                // handed the agent panel as a bindable surface.
+                docks.record(dockId, surface, DockOrigin.STOOD_UP)
+                recorded = dockId
+
+                val mark = "${cfg[WmFlags.dockMarkPrefix]}${surface.raw}"
+                run("[con_id=${dockId.raw}] mark --add $mark")
+                if (cfg[WmFlags.dockSide] == DockSide.LEFT) {
+                    run("[con_id=${dockId.raw}] move left")
+                }
+                run("[con_id=${dockId.raw}] resize set width ${cfg[WmFlags.dockSizePpt]} ppt")
+                if (cfg[WmFlags.restoreFocusAfterAttach]) settleFocus(surface, dockId)
+                dockId
             }
 
-            // Taken after the no_focus rule and before the exec, so it is exactly the set of docks
-            // that were already standing. Matching the spawned dock on app_id alone would resolve
-            // to whichever of them sway happens to list first, since in production every dock is
-            // the same panel program and they all report the same name. The snapshot only
-            // identifies anything because nothing else can exec before the claim.
-            val standing = tree().windows.filter { it.appId == appId }.map { it.id }.toSet()
-            run("exec $command")
-            val dockNode = awaitWindow(appId, standing)
-                ?: error("dock '$appId' never appeared; command was: $command")
-            val dockId = SurfaceId(dockNode.id)
-
-            run("[con_id=${dockId.raw}] mark --add ${cfg[WmFlags.dockMarkPrefix]}${surface.raw}")
-            if (cfg[WmFlags.dockSide] == DockSide.LEFT) {
-                run("[con_id=${dockId.raw}] move left")
-            }
-            run("[con_id=${dockId.raw}] resize set width ${cfg[WmFlags.dockSizePpt]} ppt")
-            if (cfg[WmFlags.restoreFocusAfterAttach]) settleFocus(surface, dockId)
-            dockId
+            // Outside the section on purpose: this is not a tree edit, and in the hotkey case it
+            // mints, which reaches a spanreed subprocess. Holding the compositor across a process
+            // spawn would stall every other attach and detach behind it — the same call
+            // `FileBindingStore.bind` makes one module down, for the same reason.
+            //
+            // Still recorded only once the dock is standing, so a failed attach leaves no durable
+            // binding to an agent that has no panel. A null agent is the hotkey case: the registry
+            // resolves the surface's existing Lifeless or mints one, which is the only moment an
+            // identity is ever minted — a trigger on window creation would spawn an agent for
+            // every window glanced at and closed.
+            val bound = registry.bind(key, agent?.asIdentity())
+            attached = true
+            return SwayDockHandle(surface, bound.agent, dockId, key)
+        } finally {
+            reservation?.let(docks::release)
+            // The dock this entry names is a window nothing holds a handle to: either it never
+            // mapped, or the attach failed after it did and the tree unwind (#6) will take it
+            // down. Suppressing it for the life of the process on the strength of a failed attach
+            // is the leak this eviction exists to prevent.
+            if (!attached) recorded?.let(docks::forget)
         }
-
-        // Outside the section on purpose: this is not a tree edit, and in the hotkey case it mints,
-        // which reaches a spanreed subprocess. Holding the compositor across a process spawn would
-        // stall every other attach and detach behind it — the same call `FileBindingStore.bind`
-        // makes one module down, for the same reason.
-        //
-        // Still recorded only once the dock is standing, so a failed attach leaves no durable
-        // binding to an agent that has no panel. A null agent is the hotkey case: the registry
-        // resolves the surface's existing Lifeless or mints one, which is the only moment an
-        // identity is ever minted — a trigger on window creation would spawn an agent for every
-        // window glanced at and closed.
-        val bound = registry.bind(key, agent?.asIdentity())
-        return SwayDockHandle(surface, bound.agent, dockId, key)
     }
 
     override val changes: Flow<SurfaceChange> = callbackFlow {
@@ -324,17 +479,30 @@ class SwayWindowManager(
      * and such a dock is left standing while this sweep says nothing about it — the deliberate
      * choice for a panel program that is merely slow to exit, and the only case in which this
      * returns having repaired less than it says.
+     *
+     * Which nodes are docks is [dockedTo]'s union, the same one enumeration answers from — but a
+     * sweep kills, so under the default [WmFlags.reapEvidence] it will not act on a recognition
+     * with nothing behind it any more (see [currentlyADock]). A dock this process stood up is
+     * reaped whatever became of its mark, including the #14 case where a later attach took it; a
+     * dock adopted after a restart is reaped while it still carries the mark that identified it,
+     * and left standing if that mark has since moved. A dock an attach has reserved but not yet
+     * identified is not swept either: nothing knows yet which surface it belongs to, so nothing
+     * can know it is an orphan.
      */
     suspend fun reapOrphans() {
-        if (config[WmFlags.orphanPolicy] != OrphanPolicy.CLOSE) return
-        val prefix = config[WmFlags.dockMarkPrefix]
+        val cfg = config
+        if (cfg[WmFlags.orphanPolicy] != OrphanPolicy.CLOSE) return
         val root = tree()
+        val table = docks.snapshot()
         val live = root.windows.map { it.id }.toSet()
         val failures = mutableListOf<Throwable>()
         root.windows.forEach { node ->
-            val mark = node.marks.firstOrNull { it.startsWith(prefix) } ?: return@forEach
-            val boundTo = mark.removePrefix(prefix).toLongOrNull() ?: return@forEach
+            val boundTo = dockedTo(node, table, cfg)?.raw ?: return@forEach
             if (boundTo in live) return@forEach
+            // Last, and deliberately not folded into the line above: enumeration and the sweep
+            // must keep answering from the same predicate — that they disagreed is #15 — so this
+            // narrows what is *killed*, not what is a dock.
+            if (!currentlyADock(node, table, cfg)) return@forEach
             try {
                 // No key: the surface is already gone, so there is nothing left to derive one
                 // from. Reaping a dock is a window-tree repair and never touches the registry.
@@ -397,6 +565,10 @@ class SwayWindowManager(
                     }
                     return@treeEdit
                 }
+                // Only once the node has actually left the tree: a dock that outlived its kill is
+                // still a dock, and forgetting it here would hand the wedged panel back to
+                // enumeration as a bindable surface.
+                docks.forget(dockId)
 
                 if (!cfg[WmFlags.normalizeContainerOnDetach]) return@treeEdit
                 // sway does not collapse a split container back down when it drops to one child,

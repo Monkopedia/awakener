@@ -18,6 +18,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -114,6 +115,282 @@ class SwayBindingTest {
 
         val appIds = wm.surfaces().map { it.appId }
         assertEquals(listOf("aw-app1"), appIds, "the dock is a real tree node but not a surface")
+    }
+
+    /**
+     * The dock is enumerable as an ordinary surface for the length of one round trip if the mark
+     * is the only thing that says otherwise. `attach` spawns the dock, waits for it to map, and
+     * marks it afterwards — so an enumeration landing in between hands the agent panel back as
+     * bindable, `resolve` calls it a Drab, and anything acting on that mints a Lifeless for the
+     * panel and writes it to the durable registry.
+     *
+     * Enumeration shares one IPC connection with the attach that is running and that connection
+     * serialises requests, so a poll waiting on its mutex is handed the tree in exactly the gap
+     * between `awaitWindow`'s successful read and the `mark` command.
+     */
+    @Test
+    fun `a dock is not enumerable before its mark lands`() = swayTest {
+        repeat(PREMAP_ROUNDS) { round ->
+            val app = openSurface("aw-app$round")
+            val leaked = mutableListOf<Surface>()
+
+            coroutineScope {
+                val attaching =
+                    async { wm.attach(app, dockFor("aw-dock"), AgentId("agent-$round")) }
+                while (attaching.isActive) {
+                    leaked += wm.surfaces().filter { it.appId == "aw-dock" }
+                    yield()
+                }
+                attaching.await()
+            }
+
+            assertEquals(
+                emptyList(),
+                leaked.map { it.id.raw }.distinct(),
+                "a dock was enumerable as an ordinary surface while its own attach was still " +
+                    "running, in round $round",
+            )
+        }
+    }
+
+    /**
+     * The mark is a hint that outlives an awakener restart, not the truth: sway's mark namespace
+     * is global, so a second attach on one surface takes the mark off the first dock (#14). While
+     * this process remembers standing a dock up, losing the mark does not make it a surface.
+     */
+    @Test
+    fun `a dock whose mark is taken off it is still not a surface`() = swayTest {
+        val app = openSurface("aw-app1")
+        val handle = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1"))
+
+        command("[con_id=${handle.dockId.raw}] unmark ${markFor(app)}")
+
+        assertEquals(emptyList(), marksOf(handle.dockId), "the mark really is gone")
+        assertEquals(
+            listOf(app.raw),
+            wm.surfaces().map { it.id.raw },
+            "the dock is still a dock: this process stood it up and has not forgotten it",
+        )
+    }
+
+    /**
+     * The same loss, one restart later, which is the case the previous test does *not* cover:
+     * there the table was still holding the dock this process stood up, so nothing rested on
+     * adoption. After a restart the mark is the only evidence a fresh manager ever had, and if
+     * adoption is only a read-time union it leaves nothing behind — so when the second attach
+     * moves the mark (#14), the first panel is neither marked nor tabled, and enumeration hands
+     * it back as bindable. That is the expensive false negative: a hotkey acting on it mints a
+     * Lifeless for the agent panel and writes it to the durable registry, while `reapOrphans`,
+     * answering from the same predicate, cannot see the panel to clean it up.
+     *
+     * The enumeration between the restart and the second attach is the adoption: it must record
+     * the dock, not merely answer about it.
+     */
+    @Test
+    fun `an adopted dock stays a dock when a later attach takes its mark`() = swayTest {
+        val app = openSurface("aw-app1")
+        val first = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1")).dockId
+
+        // awakener restarts: a fresh manager with an empty table, over a tree and marks sway
+        // has kept untouched.
+        wm = SwayWindowManager({ sway.connection() }, store, bindingStore(), scope)
+        assertEquals(
+            listOf(app.raw),
+            wm.surfaces().map { it.id.raw },
+            "the mark is the whole of what the new process knows, and here it is enough",
+        )
+
+        // Nothing forbids a second attach on one surface while #14 is open, and sway moves a
+        // mark rather than copying it.
+        val second = wm.attach(app, dockFor("aw-dock2"), AgentId("agent-1")).dockId
+
+        assertEquals(emptyList(), marksOf(first), "sway took the mark off the first dock")
+        assertEquals(listOf(markFor(app)), marksOf(second), "and put it on the second")
+        assertEquals(
+            listOf(app.raw),
+            wm.surfaces().map { it.id.raw },
+            "the first dock was adopted at the enumeration above and stays a dock: an adoption " +
+                "that leaves no record hands the agent panel back the moment the mark moves",
+        )
+    }
+
+    /**
+     * The other half of the choice. Recognising a dock only by what awakener wrote into the tree
+     * puts the whole truth in `swaymsg -t get_tree`, which is the lever to reach for when the
+     * in-memory record is suspected of hiding a real window — at the cost this issue is about.
+     */
+    @Test
+    fun `dock recognition is switchable to the mark alone`() = swayTest {
+        store.put(WmFlags.dockRecognition, DockRecognition.MARK_ONLY)
+        val app = openSurface("aw-app1")
+        val handle = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1"))
+
+        command("[con_id=${handle.dockId.raw}] unmark ${markFor(app)}")
+
+        assertEquals(
+            setOf(app.raw, handle.dockId.raw),
+            wm.surfaces().map { it.id.raw }.toSet(),
+            "with the flag on the mark is the only evidence, so an unmarked dock is a surface " +
+                "again — the hazard, kept reproducible on purpose",
+        )
+    }
+
+    /**
+     * A mark under the dock prefix whose suffix is not a `con_id` is a user's mark on a real
+     * window — `mark notes` is an ordinary thing to have bound to a key, and the namespace is
+     * shared. Treating it as a dock made that window invisible to enumeration and unresolvable,
+     * while the orphan sweep, which did validate the suffix, skipped it: unreachable by every
+     * path at once and reported by none (#15).
+     */
+    @Test
+    fun `a user's mark under the dock prefix hides nothing and is reported`() = swayTest {
+        val app = openSurface("aw-app1")
+        val userMark = "${WmFlags.dockMarkPrefix.default}notes"
+
+        command("[con_id=${app.raw}] mark --add $userMark")
+
+        assertEquals(
+            listOf(app.raw),
+            wm.surfaces().map { it.id.raw },
+            "a dock mark is the prefix plus a con_id; this is neither, so the window stands",
+        )
+        assertEquals(
+            setOf(userMark),
+            wm.unrecognisedDockMarks.value,
+            "and it is named rather than passed over, which is what made this cost a probe",
+        )
+    }
+
+    /**
+     * The cost side of materialising adoption, and the one place it must not be paid.
+     *
+     * #15's acknowledged residual is a user's own mark that happens to be the prefix plus a
+     * *live* `con_id`: it hides a genuine application window. That used to be self-healing —
+     * `swaymsg unmark` handed the window straight back — and recording what a read recognises
+     * makes it permanent, because nothing withdraws a record. Enumeration keeps hiding the
+     * window here on purpose; `wm.dock.recognition=MARK_ONLY` is the lever that releases it.
+     *
+     * What must not follow is the sweep destroying it. The window carries no dock mark at all by
+     * then, and this process never stood it up, so the only thing saying "dock" is a recognition
+     * latched at an earlier read — and the note's bar for acting destructively on a coarse
+     * predicate is explicit: a user's window is not recoverable at all.
+     */
+    @Test
+    fun `a window whose dock-shaped mark is gone stays hidden but is not killed`() = swayTest {
+        val app = openSurface("aw-app1")
+        val victim = openSurface("aw-app2")
+
+        command("[con_id=${victim.raw}] mark --add ${markFor(app)}")
+        assertEquals(
+            listOf(app.raw),
+            wm.surfaces().map { it.id.raw },
+            "while the mark is on, the pinned predicate says dock and the window is hidden",
+        )
+
+        command("[con_id=${victim.raw}] unmark ${markFor(app)}")
+        assertEquals(emptyList(), marksOf(victim), "the user's mark really is gone")
+        assertEquals(
+            listOf(app.raw),
+            wm.surfaces().map { it.id.raw },
+            "documented rather than desired: the enumeration above recorded the node, and a " +
+                "record is never withdrawn, so the window stays hidden until MARK_ONLY or a " +
+                "restart releases it",
+        )
+
+        command("[con_id=${app.raw}] kill")
+        awaitGone(app)
+        wm.reapOrphans()
+
+        assertNotNull(
+            wm.tree().find(victim.raw),
+            "and this is the line: a latched recognition may hide a window, which the user can " +
+                "get back, but it may not kill one, which they cannot",
+        )
+    }
+
+    /**
+     * The hazard kept reproducible, the same way `MARK_ONLY` keeps its own. Reaping on whatever
+     * enumeration recognises closes one real gap — an adopted dock whose mark a later attach took
+     * (#14) is then still swept — and the price is this window.
+     */
+    @Test
+    fun `reaping on a latched recognition is switchable on`() = swayTest {
+        store.put(WmFlags.reapEvidence, ReapEvidence.RECOGNITION)
+        val app = openSurface("aw-app1")
+        val victim = openSurface("aw-app2")
+
+        command("[con_id=${victim.raw}] mark --add ${markFor(app)}")
+        wm.surfaces()
+        command("[con_id=${victim.raw}] unmark ${markFor(app)}")
+
+        command("[con_id=${app.raw}] kill")
+        awaitGone(app)
+        wm.reapOrphans()
+
+        awaitGone(victim)
+        assertNull(
+            wm.tree().find(victim.raw),
+            "with the flag flipped the sweep acts on the record alone, which is what costs the " +
+                "user's window — the flag must actually change behaviour",
+        )
+    }
+
+    /**
+     * The other direction, so that requiring current evidence has not quietly stopped the sweep
+     * from doing its job. A restarted awakener knows a standing dock only by its mark — and the
+     * mark is evidence that exists now, so the orphan still comes down.
+     */
+    @Test
+    fun `a dock adopted after a restart is still reaped when its surface closes`() = swayTest {
+        val app = openSurface("aw-app1")
+        val dock = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1")).dockId
+
+        wm = SwayWindowManager({ sway.connection() }, store, bindingStore(), scope)
+        assertEquals(
+            listOf(app.raw),
+            wm.surfaces().map { it.id.raw },
+            "the fresh manager adopts the dock from its mark",
+        )
+
+        command("[con_id=${app.raw}] kill")
+        awaitGone(app)
+        wm.reapOrphans()
+
+        assertNull(wm.tree().find(dock.raw), "the dock must not outlive its surface")
+    }
+
+    /**
+     * The reservation covers the dock from before it exists, so it has to be given back whether
+     * the attach worked or not — and a leaked one is invisible in the tree while hiding every
+     * window under the dock's `app_id` for the life of the process. Cancelled rather than left to
+     * time out, because a reservation that has merely expired would prove nothing about eviction.
+     */
+    @Test
+    fun `a cancelled attach gives its reservation back`() = swayTest {
+        val app = openSurface("aw-app1")
+
+        coroutineScope {
+            // A dock command that maps its window under a different name: the attach then never
+            // identifies a dock and sits in its map wait with the reservation outstanding, and
+            // that window appearing is proof the exec — and so the reservation filed just before
+            // it — has happened.
+            val attaching = async {
+                wm.attach(app, DockSpec("aw-dock", sway.windowCommand("aw-decoy")), AgentId("a-1"))
+            }
+            val decoy = SurfaceId(assertNotNull(awaitWindow("aw-decoy"), "no decoy window"))
+
+            assertTrue(
+                wm.surfaces().any { it.id == decoy },
+                "a reservation covers one app_id, not every window that maps during an attach",
+            )
+            attaching.cancelAndJoin()
+        }
+
+        val other = openSurface("aw-dock")
+        assertTrue(
+            wm.surfaces().any { it.id == other },
+            "a window under the dock's app_id must be enumerable once no attach is in flight",
+        )
     }
 
     /**
@@ -746,5 +1023,12 @@ class SwayBindingTest {
          */
         const val ORPHANS_PER_ROUND = 6
         const val REAP_ROUNDS = 5
+
+        /**
+         * Attaches raced against enumeration. The gap between a dock mapping and its mark
+         * landing is one round trip on a connection the poller is already queued on, so one
+         * round is nearly always enough; three is what made it every run.
+         */
+        const val PREMAP_ROUNDS = 3
     }
 }
