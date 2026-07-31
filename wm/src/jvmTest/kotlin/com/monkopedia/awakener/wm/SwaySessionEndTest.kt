@@ -52,7 +52,7 @@ class SwaySessionEndTest {
 
     @BeforeTest
     fun setUp() {
-        if (!enabled) return
+        SwayHarness.assumeAvailable()
         sway = SwayHarness.start()
         scope = CoroutineScope(SupervisorJob())
         val store = InMemoryConfigStore()
@@ -222,10 +222,7 @@ class SwaySessionEndTest {
         scope.async { runCatching { connection.subscribe(listOf("window")) { _, _ -> } } }
 
     private fun swayTest(body: suspend () -> Unit) {
-        if (!enabled) {
-            println("skipping: sway/foot not installed")
-            return
-        }
+        SwayHarness.assumeAvailable()
         runBlocking {
             command("workspace 1; layout tabbed")
             body()
