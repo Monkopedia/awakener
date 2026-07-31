@@ -107,6 +107,22 @@ object WmFlags {
             "split containers, and a leftover one silently swallows the next window opened.",
     )
 
+    val wedgedDockFailsDetach = Flags.boolean(
+        "wm.dock.wedged_dock_fails_detach",
+        true,
+        "Treat a dock still in the tree when the window wait runs out as a failed detach rather " +
+            "than a completed one. sway acknowledges a kill once it has asked the client to " +
+            "close, so a panel whose process is wedged never unmaps and the wait simply expires " +
+            "— and a detach that returns anyway reports a repair it has not made, which is what " +
+            "lets the next orphan sweep find the same dock and kill it again. On by default so " +
+            "the failure reaches the sweep's aggregate instead of being the one teardown " +
+            "failure nothing can see; on also keeps the surface's durable binding, since the " +
+            "raise happens before the unbind and forgetting a binding whose panel is still on " +
+            "screen strands it. Turn it off where a real panel program is legitimately slower " +
+            "to exit than the wait, so the dock comes down a moment later and the failure is " +
+            "noise — at the cost of that dock being invisible to the sweep that left it.",
+    )
+
     val forgetBindingOnDetach = Flags.boolean(
         "wm.dock.forget_binding_on_detach",
         false,

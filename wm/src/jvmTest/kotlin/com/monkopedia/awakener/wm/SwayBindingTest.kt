@@ -10,6 +10,7 @@ import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -42,6 +43,9 @@ class SwayBindingTest {
      */
     private var mintDelayMs = 0L
 
+    /** Clients stopped by [freeze]. They have to be killed rather than asked to leave. */
+    private val frozen = mutableListOf<Int>()
+
     private val enabled get() = SwayHarness.available()
 
     @BeforeTest
@@ -73,6 +77,7 @@ class SwayBindingTest {
     @AfterTest
     fun tearDown() {
         if (!enabled) return
+        killFrozen()
         scope.cancel()
         sway.close()
         stateDir.toFile().deleteRecursively()
@@ -150,9 +155,170 @@ class SwayBindingTest {
         command("[con_id=${app.raw}] kill")
         awaitGone(app)
         wm.reapOrphans()
-        awaitGone(handle.dockId)
 
+        // Deliberately not waiting for the dock here. sway acknowledges `kill` when it has asked
+        // the client to close, not when the window unmaps, and detach used to return on that
+        // acknowledgement — so a sweep reported a repair it had not yet made, and the next sweep
+        // (there is one per `close` event) found the same dock still in the tree and killed it
+        // again. Waiting here hid that: the dock was still standing on 70 runs out of 70 against
+        // the unfixed code, so this assertion is where the race stops being a matter of luck.
         assertNull(wm.tree().find(handle.dockId.raw), "the dock must not outlive its surface")
+    }
+
+    /**
+     * The same repair driven by several sweeps at once, which is the ordinary case rather than a
+     * contrived one: `reapOrphans` is driven off the `close` event, and closing a workspace's
+     * worth of windows emits a burst of them.
+     *
+     * Unfixed, each sweep killed a dock and returned while it was still standing, so the next
+     * sweep saw it in the tree and killed it a second time — and sway rejects criteria that match
+     * nothing, so whichever loser's command happened to land in the millisecond the window
+     * unmapped threw out of the middle of `reapOrphans`, leaving every orphan after it in that
+     * pass standing. That is a transient race turning into permanent tree damage, since the
+     * `close` that would have triggered the next sweep has already been and gone.
+     *
+     * Intermittent by nature, so it is repeated: one round of this shape failed on 44 of 70 runs
+     * against `main`, and the test as written on 20 of 20.
+     */
+    @Test
+    fun `concurrent reaps do not fight over the same dock`() = swayTest {
+        repeat(REAP_ROUNDS) {
+            val docks = orphans(ORPHANS_PER_ROUND)
+
+            coroutineScope {
+                List(ORPHANS_PER_ROUND) { async { wm.reapOrphans() } }.forEach { it.await() }
+            }
+
+            val root = wm.tree()
+            assertEquals(
+                emptyList(),
+                docks.filter { root.find(it.raw) != null },
+                "every orphan must be down by the time the sweeps return",
+            )
+        }
+    }
+
+    /**
+     * The consequence that actually matters. `reapOrphans` is the whole mechanism for Hazard 2,
+     * and it gets one shot per `close` event — so a teardown that throws partway through does not
+     * merely lose that dock, it strands every orphan the sweep had not reached yet, with nothing
+     * scheduled to come back for them.
+     *
+     * The failure here is a real sway rejection rather than an injected one: `split none` is
+     * refused on a child that still has siblings, so a tab holding two other windows besides the
+     * dock cannot be normalised. A user splitting a second window into a tab produces exactly
+     * that shape.
+     */
+    @Test
+    fun `a failing teardown does not abandon the rest of the sweep`() = swayTest {
+        val stuck = openSurface("aw-app1")
+        val clean = openSurface("aw-app2")
+        val stuckDock = wm.attach(stuck, dockFor("aw-dock"), AgentId("agent-1"))
+
+        // Two extra windows in the stuck dock's tab, so the container it leaves behind has more
+        // than one survivor and sway will refuse to flatten it.
+        command("[con_id=${stuck.raw}] focus")
+        val extra = openSurface("aw-app3")
+        command("[con_id=${extra.raw}] focus")
+        openSurface("aw-app4")
+
+        val cleanDock = wm.attach(clean, dockFor("aw-dock"), AgentId("agent-2"))
+        for (surface in listOf(stuck, clean)) {
+            command("[con_id=${surface.raw}] kill")
+            awaitGone(surface)
+        }
+
+        assertFailsWith<IllegalStateException>("a teardown that fails must still be reported") {
+            wm.reapOrphans()
+        }
+
+        val root = wm.tree()
+        assertNull(
+            root.find(cleanDock.dockId.raw),
+            "the orphan after the failing one must still have been reaped — abandoning the rest " +
+                "of the sweep is what turns one lost race into tree damage nothing repairs",
+        )
+        assertNull(root.find(stuckDock.dockId.raw), "and the failing dock itself is still down")
+    }
+
+    /**
+     * The one teardown failure the collection machinery could not see. `awaitGone` returning
+     * false left `detach` by an ordinary `return`, so the dock that *genuinely refuses to die* —
+     * the case the sweep's failure handling exists for — was the single failure nothing reported.
+     * The sweep gets one pass per `close` event and that event has been and gone, so nothing is
+     * scheduled to come back for it either: the orphan survives, the sweep claims success, and
+     * every later sweep pays the full window wait on it in silence.
+     *
+     * A `SIGSTOP`ped client is what a wedged panel program looks like to sway: nothing is left to
+     * service the `xdg_toplevel` close, so the window stays mapped while `kill` is acknowledged
+     * all the same. Real, rather than an injected failure — and deterministic, since a stopped
+     * process cannot come back on its own.
+     */
+    @Test
+    fun `a dock that will not die is reported and does not stop the sweep`() = swayTest {
+        val wedged = openSurface("aw-app1")
+        val clean = openSurface("aw-app2")
+        val wedgedDock = wm.attach(wedged, dockFor("aw-dock"), AgentId("agent-1"))
+        val cleanDock = wm.attach(clean, dockFor("aw-dock"), AgentId("agent-2"))
+
+        freeze(wedgedDock.dockId)
+        for (surface in listOf(wedged, clean)) {
+            command("[con_id=${surface.raw}] kill")
+            awaitGone(surface)
+        }
+
+        assertEquals(
+            listOf(wedgedDock.dockId.raw, cleanDock.dockId.raw),
+            wm.tree().windows.map { it.id },
+            "the sweep walks the tree in order, so the wedged dock has to be the one it reaches " +
+                "first, or 'the rest of the sweep still ran' is not what this proves",
+        )
+
+        val failure = assertFailsWith<IllegalStateException>(
+            "a dock still standing when its wait runs out is a failed teardown, and the whole " +
+                "point of the sweep is that it does not report a repair it has not made",
+        ) { wm.reapOrphans() }
+
+        assertTrue(
+            wedgedDock.dockId.raw.toString() in failure.message.orEmpty(),
+            "an aggregate over a sweep of N docks has to name the dock each failure came from " +
+                "or it is not diagnosable, and reapOrphans has no production caller yet to say " +
+                "it on its behalf; the message was: ${failure.message}",
+        )
+        assertNotNull(
+            wm.tree().find(wedgedDock.dockId.raw),
+            "the wedge has to be real: if the dock came down anyway this proves nothing",
+        )
+        assertNull(
+            wm.tree().find(cleanDock.dockId.raw),
+            "and the sweep must still have reaped the orphan after it — a dock that will not " +
+                "come down costs that dock, not the rest of the pass",
+        )
+    }
+
+    /**
+     * The other half of the choice. Raising is right when the timeout means the dock is wedged,
+     * and wrong when it only means a real panel program is slower to exit than the window wait —
+     * where the dock does come down a moment later and the failure is pure noise. Which of those
+     * a given panel is, is a fact about the desktop rather than about this code.
+     */
+    @Test
+    fun `treating a wedged dock as a failed detach is switchable off`() = swayTest {
+        store.put(WmFlags.wedgedDockFailsDetach, false)
+        val app = openSurface("aw-app1")
+        val handle = wm.attach(app, dockFor("aw-dock"), AgentId("agent-1"))
+
+        freeze(handle.dockId)
+        command("[con_id=${app.raw}] kill")
+        awaitGone(app)
+
+        wm.reapOrphans()
+
+        assertNotNull(
+            wm.tree().find(handle.dockId.raw),
+            "with the flag off the dock is left standing and the sweep says nothing about it — " +
+                "the blindness the default exists to avoid, kept reproducible on purpose",
+        )
     }
 
     /**
@@ -460,6 +626,57 @@ class SwayBindingTest {
     private fun dockFor(appId: String) =
         DockSpec(appId, sway.windowCommand(DockSpec.APP_ID_PLACEHOLDER))
 
+    /**
+     * [count] docks whose surfaces have gone — the tree shape Hazard 2 leaves behind. Every
+     * surface is opened before any dock is attached so that each becomes its own tab, which keeps
+     * the orphans in sibling containers rather than nested inside one another.
+     */
+    private suspend fun orphans(count: Int): List<SurfaceId> {
+        val apps = (1..count).map { openSurface("aw-app$it") }
+        val docks = apps.map {
+            wm.attach(it, dockFor("aw-dock"), AgentId("agent-${it.raw}")).dockId
+        }
+        apps.forEach {
+            command("[con_id=${it.raw}] kill")
+            awaitGone(it)
+        }
+        return docks
+    }
+
+    /**
+     * Stops the client behind [window], so that it can no longer service a close request.
+     *
+     * The compositor's view of a wedged panel program: the window stays mapped, sway acknowledges
+     * `kill` regardless, and no amount of waiting makes the node leave the tree.
+     */
+    private suspend fun freeze(window: SurfaceId) {
+        val pid = assertNotNull(wm.tree().find(window.raw)?.pid, "no pid for ${window.raw}")
+        frozen += pid
+        signal("STOP", pid)
+    }
+
+    /**
+     * Kills whatever [freeze] stopped, children first, before sway goes.
+     *
+     * Before, because a stopped client cannot notice the compositor leaving and would sit there
+     * for the hour its `sleep` has left to run. Children first, because the client is running
+     * that `sleep` as a child of itself and a killed process cannot take its children with it —
+     * the child has to go while its parent is still there to enumerate it from. SIGKILL rather
+     * than SIGTERM throughout: a stopped process is woken for a kill and for nothing else.
+     */
+    private fun killFrozen() {
+        frozen.forEach { pid ->
+            runCatching { ProcessBuilder("pkill", "-KILL", "-P", "$pid").start().waitFor() }
+            runCatching { signal("KILL", pid) }
+        }
+        frozen.clear()
+    }
+
+    private fun signal(name: String, pid: Int) {
+        val exit = ProcessBuilder("kill", "-$name", pid.toString()).start().waitFor()
+        assertEquals(0, exit, "kill -$name $pid failed")
+    }
+
     private fun markFor(surface: SurfaceId) =
         "${WmFlags.dockMarkPrefix.default}${surface.raw}"
 
@@ -521,5 +738,13 @@ class SwayBindingTest {
 
         /** Long enough that a second attach finishing inside it cannot be luck. */
         const val MINT_DELAY_MS = 2_000L
+
+        /**
+         * Shape of the concurrent-reap round. Six orphans swept by six sweeps is where the
+         * unfixed race became likely rather than rare — measured 11/20, 16/25 and 17/25 — and
+         * five rounds is what turns that into a test that fails every time it is run.
+         */
+        const val ORPHANS_PER_ROUND = 6
+        const val REAP_ROUNDS = 5
     }
 }

@@ -6,6 +6,7 @@ import com.monkopedia.awakener.registry.AgentId
 import com.monkopedia.awakener.registry.BindingStore
 import com.monkopedia.awakener.registry.SurfaceKey
 import com.monkopedia.awakener.registry.asIdentity
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
@@ -84,10 +85,38 @@ class SwayWindowManager(
      */
     private inner class TreeEdit {
         suspend fun run(command: String) {
-            val raw = commands.request(I3Ipc.Request.RUN_COMMAND, command)
-            val results = swayJson.decodeFromString<List<CommandResult>>(raw)
-            val failure = results.firstOrNull { !it.success }
+            val failure = attempt(command)
             check(failure == null) { "sway rejected '$command': ${failure?.error}" }
+        }
+
+        /** Runs [command], returning sway's complaint if it rejected it. */
+        private suspend fun attempt(command: String): CommandResult? {
+            val raw = commands.request(I3Ipc.Request.RUN_COMMAND, command)
+            return swayJson.decodeFromString<List<CommandResult>>(raw).firstOrNull { !it.success }
+        }
+
+        /**
+         * Kills the window [id] and waits for it to leave the tree; false if it was still there
+         * after [WINDOW_WAIT_MS].
+         *
+         * The acknowledgement is not the thing to check in either direction, which is why the
+         * wait belongs in the primitive rather than at whichever call site remembers it.
+         *
+         * On success sway acknowledges as soon as it has *asked the client to close*, not when
+         * the window unmaps, so a caller reading a successful acknowledgement as "the node is
+         * gone" is wrong nearly every time, and wrong in the way that got this filed: the next
+         * teardown of the same dock finds it in the tree and kills it a second time.
+         *
+         * On rejection the tree gets the last word. sway rejects criteria that match nothing, and
+         * *the window not being there* is precisely what a kill is asking for — that is the window
+         * having died of its own accord between the read that found it and this command.
+         */
+        suspend fun kill(id: SurfaceId): Boolean {
+            val failure = attempt("[con_id=${id.raw}] kill") ?: return awaitGone(id)
+            check(tree().find(id.raw) == null) {
+                "sway rejected killing ${id.raw}: ${failure.error}"
+            }
+            return true
         }
 
         suspend fun focus(id: SurfaceId) = run("[con_id=${id.raw}] focus")
@@ -263,21 +292,58 @@ class SwayWindowManager(
      *
      * Driven by the caller off [changes] rather than run on a timer, since sway emits `close`
      * for the surface and that is the exact moment the dock becomes an orphan.
+     *
+     * One dock that will not come down does not cost the rest of the sweep. This is the whole
+     * mechanism for the probe's Hazard 2, so a teardown that throws partway through used to leave
+     * every orphan after it standing — turning one transient failure into tree damage that no
+     * later event repairs, because the `close` that would have triggered the next sweep has
+     * already been and gone.
+     *
+     * What it guarantees: every orphan is swept whatever the ones before it did, and the failures
+     * collected along the way are raised only once the sweep is complete — the first thrown, the
+     * rest attached to it as suppressed. Each names the dock it came from, since nothing under it
+     * does: a normalisation refusal reads `sway rejected 'split none': ...` and identifies no
+     * window at all, so an aggregate over N docks would otherwise say three teardowns failed
+     * without saying which three.
+     *
+     * A dock that outlives its own kill is one of those failures **while
+     * [WmFlags.wedgedDockFailsDetach] is on**, which is what it defaults to. Turn that flag off
+     * and such a dock is left standing while this sweep says nothing about it — the deliberate
+     * choice for a panel program that is merely slow to exit, and the only case in which this
+     * returns having repaired less than it says.
      */
     suspend fun reapOrphans() {
         if (config[WmFlags.orphanPolicy] != OrphanPolicy.CLOSE) return
         val prefix = config[WmFlags.dockMarkPrefix]
         val root = tree()
         val live = root.windows.map { it.id }.toSet()
+        val failures = mutableListOf<Throwable>()
         root.windows.forEach { node ->
             val mark = node.marks.firstOrNull { it.startsWith(prefix) } ?: return@forEach
             val boundTo = mark.removePrefix(prefix).toLongOrNull() ?: return@forEach
-            if (boundTo !in live) {
+            if (boundTo in live) return@forEach
+            try {
                 // No key: the surface is already gone, so there is nothing left to derive one
                 // from. Reaping a dock is a window-tree repair and never touches the registry.
                 SwayDockHandle(SurfaceId(boundTo), AgentId(""), SurfaceId(node.id), key = null)
                     .detach()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                // Tagged here because this is the only place that still knows which dock the
+                // teardown was for: `run` reports the command it sent and nothing else, so a
+                // `split none` refusal arrives anonymous. reapOrphans has no production caller
+                // yet, so this message is the whole of what whoever wires it up gets to work
+                // from.
+                failures += IllegalStateException(
+                    "reaping dock ${node.id}, bound to the gone surface $boundTo, failed",
+                    failure,
+                )
             }
+        }
+        failures.firstOrNull()?.let { first ->
+            failures.drop(1).forEach(first::addSuppressed)
+            throw first
         }
     }
 
@@ -295,16 +361,36 @@ class SwayWindowManager(
         override suspend fun detach() {
             val cfg = config
             treeEdit {
-                val root = tree()
-                val parent = root.parentOf(dockId.raw)
-                if (root.find(dockId.raw) != null) run("[con_id=${dockId.raw}] kill")
+                val parent = tree().parentOf(dockId.raw)
+                // `kill` waits, and holding the tree across that wait is the point: the critical
+                // section must not end over a dock that is still standing, or the next teardown
+                // of it — a second detach, or the next orphan sweep — finds it in the tree and
+                // kills it again. Previously the no-survivor case (which is every orphan, since
+                // the surface is what died) left on the acknowledgement by exactly that route.
+                if (!kill(dockId)) {
+                    // And a dock that outlives the wait is a *failed* teardown, not a quiet one.
+                    // Returning normally here was the same defect one door along: reapOrphans
+                    // collected nothing, the sweep reported a repair it had not made, and the one
+                    // dock that genuinely refuses to die was the single failure its aggregate
+                    // could not see — with no later close event to bring a sweep back for it.
+                    // Raising also leaves the durable binding alone, since the unbind below is
+                    // never reached: forgetting a binding whose panel is still on screen strands
+                    // the panel.
+                    if (cfg[WmFlags.wedgedDockFailsDetach]) {
+                        error(
+                            "dock ${dockId.raw} was still in the tree ${WINDOW_WAIT_MS}ms after " +
+                                "it was killed; its client is not servicing the close request",
+                        )
+                    }
+                    return@treeEdit
+                }
 
                 if (!cfg[WmFlags.normalizeContainerOnDetach]) return@treeEdit
                 // sway does not collapse a split container back down when it drops to one child,
                 // and the leftover container silently adopts the next window opened in that tab.
                 val survivor =
                     parent?.children?.firstOrNull { it.id != dockId.raw } ?: return@treeEdit
-                if (awaitGone(dockId) && tree().find(survivor.id) != null) {
+                if (tree().find(survivor.id) != null) {
                     focus(SurfaceId(survivor.id))
                     run("split none")
                 }
