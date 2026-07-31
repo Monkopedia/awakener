@@ -7,6 +7,7 @@ import kotlin.io.path.deleteIfExists
 import kotlin.io.path.exists
 import kotlin.io.path.writeText
 import kotlin.test.fail
+import org.junit.Assume.assumeTrue
 
 /**
  * A real sway, run on the headless wlroots backend for tests.
@@ -54,6 +55,8 @@ class SwayHarness private constructor(
          * Absence is a skip locally and a failure in CI: a green run on a machine that silently
          * skipped every window-management test would be worse than no signal at all, since it
          * reads as coverage that does not exist.
+         *
+         * This is the predicate only; [assumeAvailable] is what a test gates on.
          */
         fun available(): Boolean {
             val present = which(SWAY) != null && which(FOOT) != null
@@ -61,6 +64,28 @@ class SwayHarness private constructor(
                 fail("AWAKENER_REQUIRE_SWAY=1 but sway and/or foot are not installed")
             }
             return present
+        }
+
+        /**
+         * Skips the calling test — for real — when sway or foot is missing.
+         *
+         * An early `return` is not a skip. JUnit records a test method that returns normally as
+         * PASSED, so on a machine without sway this suite reported `skipped="0"`, no failures,
+         * and a full count of passing tests: character for character the shape of a run that
+         * drove a compositor. That is the reading `CLAUDE.md` and every review here treat as
+         * proof the integration suite executed, so the one signal meant to catch a hollow green
+         * run was itself producing one.
+         *
+         * An assumption failure throws, which the runner records as an assumption failure and
+         * Gradle writes into the XML as `<skipped/>`. The count then means what it is documented
+         * to mean.
+         *
+         * [available] runs first and is unchanged, so `AWAKENER_REQUIRE_SWAY=1` still turns a
+         * missing tool into a hard failure before any of this can soften it. That half of the
+         * guard was never the broken one, and it stays the one that actually protects CI.
+         */
+        fun assumeAvailable() {
+            assumeTrue("sway and/or foot are not installed", available())
         }
 
         private fun which(tool: String): String? =

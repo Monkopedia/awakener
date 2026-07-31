@@ -26,12 +26,25 @@ JAVA_HOME=/usr/lib/jvm/java-21-openjdk ./gradlew build
 That is the full autonomous check — it compiles both modules and runs all tests, including
 the `:wm` integration suite against a real headless sway.
 
-- **`AWAKENER_REQUIRE_SWAY=1` is mandatory for any run whose result you intend to report.**
-  Without it, a machine lacking `sway`/`foot` *skips* the window-management tests and still
-  reports success. With it, missing tools fail the build. CI sets it.
-- **Confirm tests actually ran** before calling a run green — read
-  `*/build/test-results/jvmTest/*.xml` and check the counts. "BUILD SUCCESSFUL" alone does not
-  distinguish a passing suite from a skipped one.
+- **The REQUIRE flags are the protection.** `AWAKENER_REQUIRE_SWAY=1` — and
+  `AWAKENER_REQUIRE_SPANREED=1` for `:registry` — are mandatory for any run whose result you
+  intend to report. Without them a machine lacking `sway`/`foot`/`spanreed` skips those tests
+  and the build still succeeds; with them a missing tool fails the build. CI sets them.
+  Nothing else *prevents* a green run that verified nothing.
+- **The skipped count corroborates; it does not protect.** Read
+  `*/build/test-results/jvmTest/*.xml` and check `tests=` and `skipped=`. A tool-gated test
+  now reports as genuinely skipped — a real `<skipped/>` element, via
+  `SwayHarness.assumeAvailable()` and `SpanreedCliTest.spanreedOrSkip()` — so `skipped="0"`
+  does mean those tests executed. That was **false before #26**: the gate was an early
+  `return`, which JUnit records as PASSED, so a host with no compositor reported `skipped="0"`
+  and a full count of passes, indistinguishable from a run against a live sway. Read the count
+  *and* set the flags: the count catches the mistake afterwards, the flags stop it happening.
+- "BUILD SUCCESSFUL" alone still distinguishes nothing. If you add a tool-gated test, gate it
+  with an assumption, never with a bare `return` — and if you add a new gate, declare what it
+  reads as a test input. `org.gradle.caching=true`, and Gradle treats neither `PATH` nor the
+  environment as an input, so `wm/build.gradle.kts` and `registry/build.gradle.kts` name the
+  tool presence and the REQUIRE flags explicitly. Without that the build cache will replay a
+  run that skipped everything into a `clean build` that demanded the tools.
 - `:wm` needs a live compositor, so "no automated test for this window behaviour" is not the
   defect it would be elsewhere — but a PR must say what it exercised and against which sway
   version.
