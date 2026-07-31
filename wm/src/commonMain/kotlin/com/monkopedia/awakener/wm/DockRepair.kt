@@ -5,8 +5,47 @@ enum class SweepFailure {
     /** Record it and keep collecting, so the next close event still gets a sweep. */
     CONTINUE,
 
-    /** Let it out of the collector, which ends the collection and its subscription with it. */
+    /**
+     * End the collection, and its event subscription with it.
+     *
+     * Where the exception goes once it leaves the sweep is [CollectorFailure]'s question, not this
+     * one: under the default it is recorded on [DockRepairStatus.collectorFailure] and the
+     * collector completes, and under [CollectorFailure.PROPAGATE] it also reaches the scope.
+     */
     STOP,
+}
+
+/**
+ * Where a collector failure that is not the session boundary goes.
+ *
+ * The collector is started by the manager's constructor on the scope its caller handed in,
+ * so there is no `try` a caller could wrap around it and no `await` it could put the failure on. A
+ * failure that simply escaped the job would therefore land in the scope — cancelling the caller's
+ * other coroutines, since an ordinary `Job()` scope is not a supervisor — and reach nothing that
+ * was asking about repair. That is measurable rather than hypothetical: with a `connect()` that
+ * throws, the whole scope and an unrelated sibling coroutine went down while
+ * [DockRepairStatus] stayed empty.
+ */
+enum class CollectorFailure {
+    /**
+     * Record it on [DockRepairStatus.collectorFailure] and complete the collector normally.
+     *
+     * The scope keeps every other coroutine it holds; what is lost is this manager's repair, which
+     * was lost either way — the subscription behind the collector is gone and nothing here rebuilds
+     * it (#33).
+     */
+    REPORT,
+
+    /**
+     * Record it and then rethrow, so the failure reaches the scope the manager was constructed
+     * with.
+     *
+     * The loud alternative, for a caller that would rather a manager whose collector died take the
+     * process down than run on quietly repairing nothing. A caller choosing this owns the
+     * consequence: the job was started by the constructor, so the scope must be one that tolerates
+     * a child failing — a `SupervisorJob`, or a `CoroutineExceptionHandler`, or both.
+     */
+    PROPAGATE,
 }
 
 /**
@@ -36,4 +75,24 @@ data class DockRepairStatus(
      * and this manager can do nothing further: its commands still ride the dead connection.
      */
     val sessionEnded: CompositorSessionEnded? = null,
+    /**
+     * What ended the collection other than the session boundary, or null if nothing did.
+     *
+     * The three ordinary ways to get here are a `connect()` that raises — sway not up yet, or a
+     * `SWAYSOCK` that names a compositor that is gone — sway refusing the event subscription, and
+     * an event payload that will not deserialize. None of them is recoverable by this manager, so
+     * the collector completes; what this field exists for is that it completes *visibly*. Set
+     * before the collector ends, so a reader who sees the repair job stop running can read this and
+     * find the reason already here.
+     *
+     * A [SweepFailure.STOP] failure arrives here as well as on [lastFailure] — the same throwable
+     * in both, one saying which sweep raised and this one saying what ended the collection. The
+     * two are distinguishable: [failures] is non-zero exactly when a sweep is what did it.
+     *
+     * Distinct from [sessionEnded] because the consequences differ. A session boundary means the
+     * table has been discarded and a successor connection is what is needed; this means the table
+     * is still whatever it was, still correct for a session that is still running, and no longer
+     * maintained — including that the boundary itself will now pass unobserved.
+     */
+    val collectorFailure: Throwable? = null,
 )

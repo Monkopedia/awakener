@@ -172,10 +172,10 @@ internal class DockTable {
      *
      * What this does not do is make the manager usable again: the connection its commands ride on
      * is still the dead one. Emptying the table is the half of the boundary that is ours; acquiring
-     * a successor connection is reconnection, which is not designed (#18).
+     * a successor connection is reconnection, which is not designed (#33).
      */
     fun discard() {
-        state.value = DockTableSnapshot()
+        state.update { DockTableSnapshot() }
     }
 }
 

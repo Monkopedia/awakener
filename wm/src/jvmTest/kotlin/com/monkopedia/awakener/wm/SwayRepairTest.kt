@@ -51,9 +51,12 @@ class SwayRepairTest {
     fun setUp() {
         SwayHarness.assumeAvailable()
         sway = SwayHarness.start()
-        // The collector under test can raise into this scope by design — that is the whole of
-        // what SweepFailure.STOP does — and an uncaught one would take the test's own noise with
-        // it. What it did is asserted through `repairs` and `repairing`, not through the handler.
+        // Belt and braces, and deliberately not the thing under test: under the default flags the
+        // collector reaches this scope with nothing at all — `SwayCollectorFailureTest` is where
+        // that is asserted, on a bare `Job()` where a failure would show. Here the scope stays
+        // tolerant so that a *regression* in that containment surfaces as a failed assertion about
+        // `repairs` rather than as a cancelled test. What the collector did is always read from
+        // `repairs` and `repairing`, never from this handler.
         scope = CoroutineScope(SupervisorJob() + CoroutineExceptionHandler { _, _ -> })
         store = InMemoryConfigStore()
         stateDir = createTempDirectory("awakener-wm-repair")
@@ -212,6 +215,12 @@ class SwayRepairTest {
             },
             "with the flag on the failure leaves the collector, so the collection ends",
         )
+        assertNotNull(
+            wm.repairs.value.collectorFailure,
+            "and it ends reported: STOP decides that a sweep failure ends the collection, " +
+                "wm.repair.collector_failure decides where the exception goes, and its default " +
+                "stops it here rather than in the caller's scope",
+        )
 
         val clean = openSurface("aw-app2")
         val cleanDock = wm.attach(clean, dockFor("aw-dock"), AgentId("agent-2")).dockId
@@ -281,7 +290,14 @@ class SwayRepairTest {
 
     /**
      * Builds the manager *inside* the test body rather than in `setUp`, because its collector
-     * starts with it: a flag that decides what the collector does has to be set before it exists.
+     * starts with it and `wm.events.enabled` decides whether there is one at all — read once, as
+     * the flow is collected, so it has to be set before the manager exists. Hence the parameter.
+     *
+     * The other repair flags are not like that and a `store.put` at the top of a test body is late
+     * for them by construction: it lands after the constructor has already launched the collector.
+     * They work anyway because `collectRepairs` re-reads config per event rather than capturing a
+     * snapshot at startup — which is `:config` reloading against a live daemon, and is the property
+     * those `store.put`s are quietly relying on.
      */
     private fun swayTest(events: Boolean = true, body: suspend () -> Unit) {
         SwayHarness.assumeAvailable()

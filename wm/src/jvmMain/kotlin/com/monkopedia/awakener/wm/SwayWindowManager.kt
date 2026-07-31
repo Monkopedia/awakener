@@ -41,6 +41,16 @@ class SwayWindowManager(
      * moment awakener restarted, taking its accumulated model with it.
      */
     private val registry: BindingStore,
+    /**
+     * The lifetime this manager is granted: `DockHandle.close()` runs here, and so does the repair
+     * collector this constructor starts ([repairing]).
+     *
+     * **Under the default flags nothing this manager launches fails this scope**, so a plain
+     * `CoroutineScope(Job())` is a legitimate thing to hand in. A collector failure is contained
+     * and reported through [repairs] instead — see [CollectorFailure], which is also how a caller
+     * asks for the opposite. Set [WmFlags.collectorFailure] to `PROPAGATE` and this scope must
+     * tolerate a child failing, since a constructor-started job leaves nowhere to put a `try`.
+     */
     private val scope: CoroutineScope,
 ) : WindowManager {
     private val commands: SwayConnection by lazy { connect() }
@@ -339,7 +349,7 @@ class SwayWindowManager(
          * the `split none`, which sway then refuses — and the next pass's read finds it already
          * standing; or after a flatten that has already succeeded, in which case the container is
          * gone and the dock arrives as its own tab. Only the last of the three is left, and it is
-         * the design note's late dock, which is #18's rather than this transaction's.
+         * the design note's late dock, which is #32's rather than this transaction's.
          *
          * **Best-effort, and [cause] is what propagates.** A compensation that fails is attached
          * to [cause] as a suppressed exception and otherwise ignored: it must not replace the
@@ -571,9 +581,10 @@ class SwayWindowManager(
      *   with nothing to cancel it by. Nothing stops it mapping after the attach has given up, and
      *   the unwind can only take down a window that is already in the tree when it looks. A dock
      *   that maps after the unwind's last look stands as a panel in no table, carrying no mark,
-     *   which enumeration reports as bindable. Nothing collects it: that is the claim mechanism
-     *   the design note specifies against a collector of [changes], and there is no collector
-     *   (#18);
+     *   which enumeration reports as bindable. Nothing collects it: [collectRepairs] collects
+     *   [changes] now, but the sweep it drives recognises a dock by mark or by table and this
+     *   window is in neither. What reaches it is the claim the design note specifies — which this
+     *   attach does not file and nothing reads (#32);
      * - [WmFlags.unwindFailedAttach] set to false, which leaves the tree wreckage standing
      *   deliberately.
      *
@@ -809,6 +820,15 @@ class SwayWindowManager(
      *
      * It runs on the scope the caller handed this manager, which is that caller's grant of a
      * lifetime: cancelling it ends the collection and closes the subscription's connection.
+     *
+     * **Nothing but a cancellation leaves this function under the default flags,** and that is
+     * load-bearing rather than tidiness. A constructor started this job, so there is no call for a
+     * caller to wrap in a `try` and no result for it to await; a failure that escaped would land in
+     * the caller's scope and — an ordinary `Job()` scope being no supervisor — cancel every
+     * unrelated coroutine on it, while [repairs] stayed empty. Measured with a `connect()` that
+     * raises: the scope and a sibling coroutine both went down and the status reported nothing.
+     * [WmFlags.collectorFailure] is what decides that, and [CollectorFailure.PROPAGATE] is the
+     * caller that would rather have it loud.
      */
     private suspend fun collectRepairs() {
         try {
@@ -824,6 +844,19 @@ class SwayWindowManager(
             // that a reader who sees `sessionEnded` set can rely on the table already being empty.
             docks.discard()
             repairState.update { it.copy(sessionEnded = ended) }
+        } catch (cancelled: CancellationException) {
+            // The caller withdrawing the lifetime it granted, which is not a failure and must not
+            // be recorded as one — nor swallowed, or this job would complete rather than cancel.
+            throw cancelled
+        } catch (failure: Exception) {
+            // Everything else: a connect that raised, a subscription sway refused, a payload that
+            // would not parse. The table is deliberately *not* discarded — none of these says the
+            // session ended, and emptying a table that still describes a live session would make
+            // every standing dock read as a bindable window. Recorded before the collection ends,
+            // so `repairing` completing and `collectorFailure` being set are never observable in
+            // the other order.
+            repairState.update { it.copy(collectorFailure = failure) }
+            if (config[WmFlags.collectorFailure] == CollectorFailure.PROPAGATE) throw failure
         }
     }
 
@@ -832,9 +865,11 @@ class SwayWindowManager(
      *
      * A sweep that raises has already tried every orphan — that isolation is `reapOrphans`'s — so
      * the only question left is whether the *collector* survives it, and that is
-     * [WmFlags.sweepFailure]'s. Under `STOP` the failure leaves the collector, which ends the
+     * [WmFlags.sweepFailure]'s. Under `STOP` the failure leaves this function, which ends the
      * collection and hence the subscription; it is recorded here first so that stopping does not
-     * also cost the diagnosis.
+     * also cost the diagnosis. Where it goes after that is [collectRepairs]'s and
+     * [WmFlags.collectorFailure]'s — under the default it stops there, recorded a second time as
+     * what ended the collection.
      */
     private suspend fun sweep() {
         try {
@@ -866,6 +901,15 @@ class SwayWindowManager(
      * anything. Otherwise it holds one IPC connection — the subscription's — for the life of
      * [scope], which is the cost of every manager now having a collector rather than only the one
      * a daemon would have wired.
+     *
+     * **This job completing is normal, and there is no `close()` to retire it early.** It ends when
+     * the session ends, when a sweep raises under [SweepFailure.STOP], or on any other failure
+     * under [CollectorFailure.REPORT] — and in every one of those cases [repairs] says which. The
+     * only lever a caller has for stopping a collector before then is cancelling the scope it gave,
+     * which retires everything else on that scope too. That is deliberate rather than missing: two
+     * managers built on one scope both collect, and both sweeps are idempotent against the same
+     * tree, so there is nothing yet that a per-manager shutdown would buy. Restarting one is
+     * reconnection (#33).
      */
     internal val repairing: Job = scope.launch { collectRepairs() }
 

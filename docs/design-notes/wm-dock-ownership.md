@@ -400,7 +400,7 @@ Two consequences, stated rather than designed around:
   leaves the manager permanently broken rather than quietly wrong. That is not a defence —
   reconnection is table stakes for a daemon, and it is the change that arms this. #18 has since
   taken the discard out of that commit's way: the table is cleared on the signal already, so
-  **whoever adds reconnect owns acquiring the successor connection and nothing else here.**
+  **whoever adds reconnect (#33) owns acquiring the successor connection and nothing else here.**
   Nothing in the queued PRs retrofits an invalidation rule this note did not ask for.
 
 If a stronger key is ever wanted than "this connection", sway supplies one: with `SWAYSOCK`
@@ -716,7 +716,13 @@ and none of #11, #12 or #17 touched either. PR #12 says so about `reapOrphans` i
 >   having a trigger.
 >
 > Both outcomes, and any sweep failure, are reported through `SwayWindowManager.repairs`, since
-> nobody is watching a collector by construction.
+> nobody is watching a collector by construction. *(Second amendment, same day, after the review
+> measured the hole in that sentence: everything **else** the collector could raise — a `connect()`
+> that fails, a subscription sway refuses, an event that will not parse — escaped into the caller's
+> scope and cancelled it, reporting nothing. A constructor started that job, so there was nowhere
+> for a caller to put a `try`. It is contained and reported as `collectorFailure` now, under
+> `wm.repair.collector_failure`; `PROPAGATE` is the loud half, and a caller choosing it owns giving
+> this manager a scope that tolerates a failing child.)*
 >
 > **What it still does not do**, so that this section is not read as closed: it does not consult a
 > claim on `window::new`, because no claim exists in the code to consult — `attach` files none,
@@ -1019,10 +1025,13 @@ needs the hotkey path, which does not exist yet. Do not force it into these flag
   them gates bookkeeping**, which is the property that matters and the one an earlier draft got
   wrong. *(As built, five of the six exist. `wm.dock.late_dock` does not: it gates a claim
   mechanism nothing builds and nothing reads — see the amendment on "The late dock".)*
-  *(#18 adds two more, outside this note's six and in their own namespace:
-  `wm.repair.sweep_on_close` and `wm.repair.sweep_failure`. Neither gates bookkeeping either, and
-  the session-boundary discard is under no flag at all, since a table outliving its session is not
-  a behaviour anyone would choose.)*
+  *(#18 adds three more, outside this note's six and in their own namespace:
+  `wm.repair.sweep_on_close`, `wm.repair.sweep_failure` and `wm.repair.collector_failure`. None of
+  them gates bookkeeping either, and the session-boundary discard is under no flag at all, since a
+  table outliving its session is not a behaviour anyone would choose. `wm.repair.collector_failure`
+  is the one that is not about repair policy but about blast radius: the collector is started by a
+  constructor, so a failure that escaped would cancel the caller's whole scope, and the default
+  contains it and reports it instead.)*
 
   An earlier draft also claimed none of them "has an off-state that silently breaks a read path",
   and that is too strong. `wm.dock.recognition = MARK_ONLY` and `wm.dock.late_dock = LEAVE` both
@@ -1127,8 +1136,9 @@ rewriting the same block twice. #4's mechanism is a step in #6's transaction.
   exceptions to Decision 2 rather than solved problems. `no_focus` is made non-default and
   non-cumulative; the late dock is reclaimed after the fact rather than prevented. Neither is
   fixed — sway cannot fix either.
-- **Reconnecting after a compositor restart** is not designed here, and is now the only piece of
-  the boundary left unowned. This note defines the session boundary and requires the table be
+- **Reconnecting after a compositor restart** is not designed here, and is the last piece of the
+  boundary — **filed as #33**, so that closing #18 does not leave it hanging off a closed issue.
+  This note defines the session boundary and requires the table be
   discarded at it; it does not say how the manager acquires a successor connection, and today it
   does not try (`commands` is `by lazy { connect() }`, so a manager whose session ended stays
   broken rather than becoming quietly wrong). Of the three things that were owed here, two have
@@ -1140,7 +1150,11 @@ rewriting the same block twice. #4's mechanism is a step in #6's transaction.
   when its session ends; and a reconnect that reuses a `SwayWindowManager` would have to answer
   what happens to the `DockHandle`s callers are still holding, every one of which names a
   `con_id` from the dead session. **Not half-built on purpose** — #18 deliberately stopped at the
-  discard rather than guessing at any of that.
+  discard rather than guessing at any of that, and #33 carries that list forward. One thing #18
+  added to it: a collector that ends on a failure other than the boundary (see
+  `wm.repair.collector_failure`) leaves the manager not observing the boundary at all, so on that
+  path the table is never discarded and the successor question arrives with a stale table already
+  in hand.
 - **Changing `wm.dock.mark_prefix` while docks are standing** orphans far less than this bullet
   used to claim, and hides more. *(Amended 2026-07-31, measured against #23's second head with the
   pre-adoption code as the control: fresh manager over intact marks, one `surfaces()`, then flip

@@ -267,8 +267,10 @@ object WmFlags {
             "the dock's app_id for the life of the process. Two things it does not reach " +
             "either: a no_focus rule, which sway cannot revoke, and the dock program itself, " +
             "which is already exec'd by the time anything can fail — a dock that maps after " +
-            "the unwind has finished stands as an unowned panel, and nothing collects it yet " +
-            "(#18).",
+            "the unwind has finished stands as an unowned panel. A repair collector exists now " +
+            "and does not reach that panel: it carries no mark and is in no table, so the sweep " +
+            "does not see it as a dock. What is missing is the claim the design note specifies, " +
+            "which attach does not file and nothing reads (#32).",
     )
 
     val wedgedDockFailsDetach = Flags.boolean(
@@ -337,7 +339,28 @@ object WmFlags {
             "ends the collection and its event subscription: louder, and reasonable if a failing " +
             "sweep is treated as a defect to be looked at rather than a wedged panel to be lived " +
             "with. Under STOP nothing repairs anything afterwards, and nothing restarts the " +
-            "collector. Either way the failure is reported through the manager's repair status.",
+            "collector. Either way the failure is reported through the manager's repair status, " +
+            "and under STOP wm.repair.collector_failure decides where the exception itself goes.",
+    )
+
+    val collectorFailure = Flags.enum(
+        "wm.repair.collector_failure",
+        CollectorFailure.REPORT,
+        "Where a repair collector's failure goes when it is not the compositor session ending. " +
+            "The collector is started by the manager's constructor on the scope the caller " +
+            "handed it, so a failure that simply escaped would land in that scope — cancelling " +
+            "the caller's unrelated coroutines, since an ordinary Job() scope is not a " +
+            "supervisor — and reach nothing that was asking about repair. The three ordinary " +
+            "ways to get here are the IPC connect raising because sway is not up or SWAYSOCK is " +
+            "stale, sway refusing the event subscription, and an event payload that will not " +
+            "parse. REPORT records it on the manager's repair status and ends the collection " +
+            "there: the caller keeps its scope, and this manager stops repairing — which it did " +
+            "either way, since the subscription behind the collector is gone and nothing " +
+            "reconnects it. PROPAGATE records it and rethrows, so the failure reaches the scope: " +
+            "louder, and reasonable if a manager that has stopped repairing should take the " +
+            "process with it, but a scope that gets this must tolerate a child failing. Neither " +
+            "restarts the collector, and under both the session boundary now passes unobserved, " +
+            "so the dock table is no longer discarded when the compositor goes away.",
     )
 
     val socketPath = Flags.string(
