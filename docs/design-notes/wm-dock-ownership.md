@@ -1,7 +1,9 @@
 # Design note: who owns a dock node
 
-**Date:** 2026-07-30, revised 2026-07-31 (three times, then amended for #20) · **Scope:** `:wm`
-only · **Status:** decided; binds issues #4, #6, #7, #9, and requires #18
+**Date:** 2026-07-30, revised 2026-07-31 (three times, then amended for #20 and again for #18) ·
+**Scope:** `:wm` only · **Status:** decided; binds issues #4, #6, #7, #9, and requires #18 —
+which has since landed the collector, in part. What it does and does not drive is stated under
+"The third outcome's owner, half built".
 
 Every claim below about how sway **or awakener** behaves was run before it was written — against
 a live headless sway 1.12, and through the real `SwayWindowManager` where the question is about
@@ -357,11 +359,21 @@ the connection and throws `CompositorSessionEnded` otherwise, and `changes` clos
 that cause. Re-measured through the real `SwayWindowManager` the same way, the probe above now
 reads `collectorActive=false flowCompleted=false failed=CompositorSessionEnded` after the `SIGKILL`
 and is unchanged on an idle desktop — both halves measured, and both are now asserted by
-`SwaySessionEndTest`. So the boundary is observable; **nothing observes it yet**, which is the
-rest of #18 — that half is read off the source rather than probed: `changes` has no collector
-outside tests and `commands` is still `by lazy { connect() }`. Reporting death is not the same as
-reacting to it, and #20 deliberately did not build the reaction — discarding the table on that
-signal is still the reconnect owner's, in the commit that acquires the successor connection.
+`SwaySessionEndTest`.
+
+> **Amended 2026-07-31 by #18.** The rest of this said "nothing observes it yet". Something does
+> now: `SwayWindowManager` starts a repair collector on the scope it is constructed with, and that
+> collector's `catch (CompositorSessionEnded)` discards the whole table — entries and reservations
+> — before recording the reason in `repairs`. Measured through the real manager against a
+> `SIGKILL`ed sway 1.12: with a dock standing, the table holds
+> `{7=DockEntry(surface=5, origin=STOOD_UP)}` before the kill and is empty after it, and the same
+> assertion against the pre-#18 code fails with that entry still in place
+> (`SwayRepairTest.the dock table is discarded when the compositor dies`).
+>
+> `commands` is still `by lazy { connect() }`, so the manager remains permanently broken after the
+> boundary rather than quietly wrong — discarding the table is the half of the boundary #18 built,
+> and acquiring a successor connection is still nobody's. See "Reconnecting after a compositor
+> restart" below, which is now the only unowned piece.
 
 On the command connection: it is `by lazy { connect() }` and learns only on next use, which is
 late. An earlier draft added "but never *wrong*: it cannot succeed against a dead socket", and
@@ -379,15 +391,17 @@ Two consequences, stated rather than designed around:
 - **With `wm.events.enabled = false` there is no promptly-detecting connection**, and the
   boundary is noticed only at the next command. In that window the table is stale, and while it
   cannot make a *command* wrong, `surfaces()` reads the tree without the lock and would answer
-  from a stale table against a fresh tree. That flag's description must say so, alongside the
-  orphan-handling caveat it already carries.
+  from a stale table against a fresh tree. That flag's description now says so, alongside the
+  orphan-handling caveat it already carried — and with events off the collector has nothing to
+  collect and returns, so *nothing* discards the table for the life of that manager, which the
+  description also says. Asserted by `SwayRepairTest.with events off nothing is collected and
+  nothing is repaired`.
 - **Today this is latent, not live**, because `commands` never reconnects: a sway restart
   leaves the manager permanently broken rather than quietly wrong. That is not a defence —
-  reconnection is table stakes for a daemon, and it is the change that arms this. **Whoever
-  adds reconnect clears the table in the same commit** — the trigger it clears on already
-  exists, since #20 made the boundary observable (above). Nothing in the four queued PRs would
-  retrofit an invalidation rule this note did not ask for; **#18** is the home for both of the
-  pieces that remain — acquiring the successor connection, and discarding the table.
+  reconnection is table stakes for a daemon, and it is the change that arms this. #18 has since
+  taken the discard out of that commit's way: the table is cleared on the signal already, so
+  **whoever adds reconnect owns acquiring the successor connection and nothing else here.**
+  Nothing in the queued PRs retrofits an invalidation rule this note did not ask for.
 
 If a stronger key is ever wanted than "this connection", sway supplies one: with `SWAYSOCK`
 unset the socket is `$XDG_RUNTIME_DIR/sway-ipc.<uid>.<pid>.sock`, so the compositor's pid is in
@@ -448,9 +462,11 @@ accepted it — but worth knowing before someone invents a heartbeat.
 **Contract:** `attach` either returns a handle whose `detach()` owns everything the attach
 did, or it throws having left the **tree** as it found it — with the sole residue of a dock
 program that may still be in flight, which the claim below owns *if a collector exists to read
-the claim*, and which today stands unowned because none does (#18) **and because no claim is
-filed either — see the amendment on that section**. No half-built container is ever observable
-to a caller.
+the claim*, and which today stands unowned **because no claim is filed and none is read** — see
+the amendment on that section. *(Amended 2026-07-31 by #18: the missing collector is no longer
+part of that sentence. `changes` has one now; it reads close events and the session boundary, and
+there is still no claim for it to consult.)* No half-built container is ever observable to a
+caller.
 
 > **Amended 2026-07-31, with #6's fix for the map-deadline race: the boundary is the unwind's
 > last look at the tree, not the moment `awaitWindow` gave up.** A dock that has mapped by then
@@ -542,7 +558,9 @@ moment it is still needed.
 > **So the third outcome is real and unowned**: a dock that maps after the unwind has finished
 > stands as an unmarked, untabled panel that `surfaces()` reports as bindable. What follows is
 > therefore the design for whoever builds the collector (#18), read as specification rather than
-> as a description of the code.
+> as a description of the code. *(Re-pointed 2026-07-31: #18 built the collector and stopped
+> there, because `RECLAIM` kills a window `attach` never saw and that is its own change. The
+> specification below is now **#32**'s, and the blocker it named is gone.)*
 >
 > **Narrowed 2026-07-31 in the same PR, and one line of the specification below is wrong.** The
 > tree evaluation this section prescribes for the claim is now done by the unwind itself, inside
@@ -608,11 +626,16 @@ window the user can see, cannot bind, and nobody owns — worse than either hone
 
 What it costs, stated rather than designed around:
 
-- **Nothing consumes `changes` today, so `RECLAIM` does nothing at all.** See "The third outcome
-  has no owner" below; this is the first cost, not the last.
+- **Nothing consumes a `window::new` for this purpose today, so `RECLAIM` does nothing at all.**
+  *(Amended 2026-07-31: was "nothing consumes `changes` today". `changes` now has a collector —
+  #18 — but it acts on `close` and on the session ending, and there is no claim in the code for it
+  to read: `DockTable` has entries, reservations and focus rules only. The `new` branch is #32's
+  to add along with the claim itself.)* See "The third outcome's owner, half built" below; this is
+  the first cost, not the last.
 - **It happens after `attach` returned.** It is not inside the transaction and cannot be — the
   transaction ended. "Left the tree as it found it" holds across the following window only if
-  something outside the transaction finishes the job, and today nothing does (#18).
+  something outside the transaction finishes the job, and today nothing does — the collector
+  exists (#18) and the claim it would read does not (#32).
 - **It is event-driven, not scheduled.** A claim is consulted when a `window::new` event
   arrives on the `changes` stream — the same stream `reapOrphans` is driven off — and its
   deadline is evaluated at that moment, not by a timer. Nothing polls, loops, or acts on a
@@ -647,9 +670,9 @@ legitimate target at all, so the only window it can ever reach is somebody else'
   and recoverable one: a Breath and a registry row, both undoable.
 - `RECLAIM` under `NEW_NODE` costs a user's window, which is not recoverable at all.
 - `RECLAIM` is also not today's behaviour. Nothing reclaims anything today, and nothing can until
-  #18 — so `LEAVE` is both the conservative default and the one that "defaults are what you would
-  have hard-coded" actually selects. Shipping a default whose behaviour cannot be exercised would
-  be worse than either.
+  #32 files a claim for #18's collector to read — so `LEAVE` is both the conservative default and
+  the one that "defaults are what you would have hard-coded" actually selects. Shipping a default
+  whose behaviour cannot be exercised would be worse than either.
 
 `RECLAIM` is the lever for whoever wants the stray panel gone, and it is the right default under
 `PER_SURFACE_APP_ID`, where the claim is exact by construction.
@@ -660,9 +683,13 @@ real panel program on a real desktop — neither exists yet. This note picks the
 default rather than guessing the distribution, and says so rather than dressing the guess up as a
 finding.
 
-### The third outcome has no owner — #18
+### The third outcome's owner, half built — #18
 
-The mechanism above is specified against a collector that **does not exist**. Verified on `main`
+*(This section said "The third outcome has no owner" until 2026-07-31. The original diagnosis is
+kept first, because it is what the rest of the note was written against, and the amendment follows
+it.)*
+
+The mechanism above was specified against a collector that **did not exist**. Verified on `main`
 (`7a01fe0`) and across every open PR:
 
 ```
@@ -671,24 +698,46 @@ wm/src/jvmTest/.../SwayBindingTest.kt:152:        wm.reapOrphans()
 wm/src/jvmMain/.../SwayWindowManager.kt:267:    suspend fun reapOrphans() {
 ```
 
-— the declaration and one test. `changes` is likewise declared and never collected outside tests,
-and none of #11, #12 or #17 touches either. PR #12 says so about `reapOrphans` in its own body.
+— the declaration and one test. `changes` was likewise declared and never collected outside tests,
+and none of #11, #12 or #17 touched either. PR #12 says so about `reapOrphans` in its own body.
 
-So, stated where it cannot be lost rather than assumed away:
-
-> **Nothing drives `reapOrphans` and nothing collects `changes` today.** Until something does,
-> `RECLAIM` is inert by construction, no claim is ever read, and the contract sentence
-> "'left the tree as it found it' holds because something outside the transaction finishes the
-> job" is true of *nothing*. This note does not design that collector and none of the four PRs is
-> its home; it is **#18**, and it should land before or alongside #6 and #9 rather than after.
+> **Amended 2026-07-31 by #18.** A collector exists now, and it is deliberately narrower than
+> "the collector" this section asked for. `SwayWindowManager` starts one on its own scope as it is
+> constructed — not offered as a `start()` for a caller to remember, because forgetting to wire it
+> is precisely the defect being fixed — and it does exactly two things:
+>
+> - **a `close` event drives one `reapOrphans`**, under `wm.repair.sweep_on_close` (default
+>   `true`; off is the previous behaviour, in which the sweep existed and nothing ran it). A sweep
+>   that raises does not end the collection, under `wm.repair.sweep_failure` (default `CONTINUE`)
+>   — the same argument that makes the sweep isolate docks from one another, one level up: a
+>   wedged panel is permanent, so a collector that stopped on the first one would sweep once and
+>   never again. `STOP` is the other half of that choice and lets the failure out of the collector.
+> - **a `CompositorSessionEnded` discards the dock table**, which is Decision 1's rule finally
+>   having a trigger.
+>
+> Both outcomes, and any sweep failure, are reported through `SwayWindowManager.repairs`, since
+> nobody is watching a collector by construction.
+>
+> **What it still does not do**, so that this section is not read as closed: it does not consult a
+> claim on `window::new`, because no claim exists in the code to consult — `attach` files none,
+> `DockTable` carries none, and `wm.dock.late_dock` was never introduced. Both halves are **#32**,
+> filed rather than folded in, because `RECLAIM` kills a window `attach` never saw and that is a
+> destructive change owed its own diff. It does not reconnect. And a `close` that the flow drops
+> under back-pressure is a sweep that does not happen; nothing comes back for it, which is the
+> same "one shot per event" property the sweep's own isolation exists to protect.
+>
+> **Why a collector is not the unattended autonomous action `docs/design.md` forbids.** That
+> agreement — "Agents wait. They don't poll, don't loop, don't act on a schedule" — is about what
+> an agent does between requests, and this does none of the three: no timer, no interval, no work
+> at all until sway writes to a socket the coroutine is parked on. What it reacts to is a user
+> closing a window, which is the user acting one layer below the hotkey, and the policy it applies
+> is entirely in flags a caller set. This is the same argument the claim mechanism above was
+> already settled on ("It is event-driven, not scheduled"), applied to its driver. A *periodic*
+> sweep would be that rule broken, and is why one was not written.
 
 The degradation list above names `wm.events.enabled = false` as the case where `RECLAIM` falls
-back to `LEAVE`. "No collector at all" is today's *actual* case and has the same effect for a
+back to `LEAVE`. "No claim to read" is today's *actual* case and has the same effect for a
 different reason, which is why `LEAVE` being the default costs nothing at the moment.
-
-#18 also owns the *reaction* to Decision 1's session boundary. The detection itself landed as #20,
-so what is missing there is the same thing that is missing here: a report `changes` now makes and
-nothing collects is the same defect seen from the other end.
 
 ### What `attach` owns
 
@@ -894,12 +943,14 @@ re-reading a config awakener does not own clears the set. So the design does not
   blinds `surfaces()`, which is the opposite of what this flag is for. The description must say
   both halves.
 - `wm.dock.late_dock` = `RECLAIM` | `LEAVE`, **default `LEAVE`.** *(Specification, not built —
-  see the amendment on "The late dock". It is #18's, and the outcome it covers is now the
+  see the amendment on "The late dock". It is **#32**'s, and the outcome it covers is now the
   narrower one recorded there.)* See "The late dock". The
   description must state that `RECLAIM` kills a window `attach` never saw; that under `NEW_NODE`
   the residual predicate is the shared `app_id`, so it can reach a hand-launched window; and that
-  it does nothing at all when `wm.events.enabled` is off **or while nothing collects `changes`,
-  which is the case today (#18)**.
+  it does nothing at all when `wm.events.enabled` is off **or while no claim exists for the
+  collector to read, which is the case today (#32)**. *(Amended 2026-07-31: that last clause said
+  "while nothing collects `changes`", which #18 fixed. The collector reads `close` and the session
+  boundary; the `window::new` branch and the claim it consults arrive together, in #32.)*
 
 ### Rejected
 
@@ -954,7 +1005,10 @@ needs the hotkey path, which does not exist yet. Do not force it into these flag
 
 - **Three calls.** Nothing here grows `WindowManager`. The table is private to
   `SwayWindowManager`; `reapOrphans` is already an implementation-side entry point and stays
-  one; teardown stays on `DockHandle`.
+  one; teardown stays on `DockHandle`. *(#18 adds no call either: the collector is private and
+  starts itself, and what it reports — `SwayWindowManager.repairs` — is on the implementation
+  beside `reapOrphans`, not on the interface. `DockRepairStatus` names no compositor concept, so
+  nothing above `:wm` learns one by reading it.)*
 - **Reads outside the lock.** Preserved. See Decision 1, Rejected.
 - **Compositor-agnostic above `:wm`.** The table is keyed on `SurfaceId`, a `:wm` value class,
   and is never returned or consulted from above. Marks, criteria, `no_focus`, split containers
@@ -964,7 +1018,11 @@ needs the hotkey path, which does not exist yet. Do not force it into these flag
   `wm.dock.focus_suppression`, `wm.dock.unwind_failed_attach`, `wm.dock.late_dock`. **None of
   them gates bookkeeping**, which is the property that matters and the one an earlier draft got
   wrong. *(As built, five of the six exist. `wm.dock.late_dock` does not: it gates a claim
-  mechanism nothing builds and nothing could read — see the amendment on "The late dock".)*
+  mechanism nothing builds and nothing reads — see the amendment on "The late dock".)*
+  *(#18 adds two more, outside this note's six and in their own namespace:
+  `wm.repair.sweep_on_close` and `wm.repair.sweep_failure`. Neither gates bookkeeping either, and
+  the session-boundary discard is under no flag at all, since a table outliving its session is not
+  a behaviour anyone would choose.)*
 
   An earlier draft also claimed none of them "has an off-state that silently breaks a read path",
   and that is too strong. `wm.dock.recognition = MARK_ONLY` and `wm.dock.late_dock = LEAVE` both
@@ -987,6 +1045,13 @@ is dead code until #18, which is why `wm.dock.late_dock` now defaults to `LEAVE`
 similarly fine, since its unwind is synchronous. So: **#7 → #9 → #6 + #4, with #18 before or
 alongside #9**, and `late_dock` reconsidered once a collector exists. The order holds.
 
+*(Amended 2026-07-31. #7 landed as PR #12, #9 as PR #23, and #6 + #4 as PR #27; #18 landed after
+all of them rather than alongside #9 — without consequence, because the only thing #9 shipped that
+needed it was the reservation's own eviction, which `attach` does in a `finally` of its own.
+#18's collector does not make `late_dock` exercisable on its own: it drives the sweep and the
+session boundary, and the claim `RECLAIM` acts on is unbuilt at both ends. So `late_dock` is
+reconsidered once **#32** lands, not now.)*
+
 1. **#7 must land the rule, not the patch.** A tolerant teardown primitive on `TreeEdit` plus
    per-dock isolation in `reapOrphans`. #6's unwind is built directly on that primitive; a
    local `try`/`catch` gets thrown away. **PR #12 does this**, and its tree-read mechanism is
@@ -1007,8 +1072,10 @@ alongside #9**, and `late_dock` reconsidered once a collector exists. The order 
    needs to run under the lock. Each PR is self-consistent on `main` on its own.
 
    **What landed:** #9 (PR #23) filed and evicted; it did not convert, and no claim exists. #6
-   added the tree compensations as assigned. The gap between them is the late dock, which is now
-   #18's along with the collector that would read a claim at all.
+   added the tree compensations as assigned. The gap between them is the late dock. *(Re-pointed
+   2026-07-31: that gap was #18's "along with the collector that would read a claim at all". #18
+   built the collector and left the claim, so the gap is **#32** and the collector it needed is
+   no longer in front of it.)*
 
    Concretely, #9 adds a `try`/`finally` at the top of `attach` covering the bookkeeping only —
    which is allowed, and is not the "top-level `try`/`catch` unwind" the note rejects. See
@@ -1036,9 +1103,16 @@ rewriting the same block twice. #4's mechanism is a step in #6's transaction.
   forward, and the table mitigates #14 in-session, but neither issue is fixed here and #9 must
   not assume the mark survives a second attach on one surface. This note is the single place the
   *recognition* predicate is decided; it is not the place #14's repair is decided.
-- **Nothing collects `changes` and nothing drives `reapOrphans` (#18).** The claim mechanism, and
-  therefore Decision 2's "something outside the transaction finishes the job", is specified
-  against an owner that does not exist yet. See "The third outcome has no owner".
+- **The claim is neither filed nor read.** *(Amended 2026-07-31: this said "nothing collects
+  `changes` and nothing drives `reapOrphans` (#18)", and #18 has since fixed that half — a
+  collector now drives the sweep off the `close` event and discards the table at the session
+  boundary.)* What remains is the claim itself, and it is *both* halves of it: `attach` files
+  none, `DockTable` holds none, `wm.dock.late_dock` does not exist, and the collector has no
+  `window::new` branch to consult one from. So Decision 2's "something outside the transaction
+  finishes the job" is still true of nothing. #18 removed the reason it could not be built — the
+  missing collector — and deliberately did not build it, because a mechanism that kills a window
+  `attach` never saw is its own change with its own review. Filed as **#32**. See "The third
+  outcome's owner, half built".
 - **A cancelled `registry.bind` can leave a durable binding with no panel.** The third instance of
   the late-recording shape above, and the one this layer cannot close. `bind` is deliberately
   outside the tree section because it can shell out to spanreed; if the attach is cancelled while
@@ -1053,14 +1127,20 @@ rewriting the same block twice. #4's mechanism is a step in #6's transaction.
   exceptions to Decision 2 rather than solved problems. `no_focus` is made non-default and
   non-cumulative; the late dock is reclaimed after the fact rather than prevented. Neither is
   fixed — sway cannot fix either.
-- **Reconnecting after a compositor restart** is not designed here. This note defines the
-  session boundary and requires the table be discarded at it; it does not say how the manager
-  acquires a successor connection, and today it does not try (`commands` is
-  `by lazy { connect() }`). Whoever adds reconnect owns two things: acquiring the successor
-  connection, and clearing the table. The third — **making the boundary observable at all** —
-  landed as #20; `changes` now fails with `CompositorSessionEnded` where it used to go silent, so
-  the trigger exists and is unclaimed. And awakener's `SWAYSOCK` is itself stale across the
-  boundary, since the default socket path carries the compositor's pid. Filed as part of #18.
+- **Reconnecting after a compositor restart** is not designed here, and is now the only piece of
+  the boundary left unowned. This note defines the session boundary and requires the table be
+  discarded at it; it does not say how the manager acquires a successor connection, and today it
+  does not try (`commands` is `by lazy { connect() }`, so a manager whose session ended stays
+  broken rather than becoming quietly wrong). Of the three things that were owed here, two have
+  landed: **making the boundary observable** (#20 — `changes` fails with `CompositorSessionEnded`
+  where it used to go silent) and **discarding the table on it** (#18 — the repair collector's
+  `catch`). What is left is acquiring the successor connection, and the parts of it this note can
+  already name: awakener's `SWAYSOCK` is itself stale across the boundary, since the default
+  socket path carries the compositor's pid; nothing restarts the repair collector, which returns
+  when its session ends; and a reconnect that reuses a `SwayWindowManager` would have to answer
+  what happens to the `DockHandle`s callers are still holding, every one of which names a
+  `con_id` from the dead session. **Not half-built on purpose** — #18 deliberately stopped at the
+  discard rather than guessing at any of that.
 - **Changing `wm.dock.mark_prefix` while docks are standing** orphans far less than this bullet
   used to claim, and hides more. *(Amended 2026-07-31, measured against #23's second head with the
   pre-adoption code as the control: fresh manager over intact marks, one `surfaces()`, then flip

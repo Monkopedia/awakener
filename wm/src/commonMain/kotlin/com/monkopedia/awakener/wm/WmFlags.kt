@@ -310,6 +310,36 @@ object WmFlags {
             "after attaching already behaves.",
     )
 
+    val sweepOnClose = Flags.boolean(
+        "wm.repair.sweep_on_close",
+        true,
+        "Sweep for orphaned docks when the compositor reports a window closing. sway leaves a " +
+            "dock standing when the surface it shares a tab with dies, and the close event is " +
+            "the exact moment that happens, so this is what turns wm.dock.orphan_policy from a " +
+            "setting into a behaviour. Off is the previous behaviour, in which the sweep existed " +
+            "and nothing ran it: orphaned panels then accumulate until something calls the sweep " +
+            "itself, and nothing in awakener does. Turn it off to drive repair by hand, or to " +
+            "leave the tree damage visible while diagnosing without also giving up the session " +
+            "boundary — the collector still watches for the compositor going away either way. " +
+            "Nothing is swept on a timer: this reacts to an event or it does not run.",
+    )
+
+    val sweepFailure = Flags.enum(
+        "wm.repair.sweep_failure",
+        SweepFailure.CONTINUE,
+        "What a sweep that raises does to the collector driving it. A sweep already isolates " +
+            "each dock and raises an aggregate naming the ones that would not come down, so by " +
+            "the time this decides anything the repair has been attempted on every orphan. " +
+            "CONTINUE records the failure and keeps collecting, because the collector is the only " +
+            "thing that will sweep the *next* orphan and one wedged panel is a poor reason to " +
+            "stop repairing the desktop — the same argument that made the sweep isolate docks " +
+            "from each other, one level up. STOP lets the failure out of the collector, which " +
+            "ends the collection and its event subscription: louder, and reasonable if a failing " +
+            "sweep is treated as a defect to be looked at rather than a wedged panel to be lived " +
+            "with. Under STOP nothing repairs anything afterwards, and nothing restarts the " +
+            "collector. Either way the failure is reported through the manager's repair status.",
+    )
+
     val socketPath = Flags.string(
         "wm.ipc.socket_path",
         "",
@@ -319,7 +349,17 @@ object WmFlags {
     val eventsEnabled = Flags.boolean(
         "wm.events.enabled",
         true,
-        "Subscribe to sway window events. Turning this off stops orphan handling too, since " +
-            "that is driven by the close event.",
+        "Subscribe to sway window events. This is the only connection that notices anything " +
+            "promptly, so turning it off costs three things rather than one. Orphan handling " +
+            "stops, since the sweep is driven by the close event and nothing else drives it. " +
+            "Nothing reads a compositor session ending either, so the dock table — whose keys are " +
+            "con_ids from a counter that restarts with the compositor — is never discarded, and " +
+            "an entry that outlives a sway restart names whatever window holds that id next: " +
+            "surfaces() takes no lock and would answer from that stale table against a fresh " +
+            "tree, hiding a genuine window. And the command connection learns of the boundary " +
+            "only at its next use, which cannot make a command wrong — a reply that arrives " +
+            "describes the session that produced it — but is late. Attaching a dock is " +
+            "unaffected: it polls the tree rather than listening, deliberately, so it keeps " +
+            "working with events off.",
     )
 }

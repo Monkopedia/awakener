@@ -8,6 +8,7 @@ import com.monkopedia.awakener.registry.SurfaceKey
 import com.monkopedia.awakener.registry.asIdentity
 import kotlin.time.Duration.Companion.milliseconds
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
@@ -51,10 +52,25 @@ class SwayWindowManager(
     /**
      * The docks this process knows about. See [DockTable]; it is read on every enumeration, and
      * written by [attach], by a teardown, and by [dockedTo] adopting a dock it found by mark.
+     *
+     * `internal` rather than private only so that the tests in this module can assert on it
+     * directly. Discarding it at the session boundary has no observable consequence from outside —
+     * by then the connection every read would go through is dead — so this is the one invariant
+     * that cannot be checked through behaviour.
      */
-    private val docks = DockTable()
+    internal val docks = DockTable()
 
     private val unparsedMarks = MutableStateFlow<Set<String>>(emptySet())
+
+    private val repairState = MutableStateFlow(DockRepairStatus())
+
+    /**
+     * What this manager's repair collector has done, and what stopped it.
+     *
+     * The collector answers to the compositor rather than to a caller, so this is where anything
+     * it would otherwise swallow surfaces — see [DockRepairStatus].
+     */
+    val repairs: StateFlow<DockRepairStatus> = repairState.asStateFlow()
 
     /**
      * Marks under [WmFlags.dockMarkPrefix] whose suffix is not a `con_id`, as seen by every
@@ -771,10 +787,94 @@ class SwayWindowManager(
     }
 
     /**
+     * The repair collector: the thing that was missing, and the reason [reapOrphans] and the
+     * session boundary both read as covered without ever running.
+     *
+     * `reapOrphans` and the `CompositorSessionEnded` that [changes] now reports were both built
+     * against a caller that did not exist — measured on `main`, `reapOrphans` had exactly two
+     * mentions in the tree, its own declaration and one test, and `changes` was collected nowhere
+     * outside tests. Repair code with no caller is indistinguishable from no repair code, except
+     * that it reads as covered, so this is deliberately started by the constructor rather than
+     * offered as a method for a caller to remember: forgetting to wire it is the defect, and a
+     * `start()` nobody calls would reproduce it exactly.
+     *
+     * **Why this is not the unattended autonomous action the design forbids.** That agreement is
+     * about what an agent does between requests — "they don't poll, don't loop, don't act on a
+     * schedule" — and this does none of the three. There is no timer and no interval; the coroutine
+     * is parked on a socket read and costs nothing until sway writes to it; and the thing it reacts
+     * to is the user closing a window, which is the user acting, one layer down from the hotkey.
+     * It also takes no decision of its own: it runs a repair whose policy is entirely in flags a
+     * caller set. `attach`'s own late-dock claim was settled the same way and for the same reason.
+     * What it is *not* allowed to become is a periodic sweep, which would be that rule broken.
+     *
+     * It runs on the scope the caller handed this manager, which is that caller's grant of a
+     * lifetime: cancelling it ends the collection and closes the subscription's connection.
+     */
+    private suspend fun collectRepairs() {
+        try {
+            changes.collect { change ->
+                // Only a close can orphan a dock, and it is the exact moment one becomes an
+                // orphan. Read per event rather than captured once, because `:config` reloads
+                // against a live daemon and a collector outlives any snapshot it took at startup.
+                if (change is SurfaceChange.Vanished && config[WmFlags.sweepOnClose]) sweep()
+            }
+        } catch (ended: CompositorSessionEnded) {
+            // The session boundary, mechanically: connection loss *is* the boundary, and #20 is
+            // what makes it distinguishable from an idle desktop. Discard before reporting, so
+            // that a reader who sees `sessionEnded` set can rely on the table already being empty.
+            docks.discard()
+            repairState.update { it.copy(sessionEnded = ended) }
+        }
+    }
+
+    /**
+     * One sweep, with its outcome recorded either way.
+     *
+     * A sweep that raises has already tried every orphan — that isolation is `reapOrphans`'s — so
+     * the only question left is whether the *collector* survives it, and that is
+     * [WmFlags.sweepFailure]'s. Under `STOP` the failure leaves the collector, which ends the
+     * collection and hence the subscription; it is recorded here first so that stopping does not
+     * also cost the diagnosis.
+     */
+    private suspend fun sweep() {
+        try {
+            reapOrphans()
+            repairState.update { it.copy(sweeps = it.sweeps + 1) }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            repairState.update {
+                it.copy(
+                    sweeps = it.sweeps + 1,
+                    failures = it.failures + 1,
+                    lastFailure = failure,
+                )
+            }
+            if (config[WmFlags.sweepFailure] == SweepFailure.STOP) throw failure
+        }
+    }
+
+    /**
+     * [collectRepairs] running on [scope], started as this manager is built.
+     *
+     * Declared last on purpose: property initialisers run in declaration order, so by the time
+     * this one launches, every field the collector touches is set — including [changes], which is
+     * a `val` further up. `internal` so that a test can see whether it is still running, which is
+     * the whole of what [WmFlags.sweepFailure]`=STOP` changes.
+     *
+     * With `wm.events.enabled` off, [changes] closes immediately and this returns without opening
+     * anything. Otherwise it holds one IPC connection — the subscription's — for the life of
+     * [scope], which is the cost of every manager now having a collector rather than only the one
+     * a daemon would have wired.
+     */
+    internal val repairing: Job = scope.launch { collectRepairs() }
+
+    /**
      * Applies [OrphanPolicy] to any dock whose surface is gone.
      *
-     * Driven by the caller off [changes] rather than run on a timer, since sway emits `close`
-     * for the surface and that is the exact moment the dock becomes an orphan.
+     * Driven off [changes] by [collectRepairs] rather than run on a timer, since sway emits
+     * `close` for the surface and that is the exact moment the dock becomes an orphan. Callable
+     * directly as well, which is what `wm.repair.sweep_on_close=false` leaves.
      *
      * One dock that will not come down does not cost the rest of the sweep. This is the whole
      * mechanism for the probe's Hazard 2, so a teardown that throws partway through used to leave
@@ -828,9 +928,9 @@ class SwayWindowManager(
             } catch (failure: Exception) {
                 // Tagged here because this is the only place that still knows which dock the
                 // teardown was for: `run` reports the command it sent and nothing else, so a
-                // `split none` refusal arrives anonymous. reapOrphans has no production caller
-                // yet, so this message is the whole of what whoever wires it up gets to work
-                // from.
+                // `split none` refusal arrives anonymous. The sweep's usual caller is the repair
+                // collector, which nobody is watching, so this message is the whole of what
+                // reaches `repairs` for a human to work from.
                 failures += IllegalStateException(
                     "reaping dock ${node.id}, bound to the gone surface $boundTo, failed",
                     failure,
