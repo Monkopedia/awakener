@@ -1,10 +1,18 @@
 # Design note: who owns a dock node
 
-**Date:** 2026-07-30, revised 2026-07-31 · **Scope:** `:wm` only · **Status:** decided; binds
-issues #4, #6, #7, #9
+**Date:** 2026-07-30, revised 2026-07-31 (three times) · **Scope:** `:wm` only · **Status:**
+decided; binds issues #4, #6, #7, #9, and requires #18
 
-Every claim below about how sway behaves was run against a live headless sway 1.12; the probe
-shapes are at the end. The revision replaced two claims that the probes disproved.
+Every claim below about how sway **or awakener** behaves was run before it was written — against
+a live headless sway 1.12, and through the real `SwayWindowManager` where the question is about
+awakener's client rather than about sway. The probe shapes are at the end.
+
+**Anything not measured is written as an open question and labelled one.** Three drafts of this
+note each replaced a disproved claim with a new plausible sentence that the next probe also
+contradicted; the failure was never the individual sentence, it was writing a reassurance in the
+same breath as a rule and reasoning about awakener's *client* the way the rest of the note
+reasons about sway. So the convention is the note's own now: an unmeasured assertion here is a
+defect, and an honest gap costs one line.
 
 Five bugs found in review today are one diagnosis: *a dock is a real tree node, and some code
 path forgot it*. #2 (fixed), #4, #6, #7, #9. Their fix sites barely overlap, so they will be
@@ -42,7 +50,9 @@ Decision 2 false on its most likely failure path. Both are now named, with their
 implementer will trip over them.
 
 Marks do not go away either — they are demoted. A mark stops being *the* truth and becomes the
-durable hint that survives awakener's own restart while sway keeps running.
+hint that survives awakener's own restart while sway keeps running. "Durable" is the word an
+earlier draft used and it is too strong: #14 and #15 were filed after that draft and both land on
+the mark. See "The mark predicate, pinned" below, which is the one place #9 should read it from.
 
 ---
 
@@ -103,6 +113,42 @@ the table after an awakener restart. The union eliminates false negatives, and a
 negative is the expensive one: mistaking a dock for a Drab mints an agent for the panel and
 writes it to the durable registry.
 
+### The mark predicate, pinned
+
+"Carries the dock mark" is not a predicate, it is two of them, and today the two call sites
+disagree — which is #15. Pin it here so #9 does not get to choose:
+
+> **A dock mark is the configured prefix followed by a parseable `con_id`, and nothing else
+> counts.** One predicate, used by `surfaces()`, by the adoption scan, and by `reapOrphans`
+> alike. A node carrying a prefix-matching mark whose suffix does not parse is **not** a dock; it
+> is reported (per #15's option 4) rather than silently hidden in one place and skipped in the
+> other.
+
+This is #15's option 1, taken here rather than left to the implementer, because #9 rewrites both
+call sites and picking `surfaces()`'s current form would carry #15 into the new design.
+
+Two things this pins and does **not** fix, both measured through the real `SwayWindowManager` on
+sway 1.12 (probe J4):
+
+- **The mark is not durable across a second attach on one surface (#14).** It is derived from
+  the *surface's* `con_id`, and sway's mark namespace is global, so applying it to a second dock
+  takes it off the first — measured directly: after `[con_id=5] mark --add awakener_dock_999`
+  then `[con_id=6] mark --add awakener_dock_999`, node 5's marks are `[]` and node 6's are
+  `[awakener_dock_999]`. **The table mitigates this in-session** — the union still recognises the
+  now-unmarked first dock, which is a point in this design's favour and worth saying — but it is
+  exactly the hint's *durability* that is lost: after an awakener restart the adoption scan
+  cannot see that dock at all. So "the hint that survives awakener's restart" is conditional on
+  no surface ever having been attached twice.
+- **The pinned predicate narrows #15 but does not close it.** A user mark that happens to be
+  `awakener_dock_<some live con_id>` still hides a real window, and measured on the unpinned
+  predicate a mark as ordinary as `awakener_dock_notes` removed a genuine application window from
+  `surfaces()` outright.
+
+**Open question, not settled here:** whether #14's fix is a second mark
+(`<prefix><dockId>_for_<surfaceId>`), a refusal to attach twice to one surface, or both. That
+belongs on #14. What this note fixes is that #9 must not *assume* the mark is durable while #14
+is open.
+
 ### The pre-map gap, which the table alone does not close
 
 This is the sharpest technical point in #9, and the reason a "just add a table" PR would not
@@ -150,10 +196,11 @@ kind of ambiguity this note exists to remove, and it hides the case that breaks 
 There are **three** combinations, not two:
 
 - **awakener restarts, sway keeps running.** The docks and their marks are still standing, so
-  the table is rebuilt by one tree scan at first use: every window carrying the mark prefix
-  becomes an entry, surface id parsed from the mark suffix. That scan is the adoption rule
-  above and it subsumes what `reapOrphans` open-codes. This is what the marks are *for*, now
-  that they are no longer the primary truth.
+  the table is rebuilt by one tree scan at first use: every window matching the pinned mark
+  predicate (prefix + parseable `con_id`) becomes an entry, surface id parsed from the suffix.
+  That scan is the adoption rule above and it subsumes what `reapOrphans` open-codes. This is
+  what the marks are *for*, now that they are no longer the primary truth — subject to #14,
+  which is the one case where a dock has no mark left to be adopted by.
 - **Both restart.** Nothing to carry across; the table starts empty and correct.
 - **sway restarts, awakener does not.** The dangerous one — and the reason this section is
   mechanical rather than prose.
@@ -195,17 +242,55 @@ safety argument for the union actively makes this worse.
 > not repaired; the successor connection starts empty and rebuilds by the adoption scan against
 > the tree it actually finds.
 
-That boundary is observable, and it needs no new machinery. Measured by killing sway under a
-client holding both of the connections `SwayWindowManager` opens:
+### Detecting that boundary needs machinery awakener does not have
+
+An earlier draft said the boundary "is observable, and it needs no new machinery". The *socket*
+observes it; **awakener's client throws the observation away**, and that is the sentence an
+implementer would have acted on.
+
+At the socket the signal is prompt and unambiguous — measured by killing sway under a client
+holding both of the connections `SwayWindowManager` opens:
 
 ```
-   blocked event connection -> EOF ("sway closed the IPC socket") after 0.001s
-   idle command connection  -> EPIPE on its next request
+   blocked event connection -> EOF ("sway closed the IPC socket"), immediately
+   idle command connection  -> ECONNRESET / EPIPE on its next request
 ```
 
-The event connection — the one `changes` already holds open for the session — sees it within
-a millisecond. The command connection is `by lazy { connect() }` and learns only on next use,
-which is late but never *wrong*: it cannot succeed against a dead socket.
+But `SwayConnection.subscribe` catches that EOF and returns *normally* — EOF and a deliberate
+`close()` land on the same line:
+
+```kotlin
+val (type, payload) = try { readMessage() }
+catch (e: IOException) { return@withContext } // closed underneath us; a normal shutdown
+```
+
+and `changes` is a `callbackFlow` whose `job` finishing does not close the channel, so the flow
+neither completes nor fails. Measured against the real `SwayWindowManager`, collecting `changes`
+across a `SIGKILL` of the compositor (probe J1):
+
+```
+   events before death = [Appeared, Focused]
+   after sway death   -> collectorActive=true flowCompleted=false failed=null
+   wm.tree() after death -> java.net.ConnectException: Connection refused
+```
+
+**A collector cannot distinguish a dead compositor from an idle desktop.** So the rule above is
+right and the cost of enforcing it is not zero. What it requires, concretely:
+
+> `subscribe` must distinguish EOF from a deliberate `close()`, and `changes` must close or fail
+> its channel when the connection dies rather than going silent. **Whoever adds reconnect owns
+> that as well as "clears the table in the same commit"** — the two are the same commit, because
+> a boundary that nothing can observe cannot be the trigger for discarding the table.
+
+That is filed as part of **#18**, which is where the collector itself is owed from.
+
+On the command connection: it is `by lazy { connect() }` and learns only on next use, which is
+late. An earlier draft added "but never *wrong*: it cannot succeed against a dead socket", and
+that absolute is false — measured directly (probe R1), a `GET_TREE` written immediately before
+`SIGKILL` came back as a **complete 4473-byte reply on 1 of 6 trials**, and giving sway 5 ms to
+serve it into the socket buffer before the kill made it **6 of 6**. The semantics survive: a
+reply that arrives describes the session that produced it, which is the session the table was
+built against. The sentence did not, and it is the kind of absolute this note now avoids.
 
 Two consequences, stated rather than designed around:
 
@@ -217,8 +302,9 @@ Two consequences, stated rather than designed around:
 - **Today this is latent, not live**, because `commands` never reconnects: a sway restart
   leaves the manager permanently broken rather than quietly wrong. That is not a defence —
   reconnection is table stakes for a daemon, and it is the change that arms this. **Whoever
-  adds reconnect clears the table in the same commit.** Nothing in the four queued PRs would
-  retrofit an invalidation rule this note did not ask for.
+  adds reconnect clears the table in the same commit, and makes the boundary observable in the
+  same commit** (above). Nothing in the four queued PRs would retrofit an invalidation rule this
+  note did not ask for; **#18** is the home for all three.
 
 If a stronger key is ever wanted than "this connection", sway supplies one: with `SWAYSOCK`
 unset the socket is `$XDG_RUNTIME_DIR/sway-ipc.<uid>.<pid>.sock`, so the compositor's pid is in
@@ -271,7 +357,8 @@ accepted it — but worth knowing before someone invents a heartbeat.
 
 **Contract:** `attach` either returns a handle whose `detach()` owns everything the attach
 did, or it throws having left the **tree** as it found it — with the sole residue of a dock
-program that may still be in flight, which the claim below owns. No half-built container is
+program that may still be in flight, which the claim below owns *if a collector exists to read
+the claim*, and which today stands unowned because none does (#18). No half-built container is
 ever observable to a caller.
 
 That is deliberately narrower than "there is no third outcome", because there is one, and
@@ -310,39 +397,131 @@ moment it is still needed.
 ### The late dock: the reservation outlives the attach that filed it
 
 On the failure path the reservation is **not** evicted. It is converted to a **claim** — same
-`app_id`, same `standing` set, deadline one further map timeout out. While a claim stands, the
-first window that maps reporting that `app_id` and is not in `standing` *is* this attach's
-abandoned dock, and it is killed. The claim is then dropped.
+`app_id`, same `standing` set, deadline one further map timeout out.
 
-Kill rather than merely suppress: a suppressed late dock is a window the user can see, cannot
-bind, and nobody owns — strictly worse than either honest alternative. Killing it is the
-compensation `attach` would have run had the window existed in time. It is late, not different.
+An earlier draft then wrote the predicate as *"the first window that maps reporting that `app_id`
+and is not in `standing` **is** this attach's abandoned dock"*. That is false, and it fails in
+the ordinary case rather than a corner. Measured through the real `SwayWindowManager` at stock
+defaults (probe J2): a failed attach with the dock command `sh -c 'exit 1'` — a dock program that
+never starts, so **no late dock ever arrives at all** — followed by the ordinary retry a user
+performs when the panel does not come up:
+
+```
+attach #1 -> IllegalStateException: dock 'aw-dock' never appeared  (after 5011ms)
+             standing set captured at attach #1 = []
+attach #2 -> dock con_id=7 at +31ms into the 5s grace
+   node 5 app_id=aw-app1 marks=[]                  matchesClaimPredicate=false
+   node 7 app_id=aw-dock marks=[awakener_dock_5]   matchesClaimPredicate=true
+```
+
+Node 7 is the **second attach's own dock** — marked, in the table, holding a live handle — and it
+satisfies the claim 31 ms into the grace. `RECLAIM` kills it; attach #2's remaining commands then
+fail against a dead node, so it throws and files a claim of its own, and the next retry is the
+next victim. So *"killing it is the compensation `attach` would have run had the window existed
+in time; it is late, not different"* is exactly wrong here: what dies is a different window,
+belonging to a different attach, that awakener itself knows is a dock.
+
+**The predicate, pinned.** A claim matches a node only if all of these hold:
+
+1. it reports the claim's `app_id`;
+2. it is not in the claim's `standing` set;
+3. it is **not covered by a live reservation**;
+4. it is **not in the dock table**;
+5. the claim's deadline has not passed.
+
+And a claim is **dropped as soon as a later attach for the same `app_id` succeeds** — that
+attach's dock is the window the `app_id` now means, and a claim that outlives it has no
+legitimate target left.
+
+(3) and (4) are what the earlier draft was missing, and (3) is the one that actually does the
+work: **the mark cannot be the exclusion.** Measured (probe J3), at the instant the dock's
+`window::new` arrives the node is present in the tree with `marks=[]`, and it only reads
+`[awakener_dock_5]` once `attach` has returned — the mark lands one round trip *after* the
+window, which is #9's entire premise. Excluding "anything carrying a dock mark" would therefore
+not have saved node 7. The in-memory reservation is the only fact that exists early enough.
+
+Kill rather than merely suppress, where the predicate does match: a suppressed late dock is a
+window the user can see, cannot bind, and nobody owns — worse than either honest alternative.
 
 What it costs, stated rather than designed around:
 
+- **Nothing consumes `changes` today, so `RECLAIM` does nothing at all.** See "The third outcome
+  has no owner" below; this is the first cost, not the last.
 - **It happens after `attach` returned.** It is not inside the transaction and cannot be — the
-  transaction ended. "Left the tree as it found it" holds across the following window only
-  because something outside the transaction finishes the job.
+  transaction ended. "Left the tree as it found it" holds across the following window only if
+  something outside the transaction finishes the job, and today nothing does (#18).
 - **It is event-driven, not scheduled.** A claim is consulted when a `window::new` event
   arrives on the `changes` stream — the same stream `reapOrphans` is driven off — and its
   deadline is evaluated at that moment, not by a timer. Nothing polls, loops, or acts on a
   schedule, per the working agreement. A claim that expires unfired simply loses to the next
-  event that reads it.
+  event that reads it. **The claim is also evaluated against the tree once at filing time**,
+  which closes the millisecond-wide gap between `awaitWindow`'s timeout and the claim existing:
+  `awaitWindow` polls the tree rather than the event stream, so a dock that maps inside that gap
+  emits a `window::new` that no claim is there to read, and nothing re-reads it afterwards.
 - **With `wm.events.enabled = false` there is no event stream, so `RECLAIM` degrades to
   `LEAVE`** and the stray panel stands. That flag's description now owes three sentences, not
   one.
-- **Under `NEW_NODE` the claim is coarse, and now destructively so.** A hand-launched window
-  reporting the dock's shared `app_id` that maps inside the grace is *killed*, not merely
-  hidden. Over-suppression costs a moment's invisibility; an over-reaching claim costs the user
-  a window. This is the strongest argument yet that `PER_SURFACE_APP_ID` should become the
-  default — under it the claim is exact by construction — and it is why the flag below exists.
+- **Under `NEW_NODE` the claim stays coarse even with the predicate pinned, and destructively
+  so.** The exclusions above cover every window *awakener* knows about; they cannot cover a
+  hand-launched window reporting the dock's shared `app_id`, which is killed rather than merely
+  hidden. Over-suppression costs a moment's invisibility; an over-reaching claim costs the user a
+  window. This is the strongest argument yet that `PER_SURFACE_APP_ID` should become the default
+  — under it the claim is exact by construction.
 - **It amends Decision 1's tolerability argument**, which is false as written. Restated: at
   most one *reservation* outstanding at a time, plus at most one *claim* per failed attach,
   each bounded by one map timeout, and none of them surviving the session boundary.
 
-**Flag:** `wm.dock.late_dock` = `RECLAIM` | `LEAVE`, **default `RECLAIM`**. `LEAVE` is today's
-behaviour: the stray panel stands, unmarked and bindable. It is the lever to reach for if
-`RECLAIM` is ever suspected of killing a window it did not spawn.
+**Flag:** `wm.dock.late_dock` = `RECLAIM` | `LEAVE`, **default `LEAVE`** — changed from `RECLAIM`
+in an earlier draft. The pinned predicate removes the cascade above; the default flip is about
+what is left. A timeout has two causes: the dock maps late, or it never starts. **`RECLAIM` has a
+legitimate target only in the first**, and in the second it stands its full grace with no
+legitimate target at all, so the only window it can ever reach is somebody else's. Against that:
+
+- `LEAVE` costs a stray bindable panel — this note's expensive false negative, but a *visible*
+  and recoverable one: a Breath and a registry row, both undoable.
+- `RECLAIM` under `NEW_NODE` costs a user's window, which is not recoverable at all.
+- `RECLAIM` is also not today's behaviour. Nothing reclaims anything today, and nothing can until
+  #18 — so `LEAVE` is both the conservative default and the one that "defaults are what you would
+  have hard-coded" actually selects. Shipping a default whose behaviour cannot be exercised would
+  be worse than either.
+
+`RECLAIM` is the lever for whoever wants the stray panel gone, and it is the right default under
+`PER_SURFACE_APP_ID`, where the claim is exact by construction.
+
+**Open question, not settled here:** which of the two timeout causes dominates in practice. That
+is the number that decides whether `RECLAIM` should be on by default, and measuring it needs a
+real panel program on a real desktop — neither exists yet. This note picks the conservative
+default rather than guessing the distribution, and says so rather than dressing the guess up as a
+finding.
+
+### The third outcome has no owner — #18
+
+The mechanism above is specified against a collector that **does not exist**. Verified on `main`
+(`7a01fe0`) and across every open PR:
+
+```
+$ grep -rn reapOrphans --include='*.kt' .
+wm/src/jvmTest/.../SwayBindingTest.kt:152:        wm.reapOrphans()
+wm/src/jvmMain/.../SwayWindowManager.kt:267:    suspend fun reapOrphans() {
+```
+
+— the declaration and one test. `changes` is likewise declared and never collected outside tests,
+and none of #11, #12 or #17 touches either. PR #12 says so about `reapOrphans` in its own body.
+
+So, stated where it cannot be lost rather than assumed away:
+
+> **Nothing drives `reapOrphans` and nothing collects `changes` today.** Until something does,
+> `RECLAIM` is inert by construction, no claim is ever read, and the contract sentence
+> "'left the tree as it found it' holds because something outside the transaction finishes the
+> job" is true of *nothing*. This note does not design that collector and none of the four PRs is
+> its home; it is **#18**, and it should land before or alongside #6 and #9 rather than after.
+
+The degradation list above names `wm.events.enabled = false` as the case where `RECLAIM` falls
+back to `LEAVE`. "No collector at all" is today's *actual* case and has the same effect for a
+different reason, which is why `LEAVE` being the default costs nothing at the moment.
+
+#18 also owns the boundary-detection machinery from Decision 1 — a collector that cannot tell a
+dead compositor from an idle desktop is the same defect seen from the other end.
 
 ### What `attach` owns
 
@@ -362,7 +541,8 @@ registry binding. On failure, each is compensated in reverse.
 
 The container normalisation must be **one routine shared by unwind and `detach`**, not two.
 #6 is the failure path of a job the success path already does correctly, and duplicating it is
-how the two drift.
+how the two drift. One routine, two failure semantics — `detach` raises, unwind suppresses — so
+the routine reports and the caller decides; see "When a compensating action itself fails".
 
 ### Bookkeeping is not compensation
 
@@ -381,6 +561,16 @@ design.
 So `wm.dock.unwind_failed_attach` covers exactly the tree compensations — the `kill` and the
 container normalisation — and nothing else. The same division answers the fix-order gap below:
 eviction is not part of #6's unwind and never was.
+
+**Where the unconditional part lives**, since #9 lands before #6 and `attach` has no failure
+handling at all today: a `try`/`finally` at the top of `attach`, around the whole method,
+covering only the bookkeeping. **This is not the "top-level `try`/`catch` unwind" that is
+rejected below.** That rejection is about the *lock* — a compensation that runs outside
+`treeEdit` releases the tree between the failure and the repair, and hands another attach a
+window in which to map its dock into the half-built container. Bookkeeping takes no lock, touches
+no compositor state, and cannot be interleaved with anything, so the top of `attach` is the
+correct home for it and the only one that works before #6 exists. Said here because otherwise it
+is invented twice or not at all.
 
 ### When a compensating action itself fails
 
@@ -406,19 +596,50 @@ leading cause of the attach failing, and it fails every compensation that follow
 rule, a compensation throwing means the transaction throws **and** the tree stays modified —
 both halves of the contract violated — with the interesting exception replaced by a dull one.
 
-Consequence for #7's tolerant `run`: it must discriminate on the **literal string
-`"No matching node."`**. `parse_error == false` is not sufficient — three of the four results
-above carry it — and swallowing every `success:false` would silently eat real command failures
-inside the compensation path. That string is a sway internal rather than an API, so it belongs
-in one place with a comment saying so; everything else that fails rides the best-effort path.
+Consequence for #7's tolerant teardown — and here an earlier draft prescribed the wrong
+mechanism. It said the tolerant `run` **must** discriminate on the literal string
+`"No matching node."`. PR #12, the open fix for #7, deliberately does not, and #12 is right:
+
+```kotlin
+suspend fun kill(id: SurfaceId) {
+    val failure = attempt("[con_id=${id.raw}] kill") ?: return
+    check(tree().find(id.raw) == null) { "sway rejected killing ${id.raw}: ${failure.error}" }
+}
+```
+
+*"The acknowledgement is therefore not the thing to check; the tree is."* That is strictly
+better: it takes no dependency on a sway internal, and it also covers the case a string match
+misses — the window dying between the read that found it and the command that acted on it. So the
+rule, re-pointed:
+
+> **Tolerate by checking the post-condition in the tree wherever one exists.** The command
+> succeeded if the tree now has the shape the command was asking for, whatever sway said about
+> it. The literal `"No matching node."` is the *fallback* for a compensation with no readable
+> post-condition, and where it is used it belongs in one place with a comment saying it is a sway
+> internal rather than an API.
+
+What `parse_error` cannot do is still worth knowing, and is why "swallow every `success:false`"
+is not the answer either: three of the four results above carry `parse_error:false`, and
+`split none` failing with `"Can only flatten a child container with no siblings"` is not a
+target-already-gone case at all — it is a genuine failure, which the best-effort rule above
+covers by logging and suppressing it rather than by pretending it succeeded.
+
+One consequence of taking #12's mechanism: **the shared container-normalisation routine now has
+two callers with different failure semantics** — `detach` raises (and `reapOrphans` collects
+per-dock, per #12), while unwind suppresses. That is fine, and it is a rule rather than an
+accident: **the routine reports, the caller decides.** It must not swallow on its own account, or
+`detach`'s aggregate loses the failures it exists to report.
 
 ### Compensation runs under the lock already held
 
-The unwind belongs inside the single `treeEdit` block, as a `TreeEdit`-scoped facility —
+The **tree** unwind belongs inside the single `treeEdit` block, as a `TreeEdit`-scoped facility —
 **not** as `try { attach() } catch { handle.detach() }` at the top of the method. Releasing
 the lock to re-take it hands another attach a window in which to map its dock into the
 half-built container, which is precisely the class of bug the serialisation exists to prevent.
 `Mutex` is not reentrant, so this has to be built where `TreeEdit` already lives.
+
+The bookkeeping `finally` is the exception, and it is not one of these: see "Bookkeeping is not
+compensation". It takes no lock, so it does not release one.
 
 ### Every compensating action is idempotent — this is #7, stated as a rule
 
@@ -428,13 +649,13 @@ instant `kill` is issued. So a teardown that races another teardown reliably iss
 rest of the sweep, turning a transient race into persistent tree damage.
 
 The rule, not the patch: **teardown and compensating commands tolerate the target already
-being gone.** "No matching node" is success for a command whose entire purpose is that the
-node not be there. This wants a distinct `TreeEdit` primitive — a tolerant `run` — used by
-every compensating command, plus per-dock isolation in `reapOrphans` so one dock's failure
-does not end the sweep.
+being gone** — established by reading the tree back, not by reading sway's complaint (above).
+This wants a distinct `TreeEdit` primitive — `kill` in PR #12 is exactly it — used by every
+compensating command, plus per-dock isolation in `reapOrphans` so one dock's failure does not
+end the sweep.
 
 That primitive is what #6's unwind is built on. If #7 lands as a local `try`/`catch` instead,
-#6 has to redo it.
+#6 has to redo it. **PR #12 satisfies this as written**, including the tree-read mechanism.
 
 ### The other declared exception: `no_focus`
 
@@ -485,10 +706,11 @@ re-reading a config awakener does not own clears the set. So the design does not
   both paths regardless; a leaked table entry or reservation is invisible in `get_tree` and
   blinds `surfaces()`, which is the opposite of what this flag is for. The description must say
   both halves.
-- `wm.dock.late_dock` = `RECLAIM` | `LEAVE`, **default `RECLAIM`.** See "The late dock". The
-  description must state that `RECLAIM` kills a window `attach` never saw, that under
-  `NEW_NODE` the predicate is the shared `app_id`, and that it does nothing at all when
-  `wm.events.enabled` is off.
+- `wm.dock.late_dock` = `RECLAIM` | `LEAVE`, **default `LEAVE`.** See "The late dock". The
+  description must state that `RECLAIM` kills a window `attach` never saw; that under `NEW_NODE`
+  the residual predicate is the shared `app_id`, so it can reach a hand-launched window; and that
+  it does nothing at all when `wm.events.enabled` is off **or while nothing collects `changes`,
+  which is the case today (#18)**.
 
 ### Rejected
 
@@ -550,27 +772,42 @@ needs the hotkey path, which does not exist yet. Do not force it into these flag
   and `con_id`s all stay below the line.
 - **Flags first.** Five flags, each defaulting to the behaviour that would otherwise have been
   hard-coded: `wm.dock.recognition`, `wm.dock.pending_suppression`,
-  `wm.dock.focus_suppression`, `wm.dock.unwind_failed_attach`, `wm.dock.late_dock`. None of
-  them gates bookkeeping, and none of them has an off-state that silently breaks a read path —
-  `wm.events.enabled` is the one flag here whose off-state costs correctness elsewhere, and its
-  description is amended to say all of it.
+  `wm.dock.focus_suppression`, `wm.dock.unwind_failed_attach`, `wm.dock.late_dock`. **None of
+  them gates bookkeeping**, which is the property that matters and the one an earlier draft got
+  wrong.
+
+  An earlier draft also claimed none of them "has an off-state that silently breaks a read path",
+  and that is too strong. `wm.dock.recognition = MARK_ONLY` and `wm.dock.late_dock = LEAVE` both
+  leave `surfaces()` reporting a dock as bindable — this note's own expensive false negative. The
+  accurate claim is weaker and still worth making: each off-state is a **chosen** cost, named in
+  the flag's own description, rather than a silent one. `wm.events.enabled` is the one flag whose
+  off-state costs correctness in a path it does not name, and its description is amended to say
+  all of it.
 
 ## Does the recommended fix order still compose
 
-**#7 → #9 → #6 + #4. Yes, unchanged**, with three amendments that are the whole reason to write
-this down:
+**#7 → #9 → #6 + #4**, with three amendments that are the whole reason to write this down — and
+one addition, **#18**, which was filed during this note's third review round.
+
+**#18 does not reorder the four; it is a prerequisite for one of them being verifiable.** #7 and
+#4 are unaffected. #9 can land its table, reservation and claim without a collector — the
+suppression half of #9 is a `surfaces()` read and needs no events at all — but the *claim* half
+is dead code until #18, which is why `wm.dock.late_dock` now defaults to `LEAVE`: shipping
+`RECLAIM` on by default would be shipping a default whose behaviour cannot be exercised. #6 is
+similarly fine, since its unwind is synchronous. So: **#7 → #9 → #6 + #4, with #18 before or
+alongside #9**, and `late_dock` reconsidered once a collector exists. The order holds.
 
 1. **#7 must land the rule, not the patch.** A tolerant teardown primitive on `TreeEdit` plus
    per-dock isolation in `reapOrphans`. #6's unwind is built directly on that primitive; a
-   local `try`/`catch` gets thrown away.
+   local `try`/`catch` gets thrown away. **PR #12 does this**, and its tree-read mechanism is
+   what the note prescribes rather than the string match an earlier draft asked for.
 2. **#9 must land the reservation, not just the table.** A post-map table narrows #9's window
    to a single round trip and leaves it open. #6 also needs something to cancel on the unwind
    path, and an entry that does not exist until the dock maps is not it.
 3. **#9 must land the reservation's whole lifetime, not just its creation.** Otherwise the
    order does not compose: `wm.dock.pending_suppression` defaults `true`, so between #9 merging
    and #6 merging, every failed attach on `main` leaks a permanent reservation and blinds
-   `surfaces()` for the dock's `app_id` — and this note forbids the local `try`/`finally` that
-   would paper over it.
+   `surfaces()` for the dock's `app_id`.
 
    The resolution is not a reordering — #6 before #9 would land an unwind with nothing to
    unwind, and the gap would reappear the moment #9 arrived. It is the division already
@@ -578,6 +815,10 @@ this down:
    `TreeEdit` unwind and never did. #9 owns file, convert, evict, and the claim that outlives a
    failed attach; #6 then adds only the tree compensations, which are the part that actually
    needs to run under the lock. Each PR is self-consistent on `main` on its own.
+
+   Concretely, #9 adds a `try`/`finally` at the top of `attach` covering the bookkeeping only —
+   which is allowed, and is not the "top-level `try`/`catch` unwind" the note rejects. See
+   "Bookkeeping is not compensation" for why the rejection does not reach it.
 
 #6 and #4 stay paired: both rewrite `attach`'s command sequence, and splitting them means
 rewriting the same block twice. #4's mechanism is a step in #6's transaction.
@@ -590,9 +831,17 @@ rewriting the same block twice. #4's mechanism is a step in #6's transaction.
   exists to turn it off.
 - **Over-*reach* under `NEW_NODE` + `RECLAIM`.** The same coarse predicate, but the cost is a
   window killed rather than hidden, and it lands on a user who did nothing but launch a panel
-  by hand during a failed attach. `wm.dock.late_dock = LEAVE` turns it off, and
-  `PER_SURFACE_APP_ID` removes it by construction — which is the sharpest reason yet to revisit
-  that default, below.
+  by hand during a failed attach. This is why `wm.dock.late_dock` defaults to `LEAVE`; it is not
+  fixed, it is off. `PER_SURFACE_APP_ID` removes it by construction — the sharpest reason yet to
+  revisit that default, below.
+- **The mark's durability has two known holes, both open: #14 and #15.** The pinned predicate
+  above (prefix + parseable `con_id`) closes the half of #15 that #9 would otherwise carry
+  forward, and the table mitigates #14 in-session, but neither issue is fixed here and #9 must
+  not assume the mark survives a second attach on one surface. This note is the single place the
+  *recognition* predicate is decided; it is not the place #14's repair is decided.
+- **Nothing collects `changes` and nothing drives `reapOrphans` (#18).** The claim mechanism, and
+  therefore Decision 2's "something outside the transaction finishes the job", is specified
+  against an owner that does not exist yet. See "The third outcome has no owner".
 - **`no_focus` remains unrevocable, and so does an `exec` in flight.** Both are declared
   exceptions to Decision 2 rather than solved problems. `no_focus` is made non-default and
   non-cumulative; the late dock is reclaimed after the fact rather than prevented. Neither is
@@ -600,9 +849,11 @@ rewriting the same block twice. #4's mechanism is a step in #6's transaction.
 - **Reconnecting after a compositor restart** is not designed here. This note defines the
   session boundary and requires the table be discarded at it; it does not say how the manager
   acquires a successor connection, and today it does not try (`commands` is
-  `by lazy { connect() }`). Whoever adds reconnect owns both halves — and awakener's `SWAYSOCK`
-  is itself stale across the boundary, since the default socket path carries the compositor's
-  pid.
+  `by lazy { connect() }`). Whoever adds reconnect owns three things, not two: acquiring the
+  successor connection, clearing the table, **and making the boundary observable at all** —
+  `subscribe` currently swallows the EOF and `changes` goes silent rather than closing. And
+  awakener's `SWAYSOCK` is itself stale across the boundary, since the default socket path
+  carries the compositor's pid. Filed as part of #18.
 - **Changing `wm.dock.mark_prefix` while docks are standing** orphans them permanently: the
   adoption scan will not find them and nothing else can. Sharp edge for the #9 implementer to
   at least document.
@@ -629,24 +880,55 @@ WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_HEADLESS_OUTPUTS=1 \
 ```
 
 Note that a client speaks the i3-ipc wire format directly rather than shelling out to
-`swaymsg`, because three of these probes are about what a *held connection* observes, which a
+`swaymsg`, because several of these probes are about what a *held connection* observes, which a
 per-command process cannot see. `SWAYSOCK` must be a short path: it becomes a `sun_path` and is
 silently truncated past 108 bytes.
+
+**Where the question is about awakener's client rather than about sway, the probe runs through
+the real `SwayWindowManager`** (throwaway tests under `wm/src/jvmTest`, run against a
+`SwayHarness` sway, deleted afterwards; nothing was pushed). That distinction is the one this
+note kept getting wrong: sway signalling something correctly and awakener's client acting on it
+are separate facts, and only the second one is what an implementer reads.
+
+Raw i3-ipc (`R*`):
 
 - **`con_id` monotonic, never recycled** — 96 windows spawn-all/kill-all, then 20 rounds of
   interleaved churn with `split` containers refilling freed ids. 236 containers, 5–240
   contiguous, zero reuse.
 - **Cross-session `con_id` collision** — two sequential sway sessions under one surviving
-  client. Session A's dock id is session B's browser.
-- **No in-place `restart` on 1.12** — `restart` returns `Unknown/invalid command 'restart'`;
-  only `reload` exists.
-- **Connection loss is observable** — kill sway under a client holding both connections. Event
-  connection EOF at 1 ms; command connection EPIPE on its next request.
+  client. Session A's dock id is session B's browser. Fresh sessions allocate from 5.
+- **No in-place `restart` on 1.12** — `restart` returns `Unknown/invalid command 'restart'`
+  with `parse_error:true`; only `reload` exists. `no_focus [...] disable` returns
+  `success:true` because it installs another rule; there is no revoke verb.
+- **R1 — connection loss, three ways** — kill sway under a client holding several connections. A
+  blocked event connection gets EOF immediately. An idle connection gets ECONNRESET/EPIPE on its
+  next request. **An in-flight request can still succeed**: `GET_TREE` written immediately before
+  `SIGKILL` returned a complete 4473-byte reply on **1 of 6** trials, and on **6 of 6** when sway
+  was given 5 ms to serve it into the socket buffer first. That is what disproved "it cannot
+  succeed against a dead socket".
 - **The default socket carries the compositor pid** — start sway with `SWAYSOCK` unset →
   `$XDG_RUNTIME_DIR/sway-ipc.<uid>.<pid>.sock`.
 - **The late dock** — tabbed workspace, `split horizontal`, `exec` a dock that maps 4 s later,
   unwind at 1.5 s. The unwind is clean; the dock then arrives as an unmarked third tab.
-- **Compensation failures distinguishable only by string** — four commands compared on
-  `success` / `parse_error` / `error`.
+- **Compensation failure taxonomy** — four commands compared on `success` / `parse_error` /
+  `error`, including `split none` on a node with siblings, which is the unwind's own
+  normalisation failing in the unwind's own scenario.
 - **`REFOCUS_AFTER_MAP`** — the real attach sequence with a `window` subscription. `new` and
   `focus` in the same millisecond, 73–78 ms transient across three runs, no steal-back over 3 s.
+
+Through the real `SwayWindowManager` (`J*`):
+
+- **J1 — what a collector observes when the compositor dies.** Collect `changes`, `SIGKILL` sway,
+  wait 2 s: `collectorActive=true flowCompleted=false failed=null`. The flow neither completes
+  nor fails; a collector cannot tell a dead compositor from an idle desktop.
+- **J2 — the claim predicate against the ordinary retry.** A failed attach at stock defaults with
+  the dock command `sh -c 'exit 1'`, then a normal attach. The second attach's own dock
+  (`con_id=7`, `marks=[awakener_dock_5]`, in the table) satisfies the un-narrowed claim predicate
+  31 ms into the 5 s grace.
+- **J3 — is the dock marked when its `window::new` arrives?** No: the node is already in the tree
+  with `marks=[]` at that instant, and reads `[awakener_dock_5]` only after `attach` returns.
+  This is why the claim's exclusion has to be the in-memory reservation and cannot be the mark.
+- **J4 — the mark namespace is global and user-facing.** Marking a second node with an existing
+  mark takes it off the first (`5 -> marks=[]`, `6 -> marks=[awakener_dock_999]`), which is #14
+  at the sway level; and adding `awakener_dock_notes` to a real application window removed it
+  from `surfaces()` entirely, which is #15.
