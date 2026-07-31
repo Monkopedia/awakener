@@ -1,7 +1,7 @@
 # Design note: who owns a dock node
 
-**Date:** 2026-07-30, revised 2026-07-31 (three times) · **Scope:** `:wm` only · **Status:**
-decided; binds issues #4, #6, #7, #9, and requires #18
+**Date:** 2026-07-30, revised 2026-07-31 (three times, then amended for #20) · **Scope:** `:wm`
+only · **Status:** decided; binds issues #4, #6, #7, #9, and requires #18
 
 Every claim below about how sway **or awakener** behaves was run before it was written — against
 a live headless sway 1.12, and through the real `SwayWindowManager` where the question is about
@@ -242,11 +242,13 @@ safety argument for the union actively makes this worse.
 > not repaired; the successor connection starts empty and rebuilds by the adoption scan against
 > the tree it actually finds.
 
-### Detecting that boundary needs machinery awakener does not have
+### Detecting that boundary needed machinery awakener did not have — added by #20
 
 An earlier draft said the boundary "is observable, and it needs no new machinery". The *socket*
-observes it; **awakener's client throws the observation away**, and that is the sentence an
-implementer would have acted on.
+observes it; **awakener's client threw the observation away**, and that is the sentence an
+implementer would have acted on. The machinery is now present — it landed as **#20** — so the
+rest of this section is the record of what was wrong and what was built; the amendment that
+states today's behaviour is at the end of it.
 
 At the socket the signal is prompt and unambiguous — measured by killing sway under a client
 holding both of the connections `SwayWindowManager` opens:
@@ -256,17 +258,18 @@ holding both of the connections `SwayWindowManager` opens:
    idle command connection  -> ECONNRESET / EPIPE on its next request
 ```
 
-But `SwayConnection.subscribe` catches that EOF and returns *normally* — EOF and a deliberate
-`close()` land on the same line:
+But `SwayConnection.subscribe` *caught* that EOF and returned *normally* — EOF and a deliberate
+`close()` landed on the same line (this is the pre-#20 code, kept because it is what the
+measurement below was taken against):
 
 ```kotlin
 val (type, payload) = try { readMessage() }
 catch (e: IOException) { return@withContext } // closed underneath us; a normal shutdown
 ```
 
-and `changes` is a `callbackFlow` whose `job` finishing does not close the channel, so the flow
-neither completes nor fails. Measured against the real `SwayWindowManager`, collecting `changes`
-across a `SIGKILL` of the compositor (probe J1):
+and `changes` was a `callbackFlow` whose `job` finishing did not close the channel, so the flow
+neither completed nor failed. Measured against the real `SwayWindowManager` at that commit,
+collecting `changes` across a `SIGKILL` of the compositor (probe J1):
 
 ```
    events before death = [Appeared, Focused]
@@ -274,23 +277,25 @@ across a `SIGKILL` of the compositor (probe J1):
    wm.tree() after death -> java.net.ConnectException: Connection refused
 ```
 
-**A collector cannot distinguish a dead compositor from an idle desktop.** So the rule above is
-right and the cost of enforcing it is not zero. What it requires, concretely:
+**A collector could not distinguish a dead compositor from an idle desktop.** So the rule above is
+right and the cost of enforcing it was not zero. What it required, concretely:
 
 > `subscribe` must distinguish EOF from a deliberate `close()`, and `changes` must close or fail
-> its channel when the connection dies rather than going silent. **Whoever adds reconnect owns
-> that as well as "clears the table in the same commit"** — the two are the same commit, because
-> a boundary that nothing can observe cannot be the trigger for discarding the table.
+> its channel when the connection dies rather than going silent. **Until that exists the table
+> rule has no trigger**, because a boundary nothing can observe cannot be what discards the table.
+> *(Both halves done by #20 — see below. This is the requirement as it stood before it.)*
 
 That was filed as part of **#18**, which is where the collector itself is owed from, and **the
 observation half of it has since landed as #20**: `subscribe` returns only when the caller closed
 the connection and throws `CompositorSessionEnded` otherwise, and `changes` closes its channel with
 that cause. Re-measured through the real `SwayWindowManager` the same way, the probe above now
 reads `collectorActive=false flowCompleted=false failed=CompositorSessionEnded` after the `SIGKILL`
-and is unchanged on an idle desktop. So the boundary is observable; **nothing observes it yet**,
-which is the rest of #18. Reporting death is not the same as reacting to it, and #20 deliberately
-did not build the reaction — discarding the table on that signal is still the reconnect owner's,
-in the commit that acquires the successor connection.
+and is unchanged on an idle desktop — both halves measured, and both are now asserted by
+`SwaySessionEndTest`. So the boundary is observable; **nothing observes it yet**, which is the
+rest of #18 — that half is read off the source rather than probed: `changes` has no collector
+outside tests and `commands` is still `by lazy { connect() }`. Reporting death is not the same as
+reacting to it, and #20 deliberately did not build the reaction — discarding the table on that
+signal is still the reconnect owner's, in the commit that acquires the successor connection.
 
 On the command connection: it is `by lazy { connect() }` and learns only on next use, which is
 late. An earlier draft added "but never *wrong*: it cannot succeed against a dead socket", and
@@ -298,7 +303,10 @@ that absolute is false — measured directly (probe R1), a `GET_TREE` written im
 `SIGKILL` came back as a **complete 4473-byte reply on 1 of 6 trials**, and giving sway 5 ms to
 serve it into the socket buffer before the kill made it **6 of 6**. The semantics survive: a
 reply that arrives describes the session that produced it, which is the session the table was
-built against. The sentence did not, and it is the kind of absolute this note now avoids.
+built against. The sentence did not, and it is the kind of absolute this note now avoids. #20 left
+`request` alone for that reason, so the command path still has no *typed* session-ended signal:
+after the session ends it raises an untyped `IOException` on the held connection and a
+`ConnectException` on a fresh one (measured in #20's review, not by a probe recorded here).
 
 Two consequences, stated rather than designed around:
 
@@ -310,9 +318,10 @@ Two consequences, stated rather than designed around:
 - **Today this is latent, not live**, because `commands` never reconnects: a sway restart
   leaves the manager permanently broken rather than quietly wrong. That is not a defence —
   reconnection is table stakes for a daemon, and it is the change that arms this. **Whoever
-  adds reconnect clears the table in the same commit, and makes the boundary observable in the
-  same commit** (above). Nothing in the four queued PRs would retrofit an invalidation rule this
-  note did not ask for; **#18** is the home for all three.
+  adds reconnect clears the table in the same commit** — the trigger it clears on already
+  exists, since #20 made the boundary observable (above). Nothing in the four queued PRs would
+  retrofit an invalidation rule this note did not ask for; **#18** is the home for both of the
+  pieces that remain — acquiring the successor connection, and discarding the table.
 
 If a stronger key is ever wanted than "this connection", sway supplies one: with `SWAYSOCK`
 unset the socket is `$XDG_RUNTIME_DIR/sway-ipc.<uid>.<pid>.sock`, so the compositor's pid is in
@@ -528,8 +537,9 @@ The degradation list above names `wm.events.enabled = false` as the case where `
 back to `LEAVE`. "No collector at all" is today's *actual* case and has the same effect for a
 different reason, which is why `LEAVE` being the default costs nothing at the moment.
 
-#18 also owns the boundary-detection machinery from Decision 1 — a collector that cannot tell a
-dead compositor from an idle desktop is the same defect seen from the other end.
+#18 also owns the *reaction* to Decision 1's session boundary. The detection itself landed as #20,
+so what is missing there is the same thing that is missing here: a report `changes` now makes and
+nothing collects is the same defect seen from the other end.
 
 ### What `attach` owns
 
