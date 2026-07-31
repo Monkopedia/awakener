@@ -34,16 +34,36 @@ internal data class DockReservation(
         node.appId == appId && node.id !in standing && !deadline.hasPassedNow()
 }
 
+/** Where an entry's claim that a node is a dock came from. */
+internal enum class DockOrigin {
+    /** This process spawned the window and marked it, inside the tree-edit lock. */
+    STOOD_UP,
+
+    /** A read found the mark on a node the table did not know, and recorded what it read. */
+    ADOPTED,
+}
+
+/**
+ * What the table knows about one dock.
+ *
+ * [origin] is here because the orphan sweep asks a different question than enumeration does.
+ * Enumeration only needs to know the node is a dock; a sweep is about to *kill* it, and an
+ * adopted entry is a recognition this process latched at some past read rather than evidence
+ * that exists now. See [WmFlags.reapEvidence].
+ */
+internal data class DockEntry(val surface: SurfaceId, val origin: DockOrigin)
+
 /** The table as one value, so a reader sees a consistent view without taking a lock. */
 internal data class DockTableSnapshot(
     /**
-     * Dock `con_id` → the surface that dock belongs to.
+     * Dock `con_id` → what is known about that dock.
      *
-     * Nothing more, because nothing reads more. The `app_id` an earlier draft carried had no
-     * reader, and an adopted entry could not supply one anyway: a dock recognised from its mark
-     * is whatever node wears the mark, and sway's `app_id` is absent on an xwayland window.
+     * The surface it belongs to and where the claim came from, and nothing else, because nothing
+     * reads more. The `app_id` an earlier draft carried had no reader, and an adopted entry could
+     * not supply one anyway: a dock recognised from its mark is whatever node wears the mark, and
+     * sway's `app_id` is absent on an xwayland window.
      */
-    val entries: Map<Long, SurfaceId> = emptyMap(),
+    val entries: Map<Long, DockEntry> = emptyMap(),
     val reservations: List<DockReservation> = emptyList(),
 ) {
     /** Whether an attach in flight has reserved the `app_id` [node] reports. */
@@ -58,6 +78,15 @@ internal data class DockTableSnapshot(
  * distinction is the whole of an adopted dock's durability: the mark is a hint sway will move to
  * the next dock on the same surface (#14), so a recognition that leaves no record behind hands
  * the first agent panel back as a bindable surface the moment it does.
+ *
+ * **Recording is one-way.** Nothing here un-records a node whose mark went away, so recognition
+ * outlives the evidence that produced it: a genuine application window that carried
+ * `<prefix><some live con_id>` — a user's own mark, #15's acknowledged residual — at any single
+ * enumeration stays out of `surfaces()` for the life of this process, and `swaymsg unmark` does
+ * not bring it back. `wm.dock.recognition=MARK_ONLY` does, live, and so does restarting awakener;
+ * those are the whole of the recovery. What the latch is *not* allowed to do is destroy that
+ * window, which is why the orphan sweep asks [DockEntry.origin] rather than trusting the entry —
+ * see [WmFlags.reapEvidence].
  *
  * Authoritative for exactly that one predicate. It never says a window exists — the tree keeps
  * that, and a node the tree has dropped is simply never asked about — and it is never consulted
@@ -94,8 +123,8 @@ internal class DockTable {
     fun release(reservation: DockReservation) =
         state.update { it.copy(reservations = it.reservations - reservation) }
 
-    fun record(dock: SurfaceId, surface: SurfaceId) =
-        state.update { it.copy(entries = it.entries + (dock.raw to surface)) }
+    fun record(dock: SurfaceId, surface: SurfaceId, origin: DockOrigin) =
+        state.update { it.copy(entries = it.entries + (dock.raw to DockEntry(surface, origin))) }
 
     fun forget(dock: SurfaceId) =
         state.update { it.copy(entries = it.entries - dock.raw) }

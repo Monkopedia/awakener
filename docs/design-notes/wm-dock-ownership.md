@@ -80,7 +80,8 @@ reboot. If the table ever appears in `resolve`'s path, the durability story has 
 
 ### What it keys on
 
-`SurfaceId` (the dock's `con_id`) → `SurfaceId` (the surface it belongs to), and nothing else.
+`SurfaceId` (the dock's `con_id`) → `{ surface: SurfaceId, origin }`, where `origin` is
+`STOOD_UP` or `ADOPTED`, and nothing else.
 
 > **Amended 2026-07-31**, from `{ surface, agent: AgentId, appId, markApplied: Boolean }` plus a
 > secondary index by `surface`. That shape was reasoned, not measured, and #9's implementation
@@ -91,6 +92,12 @@ reboot. If the table ever appears in `resolve`'s path, the durability story has 
 > is a field nothing keeps honest. `appId` had no reader either, and an *adopted* entry cannot
 > supply one: a dock recognised from its mark is whatever node wears the mark, and sway reports
 > no `app_id` at all for an xwayland window. Add each back with the caller that needs it.
+>
+> **Amended again, same day:** `origin` is the one field that arrived with its caller. `surfaces()`
+> does not care where a claim came from; `reapOrphans` does, because it kills what it acts on, and
+> a recorded adoption is a recognition latched at some past read rather than evidence that exists
+> now. See "Recording is one-way" below. This is the rule working as intended rather than an
+> exception to it.
 
 **Adoption records; it does not merely answer.** "Tree has a marked node the table does not know
 — adopt it", below, is a write. An implementation that computes the union freshly on every read
@@ -101,6 +108,32 @@ the same surface. sway moves the mark (#14), and the read-time union has nothing
 from, so the first agent panel comes back as a bindable surface — while being invisible to
 `reapOrphans`, which shares the predicate, so nothing can take it down either. A recorded
 adoption survives the mark moving; a recomputed one does not.
+
+**Recording is one-way, and that is the price.** *(Added 2026-07-31, measured on #23's second
+head with the pre-adoption code as the control in the same worktree.)* Nothing withdraws a
+record, so recognition outlives the evidence that produced it. Run #15's acknowledged residual —
+a user's own mark that happens to be `<prefix><some live con_id>`, on a genuine application
+window — through one enumeration and the window is a dock for the life of the process:
+`swaymsg unmark` used to hand it straight back (`[5, 6]`) and now does not (`[5]`). One
+enumeration while the mark is on is what arms it; mark and unmark with no read in between leaves
+the window alone. `wm.dock.recognition=MARK_ONLY` releases it live (measured `[5]` → `[5, 6]`),
+and so does restarting awakener. Those are the whole of the recovery.
+
+What that must not become is a **kill**. Measured on the same head before the gate below existed:
+the surface named in the removed mark closes, a sweep runs, and `reapOrphans` destroys the user's
+window on the strength of a mark that is no longer there. This note's own bar, two hundred lines
+down, is that `RECLAIM` under `NEW_NODE` *"costs a user's window, which is not recoverable at
+all"*. So the destructive path asks a narrower question than enumeration does: **a sweep kills
+only on evidence that exists at the moment of the sweep** — a dock mark on the node now, or an
+entry with `origin = STOOD_UP`. `wm.dock.reap_evidence` carries the choice, defaulting to that
+(`CURRENT`); `RECOGNITION` is the older, wider behaviour.
+
+The gap `CURRENT` leaves is exactly one case, and it is the mirror of the false negative above: a
+dock **adopted** after a restart whose mark a later attach then moved (#14) has neither kind of
+current evidence, so it stays out of enumeration — no agent is minted for the panel, which was
+the expensive half — but its panel is left standing when its surface closes and has to be closed
+by hand. A leftover panel is recoverable; a destroyed window is not. That asymmetry is the whole
+argument, and it is the same one that makes recognition a union in the first place.
 
 `con_id` is the right key and the only available one: it is what every sway criteria command
 takes, and it is what the tree returns. It is a key **only within one compositor session**,
@@ -145,6 +178,11 @@ disagree — which is #15. Pin it here so #9 does not get to choose:
 This is #15's option 1, taken here rather than left to the implementer, because #9 rewrites both
 call sites and picking `surfaces()`'s current form would carry #15 into the new design.
 
+`wm.dock.reap_evidence` does **not** reopen this. The two call sites still answer "is this node a
+dock" from the one predicate; what the sweep additionally asks is whether the evidence is current,
+because it is about to kill. Narrowing the *action* is not the same as the two sites disagreeing
+about the *predicate*, which is what left a window unreachable by every path at once.
+
 Two things this pins and does **not** fix, both measured through the real `SwayWindowManager` on
 sway 1.12 (probe J4):
 
@@ -161,10 +199,16 @@ sway 1.12 (probe J4):
   sway, and asserted by `an adopted dock stays a dock when a later attach takes its mark`. What
   is genuinely lost is narrower: a dock whose mark moves before anything has enumerated it —
   a hand-run `swaymsg mark`, say — since there was nothing there to adopt it.)*
-- **The pinned predicate narrows #15 but does not close it.** A user mark that happens to be
-  `awakener_dock_<some live con_id>` still hides a real window, and measured on the unpinned
-  predicate a mark as ordinary as `awakener_dock_notes` removed a genuine application window from
-  `surfaces()` outright.
+- **The pinned predicate narrows #15's trigger and widens its consequence.** A user mark that
+  happens to be `awakener_dock_<some live con_id>` still hides a real window — and measured on the
+  unpinned predicate a mark as ordinary as `awakener_dock_notes` removed a genuine application
+  window from `surfaces()` outright, which the pinned one does not. *(Amended 2026-07-31: "still
+  hides a real window" understated it once adoption records. The hiding is no longer transient —
+  removing the mark does not release the window, because a recorded node is never asked about its
+  marks again — so it lasts for the life of the process, and `wm.dock.recognition=MARK_ONLY` or an
+  awakener restart is the only way back. It stops there: `wm.dock.reap_evidence=CURRENT`, the
+  default, keeps the sweep from killing a window on a recognition with no live mark and no
+  stood-up entry behind it. See "Recording is one-way".)*
 
 **Open question, not settled here:** whether #14's fix is a second mark
 (`<prefix><dockId>_for_<surfaceId>`), a refusal to attach twice to one surface, or both. That
@@ -364,7 +408,14 @@ accepted it — but worth knowing before someone invents a heartbeat.
 - `wm.dock.recognition` = `MARK_ONLY` | `MARK_OR_TABLE`, **default `MARK_OR_TABLE`.**
   `MARK_ONLY` is today's behaviour and is the debuggable one — the whole truth is in
   `swaymsg -t get_tree`, with nothing hidden in process memory. It is the lever to reach for
-  if the table is ever suspected of hiding a real surface.
+  if the table is ever suspected of hiding a real surface — and since adoption records, it is
+  the *only* thing short of a restart that releases one; see "Recording is one-way".
+- `wm.dock.reap_evidence` = `CURRENT` | `RECOGNITION`, **default `CURRENT`.** *(Added
+  2026-07-31 with #23.)* What the orphan sweep must see before it kills a node enumeration calls
+  a dock: a mark on it now or a `STOOD_UP` entry (`CURRENT`), or nothing further at all
+  (`RECOGNITION`, the wider, older behaviour). The default costs one case — an adopted dock whose
+  mark a later attach moved is no longer reaped — and buys the case where the alternative
+  destroys a user's window.
 - `wm.dock.pending_suppression` = boolean, **default `true`.** The reservation. Off is
   today's behaviour, i.e. #9 unfixed but with no over-suppression risk at all. It gates whether
   a reservation is *filed*; it never gates whether one is cleared, and neither does any other
@@ -810,8 +861,8 @@ needs the hotkey path, which does not exist yet. Do not force it into these flag
 - **Compositor-agnostic above `:wm`.** The table is keyed on `SurfaceId`, a `:wm` value class,
   and is never returned or consulted from above. Marks, criteria, `no_focus`, split containers
   and `con_id`s all stay below the line.
-- **Flags first.** Five flags, each defaulting to the behaviour that would otherwise have been
-  hard-coded: `wm.dock.recognition`, `wm.dock.pending_suppression`,
+- **Flags first.** Six flags, each defaulting to the behaviour that would otherwise have been
+  hard-coded: `wm.dock.recognition`, `wm.dock.reap_evidence`, `wm.dock.pending_suppression`,
   `wm.dock.focus_suppression`, `wm.dock.unwind_failed_attach`, `wm.dock.late_dock`. **None of
   them gates bookkeeping**, which is the property that matters and the one an earlier draft got
   wrong.
@@ -894,9 +945,18 @@ rewriting the same block twice. #4's mechanism is a step in #6's transaction.
   landed as #20; `changes` now fails with `CompositorSessionEnded` where it used to go silent, so
   the trigger exists and is unclaimed. And awakener's `SWAYSOCK` is itself stale across the
   boundary, since the default socket path carries the compositor's pid. Filed as part of #18.
-- **Changing `wm.dock.mark_prefix` while docks are standing** orphans them permanently: the
-  adoption scan will not find them and nothing else can. Sharp edge for the #9 implementer to
-  at least document.
+- **Changing `wm.dock.mark_prefix` while docks are standing** orphans far less than this bullet
+  used to claim, and hides more. *(Amended 2026-07-31, measured against #23's second head with the
+  pre-adoption code as the control: fresh manager over intact marks, one `surfaces()`, then flip
+  the prefix — the dock is still recognised, `[5]`, where the pre-adoption code hands it back as a
+  bindable surface, `[5, 7]`.)* Because adoption records, everything already in the record
+  survives the flip: the docks this process stood up, and every dock any read has recognised from
+  its old-prefix mark. What is genuinely orphaned is narrower — a dock nothing has enumerated
+  since this process started, which then becomes an ordinary bindable surface and stops being
+  reapable. The mirror image is the sharper edge and was never stated: a genuine window hidden by
+  a prefix-shaped *user* mark under the old value stays hidden under the new one, for the same
+  reason and with the same recovery (`MARK_ONLY`, or a restart). Moving the prefix is still a
+  restart with no docks standing rather than a flip.
 - **Whether `PER_SURFACE_APP_ID` should be the default.** Still untouched here, on purpose —
   but the balance has moved. Two of this note's own decisions (the reservation, and `RECLAIM`)
   are exact under it and coarse under `NEW_NODE`, and one of them is destructive when coarse.

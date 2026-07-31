@@ -42,6 +42,15 @@ enum class DockRecognition {
     MARK_OR_TABLE,
 }
 
+/** What the orphan sweep accepts as proof that a node is a dock, before it kills it. */
+enum class ReapEvidence {
+    /** A dock mark on the node now, or an entry written when this process stood the dock up. */
+    CURRENT,
+
+    /** Whatever enumeration recognises, an adopted node whose mark has since gone included. */
+    RECOGNITION,
+}
+
 /** What happens to a dock whose bound surface has gone away. */
 enum class OrphanPolicy {
     /** Tear the dock down with its surface. */
@@ -102,10 +111,14 @@ object WmFlags {
             "mark — this prefix followed by the bound surface's con_id, nothing else — is what " +
             "keeps them out of surface enumeration and focus scripting across an awakener " +
             "restart, while sway keeps running. Changing it against a running desktop orphans " +
-            "every dock whose mark was written under the old value: this process still knows " +
-            "the ones it stood up itself, but a dock it only knows by mark becomes an ordinary " +
-            "bindable surface and an orphaned one stops being reapable. Moving the prefix is a " +
-            "restart with no docks standing, not a flip.",
+            "less than it looks and hides more. It orphans only a dock nothing has enumerated " +
+            "since this process started: everything else is already in the record — the docks " +
+            "this process stood up, and every dock recognised from its old-prefix mark by any " +
+            "read, since recognising a dock records it — and a recorded node is never matched " +
+            "against the prefix again, so the flip carries it. That last clause is also the " +
+            "sharp edge: a genuine window hidden by a prefix-shaped user mark under the old " +
+            "value stays hidden under the new one, and removing the mark does not release it " +
+            "either. Moving the prefix is a restart with no docks standing, not a flip.",
     )
 
     val dockRecognition = Flags.enum(
@@ -120,10 +133,13 @@ object WmFlags {
             "direction only, the record being ahead of the mark during an attach and the mark " +
             "outliving an awakener restart the record cannot. Recognising a dock by its mark " +
             "adds it to the record, so a dock adopted after a restart stays recognised even " +
-            "once a second attach on that surface moves the mark off it. MARK_ONLY is the " +
-            "previous behaviour and the debuggable one — the whole truth is then in `swaymsg -t " +
-            "get_tree` with nothing held in process memory — and it is the lever to reach for " +
-            "if the record is ever suspected of hiding a real window. It also stops a pending " +
+            "once a second attach on that surface moves the mark off it — and nothing " +
+            "withdraws that record, so under MARK_OR_TABLE a node that carried a dock-shaped " +
+            "mark at any single read is a dock for the life of the process whatever its marks " +
+            "say afterwards. MARK_ONLY is the previous behaviour and the debuggable one — the " +
+            "whole truth is then in `swaymsg -t get_tree` with nothing held in process memory " +
+            "— and it is the lever to reach for if the record is ever suspected of hiding a " +
+            "real window, being the only thing that releases one live. It also stops a pending " +
             "attach's reservation from suppressing anything, for the same reason. The record is " +
             "never written to disk and is never consulted by resolve, which answers from the " +
             "durable registry.",
@@ -146,6 +162,26 @@ object WmFlags {
             "registry write for the panel. Under PER_SURFACE_APP_ID the suppression is exact. " +
             "This decides only whether a reservation is filed; nothing decides whether one is " +
             "cleared, which is unconditional.",
+    )
+
+    val reapEvidence = Flags.enum(
+        "wm.dock.reap_evidence",
+        ReapEvidence.CURRENT,
+        "What the orphan sweep must see before it kills a node it believes is a dock. " +
+            "Recognising a dock by its mark records it, which is what keeps an adopted dock " +
+            "recognised after a second attach moves that mark (#14) — and that record is never " +
+            "withdrawn, so recognition outlives the mark that produced it. A genuine window " +
+            "carrying a user's own mark that happens to be the dock prefix plus a live con_id " +
+            "(#15) is therefore hidden from enumeration for the life of the process even after " +
+            "the mark is removed. Being hidden is recoverable — wm.dock.recognition=MARK_ONLY, " +
+            "or an awakener restart — and being killed is not, so CURRENT will not reap on that " +
+            "latched recognition alone: it kills only a node carrying a dock mark at the moment " +
+            "of the sweep, or one this process recorded when it stood the dock up itself. What " +
+            "that costs is the single case with neither, a dock adopted after a restart whose " +
+            "mark a later attach then took: it stays out of enumeration but its panel is left " +
+            "standing when its surface closes, to be closed by hand. RECOGNITION reaps " +
+            "everything enumeration calls a dock, which closes that gap at the price of the " +
+            "user's window.",
     )
 
     val orphanPolicy = Flags.enum(

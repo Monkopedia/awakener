@@ -262,6 +262,104 @@ class SwayBindingTest {
     }
 
     /**
+     * The cost side of materialising adoption, and the one place it must not be paid.
+     *
+     * #15's acknowledged residual is a user's own mark that happens to be the prefix plus a
+     * *live* `con_id`: it hides a genuine application window. That used to be self-healing —
+     * `swaymsg unmark` handed the window straight back — and recording what a read recognises
+     * makes it permanent, because nothing withdraws a record. Enumeration keeps hiding the
+     * window here on purpose; `wm.dock.recognition=MARK_ONLY` is the lever that releases it.
+     *
+     * What must not follow is the sweep destroying it. The window carries no dock mark at all by
+     * then, and this process never stood it up, so the only thing saying "dock" is a recognition
+     * latched at an earlier read — and the note's bar for acting destructively on a coarse
+     * predicate is explicit: a user's window is not recoverable at all.
+     */
+    @Test
+    fun `a window whose dock-shaped mark is gone stays hidden but is not killed`() = swayTest {
+        val app = openSurface("aw-app1")
+        val victim = openSurface("aw-app2")
+
+        command("[con_id=${victim.raw}] mark --add ${markFor(app)}")
+        assertEquals(
+            listOf(app.raw),
+            wm.surfaces().map { it.id.raw },
+            "while the mark is on, the pinned predicate says dock and the window is hidden",
+        )
+
+        command("[con_id=${victim.raw}] unmark ${markFor(app)}")
+        assertEquals(emptyList(), marksOf(victim), "the user's mark really is gone")
+        assertEquals(
+            listOf(app.raw),
+            wm.surfaces().map { it.id.raw },
+            "documented rather than desired: the enumeration above recorded the node, and a " +
+                "record is never withdrawn, so the window stays hidden until MARK_ONLY or a " +
+                "restart releases it",
+        )
+
+        command("[con_id=${app.raw}] kill")
+        awaitGone(app)
+        wm.reapOrphans()
+
+        assertNotNull(
+            wm.tree().find(victim.raw),
+            "and this is the line: a latched recognition may hide a window, which the user can " +
+                "get back, but it may not kill one, which they cannot",
+        )
+    }
+
+    /**
+     * The hazard kept reproducible, the same way `MARK_ONLY` keeps its own. Reaping on whatever
+     * enumeration recognises closes one real gap — an adopted dock whose mark a later attach took
+     * (#14) is then still swept — and the price is this window.
+     */
+    @Test
+    fun `reaping on a latched recognition is switchable on`() = swayTest {
+        store.put(WmFlags.reapEvidence, ReapEvidence.RECOGNITION)
+        val app = openSurface("aw-app1")
+        val victim = openSurface("aw-app2")
+
+        command("[con_id=${victim.raw}] mark --add ${markFor(app)}")
+        wm.surfaces()
+        command("[con_id=${victim.raw}] unmark ${markFor(app)}")
+
+        command("[con_id=${app.raw}] kill")
+        awaitGone(app)
+        wm.reapOrphans()
+
+        awaitGone(victim)
+        assertNull(
+            wm.tree().find(victim.raw),
+            "with the flag flipped the sweep acts on the record alone, which is what costs the " +
+                "user's window — the flag must actually change behaviour",
+        )
+    }
+
+    /**
+     * The other direction, so that requiring current evidence has not quietly stopped the sweep
+     * from doing its job. A restarted awakener knows a standing dock only by its mark — and the
+     * mark is evidence that exists now, so the orphan still comes down.
+     */
+    @Test
+    fun `a dock adopted after a restart is still reaped when its surface closes`() = swayTest {
+        val app = openSurface("aw-app1")
+        val dock = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1")).dockId
+
+        wm = SwayWindowManager({ sway.connection() }, store, bindingStore(), scope)
+        assertEquals(
+            listOf(app.raw),
+            wm.surfaces().map { it.id.raw },
+            "the fresh manager adopts the dock from its mark",
+        )
+
+        command("[con_id=${app.raw}] kill")
+        awaitGone(app)
+        wm.reapOrphans()
+
+        assertNull(wm.tree().find(dock.raw), "the dock must not outlive its surface")
+    }
+
+    /**
      * The reservation covers the dock from before it exists, so it has to be given back whether
      * the attach worked or not — and a leaked one is invisible in the tree while hiding every
      * window under the dock's `app_id` for the life of the process. Cancelled rather than left to

@@ -89,13 +89,28 @@ class DockTableTest {
     @Test
     fun `an entry names the surface its dock was stood up for`() {
         val table = DockTable()
-        table.record(SurfaceId(9), SurfaceId(4))
+        table.record(SurfaceId(9), SurfaceId(4), DockOrigin.STOOD_UP)
 
-        assertEquals(SurfaceId(4), table.snapshot().entries[9])
+        assertEquals(DockEntry(SurfaceId(4), DockOrigin.STOOD_UP), table.snapshot().entries[9])
 
         table.forget(SurfaceId(9))
 
         assertNull(table.snapshot().entries[9], "a torn-down dock is not a dock")
+    }
+
+    /**
+     * The one thing the origin is for: an adopted entry is a recognition latched at some past
+     * read, and the orphan sweep is about to kill what it acts on. Keeping the two apart is what
+     * lets `surfaces()` go on hiding a window while nothing destroys it.
+     */
+    @Test
+    fun `an entry says whether it was stood up or adopted from a mark`() {
+        val table = DockTable()
+        table.record(SurfaceId(9), SurfaceId(4), DockOrigin.STOOD_UP)
+        table.record(SurfaceId(11), SurfaceId(4), DockOrigin.ADOPTED)
+
+        assertEquals(DockOrigin.STOOD_UP, table.snapshot().entries[9]?.origin)
+        assertEquals(DockOrigin.ADOPTED, table.snapshot().entries[11]?.origin)
     }
 
     private fun window(id: Long, appId: String? = null, marks: List<String> = emptyList()) =
