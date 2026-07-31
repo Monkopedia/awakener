@@ -252,11 +252,15 @@ class FlagDiscoveryTest {
      * the permission that stops us is the jar's own or a directory's above it: the second shape
      * used to be reported as "does not exist", about a real jar that is exactly where the
      * manifest says it is.
+     *
+     * [unreadableEntries] rides along because the requirement is the same one and it is not
+     * really about archives: whatever an entry claims, a refused look leaves nothing true to
+     * say except which permission refused it.
      */
     @Test
-    fun `an archive that cannot be read is reported as unreadable, not as something else`() {
+    fun `an entry that cannot be read is reported as unreadable, not as something else`() {
         val pathingJar = dir.resolve("pathing.jar").toFile()
-        for ((shape, entry) in unreadableArchives()) {
+        for ((shape, entry) in unreadableArchives() + unreadableEntries()) {
             val reports = mapOf(
                 "top level" to FlagDiscovery.discover(classPath = entry.path),
                 "manifest" to discoverThrough(pathingJar, listOf(entry.path)),
@@ -316,6 +320,36 @@ class FlagDiscoveryTest {
         assertTrue(
             report.problems.singleOrNull()?.contains("could not be read") == true,
             "an entry nothing could read said nothing: ${report.problems}",
+        )
+    }
+
+    /**
+     * And the cost of an entry that cannot be resolved is that entry, never its siblings. A
+     * `Class-Path` entry the platform's own filesystem will not accept — on Linux a NUL, which
+     * is what a `%00` becomes once the URI is decoded — used to throw out of the manifest loop,
+     * and [FlagDiscovery]'s handler is per *classpath* entry: the throw was charged to the
+     * pathing jar, so every remaining entry went with it and the message named a jar that read
+     * perfectly well. Both halves are the contract this module is for — the flags behind a good
+     * entry arrive, and nothing asserts a fact about a file nothing opened.
+     */
+    @Test
+    fun `an unusable manifest entry costs that entry and not its siblings`() {
+        val real = stagedArchive("siblings/real.jar")
+        val report = discoverThrough(
+            dir.resolve("pathing.jar").toFile(),
+            listOf("bad%00name.jar", real.path),
+        )
+        assertTrue(
+            "com.monkopedia.awakener.wm.WmFlags" in report.loaded,
+            "one unusable Class-Path entry cost its siblings as well: $report",
+        )
+        assertTrue(
+            report.problems.none { "pathing.jar could not be read" in it },
+            "the pathing jar read fine and was blamed anyway: ${report.problems}",
+        )
+        assertTrue(
+            report.problems.singleOrNull()?.contains("bad") == true,
+            "the entry that could not be used was not the one named: ${report.problems}",
         )
     }
 
@@ -425,12 +459,14 @@ class FlagDiscoveryTest {
             "an http: URL" to "http://elsewhere.invalid/wm.jar",
             "a jar: URL" to "jar:file:${jar.path}!/",
             "a relative path to nothing" to "gone/nowhere.jar",
+            "a path holding a character no filesystem accepts" to "bad%00name.jar",
             "an archive called .war" to stagedArchive("wm.war").path,
             "an archive with no extension" to stagedArchive("wm-no-extension").path,
             "a file that is not an archive" to
                 dir.resolve("notes.txt").toFile().apply { writeText("not an archive") }.path,
             "something that is neither file nor directory" to "/dev/null",
-        ) + (brokenArchives() + missingArchives()).mapValues { (_, file) -> file.path }
+        ) + (brokenArchives() + missingArchives() + unreadableEntries())
+            .mapValues { (_, file) -> file.path }
     }
 
     /**
@@ -490,6 +526,44 @@ class FlagDiscoveryTest {
         return mapOf(
             "a .jar that cannot be read" to unreadable,
             "a .jar behind a directory that cannot be read" to behindLockedDirectory,
+        )
+    }
+
+    /**
+     * The rest of the widening `a top-level entry that cannot be read is reported though it
+     * claims nothing` pins, kept as rows rather than as prose in a PR: neither of these is
+     * *named* as an archive, so on `main` — which decided by name and never opened anything —
+     * both were silently nothing. They are the two remaining ways the filesystem answers
+     * neither yes nor no: a mode that refuses the stat, and a link that resolves forever.
+     */
+    private fun unreadableEntries(): Map<String, File> {
+        val locked = dir.resolve("locked-package").toFile().apply {
+            setReadable(true, false)
+            setExecutable(true, false)
+        }
+        locked.resolve("com/monkopedia/awakener").mkdirs()
+        locked.setReadable(false, false)
+        locked.setExecutable(false, false)
+
+        val home = dir.resolve("loop").toFile().apply { mkdirs() }
+        val there = File(home, "there.jar")
+        val back = File(home, "back.jar")
+        listOf(there, back).forEach { Files.deleteIfExists(it.toPath()) }
+        Files.createSymbolicLink(there.toPath(), back.toPath())
+        Files.createSymbolicLink(back.toPath(), there.toPath())
+
+        assertTrue(
+            !locked.canRead(),
+            "$locked is still readable, so it proves nothing — run as root?",
+        )
+        assertTrue(
+            Files.readSymbolicLink(there.toPath()) == back.toPath() &&
+                Files.readSymbolicLink(back.toPath()) == there.toPath(),
+            "$there does not close a loop, so it proves nothing",
+        )
+        return mapOf(
+            "a directory holding the package that cannot be read" to locked,
+            "a symlink loop" to there,
         )
     }
 

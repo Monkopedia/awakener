@@ -191,7 +191,14 @@ object FlagDiscovery {
                     // took this arm and was reported as missing. What we cannot resolve here is
                     // queued instead, so the fault reported is the one [scan] establishes by
                     // trying to open it.
-                    Files.notExists(target.toPath()) ->
+                    //
+                    // Contained, because [File.toPath] throws on a path the platform's own
+                    // filesystem refuses — on Linux a NUL, which is what a `%00` in an entry
+                    // becomes once the URI is decoded. [scan]'s handler is per *classpath*
+                    // entry, so a throw escaping here is charged to the pathing jar: it would
+                    // cost every sibling entry as well and name a jar that read perfectly well.
+                    // [manifestEntry] contains `URI` for the same reason.
+                    runCatching { Files.notExists(target.toPath()) }.getOrDefault(false) ->
                         problems += "$declaredBy points at $target, which does not exist"
                     else -> pending += Candidate(target, declaredBy)
                 }
