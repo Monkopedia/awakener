@@ -203,6 +203,43 @@ class FlagDiscoveryTest {
     }
 
     /**
+     * The other property, on the side that had no guard. Top-level silence is deliberate for an
+     * entry making no claim, but a file *named* `.jar` that will not open is broken rather than
+     * unrecognised — and reading content to decide what an entry is must not turn the broken
+     * ones into the `loaded=[], problems=[]` this module exists to abolish. A newly discovered
+     * way for an archive to be broken belongs in [brokenArchives], not in a test of its own.
+     */
+    @Test
+    fun `no top-level classpath entry claiming to be an archive is dropped in silence`() {
+        val silent = brokenArchives()
+            .mapValues { (_, entry) -> FlagDiscovery.discover(classPath = entry.path) }
+            .filterValues { it.loaded.isEmpty() && it.problems.isEmpty() }
+        assertEquals(emptyMap(), silent, "these classpath entries vanished without a word")
+    }
+
+    /**
+     * And of the broken ones, the entry that could not be read at all has to say so rather than
+     * be diagnosed. "It is not an archive" is a fact we never established — we never got to
+     * look — and permissions are the one fault here an operator can actually fix, so naming the
+     * wrong one costs the fix as surely as silence would. True on both paths.
+     */
+    @Test
+    fun `an archive that cannot be read is reported as unreadable, not as no archive`() {
+        val unreadable = brokenArchives().getValue("a .jar that cannot be read")
+        val reports = mapOf(
+            "top level" to FlagDiscovery.discover(classPath = unreadable.path),
+            "manifest" to
+                discoverThrough(dir.resolve("pathing.jar").toFile(), listOf(unreadable.path)),
+        )
+        for ((path, report) in reports) {
+            assertTrue(
+                report.problems.singleOrNull()?.contains("could not be read") == true,
+                "$path: an unreadable archive was not reported as unreadable: ${report.problems}",
+            )
+        }
+    }
+
+    /**
      * `file://localhost/…` is the authority form of a local path — the JVM's own `URLClassPath`
      * accepts it — but `File(URI)` refuses any authority at all, so it was reported as "not a
      * local file", which it plainly is.
@@ -250,9 +287,48 @@ class FlagDiscoveryTest {
     }
 
     /**
+     * Reading an entry to decide what it *is* must not make its content its *identity*. Entries
+     * are still de-duplicated by absolute path, and this is the case where collapsing them by
+     * content would cost a whole module's flags: a `Class-Path` entry is a URL resolved against
+     * the jar that names it, so two byte-identical pathing jars in two directories name two
+     * different files. Identical bytes, different declarations — both have to be followed.
+     */
+    @Test
+    fun `byte-identical classpath entries in different directories are both followed`() {
+        stagedArchive("first/lib/module.jar")
+        stagedArchive("second/lib/module.jar", module = "registry")
+        val first = writePathingJar(
+            dir.resolve("first/pathing.jar").toFile(),
+            listOf("lib/module.jar"),
+        )
+        val second = first.copyTo(dir.resolve("second/pathing.jar").toFile(), overwrite = true)
+        assertTrue(
+            first.readBytes().contentEquals(second.readBytes()),
+            "the two entries do not have identical content, so this proves nothing",
+        )
+
+        val report = FlagDiscovery.discover(
+            classPath = listOf(first, second).joinToString(File.pathSeparator) { it.path },
+        )
+        assertEquals(
+            listOf(
+                "com.monkopedia.awakener.wm.WmFlags",
+                "com.monkopedia.awakener.registry.RegistryFlags",
+            ),
+            report.loaded,
+            "two entries with identical content did not both contribute: $report",
+        )
+        assertEquals(emptyList(), report.problems)
+    }
+
+    /**
      * Every shape of `Class-Path` entry known to reach this code. Each one either names the real
      * `:wm` classpath or is unusable — none of them is legitimately empty, so a case reporting
      * neither flags nor a problem has lost something.
+     *
+     * A directory that opens fine and genuinely holds no `com/monkopedia/awakener` package is
+     * the one entry that may report nothing at all, and it is deliberately not a row here: it
+     * was read successfully and is empty, which is not the ambiguity this property is about.
      */
     private fun manifestCorpus(): Map<String, String> {
         val jar = stagedUnder("lib").first()
@@ -274,14 +350,42 @@ class FlagDiscoveryTest {
             "a file that is not an archive" to
                 dir.resolve("notes.txt").toFile().apply { writeText("not an archive") }.path,
             "something that is neither file nor directory" to "/dev/null",
+        ) + brokenArchives().mapValues { (_, file) -> file.path }
+    }
+
+    /**
+     * The ways a file that calls itself an archive fails to be one. Deciding an entry's type by
+     * reading it rather than by its name is what this change is for, and the failure mode it
+     * risks is exactly the one being fixed: a read that goes wrong answering "not an archive"
+     * and vanishing. These are the commonest classpath faults there are — an interrupted
+     * download, a half-written copy, a permission-mangled cache — and none may pass in silence.
+     */
+    private fun brokenArchives(): Map<String, File> {
+        val home = dir.resolve("broken").toFile()
+        home.mkdirs()
+        val unreadable = stagedArchive("broken/unreadable.jar")
+        unreadable.setReadable(false, false)
+        assertTrue(
+            !unreadable.canRead(),
+            "$unreadable is still readable, so the permission case proves nothing — run as root?",
+        )
+        return mapOf(
+            "a zero-byte .jar" to File(home, "zero.jar").apply { writeBytes(ByteArray(0)) },
+            "a .jar truncated past its header" to File(home, "truncated.jar")
+                .apply { writeBytes(byteArrayOf(0x50, 0x4B, 0x03, 0x04, 0x0A, 0x00)) },
+            "a .jar that is not an archive at all" to
+                File(home, "text.jar").apply { writeText("not an archive") },
+            // A real archive, so the only thing standing between discovery and its flags is the
+            // permission — "it is not an archive" would be a statement of a fact not in evidence.
+            "a .jar that cannot be read" to unreadable,
         )
     }
 
-    /** The real `:wm` jar under a name that says nothing true about what is inside it. */
-    private fun stagedArchive(name: String): File {
+    /** A real module jar under a name and place that say nothing true about what is inside. */
+    private fun stagedArchive(path: String, module: String = "wm"): File {
         val source = classPath.split(File.pathSeparator).map(::File)
-            .first { "/wm/build/" in it.path && it.isFile }
-        val staged = dir.resolve("archives").toFile().resolve(name)
+            .first { "/$module/build/" in it.path && it.isFile }
+        val staged = dir.toFile().resolve(path)
         staged.parentFile.mkdirs()
         source.copyTo(staged, overwrite = true)
         return staged
@@ -301,12 +405,16 @@ class FlagDiscoveryTest {
         }
     }
 
-    private fun discoverThrough(pathingJar: File, entries: List<String>): FlagDiscovery.Report {
+    private fun discoverThrough(pathingJar: File, entries: List<String>): FlagDiscovery.Report =
+        FlagDiscovery.discover(classPath = writePathingJar(pathingJar, entries).path)
+
+    private fun writePathingJar(file: File, entries: List<String>): File {
         val manifest = Manifest().apply {
             mainAttributes[Attributes.Name.MANIFEST_VERSION] = "1.0"
             mainAttributes[Attributes.Name.CLASS_PATH] = entries.joinToString(" ")
         }
-        JarOutputStream(pathingJar.outputStream(), manifest).close()
-        return FlagDiscovery.discover(classPath = pathingJar.path)
+        file.parentFile?.mkdirs()
+        JarOutputStream(file.outputStream(), manifest).close()
+        return file
     }
 }

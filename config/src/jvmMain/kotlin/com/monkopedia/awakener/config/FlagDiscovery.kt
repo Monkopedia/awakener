@@ -75,6 +75,12 @@ object FlagDiscovery {
                 when {
                     entry.isDirectory -> found += entry.classesUnderPackage()
                     entry.isArchive -> found += entry.scanJar(pending, problems)
+                    // An extension is a claim, and a file that claims to be an archive and is
+                    // not one is broken rather than unrecognised — an interrupted download, a
+                    // half-written copy. That is the commonest classpath fault there is, and it
+                    // is worth contradicting wherever the entry came from.
+                    entry.namedArchive ->
+                        problems += "$entry is named as an archive but is not one"
                     // Anything else at the top level is not ours to open — the JVM was handed
                     // that classpath, not us — and a warning per entry would put noise in front
                     // of the ones that mean something. A manifest entry is the opposite case: a
@@ -96,13 +102,29 @@ object FlagDiscovery {
      * `Class-Path` entry is a URL, and a URL says nothing about the file it names, so a `.war`
      * or an extension-less jar is an archive the JVM's own `URLClassPath` opens — deciding by
      * name would drop the flags inside it. Four bytes settle what the name cannot.
+     *
+     * The cost is an open and a read of four bytes per classpath entry where there used to be a
+     * string compare — a handful of syscalls once per process, against a module's whole flag set.
      */
-    private val ARCHIVE_HEADERS = setOf("PK\u0003\u0004", "PK\u0005\u0006", "PK\u0007\u0008")
+    private val ARCHIVE_HEADERS = listOf(
+        byteArrayOf(0x50, 0x4B, 0x03, 0x04),
+        byteArrayOf(0x50, 0x4B, 0x05, 0x06),
+        byteArrayOf(0x50, 0x4B, 0x07, 0x08),
+    )
 
+    /**
+     * Throws rather than answering `false` when the file cannot be read, because "we could not
+     * look" is a different fact from "we looked and it is not an archive" — [scan] turns the
+     * throw into the problem naming the real fault, which for a permission-denied entry is the
+     * only one an operator can act on.
+     */
     private val File.isArchive: Boolean
-        get() = isFile &&
-            runCatching { inputStream().use { it.readNBytes(4) } }
-                .getOrNull()?.toString(Charsets.ISO_8859_1) in ARCHIVE_HEADERS
+        get() = isFile && inputStream().use { it.readNBytes(4) }
+            .let { header -> ARCHIVE_HEADERS.any { it contentEquals header } }
+
+    private val File.namedArchive: Boolean
+        get() = extension.equals("jar", ignoreCase = true) ||
+            extension.equals("zip", ignoreCase = true)
 
     private fun File.classesUnderPackage(): List<String> {
         val root = resolve(PACKAGE)
