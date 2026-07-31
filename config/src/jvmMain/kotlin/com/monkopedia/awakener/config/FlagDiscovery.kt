@@ -83,9 +83,15 @@ object FlagDiscovery {
                         problems += "$entry is named as an archive but is not one"
                     // Anything else at the top level is not ours to open — the JVM was handed
                     // that classpath, not us — and a warning per entry would put noise in front
-                    // of the ones that mean something. A manifest entry is the opposite case: a
-                    // jar of ours deliberately named it, so dropping it costs every flag behind
-                    // it and reads exactly like a module that declares none.
+                    // of the ones that mean something. That silence is for the entry we looked
+                    // at and recognised as nothing, and for the one there was nothing to look
+                    // at; an entry we could not read never reaches this arm, because [isArchive]
+                    // throws and the handler below names the fault. `main` was silent there too,
+                    // having decided by name and never opened it — reporting is the deliberate
+                    // widening, since a failed read is not a recognition and permission is a
+                    // fault an operator can fix. A manifest entry is the opposite case: a jar of
+                    // ours deliberately named it, so dropping it costs every flag behind it and
+                    // reads exactly like a module that declares none.
                     declaredBy != null -> problems += "$declaredBy points at $entry, which is " +
                         "neither a directory nor an archive"
                 }
@@ -122,9 +128,18 @@ object FlagDiscovery {
         get() = isFile && inputStream().use { it.readNBytes(4) }
             .let { header -> ARCHIVE_HEADERS.any { it contentEquals header } }
 
+    /** What the name claims, against what [ARCHIVE_HEADERS] establishes. */
+    private val ARCHIVE_EXTENSIONS = listOf("jar", "zip")
+
+    /**
+     * A claim worth contradicting, but only once there is a file to contradict: a `.jar` that has
+     * been evicted from a cache, deleted with its build directory or left behind as a dangling
+     * symlink was never opened, so saying it is not an archive would be the fact never in
+     * evidence [isArchive] exists to avoid. What we know about a missing entry is that it is
+     * missing, which the manifest path already says and the top level has no standing to.
+     */
     private val File.namedArchive: Boolean
-        get() = extension.equals("jar", ignoreCase = true) ||
-            extension.equals("zip", ignoreCase = true)
+        get() = isFile && ARCHIVE_EXTENSIONS.any { extension.equals(it, ignoreCase = true) }
 
     private fun File.classesUnderPackage(): List<String> {
         val root = resolve(PACKAGE)

@@ -5,6 +5,7 @@ import com.monkopedia.awakener.config.FlagDiscoveryMode
 import com.monkopedia.awakener.config.Flags
 import java.io.File
 import java.net.URI
+import java.nio.file.Files
 import java.util.jar.Attributes
 import java.util.jar.JarOutputStream
 import java.util.jar.Manifest
@@ -240,6 +241,55 @@ class FlagDiscoveryTest {
     }
 
     /**
+     * The mirror of [brokenArchives], and the commonest classpath fault of the lot: an evicted
+     * cache, a deleted build directory, a moved artifact. Nothing opened these, so nothing may
+     * say what is inside them — "is named as an archive but is not one" is the same fact never in
+     * evidence that the unreadable case is about, one cell over. What each path may say differs
+     * because what each path knows differs: at the top level the entry is the JVM's own and we
+     * looked at nothing, so silence; under a manifest a jar of ours named it, and "does not
+     * exist" is both true and the whole of what we found out.
+     */
+    @Test
+    fun `a named archive that is not there is not diagnosed as a broken one`() {
+        val pathingJar = dir.resolve("pathing.jar").toFile()
+        for ((shape, entry) in missingArchives()) {
+            assertEquals(
+                FlagDiscovery.Report(emptyList(), emptyList()),
+                FlagDiscovery.discover(classPath = entry.path),
+                "top level: $shape was diagnosed by a reader that never opened it",
+            )
+            val problem = discoverThrough(pathingJar, listOf(entry.path)).problems.single()
+            assertTrue(
+                "does not exist" in problem,
+                "manifest: $shape was not reported as missing: $problem",
+            )
+        }
+    }
+
+    /**
+     * The widening in the other direction, asserted because it is a choice rather than an
+     * oversight. Top-level silence covers the entry we recognised as nothing; it cannot cover one
+     * we never managed to read, because deciding what an entry is now means opening it, and a
+     * failed open leaves no answer rather than a negative one. `main` was silent here having
+     * never looked — and permission is the one fault on this list an operator can fix.
+     */
+    @Test
+    fun `a top-level entry that cannot be read is reported though it claims nothing`() {
+        val unreadable = dir.resolve("unnamed-and-unreadable").toFile()
+        unreadable.writeText("not an archive, and not readable either")
+        unreadable.setReadable(false, false)
+        assertTrue(
+            !unreadable.canRead(),
+            "$unreadable is still readable, so this proves nothing — run as root?",
+        )
+        val report = FlagDiscovery.discover(classPath = unreadable.path)
+        assertTrue(
+            report.problems.singleOrNull()?.contains("could not be read") == true,
+            "an entry nothing could read said nothing: ${report.problems}",
+        )
+    }
+
+    /**
      * `file://localhost/…` is the authority form of a local path — the JVM's own `URLClassPath`
      * accepts it — but `File(URI)` refuses any authority at all, so it was reported as "not a
      * local file", which it plainly is.
@@ -350,7 +400,7 @@ class FlagDiscoveryTest {
             "a file that is not an archive" to
                 dir.resolve("notes.txt").toFile().apply { writeText("not an archive") }.path,
             "something that is neither file nor directory" to "/dev/null",
-        ) + brokenArchives().mapValues { (_, file) -> file.path }
+        ) + (brokenArchives() + missingArchives()).mapValues { (_, file) -> file.path }
     }
 
     /**
@@ -359,6 +409,11 @@ class FlagDiscoveryTest {
      * risks is exactly the one being fixed: a read that goes wrong answering "not an archive"
      * and vanishing. These are the commonest classpath faults there are — an interrupted
      * download, a half-written copy, a permission-mangled cache — and none may pass in silence.
+     *
+     * A `.jar` that is simply *not there* is [missingArchives] instead, because nothing opened
+     * it: it is not an archive that failed to be one, and the two must not collapse into one
+     * message. It is also the one member of this family the top level may pass over in silence,
+     * which is why it cannot be a row here.
      */
     private fun brokenArchives(): Map<String, File> {
         val home = dir.resolve("broken").toFile()
@@ -378,6 +433,27 @@ class FlagDiscoveryTest {
             // A real archive, so the only thing standing between discovery and its flags is the
             // permission — "it is not an archive" would be a statement of a fact not in evidence.
             "a .jar that cannot be read" to unreadable,
+        )
+    }
+
+    /**
+     * The ways a `.jar` named on a classpath is not there at all — the file gone, or the symlink
+     * standing where it used to be. Spliced into [manifestCorpus] because a jar of ours naming a
+     * file that has gone has lost every flag behind it; the top-level half is pinned separately,
+     * since there the honest report is the one `main` gave, which is none.
+     */
+    private fun missingArchives(): Map<String, File> {
+        val home = dir.resolve("missing").toFile()
+        home.mkdirs()
+        val dangling = File(home, "dangling.jar")
+        Files.createSymbolicLink(dangling.toPath(), File(home, "deleted.jar").toPath())
+        assertTrue(
+            Files.isSymbolicLink(dangling.toPath()) && !dangling.exists(),
+            "$dangling is not a dangling symlink, so it proves nothing",
+        )
+        return mapOf(
+            "a .jar that is not there" to File(home, "gone.jar"),
+            "a .jar that is a dangling symlink" to dangling,
         )
     }
 
