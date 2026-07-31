@@ -148,7 +148,11 @@ everything can't tell gist from noise.
 - An app having a clean API does **not** disqualify it from getting an agent — the durable
   asset is the personal model, not the driving expertise.
 - The binding unit is whatever has a durable personal model behind it. For most apps that's
-  the window; for Chrome it's the origin.
+  the window; for Chrome it's the origin. **For Waydroid it can only be the package** — not a
+  design choice but a substrate limit, measured 2026-07-31: two tasks of one app produce two
+  toplevels with identical `app_id` *and* identical title, and every Waydroid toplevel reports
+  the same `pid`, because the whole container is one Wayland client. Per-task binding has
+  nothing to key on from the WM layer and would need a Waydroid-side channel.
 - Every surface gets an agent. "This app doesn't get one" breaks the invariant that makes
   the whole thing worth reaching for.
 
@@ -156,14 +160,22 @@ everything can't tell gist from noise.
 
 ## Open — resolve before building on them
 
-1. ~~**Waydroid freeform lifecycle.**~~ **RESOLVED 2026-07-30** — occluded windows stay
-   RESUMED, and Android never learns it was occluded at all, so the Waydroid plan stands. See
-   `docs/findings/2026-07-30-waydroid-occlusion-probe.md`. The real lifecycle cliffs turn out
-   to be *window close* (the Android task is destroyed) and *all windows closed* (Waydroid
-   freezes the whole container by default), both of which belong to attach/detach discipline
-   rather than to the compositor abstraction. Re-confirm on a real GPU before relying on it:
-   the probe ran under software rendering, which cannot rule out buffer back-pressure from a
-   gbm-backed Waydroid.
+1. ~~**Waydroid freeform lifecycle.**~~ **RESOLVED 2026-07-30, re-confirmed natively
+   2026-07-31** — occluded windows stay RESUMED and Android never learns it was occluded at
+   all, so the Waydroid plan stands. The native re-run
+   (`docs/findings/2026-07-31-waydroid-occlusion-native.md`) removed the TCG timing caveat and
+   tightened the CPU corroboration from 40% jitter to 0.8%. Still **not** settled: the probe
+   ran under software rendering both times, so buffer back-pressure from a *gbm/DRM-backed*
+   Waydroid remains untested and needs adolin's real GPU.
+
+   The real lifecycle cliffs are *window close* (the Android task is destroyed) and *all
+   windows closed*, both of which belong to attach/detach discipline. Two things the native
+   run added: the freeze is driven by Android's display sleep, **not** by window count or
+   `waydroid.active_apps` — neither predicts it in either direction, and only
+   `cgroup.freeze` reads true. And enabling multi-window is a **race** that a fast host loses
+   deterministically, whose symptom is other agents' surfaces vanishing and their activities
+   going STOPPED, so a Waydroid manager must assert `android.hardware.type.pc` at startup
+   rather than assume the property took effect.
 2. **Focus contention for native non-Waydroid apps.** Input injection goes to the focused
    surface. Either the agent steals focus mid-sentence or the app needs a second headless
    instance, which many apps refuse. Probably per-app tiering, not a general solution.

@@ -84,11 +84,19 @@ conversation, not a local workaround.
 
 - **kaladin** — this repo's host. Headless: no `/dev/dri`, no seat, no compositor. Cannot run
   anything needing a display. **`sudo` here is passwordless**, so installing a tool you need
-  is your call to make, not something to ask Jason for. `sway`, `foot`, `chromium`, `jq` and
-  `qemu` are already present. **No KVM**: the kernel reports
-  `SVM disabled (by BIOS) in MSR_VM_CR`, so virtualisation is a firmware setting no amount of
-  `modprobe` will fix, and VM work runs under TCG at roughly 10-20x slowdown.
-  `kernel.dmesg_restrict=1`, so read kernel messages with `journalctl -k`, not `dmesg`.
+  is your call to make, not something to ask Jason for. `sway`, `foot`, `chromium`, `jq`,
+  `qemu` and `waydroid` are already present. **KVM works** (Jason enabled SVM in firmware on
+  2026-07-31): `kvm_amd` loads at boot, `/dev/kvm` is mode 0666, nested virtualisation is on.
+  Binder needs nothing — the LTS kernel ships `CONFIG_ANDROID_BINDER_IPC_RUST=y`, so Waydroid
+  runs natively with no DKMS module. `kernel.dmesg_restrict=1`, so read kernel messages with
+  `journalctl -k`, not `dmesg`.
+- **kaladin has hung twice at kernel level** (2026-07-30 15:09 and 07-31 00:07): powered but
+  unresponsive, no journal, staying dark until power-cycled. It is now instrumented —
+  `kernel.panic=30` and `panic_on_oops=1` so a panic reboots instead of hanging forever, a 60s
+  systemd hardware watchdog, netconsole streaming kernel output to adolin
+  (`~/kaladin-netconsole/kernel.log`), and a 15s load/thermal sampler at
+  `/var/log/kaladin-load.log`. Cause unproven. Keep concurrent heavy work modest and prefer
+  targeted module tests over repeated full builds.
 - **adolin** — the desktop, and awakener's actual target. GPU, active seat0, running
   **GNOME Shell**. `google-chrome-stable` and `xorg-xwayland` installed. Reachable by
   passwordless ssh from kaladin, but **sudo there requires a password** — Jason runs
