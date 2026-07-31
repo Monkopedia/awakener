@@ -60,6 +60,20 @@ class FlagVisibilityTest {
     }
 
     /**
+     * And a module that calls its holder `Flags` — the name the registry itself uses, which no
+     * package outside `:config` has any reason to avoid. The declarer is
+     * [com.monkopedia.awakener.futuremodule.Flags], referenced by nothing either, so this key
+     * appears only if discovery kept it.
+     */
+    @Test
+    fun `a holder sharing the registry's name still gets its flags listed`() {
+        assertTrue(
+            "futuremodule.plain_named_knob" in list().keys(),
+            "a declarer named Flags is invisible to list",
+        )
+    }
+
+    /**
      * Discovery can only find what is on the classpath, so the other half of the guarantee is
      * the build: `:cli` depends on every module in the build, computed from the build itself.
      * If a new module is included in `settings.gradle.kts` this starts covering it too.
