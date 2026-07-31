@@ -26,6 +26,17 @@ class SwayHarness private constructor(
     /** Launches a window that simply sits there, for use as a surface or a dock. */
     fun windowCommand(appId: String): String = "$FOOT -a $appId -- sleep 3600"
 
+    /**
+     * SIGKILLs sway and waits for it to be gone, which is a compositor crash as a client sees it.
+     *
+     * `destroyForcibly` is SIGKILL on Unix, and the signal matters: anything sway could catch
+     * would let it shut its listeners down tidily, and a test that closes the socket politely is
+     * testing the deliberate-close path it is supposed to be distinguishing itself from.
+     */
+    fun kill() {
+        process.destroyForcibly().waitFor()
+    }
+
     override fun close() {
         process.destroy()
         if (!process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) process.destroyForcibly()

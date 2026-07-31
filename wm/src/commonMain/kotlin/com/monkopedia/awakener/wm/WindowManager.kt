@@ -61,6 +61,22 @@ sealed interface SurfaceChange {
 }
 
 /**
+ * The compositor session behind [WindowManager.changes] ended: the connection the stream was
+ * riding on died rather than being closed by the collector.
+ *
+ * It exists because the two are otherwise the same observation — a stream that stops producing —
+ * and they want opposite responses. Nothing happening is the desktop's normal resting state; the
+ * compositor going away means every handle, every dock and the whole in-memory view of the tree
+ * describes a session that no longer exists. A collector that cannot tell them apart treats the
+ * second as the first and keeps waiting, which is what this is here to prevent.
+ *
+ * Deliberately compositor-agnostic: a collector learns that the session ended, not what was
+ * speaking on the other end of the socket.
+ */
+class CompositorSessionEnded(message: String, cause: Throwable? = null) :
+    IllegalStateException(message, cause)
+
+/**
  * A live dock bound to a surface.
  *
  * Teardown lives here rather than as a `detach` on [WindowManager] deliberately: the design's
@@ -128,5 +144,14 @@ interface WindowManager {
      */
     suspend fun attach(surface: SurfaceId, dock: DockSpec, agent: AgentId? = null): DockHandle
 
+    /**
+     * Every window change the compositor reports, for as long as it is there to report them.
+     *
+     * **The stream says when it is over, and why.** It completes normally when there is nothing
+     * more to say — the collector stopped, or events are switched off — and fails with
+     * [CompositorSessionEnded] when the session it was reading from died. Going quiet is not one
+     * of the endings: an idle desktop is a live stream with nothing on it, which is the normal
+     * resting state and must stay distinguishable from a compositor that is gone.
+     */
     val changes: Flow<SurfaceChange>
 }

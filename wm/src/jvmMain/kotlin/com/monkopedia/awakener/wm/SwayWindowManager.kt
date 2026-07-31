@@ -265,21 +265,34 @@ class SwayWindowManager(
         }
         val events = connect()
         val job = scope.launch {
-            events.subscribe(listOf("window")) { _, payload ->
-                val event = swayJson.decodeFromString<WindowEvent>(payload)
-                val container = event.container ?: return@subscribe
-                val id = SurfaceId(container.id)
-                when (event.change) {
-                    "new" -> trySend(
-                        SurfaceChange.Appeared(
-                            id,
-                            Surface(id, container.appId, container.name, container.pid),
-                        ),
-                    )
-                    "close" -> trySend(SurfaceChange.Vanished(id))
-                    "focus" -> trySend(SurfaceChange.Focused(id))
+            // However the subscription ends, it ends this flow — and with the reason attached.
+            // A job that simply finished left the channel open, so a collector saw a compositor
+            // that had gone away as a desktop on which nothing was happening. Caught rather than
+            // left to the scope for the same reason: an exception delivered to `scope` is one the
+            // collector never learns about.
+            val failure = try {
+                events.subscribe(listOf("window")) { _, payload ->
+                    val event = swayJson.decodeFromString<WindowEvent>(payload)
+                    val container = event.container ?: return@subscribe
+                    val id = SurfaceId(container.id)
+                    when (event.change) {
+                        "new" -> trySend(
+                            SurfaceChange.Appeared(
+                                id,
+                                Surface(id, container.appId, container.name, container.pid),
+                            ),
+                        )
+                        "close" -> trySend(SurfaceChange.Vanished(id))
+                        "focus" -> trySend(SurfaceChange.Focused(id))
+                    }
                 }
+                null
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                failure
             }
+            close(failure)
         }
         awaitClose {
             job.cancel()
