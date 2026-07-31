@@ -7,6 +7,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlinx.coroutines.test.runTest
 
 class SurfaceKeyTest {
     @Test
@@ -60,6 +61,72 @@ class SurfaceKeyTest {
             origin.slug,
             truncatedAway.slug,
             "two origins that differ only past the truncation point must still differ",
+        )
+    }
+
+    /**
+     * The `app_id` half of #13. Both strings are things an ordinary desktop program can ask the
+     * compositor for — `foot -a <anything>`, or a Chrome `--app=URL` toplevel — and they are a
+     * real collision under the 32-bit FNV-1a this replaced: sanitised prefixes equal past the
+     * 48-character truncation, digests equal, so the second surface was handed the first one's
+     * agent id and residue file.
+     */
+    @Test
+    fun `a program cannot choose an app_id that mints another surface's agent`() = runTest {
+        val appId = "chrome-github.com__Monkopedia__awakener__pull__11-Default"
+        val impostor = "chrome-github.com__Monkopedia__awakener__pull__hOtRa4"
+        assertMintsSeparately(
+            SurfaceDescriptor(appId, "Pull request 11", 1),
+            SurfaceDescriptor(impostor, "Anything at all", 2),
+        )
+    }
+
+    /**
+     * The title half of #13, which is the wider hole: [RegistryFlags.missingAppId] defaults to
+     * [MissingAppId.TITLE], so a window reporting no `app_id` is keyed on its title — and a
+     * title is set by whatever runs in the window, including remote output in a terminal.
+     */
+    @Test
+    fun `a program cannot choose a title that mints another surface's agent`() = runTest {
+        val title = "IntelliJ IDEA - awakener - registry/src/commonMain/SurfaceKey.kt"
+        val impostor = "IntelliJ IDEA - awakener - registry/src/commonMain/fz4kCM"
+        assertMintsSeparately(
+            SurfaceDescriptor(null, title, 1),
+            SurfaceDescriptor(null, impostor, 2),
+        )
+    }
+
+    /**
+     * Asserts the whole downstream chain separates, not just the keys. The slug becomes the
+     * `SPANREED_AGENT_NAME`, which becomes the `agent_id` spanreed routes on, and separately the
+     * residue path — so any one of these agreeing is one surface addressable as, or reading the
+     * accumulated model of, another.
+     */
+    private suspend fun assertMintsSeparately(
+        first: SurfaceDescriptor,
+        second: SurfaceDescriptor,
+    ) {
+        val store = InMemoryBindingStore()
+        val a = SurfaceKey.of(first, Config.EMPTY)
+        val b = SurfaceKey.of(second, Config.EMPTY)
+        assertNotEquals(a, b, "the descriptors must key differently or this proves nothing")
+
+        assertNotEquals(a.slug, b.slug, "distinct keys must not share a slug")
+        assertNotEquals(
+            store.residueLocation(a),
+            store.residueLocation(b),
+            "distinct keys must not share a residue file",
+        )
+        val bindings = listOf(store.bind(a), store.bind(b))
+        assertNotEquals(
+            bindings[0].agentId,
+            bindings[1].agentId,
+            "distinct keys must not mint one agent id",
+        )
+        assertNotEquals(
+            bindings[0].spanreedName,
+            bindings[1].spanreedName,
+            "distinct keys must not mint one SPANREED_AGENT_NAME",
         )
     }
 
