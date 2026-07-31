@@ -30,11 +30,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends sway foot
 
+      # :registry shells out to the spanreed CLI, and its suite skips silently without it —
+      # the same false-green trap as :wm without sway, in a second module.
+      - name: Install spanreed
+        run: |
+          pipx install spanreed-bus || pip install --user spanreed-bus
+          spanreed --help > /dev/null
+
       - name: Build and test
         env:
-          # Turns "sway is missing" from a silent skip into a failure. A green run that
-          # skipped every window-management test reads as coverage that does not exist.
+          # Turn "the tool is missing" from a silent skip into a failure. A green run that
+          # skipped every window-management or registry test reads as coverage that does not
+          # exist — which is worse than a red one, because nobody investigates it.
           AWAKENER_REQUIRE_SWAY: '1'
+          AWAKENER_REQUIRE_SPANREED: '1'
         run: ./gradlew build --stacktrace
 
       - name: Upload test results
