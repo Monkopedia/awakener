@@ -524,6 +524,100 @@ class SwayBindingTest {
     }
 
     /**
+     * **This test documents what awakener does today; it does not prove a fix, and the behaviour
+     * it pins is a defect.** It is here so that the cost stated in `WmFlags.dockMarkScheme` and in
+     * `docs/design-notes/wm-dock-ownership.md` under "What it does not close" is measured rather
+     * than reasoned, and so that whoever closes the residual has the case already written down.
+     *
+     * The residual the self-check leaves: a user's own window carrying `<prefix><that window's own
+     * con_id>_for_<some con_id>`. The self-check passes — the mark does name this node — so the
+     * one predicate calls it a dock, and `wm.dock.reap_evidence=CURRENT` is no defence, because
+     * the mark is on the node at the moment the sweep looks. When the `con_id` after `_for_`
+     * closes, the sweep destroys the user's window.
+     *
+     * That is the destructive half of the note's own bar, not the recoverable one: everywhere else
+     * in this repo the residual is described as hiding, and hiding is what `MARK_ONLY` or a
+     * restart undoes. This is not. What the self-check narrows is the *trigger* — the user has to
+     * have written their own window's `con_id` into the mark, where before any live `con_id` under
+     * the prefix would do, which is the case the test above covers.
+     */
+    @Test
+    fun `the residual the self-check leaves is a destroyed window, not a hidden one`() = swayTest {
+        val app = openSurface("aw-app1")
+        val victim = openSurface("aw-app2")
+
+        command("[con_id=${victim.raw}] mark --add ${markFor(victim, app)}")
+
+        command("[con_id=${app.raw}] kill")
+        awaitGone(app)
+        awaitSweep()
+        // By hand as well, so that what is asserted does not rest on collector timing.
+        wm.reapOrphans()
+
+        assertNull(
+            wm.tree().find(victim.raw),
+            "the residual is not merely hiding: the mark passes the self-check, so it is current " +
+                "evidence, and the sweep destroys a window the user marked themselves",
+        )
+    }
+
+    /**
+     * **Also a record of current behaviour rather than a fix**: what an upgrade over standing
+     * docks costs. The scheme decides reading and writing together, so a dock marked by an older
+     * awakener is marked under the value this build no longer reads, and a live sway session
+     * outlives the process that marked into it.
+     *
+     * The choice made, and the reason it is this one: a stranded mark is **not** adopted. Reading
+     * the old shape as well would mean recognising `<prefix><any live con_id>` on any node again,
+     * which is exactly the destructive defect #15 filed and this change closes — a migration read
+     * would re-open the kill path on every window in the session. So the old mark falls where any
+     * unrecognised mark under the prefix falls: it is *named* in `unrecognisedDockMarks`, its dock
+     * is enumerated as an ordinary bindable surface, and no sweep will touch it.
+     *
+     * Both directions of the strand are safe in the direction that matters — a mark of the other
+     * scheme can never be *mistaken* for a dock mark of this one, since one has `_for_` in it and
+     * the other cannot — so the cost is a leak and never a kill. The recovery is
+     * `wm.dock.mark_scheme=SURFACE` and its own price, both stated at the flag.
+     */
+    @Test
+    fun `a dock marked under the other scheme is reported and left standing`() = swayTest {
+        // The manager that stood the dock up still holds a STOOD_UP entry for it and would reap
+        // from that, which would say nothing about what a fresh process reads from the mark.
+        store.put(WmFlags.sweepOnClose, false)
+        store.put(WmFlags.dockMarkScheme, DockMarkScheme.SURFACE)
+        val app = openSurface("aw-app1")
+        val dock = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1")).dockId
+        val oldMark = dockMarkFor(dock, app, WmFlags.dockMarkPrefix.default, DockMarkScheme.SURFACE)
+        assertEquals(listOf(oldMark), marksOf(dock), "the dock is marked as the older build did")
+
+        // The upgrade: same sway session, same standing dock, a build that reads the other scheme.
+        store.put(WmFlags.dockMarkScheme, DockMarkScheme.DOCK_AND_SURFACE)
+        wm = SwayWindowManager({ sway.connection() }, store, bindingStore(), scope)
+
+        assertEquals(
+            setOf(app.raw, dock.raw),
+            wm.surfaces().map { it.id.raw }.toSet(),
+            "a stranded dock is handed back as a bindable surface: that is the cost of the " +
+                "upgrade, and it is the recoverable kind — a Breath and a registry row",
+        )
+        assertEquals(
+            setOf(oldMark),
+            wm.unrecognisedDockMarks.value,
+            "and it is named rather than passed over, which is the whole of the diagnosis",
+        )
+
+        command("[con_id=${app.raw}] kill")
+        awaitGone(app)
+        wm.reapOrphans()
+
+        assertNotNull(
+            wm.tree().find(dock.raw),
+            "a stranded dock is never killed on the strength of a mark this build does not " +
+                "recognise — the leak is the cost, and it must not become a kill",
+        )
+    }
+
+    /**
      * The reservation covers the dock from before it exists, so it has to be given back whether
      * the attach worked or not — and a leaked one is invisible in the tree while hiding every
      * window under the dock's `app_id` for the life of the process. Cancelled rather than left to

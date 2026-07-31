@@ -140,6 +140,13 @@ only on evidence that exists at the moment of the sweep** — a dock mark on the
 entry with `origin = STOOD_UP`. `wm.dock.reap_evidence` carries the choice, defaulting to that
 (`CURRENT`); `RECOGNITION` is the older, wider behaviour.
 
+**That gate bounds the latch and nothing wider, and the difference is a window.** It is about a
+recognition whose mark has *gone*. While the user's mark is still on the node, it is precisely the
+evidence `CURRENT` asks for, so the sweep kills on it — measured on the current head, probe J7.
+`CURRENT` is what makes removing the mark survivable; it is not what makes the mark itself safe.
+The residual that survives it is stated under "What it does not close", on the destructive side of
+this note's bar rather than the recoverable one.
+
 The gap `CURRENT` leaves is exactly one case, and it is the mirror of the false negative above: a
 dock **adopted** after a restart whose mark has since gone has neither kind of
 current evidence, so it stays out of enumeration — no agent is minted for the panel, which was
@@ -221,17 +228,50 @@ fixing #14 alone — a second mark, or a `<dockId>_for_<surfaceId>` string recog
 would have left every dock carrying a mark this predicate reported as unrecognised. Requiring the
 node to be the one named is what keeps one predicate rather than two.
 
-**What it does not close.** A user mark that is `<prefix><that window's own con_id>_for_<some
-con_id>` still hides that window, and hides it for the life of the process once adoption records
-it. That is narrower than the residual it replaces by exactly the amount the self-check buys: the
-user has to have written their own window's `con_id` into it.
+**What it does not close, and it is on the destructive side of this note's own bar.** A user mark
+that is `<prefix><that window's own con_id>_for_<some con_id>` passes the self-check — the mark
+does name the node it is on — so the one predicate calls that window a dock. It is hidden from
+enumeration, and hidden for the life of the process once adoption records it. It is also
+**destroyed**: the mark is on the node at the moment the sweep looks, so `reap_evidence=CURRENT`
+is satisfied, and when the `con_id` after `_for_` closes `reapOrphans` kills the user's window —
+which #18 gave a caller on every window close.
 
-**A scheme flip is a restart, not a flip.** `wm.dock.mark_scheme` decides reading and writing
-together, so flipping it — or upgrading awakener over standing docks — strands every dock marked
-under the other value: those marks stop being recognised, the docks become bindable surfaces, and
-their names arrive in `unrecognisedDockMarks` rather than being passed over. Same shape as
-`wm.dock.mark_prefix`, and the same advice; `SURFACE` exists so that the recovery is a flag rather
-than a downgrade.
+Measured on this branch, through the real `SwayWindowManager` against sway 1.12 (probe J7): a
+second application window marked `awakener_dock_<its own con_id>_for_<the first window's con_id>`,
+the first window killed, one sweep, and the marked window is gone from the tree. Asserted by
+`SwayBindingTest.the residual the self-check leaves is a destroyed window, not a hidden one`,
+whose KDoc says in as many words that it records a defect rather than a fix.
+
+So what the self-check buys is the **trigger, not the consequence**. Before it, any
+`<prefix><live con_id>` on any window would do; now the user has to have written their own
+window's `con_id` into the mark. That is a real narrowing and it is the whole of this change's
+claim. Everywhere else this document says *a window hidden is recoverable and a window destroyed
+is not* — this residual is the second kind, and it is filed here as such rather than under the
+recoverable half. Closing it is a separate design decision and is not taken here: it needs a mark
+shape a user cannot write by hand, which means a nonce or a shape sway will not round-trip, and
+either is a change to what a dock's identity *is* rather than to what its mark says.
+
+**A scheme flip is a restart, not a flip — and an upgrade over standing docks is one.**
+`wm.dock.mark_scheme` decides reading and writing together, so a live sway session that outlives
+the awakener process holds marks the successor no longer reads. **The choice made here is: do not
+adopt them.** Reading the old shape as well would mean recognising `<prefix><any live con_id>` on
+any node again, which is the destructive defect #15 filed and this change closes — a migration
+read re-opens the kill path on every window in the session, so the migration would cost strictly
+more than the strand it repairs.
+
+What an upgrade therefore costs, measured on this branch (probe J7): the stranded dock is
+**enumerated as an ordinary bindable surface**, so a hotkey on it mints a Lifeless for an agent
+panel and writes it to the durable registry; its mark is **named in `unrecognisedDockMarks`**, so
+it is diagnosable rather than silently lost; and it is **never reaped**, because a mark this build
+does not recognise is not evidence for a kill. The reverse mistake cannot happen either — neither
+scheme reads the other's mark as a dock mark, since one contains `_for_` and the other cannot
+(`DockTableTest.the surface-only mark is switchable back on`) — so a strand costs a leak and never
+a kill, which is the direction this note demands.
+
+The recovery is by hand or by flag: close the stranded panels, or set
+`wm.dock.mark_scheme=SURFACE`, let the docks be recognised again, close them, and flip back.
+`SURFACE` is here for that, and it has its own price, stated at the value. Same shape as
+`wm.dock.mark_prefix`, and the same advice: move it with no docks standing.
 
 **#14's other option is not taken.** Refusing a second attach on an already-docked surface (#14's
 option 2) is a change to `attach`'s contract — it is currently documented as safe to call
@@ -256,10 +296,13 @@ because they are the argument for it.**
   2026-07-31: the rest of this bullet said that after an awakener restart the adoption scan
   cannot see that dock at all, and that is true only of an adoption that leaves no record.
   Because adoption writes an entry, a dock enumerated even once after the restart stays
-  recognised when a second attach moves its mark — measured through two managers against one
-  sway, and asserted by `an adopted dock stays a dock when a later attach takes its mark`. What
-  is genuinely lost is narrower: a dock whose mark moves before anything has enumerated it —
-  a hand-run `swaymsg mark`, say — since there was nothing there to adopt it.)*
+  recognised when something takes its mark off it — measured through two managers against one
+  sway, and asserted by `an adopted dock stays a dock once its mark is taken off it`. That test
+  drove the loss with a second attach while the mark named the surface; it takes the mark off by
+  hand now, because under the default scheme a hand is the only thing that takes one off, and what
+  it is about — that an adoption is a write — is unchanged either way. What is genuinely lost is
+  narrower: a dock whose mark goes before anything has enumerated it — a hand-run `swaymsg unmark`,
+  say — since there was nothing there to adopt it.)*
 - **The pinned predicate narrows #15's trigger and widens its consequence.** A user mark that
   happens to be `awakener_dock_<some live con_id>` still hides a real window — and measured on the
   unpinned predicate a mark as ordinary as `awakener_dock_notes` removed a genuine application
@@ -267,16 +310,18 @@ because they are the argument for it.**
   hides a real window" understated it once adoption records. The hiding is no longer transient —
   removing the mark does not release the window, because a recorded node is never asked about its
   marks again — so it lasts for the life of the process, and `wm.dock.recognition=MARK_ONLY` or an
-  awakener restart is the only way back. It stops there: `wm.dock.reap_evidence=CURRENT`, the
-  default, keeps the sweep from killing a window on a recognition with no live mark and no
-  stood-up entry behind it. See "Recording is one-way".)*
+  awakener restart is the only way back. It stops there **for the latch, and only for it**:
+  `wm.dock.reap_evidence=CURRENT`, the default, keeps the sweep from killing a window on a
+  recognition with no live mark and no stood-up entry behind it — but while the mark is still on,
+  it is exactly the evidence `CURRENT` asks for and the sweep destroys the window. See "Recording
+  is one-way", and "What it does not close" above for the residual that survives the amendment.)*
 
 ~~**Open question, not settled here:** whether #14's fix is a second mark
 (`<prefix><dockId>_for_<surfaceId>`), a refusal to attach twice to one surface, or both. That
 belongs on #14.~~ *(Settled 2026-07-31: the mark, in one string rather than two, and recognised
 only on the node it names. See "Why the dock's `con_id` is in it" above. The refusal is not
-taken.)* What this note fixes is that #9 must not *assume* the mark is durable while #14
-is open.
+taken.)* What this note fixed was that #9 must not *assume* the mark is durable while #14 was
+open; #14 is closed by the commit that amended this section.
 
 ### The pre-map gap, which the table alone does not close
 
@@ -498,8 +543,12 @@ accepted it — but worth knowing before someone invents a heartbeat.
   *(Added 2026-07-31 with #14/#15.)* What a dock's mark says after the prefix, for reading and
   writing together. The default is `<dockId>_for_<surfaceId>`, recognised only on the node it
   names — unique per dock, which is #14, and self-checking, which is #15. `SURFACE` is the old
-  `<surfaceId>`, with both holes open; it is the recovery path if an upgrade lands while docks
-  are standing, since a flip strands every mark written under the other value.
+  `<surfaceId>`, and its price is a destroyed window: under it any `<prefix><live con_id>` is a
+  dock mark on whatever node wears it, so a user's own `awakener_dock_7` is hidden and then killed
+  by the sweep when node 7 closes. It is the recovery path if an upgrade lands while docks are
+  standing — a flip strands every mark written under the other value — and it is worth that price
+  only in a session with no marks under this prefix that awakener did not write. The default's own
+  residual is destructive too, and narrower; see "What it does not close".
 - `wm.dock.pending_suppression` = boolean, **default `true`.** The reservation. Off is
   today's behaviour, i.e. #9 unfixed but with no over-suppression risk at all. It gates whether
   a reservation is *filed*; it never gates whether one is cleared, and neither does any other
@@ -1349,3 +1398,19 @@ Through the real `SwayWindowManager` (`J*`):
   building exactly that (`FLATTEN_PASSES = 1`) and running both, 2 runs, placement 1 green and
   placement 2 red on each. Two check-and-flatten passes fix both, 2 runs green, and the whole
   `SwayBindingTest` suite green with them.
+- **J7 — what the `_for_` mark leaves behind, and what an upgrade over standing docks costs.**
+  Added when #14/#15's fix landed, both run against that fix rather than against `main`, and both
+  kept as tests whose KDoc says they record current behaviour rather than prove one.
+
+  1. **The residual is destructive, not hiding.** A second application window marked
+     `<prefix><its own con_id>_for_<the first window's con_id>`, the first window killed, one
+     sweep: the marked window is **gone from the tree**. The self-check passes, so the mark is
+     current evidence and `reap_evidence=CURRENT` is no defence. `SwayBindingTest.the residual the
+     self-check leaves is a destroyed window, not a hidden one`.
+  2. **A stranded dock leaks and is never killed.** A dock attached under `SURFACE`, then a fresh
+     `SwayWindowManager` reading `DOCK_AND_SURFACE` against the same sway session — which is an
+     upgrade over a standing dock, since the scheme decides reading and writing together. The dock
+     comes back as a **bindable surface**, its mark is **named in `unrecognisedDockMarks`**, and
+     killing its surface and sweeping **leaves it standing**. `SwayBindingTest.a dock marked under
+     the other scheme is reported and left standing`; the parse in the other direction is
+     `DockTableTest.the surface-only mark is switchable back on`.

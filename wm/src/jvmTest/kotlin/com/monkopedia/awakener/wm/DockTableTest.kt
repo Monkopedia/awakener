@@ -21,7 +21,7 @@ class DockTableTest {
 
         assertEquals("${PREFIX}9_for_7", mark)
         assertEquals(SurfaceId(7), reading.surface)
-        assertEquals(emptyList(), reading.unparsed)
+        assertEquals(emptyList(), reading.unrecognised)
     }
 
     /**
@@ -48,7 +48,7 @@ class DockTableTest {
         val reading = window(9, marks = listOf(mark)).dockMark(PREFIX, SCHEME)
 
         assertNull(reading.surface, "node 9 is not the dock this mark names")
-        assertEquals(listOf(mark), reading.unparsed)
+        assertEquals(listOf(mark), reading.unrecognised)
     }
 
     @Test
@@ -62,7 +62,7 @@ class DockTableTest {
         )
         assertEquals(
             marks,
-            reading.unparsed,
+            reading.unrecognised,
             "and they have to be reported: hidden in one place and skipped in another is how a " +
                 "window ended up reachable by no code path at all — and `${PREFIX}7` is also " +
                 "what a dock marked under the other scheme wears, which is how a flip is " +
@@ -85,6 +85,12 @@ class DockTableTest {
             "and it is a dock mark on any node at all, which is #15's live half kept " +
                 "reproducible on purpose",
         )
+        assertNull(
+            window(9, marks = listOf(dockMarkFor(SurfaceId(9), SurfaceId(7), PREFIX, SCHEME)))
+                .dockMark(PREFIX, scheme).surface,
+            "and the other scheme's mark is not one of these — neither scheme reads the other's " +
+                "mark as a dock mark, so a strand costs a leaked panel and never a kill",
+        )
     }
 
     @Test
@@ -92,7 +98,7 @@ class DockTableTest {
         val reading = window(9, marks = listOf("notes", "urgent")).dockMark(PREFIX, SCHEME)
 
         assertNull(reading.surface)
-        assertEquals(emptyList(), reading.unparsed)
+        assertEquals(emptyList(), reading.unrecognised)
     }
 
     @Test

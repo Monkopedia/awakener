@@ -70,7 +70,7 @@ class SwayWindowManager(
      */
     internal val docks = DockTable()
 
-    private val unparsedMarks = MutableStateFlow<Set<String>>(emptySet())
+    private val unrecognisedMarks = MutableStateFlow<Set<String>>(emptySet())
 
     private val repairState = MutableStateFlow(DockRepairStatus())
 
@@ -96,7 +96,7 @@ class SwayWindowManager(
      * the prefix and is not a mark this build recognises. That is the whole of the diagnosis for
      * a dock the flip stranded.
      */
-    val unrecognisedDockMarks: StateFlow<Set<String>> = unparsedMarks.asStateFlow()
+    val unrecognisedDockMarks: StateFlow<Set<String>> = unrecognisedMarks.asStateFlow()
 
     /** Whether awakener's own memory counts as evidence, or only what it wrote into the tree. */
     private val Config.consultsTable: Boolean
@@ -127,7 +127,7 @@ class SwayWindowManager(
      * made depend on when in a dock's life it was looked at.
      *
      * Writing on a read path is deliberate and is not a lock: [DockTable] is a compare-and-set
-     * over an immutable snapshot, the same one [unparsedMarks] already does two lines up. A
+     * over an immutable snapshot, the same one [unrecognisedMarks] already does two lines up. A
      * concurrent `attach` that has just evicted a failed dock's entry can be immediately followed
      * here by an adoption of that same node — correctly, since it is a node still wearing the
      * mark, which is exactly what adoption is for.
@@ -142,13 +142,25 @@ class SwayWindowManager(
      * leaves — a user's own mark shaped exactly like that window's own dock mark — stops being
      * transient. Before this, `swaymsg unmark` handed the window straight
      * back to enumeration; now it does not, and only `wm.dock.recognition=MARK_ONLY` or an
-     * awakener restart releases it. That is a window hidden, which is recoverable. It is not a
-     * window destroyed: [reapOrphans] does not kill on this recognition alone under the default
-     * [WmFlags.reapEvidence].
+     * awakener restart releases it. **That latch is a window hidden, which is recoverable, and it
+     * is not a window destroyed:** [reapOrphans] does not kill on this recognition alone under the
+     * default [WmFlags.reapEvidence].
+     *
+     * **That sentence is about the latch, and the residual itself is worse than the latch.** While
+     * the user's mark is still on the window it is exactly the evidence
+     * [WmFlags.reapEvidence]`=CURRENT` asks for, so when the `con_id` after `_for_` closes the
+     * sweep **destroys** that window — and #18 gave the sweep a caller on every window close.
+     * Measured on sway 1.12 through this class: `SwayBindingTest.the residual the self-check
+     * leaves is a destroyed window, not a hidden one`. Recognising the mark on the node it names
+     * narrows *who* can trip that — the user has to have written their own window's `con_id` into
+     * the mark, where before any live `con_id` under the prefix on any window would do — and it
+     * does not change what happens once they have. Closing it needs a mark shape a user cannot
+     * write by accident; see [DockMarkScheme].
      */
     private fun dockedTo(node: Node, table: DockTableSnapshot, cfg: Config): SurfaceId? {
         val reading = node.dockMark(cfg[WmFlags.dockMarkPrefix], cfg[WmFlags.dockMarkScheme])
-        if (reading.unparsed.isNotEmpty()) unparsedMarks.update { it + reading.unparsed }
+        val unrecognised = reading.unrecognised
+        if (unrecognised.isNotEmpty()) unrecognisedMarks.update { it + unrecognised }
         if (!cfg.consultsTable) return reading.surface
         table.entries[node.id]?.let { return it.surface }
         val adopted = reading.surface ?: return null

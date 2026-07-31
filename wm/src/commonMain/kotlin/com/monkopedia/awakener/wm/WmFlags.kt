@@ -189,13 +189,25 @@ object WmFlags {
             "see it to take it down. And because the mark now says which node it belongs on, a " +
             "mark on any other node is not a dock mark, which is what stops a user's own mark " +
             "under this prefix from hiding their window and — since a sweep runs on every window " +
-            "close — from getting it killed when the con_id in it closes (#15). SURFACE is the " +
-            "previous <surfaceCon_id>, with both holes open; it is here because it is the whole " +
-            "of the recovery if an upgrade lands while docks are standing. This decides reading " +
-            "and writing together, so flipping it against a live desktop strands every dock " +
-            "marked under the other value: those marks stop being recognised, the docks become " +
-            "bindable surfaces, and their names are reported through the manager's " +
-            "unrecognised dock marks rather than passed over. Move it with no docks standing.",
+            "close — from getting it killed when the con_id in it closes (#15). That narrows who " +
+            "can trip #15, not what tripping it costs: a user mark that is this prefix, the " +
+            "marked window's own con_id, _for_, and any con_id still passes the check, and the " +
+            "sweep destroys that window when the con_id after _for_ closes. Measured on sway " +
+            "1.12. SURFACE is the previous <surfaceCon_id>, and its price is that same destroyed " +
+            "window reached far more easily: under it this prefix plus any live con_id is a dock " +
+            "mark on whatever window wears it, so a user's own 'awakener_dock_7' hides that " +
+            "window and the sweep destroys it when node 7 closes — measured on sway 1.12, which " +
+            "is what #15 is. It is here because it is the whole of the recovery if an upgrade " +
+            "lands while docks are standing, and it is worth that price only in a session with " +
+            "no marks under this prefix that awakener did not write. This decides reading and " +
+            "writing together, so an upgrade over standing docks — or a flip against a live " +
+            "desktop — strands every dock marked under the other value: those marks stop being " +
+            "recognised, the docks become bindable surfaces a hotkey will mint an agent for, and " +
+            "their names are reported through the manager's unrecognised dock marks rather than " +
+            "passed over. A stranded dock is never reaped and a mark of one scheme is never read " +
+            "as a dock mark of the other, so that costs a leak and never a kill: close the " +
+            "stranded panels by hand, or flip to the value they were marked under, close them, " +
+            "and flip back. Move it with no docks standing.",
     )
 
     val dockRecognition = Flags.enum(
@@ -254,7 +266,12 @@ object WmFlags {
             "wm.dock.recognition=MARK_ONLY, " +
             "or an awakener restart — and being killed is not, so CURRENT will not reap on that " +
             "latched recognition alone: it kills only a node carrying a dock mark at the moment " +
-            "of the sweep, or one this process recorded when it stood the dock up itself. What " +
+            "of the sweep, or one this process recorded when it stood the dock up itself. That " +
+            "bounds the latch and not the mark, and it is worth being exact about which: while " +
+            "that user's mark is still on the window it is precisely the evidence CURRENT asks " +
+            "for, so CURRENT reaps on it and the window is destroyed. Removing the mark is what " +
+            "this flag makes survivable. See wm.dock.mark_scheme, which is where that residual " +
+            "and its cost are stated. What " +
             "that costs is the case with neither — a dock adopted after a restart whose mark " +
             "something has since taken off it, which stays out of enumeration but is left " +
             "standing when its surface closes, to be closed by hand. Under the default " +
