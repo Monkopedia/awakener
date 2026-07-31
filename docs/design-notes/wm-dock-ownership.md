@@ -75,8 +75,10 @@ markApplied: Boolean }`, with a secondary index by `surface` so the hotkey path 
 this surface already have a dock" without a tree read.
 
 `con_id` is the right key and the only available one: it is what every sway criteria command
-takes, and it is what the tree returns. It is also the reason the table must not persist —
-see below.
+takes, and it is what the tree returns. It is a key **only within one compositor session**,
+though — verified monotonic and never recycled inside a session, and restarting from 5 in the
+next one — which is why the table must neither persist nor outlive its IPC connection. Both
+follow from the same fact, and both are in "The session boundary" below.
 
 ### When the table and the tree disagree
 
