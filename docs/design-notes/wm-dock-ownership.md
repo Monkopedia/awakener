@@ -448,8 +448,9 @@ accepted it — but worth knowing before someone invents a heartbeat.
 **Contract:** `attach` either returns a handle whose `detach()` owns everything the attach
 did, or it throws having left the **tree** as it found it — with the sole residue of a dock
 program that may still be in flight, which the claim below owns *if a collector exists to read
-the claim*, and which today stands unowned because none does (#18). No half-built container is
-ever observable to a caller.
+the claim*, and which today stands unowned because none does (#18) **and because no claim is
+filed either — see the amendment on that section**. No half-built container is ever observable
+to a caller.
 
 That is deliberately narrower than "there is no third outcome", because there is one, and
 promising two is how it gets implemented away. Two things `attach` does are not tree edits and
@@ -485,6 +486,17 @@ and the reservation that would have suppressed it is evicted by the unwind at ex
 moment it is still needed.
 
 ### The late dock: the reservation outlives the attach that filed it
+
+> **Amended 2026-07-31, in the PR that landed #6 and #4: none of this section is built.** The
+> reservation is released on both paths rather than converted, no claim is ever filed, and
+> `wm.dock.late_dock` was not introduced. #9 landed the table, the reservation and its
+> unconditional eviction (PR #23) and stopped there; #6 was assigned only the tree compensations
+> and did not widen to take it on, since a claim nothing reads is a flag whose default behaviour
+> cannot be exercised — which is the same argument that already set that default to `LEAVE`.
+> **So the third outcome is real and unowned**: a dock that maps after the unwind has finished
+> stands as an unmarked, untabled panel that `surfaces()` reports as bindable. What follows is
+> therefore the design for whoever builds the collector (#18), read as specification rather than
+> as a description of the code.
 
 On the failure path the reservation is **not** evicted. It is converted to a **claim** — same
 `app_id`, same `standing` set, deadline one further map timeout out.
@@ -626,7 +638,7 @@ registry binding. On failure, each is compensated in reverse.
 | resting focus / geometry / mark | none needed; they die with the window |
 | dock window | `kill`, then `awaitGone` |
 | table entry | evict — *bookkeeping, always runs* |
-| reservation | convert to a claim, then evict when the claim resolves or expires — *bookkeeping, always runs* |
+| reservation | convert to a claim, then evict when the claim resolves or expires — *bookkeeping, always runs*. **As built: evicted outright, no claim** — see the amendment above |
 | focus suppression | **`REFOCUS_AFTER_MAP`: nothing to undo. `NO_FOCUS_RULE`: not undoable.** |
 | `split horizontal` | `split none` on the surviving child — the same normalisation `detach` already performs on the success path |
 
@@ -779,6 +791,26 @@ re-reading a config awakener does not own clears the set. So the design does not
   Transient steal **73–78 ms** over one persistent IPC connection across three runs, ≈96 ms
   when driven through separate `swaymsg` process spawns. No steal-back over a 3 s observation;
   focus rests on the app.
+
+  **Re-measured through the built code when #4 landed, and the number is much smaller: 1–2 ms.**
+  Same shape — a `window` subscription on its own connection, three runs on sway 1.12 —
+  but driven by `SwayWindowManager.attach` rather than by the probe's hand-written sequence:
+
+  ```
+    17ms new con=7 | 17ms focus con=7 | 18ms focus con=5   <- the correction
+    21ms new con=7 | 21ms focus con=7 | 22ms focus con=5
+    32ms new con=7 | 36ms focus con=7 | 38ms focus con=5
+  ```
+
+  The 73–78 ms above is a fact about the probe, not about awakener's client: `awaitWindow`
+  polls `get_tree` in a tight loop on a connection nothing else is using, so it sees the node
+  within a round trip of the map, and only three commands separate that from the correction.
+  `new` and `focus` land in the same millisecond on two of three runs and 4 ms apart on the
+  third, so the no-race finding holds unchanged. Focus rested on the app over a 1 s observation.
+  Recorded because this note's own convention is that sway behaving a certain way and awakener's
+  client behaving that way are separate facts — the flicker `REFOCUS_AFTER_MAP` costs is an
+  order of magnitude smaller than the argument for it assumed, which strengthens the default
+  rather than weakening it.
 - Under `NO_FOCUS_RULE`, `attach`'s unwind contract **explicitly excludes the rule**, and the
   flag description must say so. What can still be fixed is the *cumulative* half of #4: the
   table also remembers which `app_id`s already carry a rule, so a rule is issued at most once
@@ -865,7 +897,8 @@ needs the hotkey path, which does not exist yet. Do not force it into these flag
   hard-coded: `wm.dock.recognition`, `wm.dock.reap_evidence`, `wm.dock.pending_suppression`,
   `wm.dock.focus_suppression`, `wm.dock.unwind_failed_attach`, `wm.dock.late_dock`. **None of
   them gates bookkeeping**, which is the property that matters and the one an earlier draft got
-  wrong.
+  wrong. *(As built, five of the six exist. `wm.dock.late_dock` does not: it gates a claim
+  mechanism nothing builds and nothing could read — see the amendment on "The late dock".)*
 
   An earlier draft also claimed none of them "has an off-state that silently breaks a read path",
   and that is too strong. `wm.dock.recognition = MARK_ONLY` and `wm.dock.late_dock = LEAVE` both
@@ -906,6 +939,10 @@ alongside #9**, and `late_dock` reconsidered once a collector exists. The order 
    `TreeEdit` unwind and never did. #9 owns file, convert, evict, and the claim that outlives a
    failed attach; #6 then adds only the tree compensations, which are the part that actually
    needs to run under the lock. Each PR is self-consistent on `main` on its own.
+
+   **What landed:** #9 (PR #23) filed and evicted; it did not convert, and no claim exists. #6
+   added the tree compensations as assigned. The gap between them is the late dock, which is now
+   #18's along with the collector that would read a claim at all.
 
    Concretely, #9 adds a `try`/`finally` at the top of `attach` covering the bookkeeping only —
    which is allowed, and is not the "top-level `try`/`catch` unwind" the note rejects. See
@@ -1033,3 +1070,8 @@ Through the real `SwayWindowManager` (`J*`):
   mark takes it off the first (`5 -> marks=[]`, `6 -> marks=[awakener_dock_999]`), which is #14
   at the sway level; and adding `awakener_dock_notes` to a real application window removed it
   from `surfaces()` entirely, which is #15.
+- **J5 — the `REFOCUS_AFTER_MAP` transient, as built.** Added when #4 landed: the real `attach`
+  under `wm.dock.focus_on_map=false`, watched on a `window` subscription over its own connection,
+  three runs. 1–2 ms of steal, `new` and `focus` in the same millisecond on two runs of three,
+  focus resting on the app after 1 s. See the amendment under the flag; the probe's 73–78 ms was
+  a fact about the probe's own command sequence.

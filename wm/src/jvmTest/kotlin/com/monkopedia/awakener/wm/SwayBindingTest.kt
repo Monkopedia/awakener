@@ -44,6 +44,14 @@ class SwayBindingTest {
      */
     private var mintDelayMs = 0L
 
+    /**
+     * Whether minting fails. The production minter shells out to spanreed, so this is the
+     * ordinary way `attach` fails *after* its dock is standing — and the only such failure a test
+     * can produce on demand, since every command `attach` sends between the map and the bind is
+     * one sway accepts.
+     */
+    private var mintFails = false
+
     /** Clients stopped by [freeze]. They have to be killed rather than asked to leave. */
     private val frozen = mutableListOf<Int>()
 
@@ -69,6 +77,7 @@ class SwayBindingTest {
         configStore = store,
         identities = { key, residuePath ->
             if (mintDelayMs > 0) delay(mintDelayMs)
+            check(!mintFails) { "the minter is unavailable" }
             minted++
             DerivedAgentIdentities(store).mint(key, residuePath)
         },
@@ -423,6 +432,93 @@ class SwayBindingTest {
         assertEquals(handle.dockId.raw, focusedId(), "the flag must actually change behaviour")
     }
 
+    /**
+     * #4. Suppressing focus with a `no_focus` rule spends compositor state that sway has no verb
+     * to take back, and under the default identity scheme every dock reports one `app_id` — so
+     * one attach with `wm.dock.focus_on_map` off suppressed focus for every dock afterwards, for
+     * the life of the sway session. The flag stopped meaning what it says after its first use.
+     *
+     * `wm.focus.restore_after_attach` is off throughout so that what is read at the end is where
+     * the map left focus, rather than where the resting-focus rule put it back.
+     */
+    @Test
+    fun `suppressing focus for one dock does not suppress it for the next`() = swayTest {
+        store.put(WmFlags.restoreFocusAfterAttach, false)
+        store.put(WmFlags.dockFocusOnMap, false)
+        val app1 = openSurface("aw-app1")
+
+        wm.attach(app1, dockFor("aw-dock"), AgentId("agent-1"))
+        assertEquals(
+            app1.raw,
+            focusedId(),
+            "the attach that asked for suppression still gets it — however it is achieved, the " +
+                "dock must not be left holding focus",
+        )
+
+        store.put(WmFlags.dockFocusOnMap, true)
+        val app2 = openSurface("aw-app2")
+        val second = wm.attach(app2, dockFor("aw-dock"), AgentId("agent-2"))
+
+        assertEquals(
+            second.dockId.raw,
+            focusedId(),
+            "and the next attach, made while the flag says to focus on map, has to actually " +
+                "get focus: a suppression the first attach cannot revoke poisons every dock " +
+                "after it for the rest of the session",
+        )
+    }
+
+    /**
+     * The combination that would otherwise leave the suppression flag suppressing nothing.
+     * `settleFocus` runs only under `wm.focus.restore_after_attach`, so with that off and the
+     * correction treated as part of resting focus, the dock would keep the focus it took on map —
+     * the one outcome `focus_on_map = false` was asked for. The correction belongs to the
+     * suppression instead, and runs regardless.
+     */
+    @Test
+    fun `the focus correction runs whatever restore_after_attach says`() = swayTest {
+        store.put(WmFlags.restoreFocusAfterAttach, false)
+        store.put(WmFlags.dockFocusOnMap, false)
+        val app = openSurface("aw-app1")
+
+        wm.attach(app, dockFor("aw-dock"), AgentId("agent-1"))
+
+        assertEquals(
+            app.raw,
+            focusedId(),
+            "restore_after_attach decides whether the resting-focus rule is applied at the end " +
+                "of an attach, not whether a transient steal is corrected",
+        )
+    }
+
+    /**
+     * The previous mechanism, kept reachable for anyone who would rather have no flicker than a
+     * revocable rule — with the cost that made it the wrong default kept reproducible in the same
+     * test, since a rule sway cannot revoke reaches every dock the criteria match.
+     */
+    @Test
+    fun `no_focus focus suppression is switchable on`() = swayTest {
+        store.put(WmFlags.dockFocusSuppression, FocusSuppression.NO_FOCUS_RULE)
+        store.put(WmFlags.restoreFocusAfterAttach, false)
+        store.put(WmFlags.dockFocusOnMap, false)
+        val app1 = openSurface("aw-app1")
+
+        wm.attach(app1, dockFor("aw-dock"), AgentId("agent-1"))
+        assertEquals(app1.raw, focusedId(), "the rule must actually suppress the map-time focus")
+
+        store.put(WmFlags.dockFocusOnMap, true)
+        val app2 = openSurface("aw-app2")
+        val second = wm.attach(app2, dockFor("aw-dock"), AgentId("agent-2"))
+
+        assertEquals(
+            app2.raw,
+            focusedId(),
+            "and this is what it costs: sway has no verb that takes the rule back, so under the " +
+                "shared app_id it goes on suppressing focus for a dock attached while the flag " +
+                "says to focus on map — dock ${second.dockId.raw} never gets it",
+        )
+    }
+
     /** Hazard 2: sway leaves the dock standing when its surface dies. */
     @Test
     fun `orphaned dock is reaped when its surface closes`() = swayTest {
@@ -617,6 +713,104 @@ class SwayBindingTest {
                 "container the dock left behind",
         )
         assertEquals(2, workspace.children.size, "two surfaces means two tabs")
+    }
+
+    /**
+     * The same hazard reached through the failure path, which is #6. `attach` splits the tab
+     * before it spawns anything, so a dock that never maps leaves the surface wrapped in a
+     * single-child split container that sway will not collapse — and the next window opened in
+     * that tab is swallowed into it.
+     *
+     * The failure is the dock program exiting without ever mapping a window, which is what a
+     * mistyped command or a panel binary that dies on startup looks like, and it is the failure
+     * mode `attach` was already reproduced on. It costs this test the full 5s map wait.
+     */
+    @Test
+    fun `a failed attach leaves the tab as it found it`() = swayTest {
+        val app1 = openSurface("aw-app1")
+        openSurface("aw-app2")
+        val before = assertNotNull(wm.tree().workspace("1")).children.map { it.id }
+
+        assertFailsWith<IllegalStateException>("a dock that never maps has to fail the attach") {
+            wm.attach(app1, DockSpec("aw-dock", "sh -c 'exit 1'"), AgentId("agent-1"))
+        }
+
+        assertEquals(
+            before,
+            assertNotNull(wm.tree().workspace("1")).children.map { it.id },
+            "the tab has to be the surface again: a leftover container is a new node, so its " +
+                "id shows up here in place of the one the surface had",
+        )
+
+        val later = openSurface("aw-app3")
+        val workspace = assertNotNull(wm.tree().workspace("1"))
+        assertTrue(
+            workspace.children.any { it.id == later.raw },
+            "and this is what the leftover costs — a window opened afterwards is swallowed " +
+                "into the container the failed attach left behind instead of becoming its own tab",
+        )
+        assertEquals(3, workspace.children.size, "three surfaces means three tabs")
+    }
+
+    /**
+     * The other half of #6: a failure *after* the dock has mapped owes the window as well as the
+     * container. The binding is what fails here, and it is the realistic case rather than a
+     * contrived one — it is recorded outside the tree section because the minter shells out to
+     * spanreed, so it is the step of `attach` most likely to fail and the only one that can fail
+     * once sway has accepted everything else.
+     *
+     * It is also the one compensation that cannot run inside the section that built the dock,
+     * since that section ended before the bind began.
+     */
+    @Test
+    fun `a dock whose binding cannot be recorded is taken back down`() = swayTest {
+        val app = openSurface("aw-app1")
+        val before = assertNotNull(wm.tree().workspace("1")).children.map { it.id }
+        mintFails = true
+
+        assertFailsWith<IllegalStateException>("a bind that fails has to fail the attach") {
+            // No agent: the hotkey case, and the only path that mints.
+            wm.attach(app, dockFor("aw-dock"))
+        }
+
+        assertEquals(
+            emptyList(),
+            wm.tree().windows.filter { it.appId == "aw-dock" }.map { it.id },
+            "the dock is a window nothing holds a handle to and nothing is bound to, so an " +
+                "attach that could not finish owes it",
+        )
+        assertEquals(
+            before,
+            assertNotNull(wm.tree().workspace("1")).children.map { it.id },
+            "and the container it was spawned into goes with it",
+        )
+    }
+
+    /**
+     * The other half of the choice, for the same reason `OrphanPolicy.LEAVE` exists: when
+     * diagnosing, tree damage you can see beats tree damage that was tidied away. Driven from the
+     * bind failure rather than the map timeout because that is the shape where both compensations
+     * have something to leave standing.
+     */
+    @Test
+    fun `leaving the wreckage of a failed attach standing is switchable on`() = swayTest {
+        store.put(WmFlags.unwindFailedAttach, false)
+        val app = openSurface("aw-app1")
+        mintFails = true
+
+        assertFailsWith<IllegalStateException> { wm.attach(app, dockFor("aw-dock")) }
+
+        assertEquals(
+            1,
+            wm.tree().windows.count { it.appId == "aw-dock" },
+            "with the flag off the dock the attach spawned is left where it is",
+        )
+        assertEquals(
+            "splith",
+            assertNotNull(wm.tree().workspace("1")).children.single().layout,
+            "and so is the container it was spawned into — the hazard, kept reproducible on " +
+                "purpose",
+        )
     }
 
     @Test

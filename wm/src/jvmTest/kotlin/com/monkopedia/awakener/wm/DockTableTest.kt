@@ -113,6 +113,22 @@ class DockTableTest {
         assertEquals(DockOrigin.ADOPTED, table.snapshot().entries[11]?.origin)
     }
 
+    /**
+     * The non-accumulating half of #4, which is the only half a test can see: two `no_focus`
+     * rules for one `app_id` are indistinguishable from one through anything sway offers — it has
+     * no verb that lists them and none that revokes them — so what the table remembers is what
+     * decides whether the second is ever issued.
+     */
+    @Test
+    fun `a no_focus rule is remembered once per app_id`() {
+        val table = DockTable()
+        table.recordFocusRule("aw-dock")
+        table.recordFocusRule("aw-dock")
+        table.recordFocusRule("other-dock")
+
+        assertEquals(setOf("aw-dock", "other-dock"), table.snapshot().focusRules)
+    }
+
     private fun window(id: Long, appId: String? = null, marks: List<String> = emptyList()) =
         Node(id = id, type = "con", appId = appId, pid = 1, marks = marks)
 

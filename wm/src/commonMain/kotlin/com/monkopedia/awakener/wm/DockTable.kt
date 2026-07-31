@@ -65,6 +65,15 @@ internal data class DockTableSnapshot(
      */
     val entries: Map<Long, DockEntry> = emptyMap(),
     val reservations: List<DockReservation> = emptyList(),
+    /**
+     * `app_id`s a `no_focus` rule has already been issued for.
+     *
+     * The one thing here that is a record of *compositor* state rather than of awakener's own,
+     * and it is here because sway offers no way to read the rule list back. It is bounded by the
+     * same session boundary as everything else in this table, and correctly so: a rule cannot
+     * outlive the compositor that holds it, so a new sway session has none.
+     */
+    val focusRules: Set<String> = emptySet(),
 ) {
     /** Whether an attach in flight has reserved the `app_id` [node] reports. */
     fun reserves(node: Node): Boolean = reservations.any { it.covers(node) }
@@ -128,6 +137,15 @@ internal class DockTable {
 
     fun forget(dock: SurfaceId) =
         state.update { it.copy(entries = it.entries - dock.raw) }
+
+    /**
+     * Records that a `no_focus` rule now stands for [appId].
+     *
+     * A set rather than a count because the point is that the second rule is never issued: sway
+     * cannot revoke one, so every rule after the first changes nothing and outlives everything.
+     */
+    fun recordFocusRule(appId: String) =
+        state.update { it.copy(focusRules = it.focusRules + appId) }
 }
 
 /** What a node's marks say about the surface it is a dock for. */

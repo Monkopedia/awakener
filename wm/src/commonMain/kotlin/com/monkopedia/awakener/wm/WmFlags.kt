@@ -33,6 +33,24 @@ enum class DockIdentity {
     PER_SURFACE_APP_ID,
 }
 
+/** How `attach` keeps the dock off the focus when [WmFlags.dockFocusOnMap] is off. */
+enum class FocusSuppression {
+    /**
+     * Let the dock take focus when it maps and take it back before `attach` returns, inside the
+     * section that already holds the tree. Costs a transient steal — 1–2ms across three runs of
+     * this code against sway 1.12 — and installs nothing that outlives the attach.
+     */
+    REFOCUS_AFTER_MAP,
+
+    /**
+     * A `no_focus` rule on the dock's `app_id`, issued before the spawn because sway evaluates
+     * focus rules when a window maps. No steal at all, at the price of compositor state with no
+     * revoke verb: the rule stands until the sway session ends, over every later dock the
+     * criteria match.
+     */
+    NO_FOCUS_RULE,
+}
+
 /** What counts as evidence that a tree node is a dock rather than a bindable surface. */
 enum class DockRecognition {
     /** The sway mark alone, so that `swaymsg -t get_tree` holds the whole truth. */
@@ -83,8 +101,38 @@ object WmFlags {
     val dockFocusOnMap = Flags.boolean(
         "wm.dock.focus_on_map",
         true,
-        "Focus the dock as soon as it appears. Right for a hotkey invocation (you are about " +
-            "to type at the agent), wrong for a dock created proactively for a surface.",
+        "Whether the dock is allowed to hold focus while it maps. Right for a hotkey " +
+            "invocation (you are about to type at the agent), wrong for a dock created " +
+            "proactively for a surface. It decides only that transient: where focus rests once " +
+            "attach returns is wm.focus.resting's, and how the suppression is achieved is " +
+            "wm.dock.focus_suppression's.",
+    )
+
+    val dockFocusSuppression = Flags.enum(
+        "wm.dock.focus_suppression",
+        FocusSuppression.REFOCUS_AFTER_MAP,
+        "How wm.dock.focus_on_map=false is achieved; read only when that flag is off. " +
+            "REFOCUS_AFTER_MAP lets the dock take focus and takes it back before attach " +
+            "returns, still holding the tree, so the correction is scoped to the one attach " +
+            "that asked for it and nothing outlives it — at the cost of a transient steal, " +
+            "measured at 1-2ms across three runs against sway 1.12, with focus resting on the " +
+            "application afterwards rather than going back. That correction is part of " +
+            "the suppression rather than of resting focus, so it runs whatever " +
+            "wm.focus.restore_after_attach says; that flag decides whether the resting-focus " +
+            "rule is applied at the end of an attach, not whether a steal is corrected. " +
+            "NO_FOCUS_RULE is the previous behaviour and has no steal, but sway has no verb " +
+            "that revokes a no_focus rule: it stands for the rest of the compositor session " +
+            "over every window the criteria match, and an attach that fails does not take it " +
+            "back either — it is named as an exception to that unwind rather than covered by " +
+            "it. Under the default " +
+            "wm.dock.identity=NEW_NODE those criteria are the app_id every dock shares, so one " +
+            "attach under it suppresses focus for every dock afterwards, including docks " +
+            "attached while this flag says to focus on map. That half is not fixable here and " +
+            "is why REFOCUS_AFTER_MAP is the default; what is fixed is the accumulation — at " +
+            "most one rule is issued per app_id per compositor session rather than one per " +
+            "attach. Combining it with wm.dock.identity=PER_SURFACE_APP_ID is the one " +
+            "arrangement whose rule list still grows without bound, since every attach mints a " +
+            "fresh name for the memory to miss.",
     )
 
     val dockIdentity = Flags.enum(
@@ -98,10 +146,11 @@ object WmFlags {
             "panel launched by hand, a second copy started outside awakener — is adopted as " +
             "the dock, marked, and killed by the eventual detach while the real dock goes " +
             "unmanaged. PER_SURFACE_APP_ID makes the name itself unique, so nothing else can " +
-            "answer the wait, and it additionally scopes the no_focus rule to one dock instead " +
-            "of to every dock ever spawned — at the cost of requiring the dock command to " +
-            "accept the name, and of one permanent no_focus rule per attach, since sway " +
-            "cannot revoke one.",
+            "answer the wait, and where wm.dock.focus_suppression=NO_FOCUS_RULE is chosen it " +
+            "additionally scopes that rule to one dock instead of to every dock ever spawned — " +
+            "at the cost of requiring the dock command to accept the name, and, in that " +
+            "combination only, of one permanent no_focus rule per attach, since sway cannot " +
+            "revoke one and a fresh name defeats the memory that would suppress the second.",
     )
 
     val dockMarkPrefix = Flags.string(
@@ -196,6 +245,26 @@ object WmFlags {
         true,
         "Collapse the split container once the dock leaves. sway does not remove single-child " +
             "split containers, and a leftover one silently swallows the next window opened.",
+    )
+
+    val unwindFailedAttach = Flags.boolean(
+        "wm.dock.unwind_failed_attach",
+        true,
+        "Take back what an attach put into the tree when it cannot finish. attach splits the " +
+            "tab before it spawns anything, so without this a failure leaves the surface " +
+            "wrapped in a single-child split container — which sway does not collapse and " +
+            "which silently swallows the next window opened in that tab — plus, if the failure " +
+            "came after the dock mapped, a panel window nothing holds a handle to. Off leaves " +
+            "both standing, for the same reason wm.dock.orphan_policy=LEAVE exists: when " +
+            "diagnosing, tree damage you can see beats tree damage that was tidied away. It " +
+            "covers the tree and only the tree — awakener's own record of the dock and of the " +
+            "attach's reservation is cleared on both paths whatever this says, since a leaked " +
+            "reservation is invisible in `swaymsg -t get_tree` while hiding every window under " +
+            "the dock's app_id for the life of the process. Two things it does not reach " +
+            "either: a no_focus rule, which sway cannot revoke, and the dock program itself, " +
+            "which is already exec'd by the time anything can fail — a dock that maps after " +
+            "the unwind has finished stands as an unowned panel, and nothing collects it yet " +
+            "(#18).",
     )
 
     val wedgedDockFailsDetach = Flags.boolean(
