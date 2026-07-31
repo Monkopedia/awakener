@@ -43,6 +43,9 @@ class SwayBindingTest {
      */
     private var mintDelayMs = 0L
 
+    /** Clients stopped by [freeze]. They have to be killed rather than asked to leave. */
+    private val frozen = mutableListOf<Int>()
+
     private val enabled get() = SwayHarness.available()
 
     @BeforeTest
@@ -74,6 +77,7 @@ class SwayBindingTest {
     @AfterTest
     fun tearDown() {
         if (!enabled) return
+        killFrozen()
         scope.cancel()
         sway.close()
         stateDir.toFile().deleteRecursively()
@@ -235,6 +239,86 @@ class SwayBindingTest {
                 "of the sweep is what turns one lost race into tree damage nothing repairs",
         )
         assertNull(root.find(stuckDock.dockId.raw), "and the failing dock itself is still down")
+    }
+
+    /**
+     * The one teardown failure the collection machinery could not see. `awaitGone` returning
+     * false left `detach` by an ordinary `return`, so the dock that *genuinely refuses to die* —
+     * the case the sweep's failure handling exists for — was the single failure nothing reported.
+     * The sweep gets one pass per `close` event and that event has been and gone, so nothing is
+     * scheduled to come back for it either: the orphan survives, the sweep claims success, and
+     * every later sweep pays the full window wait on it in silence.
+     *
+     * A `SIGSTOP`ped client is what a wedged panel program looks like to sway: nothing is left to
+     * service the `xdg_toplevel` close, so the window stays mapped while `kill` is acknowledged
+     * all the same. Real, rather than an injected failure — and deterministic, since a stopped
+     * process cannot come back on its own.
+     */
+    @Test
+    fun `a dock that will not die is reported and does not stop the sweep`() = swayTest {
+        val wedged = openSurface("aw-app1")
+        val clean = openSurface("aw-app2")
+        val wedgedDock = wm.attach(wedged, dockFor("aw-dock"), AgentId("agent-1"))
+        val cleanDock = wm.attach(clean, dockFor("aw-dock"), AgentId("agent-2"))
+
+        freeze(wedgedDock.dockId)
+        for (surface in listOf(wedged, clean)) {
+            command("[con_id=${surface.raw}] kill")
+            awaitGone(surface)
+        }
+
+        assertEquals(
+            listOf(wedgedDock.dockId.raw, cleanDock.dockId.raw),
+            wm.tree().windows.map { it.id },
+            "the sweep walks the tree in order, so the wedged dock has to be the one it reaches " +
+                "first, or 'the rest of the sweep still ran' is not what this proves",
+        )
+
+        val failure = assertFailsWith<IllegalStateException>(
+            "a dock still standing when its wait runs out is a failed teardown, and the whole " +
+                "point of the sweep is that it does not report a repair it has not made",
+        ) { wm.reapOrphans() }
+
+        assertTrue(
+            wedgedDock.dockId.raw.toString() in failure.message.orEmpty(),
+            "an aggregate over a sweep of N docks has to name the dock each failure came from " +
+                "or it is not diagnosable, and reapOrphans has no production caller yet to say " +
+                "it on its behalf; the message was: ${failure.message}",
+        )
+        assertNotNull(
+            wm.tree().find(wedgedDock.dockId.raw),
+            "the wedge has to be real: if the dock came down anyway this proves nothing",
+        )
+        assertNull(
+            wm.tree().find(cleanDock.dockId.raw),
+            "and the sweep must still have reaped the orphan after it — a dock that will not " +
+                "come down costs that dock, not the rest of the pass",
+        )
+    }
+
+    /**
+     * The other half of the choice. Raising is right when the timeout means the dock is wedged,
+     * and wrong when it only means a real panel program is slower to exit than the window wait —
+     * where the dock does come down a moment later and the failure is pure noise. Which of those
+     * a given panel is, is a fact about the desktop rather than about this code.
+     */
+    @Test
+    fun `treating a wedged dock as a failed detach is switchable off`() = swayTest {
+        store.put(WmFlags.wedgedDockFailsDetach, false)
+        val app = openSurface("aw-app1")
+        val handle = wm.attach(app, dockFor("aw-dock"), AgentId("agent-1"))
+
+        freeze(handle.dockId)
+        command("[con_id=${app.raw}] kill")
+        awaitGone(app)
+
+        wm.reapOrphans()
+
+        assertNotNull(
+            wm.tree().find(handle.dockId.raw),
+            "with the flag off the dock is left standing and the sweep says nothing about it — " +
+                "the blindness the default exists to avoid, kept reproducible on purpose",
+        )
     }
 
     /**
@@ -557,6 +641,40 @@ class SwayBindingTest {
             awaitGone(it)
         }
         return docks
+    }
+
+    /**
+     * Stops the client behind [window], so that it can no longer service a close request.
+     *
+     * The compositor's view of a wedged panel program: the window stays mapped, sway acknowledges
+     * `kill` regardless, and no amount of waiting makes the node leave the tree.
+     */
+    private suspend fun freeze(window: SurfaceId) {
+        val pid = assertNotNull(wm.tree().find(window.raw)?.pid, "no pid for ${window.raw}")
+        frozen += pid
+        signal("STOP", pid)
+    }
+
+    /**
+     * Kills whatever [freeze] stopped, children first, before sway goes.
+     *
+     * Before, because a stopped client cannot notice the compositor leaving and would sit there
+     * for the hour its `sleep` has left to run. Children first, because the client is running
+     * that `sleep` as a child of itself and a killed process cannot take its children with it —
+     * the child has to go while its parent is still there to enumerate it from. SIGKILL rather
+     * than SIGTERM throughout: a stopped process is woken for a kill and for nothing else.
+     */
+    private fun killFrozen() {
+        frozen.forEach { pid ->
+            runCatching { ProcessBuilder("pkill", "-KILL", "-P", "$pid").start().waitFor() }
+            runCatching { signal("KILL", pid) }
+        }
+        frozen.clear()
+    }
+
+    private fun signal(name: String, pid: Int) {
+        val exit = ProcessBuilder("kill", "-$name", pid.toString()).start().waitFor()
+        assertEquals(0, exit, "kill -$name $pid failed")
     }
 
     private fun markFor(surface: SurfaceId) =
