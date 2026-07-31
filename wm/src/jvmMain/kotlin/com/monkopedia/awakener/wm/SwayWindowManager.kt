@@ -47,8 +47,8 @@ class SwayWindowManager(
     private val treeEditLock = Mutex()
 
     /**
-     * The docks this process knows about. See [DockTable]; it is read on every enumeration and
-     * written only by [attach] and by a teardown.
+     * The docks this process knows about. See [DockTable]; it is read on every enumeration, and
+     * written by [attach], by a teardown, and by [dockedTo] adopting a dock it found by mark.
      */
     private val docks = DockTable()
 
@@ -78,15 +78,38 @@ class SwayWindowManager(
      * dock still carries. A false negative is the expensive direction, so recognising by either
      * is deliberate.
      *
+     * **Recognising a dock from its mark records it.** Adoption has to materialise, not merely be
+     * answered: sway moves a dock mark to the next dock attached to the same surface (#14), so a
+     * union computed afresh on every read has nothing left once it does. Measured, two managers
+     * against one sway: attach, restart awakener, enumerate — correct either way — then attach a
+     * second dock to that surface, and a non-recording union hands the first agent panel back as
+     * a bindable surface. That is this note's expensive false negative arriving through the
+     * mechanism built to prevent it, and it is worse than the original: the panel is invisible to
+     * [reapOrphans] for the same reason, so nothing can take it down again.
+     *
+     * The mark is therefore read *before* the table is consulted rather than after. That costs a
+     * list scan on a hit and buys two things: an adopted entry, and a user's mark under the
+     * prefix being reported on a node that is already a known dock, which a table-first order
+     * made depend on when in a dock's life it was looked at.
+     *
+     * Writing on a read path is deliberate and is not a lock: [DockTable] is a compare-and-set
+     * over an immutable snapshot, the same one [unparsedMarks] already does two lines up. A
+     * concurrent `attach` that has just evicted a failed dock's entry can be immediately followed
+     * here by an adoption of that same node — correctly, since it is a node still wearing the
+     * mark, which is exactly what adoption is for.
+     *
      * Reports rather than hides a mark under the prefix that does not parse: that is a user's
      * mark on a genuine window, and treating it as a dock is what made such a window unreachable
      * by every code path at once (#15).
      */
     private fun dockedTo(node: Node, table: DockTableSnapshot, cfg: Config): SurfaceId? {
-        if (cfg.consultsTable) table.entries[node.id]?.let { return it.surface }
         val reading = node.dockMark(cfg[WmFlags.dockMarkPrefix])
         if (reading.unparsed.isNotEmpty()) unparsedMarks.update { it + reading.unparsed }
-        return reading.surface
+        if (!cfg.consultsTable) return reading.surface
+        table.entries[node.id]?.let { return it }
+        val adopted = reading.surface ?: return null
+        docks.record(SurfaceId(node.id), adopted)
+        return adopted
     }
 
     /**
@@ -326,7 +349,7 @@ class SwayWindowManager(
                 // Before the mark, and this order is the fix: the mark is a round trip away and
                 // enumeration does not take this lock, so a reader landing in between would be
                 // handed the agent panel as a bindable surface.
-                docks.record(dockId, DockEntry(surface, appId))
+                docks.record(dockId, surface)
                 recorded = dockId
 
                 val mark = "${cfg[WmFlags.dockMarkPrefix]}${surface.raw}"
@@ -431,7 +454,9 @@ class SwayWindowManager(
      *
      * Which nodes are docks is [dockedTo]'s union, the same one enumeration answers from, so a
      * dock whose mark a later attach took off it (#14) is still reaped for as long as this
-     * process remembers standing it up. A dock an attach has reserved but not yet identified is
+     * process remembers it — which, since recognising a dock by its mark records it, covers a
+     * dock adopted after a restart and not only one this process stood up. A dock an attach has
+     * reserved but not yet identified is
      * not swept: nothing knows yet which surface it belongs to, so nothing can know it is an
      * orphan.
      */

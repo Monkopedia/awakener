@@ -174,6 +174,47 @@ class SwayBindingTest {
     }
 
     /**
+     * The same loss, one restart later, which is the case the previous test does *not* cover:
+     * there the table was still holding the dock this process stood up, so nothing rested on
+     * adoption. After a restart the mark is the only evidence a fresh manager ever had, and if
+     * adoption is only a read-time union it leaves nothing behind — so when the second attach
+     * moves the mark (#14), the first panel is neither marked nor tabled, and enumeration hands
+     * it back as bindable. That is the expensive false negative: a hotkey acting on it mints a
+     * Lifeless for the agent panel and writes it to the durable registry, while `reapOrphans`,
+     * answering from the same predicate, cannot see the panel to clean it up.
+     *
+     * The enumeration between the restart and the second attach is the adoption: it must record
+     * the dock, not merely answer about it.
+     */
+    @Test
+    fun `an adopted dock stays a dock when a later attach takes its mark`() = swayTest {
+        val app = openSurface("aw-app1")
+        val first = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1")).dockId
+
+        // awakener restarts: a fresh manager with an empty table, over a tree and marks sway
+        // has kept untouched.
+        wm = SwayWindowManager({ sway.connection() }, store, bindingStore(), scope)
+        assertEquals(
+            listOf(app.raw),
+            wm.surfaces().map { it.id.raw },
+            "the mark is the whole of what the new process knows, and here it is enough",
+        )
+
+        // Nothing forbids a second attach on one surface while #14 is open, and sway moves a
+        // mark rather than copying it.
+        val second = wm.attach(app, dockFor("aw-dock2"), AgentId("agent-1")).dockId
+
+        assertEquals(emptyList(), marksOf(first), "sway took the mark off the first dock")
+        assertEquals(listOf(markFor(app)), marksOf(second), "and put it on the second")
+        assertEquals(
+            listOf(app.raw),
+            wm.surfaces().map { it.id.raw },
+            "the first dock was adopted at the enumeration above and stays a dock: an adoption " +
+                "that leaves no record hands the agent panel back the moment the mark moves",
+        )
+    }
+
+    /**
      * The other half of the choice. Recognising a dock only by what awakener wrote into the tree
      * puts the whole truth in `swaymsg -t get_tree`, which is the lever to reach for when the
      * in-memory record is suspected of hiding a real window — at the cost this issue is about.
@@ -843,20 +884,6 @@ class SwayBindingTest {
                 true
             },
             "no dock was ever marked for ${surface.raw}",
-        )
-    }
-
-    /**
-     * Waits until [surface]'s tab has become the split container `attach` creates, which is the
-     * first of its tree work and happens before the reservation is filed.
-     */
-    private suspend fun awaitSplit(surface: SurfaceId) {
-        assertNotNull(
-            withTimeoutOrNull(WAIT_MS) {
-                while (tabHolding(surface)?.layout != "splith") yield()
-                true
-            },
-            "${surface.raw} was never split for a dock",
         )
     }
 

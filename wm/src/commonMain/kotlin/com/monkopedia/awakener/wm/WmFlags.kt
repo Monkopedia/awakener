@@ -118,8 +118,10 @@ object WmFlags {
             "MARK_OR_TABLE also counts awakener's own record of the docks it stood up, which " +
             "covers the panel from the moment it maps; the two sources are each reliable in one " +
             "direction only, the record being ahead of the mark during an attach and the mark " +
-            "outliving an awakener restart the record cannot. MARK_ONLY is the previous " +
-            "behaviour and the debuggable one — the whole truth is then in `swaymsg -t " +
+            "outliving an awakener restart the record cannot. Recognising a dock by its mark " +
+            "adds it to the record, so a dock adopted after a restart stays recognised even " +
+            "once a second attach on that surface moves the mark off it. MARK_ONLY is the " +
+            "previous behaviour and the debuggable one — the whole truth is then in `swaymsg -t " +
             "get_tree` with nothing held in process memory — and it is the lever to reach for " +
             "if the record is ever suspected of hiding a real window. It also stops a pending " +
             "attach's reservation from suppressing anything, for the same reason. The record is " +

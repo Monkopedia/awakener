@@ -89,9 +89,9 @@ class DockTableTest {
     @Test
     fun `an entry names the surface its dock was stood up for`() {
         val table = DockTable()
-        table.record(SurfaceId(9), DockEntry(SurfaceId(4), "aw-dock"))
+        table.record(SurfaceId(9), SurfaceId(4))
 
-        assertEquals(SurfaceId(4), table.snapshot().entries[9]?.surface)
+        assertEquals(SurfaceId(4), table.snapshot().entries[9])
 
         table.forget(SurfaceId(9))
 

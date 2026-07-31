@@ -80,9 +80,27 @@ reboot. If the table ever appears in `resolve`'s path, the durability story has 
 
 ### What it keys on
 
-`SurfaceId` (the dock's `con_id`) → entry of `{ surface: SurfaceId, agent: AgentId, appId,
-markApplied: Boolean }`, with a secondary index by `surface` so the hotkey path can ask "does
-this surface already have a dock" without a tree read.
+`SurfaceId` (the dock's `con_id`) → `SurfaceId` (the surface it belongs to), and nothing else.
+
+> **Amended 2026-07-31**, from `{ surface, agent: AgentId, appId, markApplied: Boolean }` plus a
+> secondary index by `surface`. That shape was reasoned, not measured, and #9's implementation
+> found three of its four fields unwritable or unread. `agent` is not known when the entry is
+> created: the bind happens *after* the tree edit, deliberately and for the reason under "Reads
+> outside the lock", so an entry recorded inside the lock has nothing to put there. `markApplied`
+> and the by-surface index have no reader until the hotkey path exists, and a field nothing reads
+> is a field nothing keeps honest. `appId` had no reader either, and an *adopted* entry cannot
+> supply one: a dock recognised from its mark is whatever node wears the mark, and sway reports
+> no `app_id` at all for an xwayland window. Add each back with the caller that needs it.
+
+**Adoption records; it does not merely answer.** "Tree has a marked node the table does not know
+— adopt it", below, is a write. An implementation that computes the union freshly on every read
+gives a different answer, and the difference is this note's expensive false negative: measured
+2026-07-31 through two real `SwayWindowManager`s against one sway 1.12, a dock attached, awakener
+restarted, the surface enumerated (correct — the mark carries it), then a second dock attached to
+the same surface. sway moves the mark (#14), and the read-time union has nothing left to answer
+from, so the first agent panel comes back as a bindable surface — while being invisible to
+`reapOrphans`, which shares the predicate, so nothing can take it down either. A recorded
+adoption survives the mark moving; a recomputed one does not.
 
 `con_id` is the right key and the only available one: it is what every sway criteria command
 takes, and it is what the tree returns. It is a key **only within one compositor session**,
@@ -135,10 +153,14 @@ sway 1.12 (probe J4):
   takes it off the first — measured directly: after `[con_id=5] mark --add awakener_dock_999`
   then `[con_id=6] mark --add awakener_dock_999`, node 5's marks are `[]` and node 6's are
   `[awakener_dock_999]`. **The table mitigates this in-session** — the union still recognises the
-  now-unmarked first dock, which is a point in this design's favour and worth saying — but it is
-  exactly the hint's *durability* that is lost: after an awakener restart the adoption scan
-  cannot see that dock at all. So "the hint that survives awakener's restart" is conditional on
-  no surface ever having been attached twice.
+  now-unmarked first dock, which is a point in this design's favour and worth saying. *(Amended
+  2026-07-31: the rest of this bullet said that after an awakener restart the adoption scan
+  cannot see that dock at all, and that is true only of an adoption that leaves no record.
+  Because adoption writes an entry, a dock enumerated even once after the restart stays
+  recognised when a second attach moves its mark — measured through two managers against one
+  sway, and asserted by `an adopted dock stays a dock when a later attach takes its mark`. What
+  is genuinely lost is narrower: a dock whose mark moves before anything has enumerated it —
+  a hand-run `swaymsg mark`, say — since there was nothing there to adopt it.)*
 - **The pinned predicate narrows #15 but does not close it.** A user mark that happens to be
   `awakener_dock_<some live con_id>` still hides a real window, and measured on the unpinned
   predicate a mark as ordinary as `awakener_dock_notes` removed a genuine application window from

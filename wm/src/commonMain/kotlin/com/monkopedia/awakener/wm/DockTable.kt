@@ -5,9 +5,6 @@ import kotlin.time.TimeSource
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
 
-/** A dock this process stood up, and the surface it stood it up beside. */
-internal data class DockEntry(val surface: SurfaceId, val appId: String)
-
 /**
  * An attach that has spawned a dock it cannot name yet.
  *
@@ -39,7 +36,14 @@ internal data class DockReservation(
 
 /** The table as one value, so a reader sees a consistent view without taking a lock. */
 internal data class DockTableSnapshot(
-    val entries: Map<Long, DockEntry> = emptyMap(),
+    /**
+     * Dock `con_id` → the surface that dock belongs to.
+     *
+     * Nothing more, because nothing reads more. The `app_id` an earlier draft carried had no
+     * reader, and an adopted entry could not supply one anyway: a dock recognised from its mark
+     * is whatever node wears the mark, and sway's `app_id` is absent on an xwayland window.
+     */
+    val entries: Map<Long, SurfaceId> = emptyMap(),
     val reservations: List<DockReservation> = emptyList(),
 ) {
     /** Whether an attach in flight has reserved the `app_id` [node] reports. */
@@ -49,6 +53,12 @@ internal data class DockTableSnapshot(
 /**
  * Which nodes are docks, and whose.
  *
+ * Holds the docks this process stood up *and* the ones it adopted — a marked node the table did
+ * not know is recorded the first time anything reads the tree, not merely answered about. That
+ * distinction is the whole of an adopted dock's durability: the mark is a hint sway will move to
+ * the next dock on the same surface (#14), so a recognition that leaves no record behind hands
+ * the first agent panel back as a bindable surface the moment it does.
+ *
  * Authoritative for exactly that one predicate. It never says a window exists — the tree keeps
  * that, and a node the tree has dropped is simply never asked about — and it is never consulted
  * by `resolve`, which answers from the durable registry: a `con_id` is meaningless after a
@@ -57,10 +67,17 @@ internal data class DockTableSnapshot(
  * Deliberately not persisted, and deliberately no longer lived than the IPC connection it was
  * built against. sway allocates `con_id`s from a counter that restarts with the compositor, so an
  * entry that outlived a sway restart would name whatever window happens to hold that id next.
- * Nothing here enforces that bound today: no code path notices the connection dying (#18).
+ * Nothing here enforces that bound today. The boundary is now *observable* — #20 made `changes`
+ * fail with `CompositorSessionEnded` where it used to go quiet — but nothing reacts to it, and
+ * discarding this table on it belongs to whoever adds reconnect (#18).
  *
  * Every mutation replaces the snapshot atomically, so [snapshot] blocks on nothing and enumeration
  * never queues behind an attach.
+ *
+ * Nothing evicts the entry of a dock the user closed outside `detach`. The note's rule for that
+ * case is "evict it, silently"; this never asks, which is observationally the same thing inside a
+ * session — sway does not recycle a `con_id` — but it does mean entries accumulate for the life
+ * of the process, one per dock ever stood up or adopted.
  */
 internal class DockTable {
     private val state = MutableStateFlow(DockTableSnapshot())
@@ -77,8 +94,8 @@ internal class DockTable {
     fun release(reservation: DockReservation) =
         state.update { it.copy(reservations = it.reservations - reservation) }
 
-    fun record(dock: SurfaceId, entry: DockEntry) =
-        state.update { it.copy(entries = it.entries + (dock.raw to entry)) }
+    fun record(dock: SurfaceId, surface: SurfaceId) =
+        state.update { it.copy(entries = it.entries + (dock.raw to surface)) }
 
     fun forget(dock: SurfaceId) =
         state.update { it.copy(entries = it.entries - dock.raw) }
