@@ -188,6 +188,18 @@ class SwayWindowManager(
         treeEditLock.withLock { TreeEdit().edit() }
 
     /**
+     * What identifies the dock an `attach` has `exec`'d but has not found yet: the `app_id` it
+     * will report, and the windows already carrying that name when the exec went out.
+     *
+     * Filed before the window it describes can exist, like the reservation and for the same
+     * reason — a `con_id` is minted when the dock maps, so nothing keyed on one can cover the
+     * dock across the span in which it becomes visible to a reader of the tree. Unlike the
+     * reservation it is never consulted by a read path: [TreeEdit.strayDock] is its only reader,
+     * and only where the attach has already failed.
+     */
+    private class PendingDock(val appId: String, val standing: Set<Long>)
+
+    /**
      * The only way to change the tree. See [treeEdit] for why it is a receiver.
      *
      * Everything here assumes the lock is held. Constructing it is [treeEdit]'s job alone: do not
@@ -267,6 +279,16 @@ class SwayWindowManager(
          *
          * The record is written after sway accepts the command and both happen under the tree
          * lock, so a rejected rule is not remembered as installed.
+         *
+         * **That order is the one place `attach` records a fact later than the failure that
+         * needs it and is left that way on purpose** — see [unwindAttach] for the two where it
+         * was not. A cancellation landing on this acknowledgement installs a rule nothing
+         * remembers, and the next attach under the same name issues a second one, which is #4's
+         * accumulation arriving through a one-round-trip door. Recording first would close it and
+         * open a worse one: a rule that never installed but is remembered as installed suppresses
+         * nothing for the rest of the session, for every dock under that name, with no correction
+         * running either — where the residue here is one redundant rule that suppresses exactly
+         * what the first already did.
          */
         suspend fun suppressFocusFor(appId: String) {
             if (appId in docks.snapshot().focusRules) return
@@ -275,14 +297,33 @@ class SwayWindowManager(
         }
 
         /**
-         * Takes back the tree edits of an [attach] that could not finish: the dock window
-         * [spawned], if it got that far, and the split container it created around [surface] if
-         * [container] says it did.
+         * Takes back the tree edits of an [attach] that could not finish: the dock window it
+         * spawned, and the split container it created around [surface] if [container] says it
+         * did.
          *
          * Runs inside the section the attach already holds, rather than as a `catch` around the
          * whole call. Releasing the tree to re-take it would hand a concurrent attach a window in
          * which to map its own dock into the half-built container, which is the class of bug the
          * serialisation exists to prevent.
+         *
+         * **Which node the dock is comes from the tree, not only from [spawned].** `spawned` is
+         * assigned once [awaitWindow] has returned, so it is null across the whole of the map
+         * deadline — and the likeliest failure of all is that deadline expiring, at the moment a
+         * slow dock is most likely to be mapping. A dock that maps in that gap would otherwise be
+         * a window this unwind does not know exists: the kill is skipped, and the flatten is then
+         * refused on a container that has acquired a second child, which reinstates exactly the
+         * leftover `splith` (#6) the unwind exists to remove. [pending] is the record that exists
+         * early enough — it is filed with the `exec` — and [strayDock] turns it back into a
+         * `con_id`. This is the note's "tolerate by checking the post-condition in the tree",
+         * applied to the precondition instead.
+         *
+         * **Two flattens at most while a dock is still unidentified, and the second is not
+         * padding.** The dock program maps one window, and each pass divides time into three: it
+         * maps before that pass's tree read, which adopts and kills it; or between the read and
+         * the `split none`, which sway then refuses — and the next pass's read finds it already
+         * standing; or after a flatten that has already succeeded, in which case the container is
+         * gone and the dock arrives as its own tab. Only the last of the three is left, and it is
+         * the design note's late dock, which is #18's rather than this transaction's.
          *
          * **Best-effort, and [cause] is what propagates.** A compensation that fails is attached
          * to [cause] as a suppressed exception and otherwise ignored: it must not replace the
@@ -295,6 +336,14 @@ class SwayWindowManager(
          * cancelled coroutine cannot make, so they run under [NonCancellable]. That is bounded by
          * the same window wait a `kill` already costs.
          *
+         * **A dock that outlives its kill ends the unwind, and what it leaves does not get
+         * repaired later.** The container stays a `splith` holding [surface] beside a panel that
+         * will not close, and `attach`'s bookkeeping has by then evicted that panel's table entry
+         * — so once the user closes it by hand, the leftover container is one nothing in this
+         * class recognises as a dock's and nothing will normalise. Reported rather than repaired:
+         * the flatten is a command sway refuses while the container holds two windows, so trying
+         * it would add a second failure saying nothing the first did not.
+         *
          * What it does not restore: focus. `attach` moves focus to [surface] as its first act and
          * does not put it back on the success path either, so an unwind leaving it there is the
          * tree in the state a completed attach would also have left it.
@@ -302,32 +351,104 @@ class SwayWindowManager(
         suspend fun unwindAttach(
             surface: SurfaceId,
             spawned: SurfaceId?,
+            pending: PendingDock?,
             container: Boolean,
             cause: Throwable,
         ) {
             if (!config[WmFlags.unwindFailedAttach]) return
             withContext(NonCancellable) {
-                val dockDown = spawned == null || compensate(cause) {
-                    check(kill(spawned)) {
-                        "dock ${spawned.raw} was still in the tree ${WINDOW_WAIT_MS}ms after the " +
-                            "unwind killed it; its client is not servicing the close request"
-                    }
+                // A dock that outlives its kill stops the normalisation: a container that still
+                // holds two windows is one sway refuses to flatten, so attempting it would report
+                // a second failure that says nothing the first did not.
+                if (spawned != null && !compensate(cause) { killDock(spawned) }) return@withContext
+                if (!container) return@withContext
+
+                // An `exec` whose window the attach never identified is the only thing that can
+                // still arrive in the container while the unwind is working in it.
+                val outstanding = if (spawned == null) pending else null
+                val flattens = if (outstanding == null) 1 else FLATTEN_PASSES
+                repeat(flattens) { pass ->
+                    val stray = outstanding?.let { strayDock(surface, it, cause) }
+                    if (stray != null && !compensate(cause) { killDock(stray) }) return@withContext
+                    // A refusal that is not the last word is not reported: it means a window
+                    // arrived between the read above and this command, and the next pass is what
+                    // takes that window down. Reporting it would put a repaired problem into the
+                    // diagnosis of why the attach failed.
+                    val last = pass == flattens - 1
+                    val report = if (last) cause else null
+                    if (compensate(report) { normalizeContainer(surface) }) return@withContext
                 }
-                // Only once the dock has actually gone: a container that still holds two windows
-                // is one sway refuses to flatten, so attempting it would report a second failure
-                // that says nothing the first did not.
-                if (container && dockDown) compensate(cause) { normalizeContainer(surface) }
             }
         }
 
-        /** Runs [action], reporting a failure onto [cause] instead of raising it. */
-        private suspend fun compensate(cause: Throwable, action: suspend () -> Unit): Boolean = try {
+        /**
+         * [kill] as a compensation: a dock that outlives the wait is a compensation that failed,
+         * and the message has to say which dock, since nothing under here does.
+         */
+        private suspend fun killDock(dock: SurfaceId) = check(kill(dock)) {
+            "dock ${dock.raw} was still in the tree ${WINDOW_WAIT_MS}ms after the unwind killed " +
+                "it; its client is not servicing the close request"
+        }
+
+        /**
+         * The window an [attach] spawned and never identified, if it is in [surface]'s container
+         * now.
+         *
+         * Scoped to that container rather than to the whole tree, and both halves of that are
+         * load-bearing. `attach` focuses the surface and holds the lock throughout, so sway maps
+         * a dock of its own in there and nowhere else; and a window elsewhere reporting the same
+         * `app_id` is not this attach's to kill — under [DockIdentity.NEW_NODE] that name is
+         * shared with every other dock and with anything the user launched by hand. Nothing else
+         * may `exec` while the lock is held, which is the same exclusion [awaitWindow]'s
+         * [PendingDock.standing] set rests on.
+         *
+         * What the scoping does not remove is [DockIdentity.NEW_NODE]'s disclosed trust in the
+         * shared name, which this is a second route to: a window a user launches *into this
+         * surface's tab* while the attach is waiting reports the same `app_id`, is not in
+         * [PendingDock.standing], and is killed here. Named on [WmFlags.dockIdentity] alongside
+         * the adoption route `attach` and `detach` already had, and removed by construction under
+         * [DockIdentity.PER_SURFACE_APP_ID].
+         *
+         * Reports a failed read onto [cause] rather than raising it, for [compensate]'s reason:
+         * losing the original diagnosis to a compensation's own failure is what that rule exists
+         * to prevent, and a dead socket fails this read and every repair after it alike.
+         */
+        private suspend fun strayDock(
+            surface: SurfaceId,
+            pending: PendingDock,
+            cause: Throwable,
+        ): SurfaceId? = try {
+            tree().parentOf(surface.raw)?.children
+                ?.firstOrNull {
+                    it.id != surface.raw &&
+                        it.appId == pending.appId &&
+                        it.id !in pending.standing
+                }
+                ?.let { SurfaceId(it.id) }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            cause.addSuppressed(failure)
+            null
+        }
+
+        /**
+         * Runs [action], reporting a failure onto [cause] instead of raising it.
+         *
+         * A null [cause] discards the failure instead, which is only for a step whose caller is
+         * about to try again: an attempt whose refusal is the signal to retry is not a
+         * compensation failure, and reporting it would name a problem that was then repaired.
+         */
+        private suspend fun compensate(
+            cause: Throwable?,
+            action: suspend () -> Unit,
+        ): Boolean = try {
             action()
             true
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (failure: Exception) {
-            cause.addSuppressed(failure)
+            cause?.addSuppressed(failure)
             false
         }
 
@@ -418,11 +539,12 @@ class SwayWindowManager(
      * Stands a dock up beside [surface], as a transaction over the tree.
      *
      * It returns a handle whose `detach` owns everything the attach did, or it throws having
-     * taken its own tree edits back — the split container it created and, if the failure came
-     * after the dock mapped, the dock window. No half-built container is left for a caller to
-     * find. The compensations are best-effort: one that fails is suppressed onto the exception
-     * that caused the unwind rather than replacing it, so "took its edits back" is what was
-     * attempted and reported, not a guarantee sway can be held to.
+     * taken its own tree edits back — the split container it created, and the dock window
+     * whether or not the dock mapped in time for the attach to identify it (see
+     * [TreeEdit.unwindAttach], which reads the tree for one it never saw). The compensations are
+     * best-effort: one that fails is suppressed onto the exception that caused the unwind rather
+     * than replacing it, so "took its edits back" is what was attempted and reported, not a
+     * guarantee sway can be held to.
      *
      * Three things are outside that, and each is named where it is spent rather than designed
      * around:
@@ -430,12 +552,12 @@ class SwayWindowManager(
      * - a `no_focus` rule under [FocusSuppression.NO_FOCUS_RULE], which sway has no verb to
      *   revoke. Not the default, and issued at most once per `app_id` per session;
      * - the dock program, which is `exec`'d before anything can fail and which sway acknowledges
-     *   with nothing to cancel it by. On the likeliest failure — the map wait running out — the
-     *   window has not appeared, so there is nothing to kill and nothing stops it mapping
-     *   afterwards. A dock that maps after the unwind has finished stands as a panel in no table,
-     *   carrying no mark, which enumeration reports as bindable. Nothing collects it: that is the
-     *   claim mechanism the design note specifies against a collector of [changes], and there is
-     *   no collector (#18);
+     *   with nothing to cancel it by. Nothing stops it mapping after the attach has given up, and
+     *   the unwind can only take down a window that is already in the tree when it looks. A dock
+     *   that maps after the unwind's last look stands as a panel in no table, carrying no mark,
+     *   which enumeration reports as bindable. Nothing collects it: that is the claim mechanism
+     *   the design note specifies against a collector of [changes], and there is no collector
+     *   (#18);
      * - [WmFlags.unwindFailedAttach] set to false, which leaves the tree wreckage standing
      *   deliberately.
      *
@@ -480,12 +602,26 @@ class SwayWindowManager(
                 // did not create is a different edit, and sway would refuse it anyway.
                 var container = false
                 var spawned: SurfaceId? = null
+                // What identifies the dock between the exec and `spawned` being assigned. See
+                // PendingDock: without it the unwind cannot name a window that maps in that span.
+                var pending: PendingDock? = null
                 try {
                     // Focus first: sway's split applies to the focused container, and the dock has
                     // to land inside this surface's tab rather than wherever focus happened to be.
                     focus(surface)
-                    run("split horizontal")
+                    // Recorded before the command rather than after it, for the same reason
+                    // `pending` is: a fact recorded on the far side of a round trip is one the
+                    // failure that needs it can arrive ahead of — a cancellation landing on this
+                    // acknowledgement would otherwise leave the container built and unrecorded.
+                    // Rolled back only where sway itself refuses, which is the one failure that
+                    // means the container certainly does not exist.
                     container = true
+                    try {
+                        run("split horizontal")
+                    } catch (rejected: IllegalStateException) {
+                        container = false
+                        throw rejected
+                    }
 
                     // Must precede the exec — sway evaluates focus rules when the window maps, so
                     // issuing this afterwards would be too late to prevent the steal. The other
@@ -511,6 +647,11 @@ class SwayWindowManager(
                     if (cfg[WmFlags.dockPendingSuppression]) {
                         reservation = docks.reserve(appId, standing, WINDOW_WAIT_MS.milliseconds)
                     }
+                    // Filed before the exec for the reason above it: from the moment the command
+                    // goes out this attach may have a window in the tree, and the map deadline
+                    // can expire before anything has identified it. Ungated, because it is not a
+                    // suppression — nothing reads it but the unwind.
+                    pending = PendingDock(appId, standing)
                     run("exec $command")
                     val dockNode = awaitWindow(appId, standing)
                         ?: error("dock '$appId' never appeared; command was: $command")
@@ -543,7 +684,7 @@ class SwayWindowManager(
                     if (cfg[WmFlags.restoreFocusAfterAttach]) settleFocus(surface, dockId)
                     dockId
                 } catch (failure: Throwable) {
-                    unwindAttach(surface, spawned, container, failure)
+                    unwindAttach(surface, spawned, pending, container, failure)
                     throw failure
                 }
             }
@@ -567,7 +708,11 @@ class SwayWindowManager(
                 // in a complete container, an ordinary shape for another attach to interleave
                 // with, rather than the half-built one the serialisation exists to hide.
                 withContext(NonCancellable) {
-                    treeEdit { unwindAttach(surface, dockId, container = true, failure) }
+                    // No pending dock: this attach identified its own, so there is no window of
+                    // its making left for the unwind to find in the tree.
+                    treeEdit {
+                        unwindAttach(surface, dockId, pending = null, container = true, failure)
+                    }
                 }
                 throw failure
             }
@@ -759,5 +904,14 @@ class SwayWindowManager(
 
     private companion object {
         const val WINDOW_WAIT_MS = 5_000L
+
+        /**
+         * How many times an unwind will try to flatten the container it is taking back while the
+         * dock it spawned is still unidentified. Two, and the second is what covers a dock that
+         * maps between the unwind's read of the tree and its `split none` — see
+         * [TreeEdit.unwindAttach]. A third would cover nothing: the dock program maps one window,
+         * and by the second pass that window is either down or was never going to arrive in time.
+         */
+        const val FLATTEN_PASSES = 2
     }
 }

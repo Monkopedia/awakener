@@ -145,8 +145,12 @@ object WmFlags {
             "for the length of the wait, so any other window reporting it that maps first — a " +
             "panel launched by hand, a second copy started outside awakener — is adopted as " +
             "the dock, marked, and killed by the eventual detach while the real dock goes " +
-            "unmanaged. PER_SURFACE_APP_ID makes the name itself unique, so nothing else can " +
-            "answer the wait, and where wm.dock.focus_suppression=NO_FOCUS_RULE is chosen it " +
+            "unmanaged. A failed attach reaches the same window by a second route: its unwind " +
+            "reads the surface's container back against this name to find a dock it never " +
+            "identified, so a window under it that maps in there during the attach is killed " +
+            "by the unwind instead. PER_SURFACE_APP_ID makes the name itself unique, so " +
+            "nothing else can answer the wait, and where " +
+            "wm.dock.focus_suppression=NO_FOCUS_RULE is chosen it " +
             "additionally scopes that rule to one dock instead of to every dock ever spawned — " +
             "at the cost of requiring the dock command to accept the name, and, in that " +
             "combination only, of one permanent no_focus rule per attach, since sway cannot " +
