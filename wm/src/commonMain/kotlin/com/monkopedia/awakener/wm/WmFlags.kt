@@ -33,6 +33,15 @@ enum class DockIdentity {
     PER_SURFACE_APP_ID,
 }
 
+/** What counts as evidence that a tree node is a dock rather than a bindable surface. */
+enum class DockRecognition {
+    /** The sway mark alone, so that `swaymsg -t get_tree` holds the whole truth. */
+    MARK_ONLY,
+
+    /** The mark, or awakener's own record of the docks it stood up this session. */
+    MARK_OR_TABLE,
+}
+
 /** What happens to a dock whose bound surface has gone away. */
 enum class OrphanPolicy {
     /** Tear the dock down with its surface. */
@@ -89,8 +98,52 @@ object WmFlags {
     val dockMarkPrefix = Flags.string(
         "wm.dock.mark_prefix",
         "awakener_dock_",
-        "Prefix for the sway mark identifying a dock. Docks are real tree nodes, so this " +
-            "mark is what keeps them out of surface enumeration and focus scripting.",
+        "Prefix for the sway mark identifying a dock. Docks are real tree nodes, and a dock " +
+            "mark — this prefix followed by the bound surface's con_id, nothing else — is what " +
+            "keeps them out of surface enumeration and focus scripting across an awakener " +
+            "restart, while sway keeps running. Changing it against a running desktop orphans " +
+            "every dock whose mark was written under the old value: this process still knows " +
+            "the ones it stood up itself, but a dock it only knows by mark becomes an ordinary " +
+            "bindable surface and an orphaned one stops being reapable. Moving the prefix is a " +
+            "restart with no docks standing, not a flip.",
+    )
+
+    val dockRecognition = Flags.enum(
+        "wm.dock.recognition",
+        DockRecognition.MARK_OR_TABLE,
+        "What identifies a node as a dock. The mark lands one IPC round trip after the window " +
+            "maps, so under MARK_ONLY there is a moment in every attach when enumeration " +
+            "reports the agent panel as an ordinary bindable surface — and a hotkey acting on " +
+            "that answer mints an agent for the panel and writes it to the durable registry. " +
+            "MARK_OR_TABLE also counts awakener's own record of the docks it stood up, which " +
+            "covers the panel from the moment it maps; the two sources are each reliable in one " +
+            "direction only, the record being ahead of the mark during an attach and the mark " +
+            "outliving an awakener restart the record cannot. MARK_ONLY is the previous " +
+            "behaviour and the debuggable one — the whole truth is then in `swaymsg -t " +
+            "get_tree` with nothing held in process memory — and it is the lever to reach for " +
+            "if the record is ever suspected of hiding a real window. It also stops a pending " +
+            "attach's reservation from suppressing anything, for the same reason. The record is " +
+            "never written to disk and is never consulted by resolve, which answers from the " +
+            "durable registry.",
+    )
+
+    val dockPendingSuppression = Flags.boolean(
+        "wm.dock.pending_suppression",
+        true,
+        "Keep windows reporting the dock's app_id out of surface enumeration while an attach " +
+            "for that app_id is in flight. A con_id does not exist until the dock maps, so the " +
+            "record of a dock cannot be made before that and, without this, enumeration can " +
+            "still read the tree in the gap between the map and the record. The app_id is the " +
+            "only predicate that exists before the window does. Off is the previous behaviour, " +
+            "with no over-suppression at all. On costs that under wm.dock.identity=NEW_NODE, " +
+            "where every dock reports the same name, a further window under it is hidden for " +
+            "the rest of the attach — narrower than it sounds, since the first such window is " +
+            "the one attach adopts as its dock either way, but real. The asymmetry is " +
+            "deliberate: a surface briefly missing costs a hotkey that says 'no such surface' " +
+            "for a moment, while a dock briefly present costs a minted agent and a durable " +
+            "registry write for the panel. Under PER_SURFACE_APP_ID the suppression is exact. " +
+            "This decides only whether a reservation is filed; nothing decides whether one is " +
+            "cleared, which is unconditional.",
     )
 
     val orphanPolicy = Flags.enum(
