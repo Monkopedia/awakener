@@ -3,6 +3,7 @@ package com.monkopedia.awakener.wm
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.milliseconds
@@ -14,32 +15,81 @@ import kotlin.time.Duration.Companion.seconds
  */
 class DockTableTest {
     @Test
-    fun `a dock mark is the prefix and a con_id`() {
-        val reading = window(9, marks = listOf("${PREFIX}7")).dockMark(PREFIX)
+    fun `a dock mark is the prefix, the dock's con_id and its surface's`() {
+        val mark = dockMarkFor(SurfaceId(9), SurfaceId(7), PREFIX, SCHEME)
+        val reading = window(9, marks = listOf(mark)).dockMark(PREFIX, SCHEME)
 
+        assertEquals("${PREFIX}9_for_7", mark)
         assertEquals(SurfaceId(7), reading.surface)
         assertEquals(emptyList(), reading.unparsed)
     }
 
+    /**
+     * #14 at its root. A sway mark identifier is globally unique — marking a second container
+     * with one takes it off the first — so two docks of one surface can only both keep a mark if
+     * the two strings differ, and only the dock's own `con_id` differs between them.
+     */
     @Test
-    fun `a mark under the prefix that is not a con_id is not a dock, and is reported`() {
-        val reading = window(9, marks = listOf("${PREFIX}notes")).dockMark(PREFIX)
+    fun `two docks of one surface are marked differently`() {
+        assertNotEquals(
+            dockMarkFor(SurfaceId(6), SurfaceId(5), PREFIX, SCHEME),
+            dockMarkFor(SurfaceId(8), SurfaceId(5), PREFIX, SCHEME),
+        )
+    }
+
+    /**
+     * #15's other half, and the one the pinned predicate did not close: requiring a `con_id` in
+     * the suffix stopped `awakener_dock_notes` hiding a window, but `awakener_dock_7` was still a
+     * dock mark on whatever node wore it. A mark that names the node it belongs on cannot be that.
+     */
+    @Test
+    fun `a dock mark on a node it does not name is not a dock, and is reported`() {
+        val mark = dockMarkFor(SurfaceId(8), SurfaceId(7), PREFIX, SCHEME)
+        val reading = window(9, marks = listOf(mark)).dockMark(PREFIX, SCHEME)
+
+        assertNull(reading.surface, "node 9 is not the dock this mark names")
+        assertEquals(listOf(mark), reading.unparsed)
+    }
+
+    @Test
+    fun `a mark under the prefix that is not a dock mark is not a dock, and is reported`() {
+        val marks = listOf("${PREFIX}notes", "${PREFIX}7", "${PREFIX}9_for_soon")
+        val reading = window(9, marks = marks).dockMark(PREFIX, SCHEME)
 
         assertNull(
             reading.surface,
             "sway's mark namespace is the user's too, so this is an ordinary window",
         )
         assertEquals(
-            listOf("${PREFIX}notes"),
+            marks,
             reading.unparsed,
-            "and it has to be reported: hidden in one place and skipped in another is how a " +
-                "window ended up reachable by no code path at all",
+            "and they have to be reported: hidden in one place and skipped in another is how a " +
+                "window ended up reachable by no code path at all — and `${PREFIX}7` is also " +
+                "what a dock marked under the other scheme wears, which is how a flip is " +
+                "diagnosable rather than merely lossy",
+        )
+    }
+
+    /** The previous mark, kept reachable — it is the whole of the recovery from a scheme flip. */
+    @Test
+    fun `the surface-only mark is switchable back on`() {
+        val scheme = DockMarkScheme.SURFACE
+        val mark = dockMarkFor(SurfaceId(9), SurfaceId(7), PREFIX, scheme)
+        val reading = window(9, marks = listOf(mark)).dockMark(PREFIX, scheme)
+
+        assertEquals("${PREFIX}7", mark, "it names the surface and nothing else")
+        assertEquals(SurfaceId(7), reading.surface)
+        assertEquals(
+            SurfaceId(7),
+            window(11, marks = listOf(mark)).dockMark(PREFIX, scheme).surface,
+            "and it is a dock mark on any node at all, which is #15's live half kept " +
+                "reproducible on purpose",
         )
     }
 
     @Test
     fun `marks outside the prefix say nothing either way`() {
-        val reading = window(9, marks = listOf("notes", "urgent")).dockMark(PREFIX)
+        val reading = window(9, marks = listOf("notes", "urgent")).dockMark(PREFIX, SCHEME)
 
         assertNull(reading.surface)
         assertEquals(emptyList(), reading.unparsed)
@@ -134,5 +184,6 @@ class DockTableTest {
 
     private companion object {
         const val PREFIX = "awakener_dock_"
+        val SCHEME = DockMarkScheme.DOCK_AND_SURFACE
     }
 }

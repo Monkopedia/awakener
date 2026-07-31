@@ -166,16 +166,16 @@ class SwayBindingTest {
     }
 
     /**
-     * The mark is a hint that outlives an awakener restart, not the truth: sway's mark namespace
-     * is global, so a second attach on one surface takes the mark off the first dock (#14). While
-     * this process remembers standing a dock up, losing the mark does not make it a surface.
+     * The mark is a hint that outlives an awakener restart, not the truth: it lives in a namespace
+     * the user writes into as well, so it can go without awakener doing anything. While this
+     * process remembers standing a dock up, losing the mark does not make it a surface.
      */
     @Test
     fun `a dock whose mark is taken off it is still not a surface`() = swayTest {
         val app = openSurface("aw-app1")
         val handle = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1"))
 
-        command("[con_id=${handle.dockId.raw}] unmark ${markFor(app)}")
+        command("[con_id=${handle.dockId.raw}] unmark ${markFor(handle.dockId, app)}")
 
         assertEquals(emptyList(), marksOf(handle.dockId), "the mark really is gone")
         assertEquals(
@@ -189,17 +189,22 @@ class SwayBindingTest {
      * The same loss, one restart later, which is the case the previous test does *not* cover:
      * there the table was still holding the dock this process stood up, so nothing rested on
      * adoption. After a restart the mark is the only evidence a fresh manager ever had, and if
-     * adoption is only a read-time union it leaves nothing behind — so when the second attach
-     * moves the mark (#14), the first panel is neither marked nor tabled, and enumeration hands
-     * it back as bindable. That is the expensive false negative: a hotkey acting on it mints a
-     * Lifeless for the agent panel and writes it to the durable registry, while `reapOrphans`,
-     * answering from the same predicate, cannot see the panel to clean it up.
+     * adoption is only a read-time union it leaves nothing behind — so the moment the mark goes,
+     * the panel is neither marked nor tabled and enumeration hands it back as bindable. That is
+     * the expensive false negative: a hotkey acting on it mints a Lifeless for the agent panel
+     * and writes it to the durable registry, while `reapOrphans`, answering from the same
+     * predicate, cannot see the panel to clean it up.
      *
-     * The enumeration between the restart and the second attach is the adoption: it must record
-     * the dock, not merely answer about it.
+     * The enumeration between the restart and the unmark is the adoption: it must record the
+     * dock, not merely answer about it.
+     *
+     * The mark is taken off by hand because that is now the only thing that takes one off. This
+     * test used to drive it with a second attach on the same surface, which is #14: while the
+     * mark named only the surface, sway moved it to the second dock. It no longer does, and what
+     * this test is about — that an adoption is a write — is unchanged either way.
      */
     @Test
-    fun `an adopted dock stays a dock when a later attach takes its mark`() = swayTest {
+    fun `an adopted dock stays a dock once its mark is taken off it`() = swayTest {
         val app = openSurface("aw-app1")
         val first = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1")).dockId
 
@@ -212,17 +217,14 @@ class SwayBindingTest {
             "the mark is the whole of what the new process knows, and here it is enough",
         )
 
-        // Nothing forbids a second attach on one surface while #14 is open, and sway moves a
-        // mark rather than copying it.
-        val second = wm.attach(app, dockFor("aw-dock2"), AgentId("agent-1")).dockId
+        command("[con_id=${first.raw}] unmark ${markFor(first, app)}")
 
-        assertEquals(emptyList(), marksOf(first), "sway took the mark off the first dock")
-        assertEquals(listOf(markFor(app)), marksOf(second), "and put it on the second")
+        assertEquals(emptyList(), marksOf(first), "the mark really is gone")
         assertEquals(
             listOf(app.raw),
             wm.surfaces().map { it.id.raw },
-            "the first dock was adopted at the enumeration above and stays a dock: an adoption " +
-                "that leaves no record hands the agent panel back the moment the mark moves",
+            "the dock was adopted at the enumeration above and stays a dock: an adoption that " +
+                "leaves no record hands the agent panel back the moment the mark goes",
         )
     }
 
@@ -237,7 +239,7 @@ class SwayBindingTest {
         val app = openSurface("aw-app1")
         val handle = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1"))
 
-        command("[con_id=${handle.dockId.raw}] unmark ${markFor(app)}")
+        command("[con_id=${handle.dockId.raw}] unmark ${markFor(handle.dockId, app)}")
 
         assertEquals(
             setOf(app.raw, handle.dockId.raw),
@@ -276,8 +278,8 @@ class SwayBindingTest {
     /**
      * The cost side of materialising adoption, and the one place it must not be paid.
      *
-     * #15's acknowledged residual is a user's own mark that happens to be the prefix plus a
-     * *live* `con_id`: it hides a genuine application window. That used to be self-healing —
+     * #15's residual is a user's own mark shaped exactly like the marked window's *own* dock
+     * mark: it hides a genuine application window. That used to be self-healing —
      * `swaymsg unmark` handed the window straight back — and recording what a read recognises
      * makes it permanent, because nothing withdraws a record. Enumeration keeps hiding the
      * window here on purpose; `wm.dock.recognition=MARK_ONLY` is the lever that releases it.
@@ -292,14 +294,14 @@ class SwayBindingTest {
         val app = openSurface("aw-app1")
         val victim = openSurface("aw-app2")
 
-        command("[con_id=${victim.raw}] mark --add ${markFor(app)}")
+        command("[con_id=${victim.raw}] mark --add ${markFor(victim, app)}")
         assertEquals(
             listOf(app.raw),
             wm.surfaces().map { it.id.raw },
             "while the mark is on, the pinned predicate says dock and the window is hidden",
         )
 
-        command("[con_id=${victim.raw}] unmark ${markFor(app)}")
+        command("[con_id=${victim.raw}] unmark ${markFor(victim, app)}")
         assertEquals(emptyList(), marksOf(victim), "the user's mark really is gone")
         assertEquals(
             listOf(app.raw),
@@ -322,8 +324,8 @@ class SwayBindingTest {
 
     /**
      * The hazard kept reproducible, the same way `MARK_ONLY` keeps its own. Reaping on whatever
-     * enumeration recognises closes one real gap — an adopted dock whose mark a later attach took
-     * (#14) is then still swept — and the price is this window.
+     * enumeration recognises closes one real gap — an adopted dock whose mark has since been
+     * taken off it is then still swept — and the price is this window.
      */
     @Test
     fun `reaping on a latched recognition is switchable on`() = swayTest {
@@ -331,9 +333,9 @@ class SwayBindingTest {
         val app = openSurface("aw-app1")
         val victim = openSurface("aw-app2")
 
-        command("[con_id=${victim.raw}] mark --add ${markFor(app)}")
+        command("[con_id=${victim.raw}] mark --add ${markFor(victim, app)}")
         wm.surfaces()
-        command("[con_id=${victim.raw}] unmark ${markFor(app)}")
+        command("[con_id=${victim.raw}] unmark ${markFor(victim, app)}")
 
         command("[con_id=${app.raw}] kill")
         awaitGone(app)
@@ -373,6 +375,152 @@ class SwayBindingTest {
         wm.reapOrphans()
 
         assertNull(wm.tree().find(dock.raw), "the dock must not outlive its surface")
+    }
+
+    /**
+     * #14, at the level where it happens: sway's mark namespace is one global set of unique
+     * identifiers, so a mark derived from the *surface* is a name that two docks of one surface
+     * both want, and marking the second takes it off the first. Nothing forbids a second attach —
+     * `WindowManager` says the hotkey path on a bound surface should call `DockHandle.focus`, but
+     * that is a caller convention rather than a guard, and `attach` is documented as safe to call
+     * concurrently.
+     *
+     * Asserted twice over, because the table hides the first half from behaviour. While this
+     * process is the one that stood both docks up it remembers them whatever their marks say, so
+     * the loss shows only in the tree; the fresh manager below is the awakener restart that has
+     * nothing but the marks to read, and it is where a dock with no mark left comes back as a
+     * bindable surface and stops being reapable.
+     *
+     * Deliberately says nothing about the mark's *format* — that is `dockMarkFor`'s, and this test
+     * has to keep meaning the same thing if it changes again.
+     */
+    @Test
+    fun `a second attach on one surface leaves the first dock its own mark`() = swayTest {
+        // The manager that stood the docks up is still collecting close events on this scope and
+        // would reap from its own table, which would prove nothing about what the marks carry.
+        store.put(WmFlags.sweepOnClose, false)
+        val app = openSurface("aw-app1")
+        val first = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1")).dockId
+        val second = wm.attach(app, dockFor("aw-dock2"), AgentId("agent-1")).dockId
+
+        val firstMarks = marksOf(first).orEmpty()
+        val secondMarks = marksOf(second).orEmpty()
+        assertTrue(
+            firstMarks.isNotEmpty(),
+            "the second attach took the first dock's mark off it: sway moves a mark rather than " +
+                "copying it, so a mark naming the surface is one two docks of that surface cannot " +
+                "both hold",
+        )
+        assertTrue(secondMarks.isNotEmpty(), "the second dock is marked too")
+        assertEquals(
+            emptySet(),
+            firstMarks.toSet() intersect secondMarks.toSet(),
+            "and each mark names one dock: a string both wear is a string neither identifies",
+        )
+
+        // awakener restarts. The marks are the whole of what a fresh process knows, which is what
+        // makes them worth being per-dock.
+        wm = SwayWindowManager({ sway.connection() }, store, bindingStore(), scope)
+        assertEquals(
+            listOf(app.raw),
+            wm.surfaces().map { it.id.raw },
+            "a dock the restart cannot recognise is handed back as a bindable surface, and a " +
+                "hotkey on it mints a Lifeless for the agent panel",
+        )
+
+        command("[con_id=${app.raw}] kill")
+        awaitGone(app)
+        wm.reapOrphans()
+
+        assertNull(wm.tree().find(first.raw), "the first dock must not outlive its surface")
+        assertNull(wm.tree().find(second.raw), "nor the second")
+    }
+
+    /**
+     * The previous mark kept reachable, and the hazard with it — the recovery if an upgrade lands
+     * while docks are standing has to be a flag rather than a downgrade. Under `SURFACE` the two
+     * docks of one surface want one identifier and sway gives it to whichever was marked last,
+     * which is #14 as the compositor performs it.
+     */
+    @Test
+    fun `the surface-only dock mark is switchable back on`() = swayTest {
+        store.put(WmFlags.dockMarkScheme, DockMarkScheme.SURFACE)
+        val app = openSurface("aw-app1")
+        val first = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1")).dockId
+        val second = wm.attach(app, dockFor("aw-dock2"), AgentId("agent-1")).dockId
+
+        assertEquals(emptyList(), marksOf(first), "#14, kept reproducible on purpose")
+        assertEquals(
+            listOf(dockMarkFor(second, app, WmFlags.dockMarkPrefix.default, DockMarkScheme.SURFACE)),
+            marksOf(second),
+            "the flag has to actually change what attach writes",
+        )
+    }
+
+    /**
+     * #15's live half. `mark` is a user-facing verb in a single global namespace, so a mark under
+     * awakener's prefix is an ordinary thing for a personal sway config to produce — and while a
+     * dock mark meant "the prefix and *the bound surface's* con_id", `awakener_dock_<n>` for any
+     * live `n` was one, on whatever window wore it.
+     *
+     * That the suffix is a number is the whole of the difference from the `notes` case above, and
+     * it is the half the pinned predicate did not close: enumeration and the sweep agree about it,
+     * and what they agree on is wrong.
+     */
+    @Test
+    fun `a user's mark of the prefix and another window's con_id hides nothing`() = swayTest {
+        val app = openSurface("aw-app1")
+        val victim = openSurface("aw-app2")
+        val userMark = "${WmFlags.dockMarkPrefix.default}${app.raw}"
+
+        command("[con_id=${victim.raw}] mark --add $userMark")
+
+        assertEquals(
+            setOf(app.raw, victim.raw),
+            wm.surfaces().map { it.id.raw }.toSet(),
+            "a mark the user wrote on their own window must not remove it from enumeration: " +
+                "every surface gets an agent, and one that cannot be enumerated never gets one",
+        )
+        assertNotNull(
+            wm.keyFor(victim),
+            "and it stays bindable — keyFor answers from surfaces(), so attach would say 'no " +
+                "such surface' for a window that is plainly there",
+        )
+        assertEquals(
+            setOf(userMark),
+            wm.unrecognisedDockMarks.value,
+            "reported rather than passed over: a mark under the prefix that is not a dock mark " +
+                "is the one thing that would have made this take minutes rather than a probe",
+        )
+    }
+
+    /**
+     * The same mark, and the consequence #18 added. A sweep runs on every window close now, so a
+     * window mis-recognised as a dock is reachable by a *destructive* path and not merely by an
+     * enumeration one — and `wm.dock.reap_evidence=CURRENT` is no defence here, because the mark
+     * the sweep is asked about is on the node at the moment it looks. It is the user's mark.
+     *
+     * The bar is the design note's own, set for `RECLAIM` and applying unchanged: a window hidden
+     * is recoverable and a window destroyed is not.
+     */
+    @Test
+    fun `the sweep does not destroy a window carrying a user's prefix-shaped mark`() = swayTest {
+        val app = openSurface("aw-app1")
+        val victim = openSurface("aw-app2")
+
+        command("[con_id=${victim.raw}] mark --add ${WmFlags.dockMarkPrefix.default}${app.raw}")
+
+        command("[con_id=${app.raw}] kill")
+        awaitGone(app)
+        awaitSweep()
+        // By hand as well, so that the assertion does not rest on the collector having got there.
+        wm.reapOrphans()
+
+        assertNotNull(
+            wm.tree().find(victim.raw),
+            "the sweep killed a window on the strength of a mark the user wrote themselves — " +
+                "the con_id in it named a different window, which has now closed",
+        )
     }
 
     /**
@@ -1041,8 +1189,8 @@ class SwayBindingTest {
             "the second attach must resolve to the dock it just spawned (${dock2.dockId.raw}) " +
                 "and not to the first one (${dock1.dockId.raw})",
         )
-        assertEquals(listOf(markFor(app1)), marksOf(dock1.dockId), "one mark per dock")
-        assertEquals(listOf(markFor(app2)), marksOf(dock2.dockId), "one mark per dock")
+        assertEquals(listOf(markFor(dock1.dockId, app1)), marksOf(dock1.dockId), "one per dock")
+        assertEquals(listOf(markFor(dock2.dockId, app2)), marksOf(dock2.dockId), "one per dock")
         assertEquals(
             setOf(app1.raw, dock1.dockId.raw),
             assertNotNull(tabHolding(app1)).children.map { it.id }.toSet(),
@@ -1061,7 +1209,11 @@ class SwayBindingTest {
             wm.tree().find(dock2.dockId.raw),
             "detaching one surface's dock must leave the other surface's dock standing",
         )
-        assertEquals(listOf(markFor(app2)), marksOf(dock2.dockId), "and still bound to its own")
+        assertEquals(
+            listOf(markFor(dock2.dockId, app2)),
+            marksOf(dock2.dockId),
+            "and still bound to its own",
+        )
     }
 
     /**
@@ -1093,8 +1245,8 @@ class SwayBindingTest {
         )
         assertEquals(
             mapOf(
-                dock1.dockId.raw to listOf(markFor(app1)),
-                dock2.dockId.raw to listOf(markFor(app2)),
+                dock1.dockId.raw to listOf(markFor(dock1.dockId, app1)),
+                dock2.dockId.raw to listOf(markFor(dock2.dockId, app2)),
             ),
             docksOf("aw-dock"),
             "every window the dock program produced must be exactly one surface's dock: a node " +
@@ -1191,8 +1343,8 @@ class SwayBindingTest {
 
         assertEquals("aw-dock-${app1.raw}", appIdOf(dock1.dockId))
         assertEquals("aw-dock-${app2.raw}", appIdOf(dock2.dockId))
-        assertEquals(listOf(markFor(app1)), marksOf(dock1.dockId), "one mark per dock")
-        assertEquals(listOf(markFor(app2)), marksOf(dock2.dockId), "one mark per dock")
+        assertEquals(listOf(markFor(dock1.dockId, app1)), marksOf(dock1.dockId), "one per dock")
+        assertEquals(listOf(markFor(dock2.dockId, app2)), marksOf(dock2.dockId), "one per dock")
     }
 
     // -- helpers ------------------------------------------------------------------------
@@ -1286,8 +1438,13 @@ class SwayBindingTest {
         assertEquals(0, exit, "kill -$name $pid failed")
     }
 
-    private fun markFor(surface: SurfaceId) =
-        "${WmFlags.dockMarkPrefix.default}${surface.raw}"
+    /** The mark [dock] carries to say it is [surface]'s dock, at stock defaults. */
+    private fun markFor(dock: SurfaceId, surface: SurfaceId) = dockMarkFor(
+        dock,
+        surface,
+        WmFlags.dockMarkPrefix.default,
+        WmFlags.dockMarkScheme.default,
+    )
 
     private suspend fun marksOf(dock: SurfaceId): List<String>? = wm.tree().find(dock.raw)?.marks
 
@@ -1306,16 +1463,27 @@ class SwayBindingTest {
 
     private suspend fun focusedId(): Long? = wm.tree().windows.firstOrNull { it.focused }?.id
 
-    /** Waits until [surface]'s dock has been marked, which is the last of `attach`'s tree work. */
+    /**
+     * Waits until [surface]'s dock has been marked, which is the last of `attach`'s tree work.
+     *
+     * Asks the production predicate rather than matching a string, because the mark names the
+     * dock as well as the surface and the caller does not know which node the dock is yet.
+     */
     private suspend fun awaitMarked(surface: SurfaceId) {
         assertNotNull(
             withTimeoutOrNull(WAIT_MS) {
-                while (wm.tree().windows.none { markFor(surface) in it.marks }) yield()
+                while (wm.tree().windows.none { dockMarkOf(it) == surface }) yield()
                 true
             },
             "no dock was ever marked for ${surface.raw}",
         )
     }
+
+    /** The surface [node]'s marks say it is the dock for, at stock defaults. */
+    private fun dockMarkOf(node: Node): SurfaceId? = node.dockMark(
+        WmFlags.dockMarkPrefix.default,
+        WmFlags.dockMarkScheme.default,
+    ).surface
 
     private suspend fun awaitFocused(surface: SurfaceId) {
         assertNotNull(
@@ -1340,6 +1508,17 @@ class SwayBindingTest {
         withTimeoutOrNull(WAIT_MS) {
             while (wm.tree().find(id.raw) != null) yield()
         }
+    }
+
+    /** Waits for the repair collector to have completed a sweep of its own. */
+    private suspend fun awaitSweep() {
+        assertNotNull(
+            withTimeoutOrNull(WAIT_MS) {
+                while (wm.repairs.value.sweeps == 0) yield()
+                true
+            },
+            "the collector never swept, so a test asserting what a sweep did not do proves nothing",
+        )
     }
 
     private companion object {
