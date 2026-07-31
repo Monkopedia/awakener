@@ -84,18 +84,26 @@ internal data class DockTableSnapshot(
  *
  * Holds the docks this process stood up *and* the ones it adopted — a marked node the table did
  * not know is recorded the first time anything reads the tree, not merely answered about. That
- * distinction is the whole of an adopted dock's durability: the mark is a hint sway will move to
- * the next dock on the same surface (#14), so a recognition that leaves no record behind hands
- * the first agent panel back as a bindable surface the moment it does.
+ * distinction is the whole of an adopted dock's durability: a mark lives in a namespace shared
+ * with the user, so it can be moved or removed by a hand that is not awakener's, and a recognition
+ * that leaves no record behind hands the agent panel back as a bindable surface the moment it is.
+ * Under the previous [DockMarkScheme.SURFACE] mark awakener did that to itself — a second attach
+ * on one surface took the mark off the first dock (#14) — which is what the default scheme fixes.
  *
  * **Recording is one-way.** Nothing here un-records a node whose mark went away, so recognition
- * outlives the evidence that produced it: a genuine application window that carried
- * `<prefix><some live con_id>` — a user's own mark, #15's acknowledged residual — at any single
+ * outlives the evidence that produced it: a genuine application window that carried a mark shaped
+ * exactly like its own dock mark — a user's own mark, #15's residual — at any single
  * enumeration stays out of `surfaces()` for the life of this process, and `swaymsg unmark` does
  * not bring it back. `wm.dock.recognition=MARK_ONLY` does, live, and so does restarting awakener;
  * those are the whole of the recovery. What the latch is *not* allowed to do is destroy that
  * window, which is why the orphan sweep asks [DockEntry.origin] rather than trusting the entry —
  * see [WmFlags.reapEvidence].
+ *
+ * That bounds the **latch** and nothing wider. While the user's mark is still on the window it is
+ * evidence the sweep accepts, and the sweep destroys that window when the surface the mark names
+ * closes — measured, and stated at [DockMarkScheme.DOCK_AND_SURFACE], which is where the residual
+ * belongs. Recording is what makes the *hiding* outlast the mark; it is not what makes the kill
+ * possible.
  *
  * Authoritative for exactly that one predicate. It never says a window exists — the tree keeps
  * that, and a node the tree has dropped is simply never asked about — and it is never consulted
@@ -183,37 +191,108 @@ internal class DockTable {
 internal data class DockMarkReading(
     val surface: SurfaceId?,
     /**
-     * Marks under the dock prefix whose suffix is not a `con_id`.
+     * Marks under the dock prefix that are not this node's dock mark.
      *
      * A user's own mark, in other words: sway's mark namespace is one global, user-facing set and
      * `mark notes` is an ordinary thing to have bound to a key. Such a node is not a dock, so it
      * is reported here and left enumerable rather than hidden.
+     *
+     * Named for the question rather than for the parse: this holds a mark that does not parse at
+     * all *and* one that parses perfectly while naming a different node — see [dockMark], where
+     * refusing the second is what stops a user's mark from hiding their window. It is what
+     * `SwayWindowManager.unrecognisedDockMarks` reports, and the two names say the same thing on
+     * purpose.
      */
-    val unparsed: List<String>,
+    val unrecognised: List<String>,
 )
 
+/** What a dock's mark names. */
+enum class DockMarkScheme {
+    /**
+     * The dock's own `con_id` and the surface's: `<prefix><dockId>_for_<surfaceId>`.
+     *
+     * Unique per dock by construction, which is the whole point — sway's mark identifiers are one
+     * global namespace and marking a second container with an existing identifier *removes it from
+     * the first*, so a mark naming only the surface is a string two docks of one surface both want
+     * (#14).
+     *
+     * It also makes the mark self-validating: it says which node it belongs on, so a mark on any
+     * other node is not a dock mark at all. That is what narrows #15 from "any `<prefix><live
+     * con_id>`, on any window" to a mark whose user wrote their own window's `con_id` into it.
+     *
+     * **The narrowing is of the trigger, not of the consequence.** What is left still ends in a
+     * destroyed window: a mark that passes the self-check is on the node when the sweep looks, so
+     * `wm.dock.reap_evidence=CURRENT` is satisfied, and the sweep kills that window when the
+     * `con_id` after `_for_` closes. Measured on sway 1.12 — `SwayBindingTest.the residual the
+     * self-check leaves is a destroyed window, not a hidden one`.
+     */
+    DOCK_AND_SURFACE,
+
+    /**
+     * The surface's `con_id` alone: `<prefix><surfaceId>`. The previous behaviour, with both of
+     * the above holes open — so under it any `<prefix><live con_id>` the user has written on any
+     * window of their own is a dock mark, and the sweep destroys that window when the `con_id` in
+     * it closes. Measured on sway 1.12, which is what #15 is.
+     */
+    SURFACE,
+}
+
+/** Separates the two ids in a [DockMarkScheme.DOCK_AND_SURFACE] mark. */
+private const val DOCK_MARK_INFIX = "_for_"
+
+/** The mark [dock] carries to say it is [surface]'s dock. */
+internal fun dockMarkFor(
+    dock: SurfaceId,
+    surface: SurfaceId,
+    prefix: String,
+    scheme: DockMarkScheme,
+): String = when (scheme) {
+    DockMarkScheme.DOCK_AND_SURFACE -> "$prefix${dock.raw}$DOCK_MARK_INFIX${surface.raw}"
+    DockMarkScheme.SURFACE -> "$prefix${surface.raw}"
+}
+
 /**
- * The one dock-mark predicate: the configured prefix followed by a parseable `con_id`, and
- * nothing else counts.
+ * The one dock-mark predicate: whether this node carries the mark [dockMarkFor] would write for
+ * it, and if so which surface that mark names.
  *
  * Shared by enumeration and by the orphan sweep so that the two cannot disagree about what the
  * prefix identifies — when they did, a window carrying `awakener_dock_notes` was hidden from
  * enumeration by one and skipped by the other, leaving it unreachable by any code path and
  * reported by none (#15).
  *
- * A node carrying more than one parseable dock mark takes the first; sway moves a mark rather
- * than copying it, so nothing awakener does produces that.
+ * Under [DockMarkScheme.DOCK_AND_SURFACE] the node has to be the one the mark names. That is the
+ * rest of #15: a mark is a string in a namespace the user writes into too, so the question worth
+ * asking is not "does this look like a dock mark" but "does this look like *this node's* dock
+ * mark", and only awakener knows a node's `con_id` at the moment it marks it.
+ *
+ * Anything else under the prefix is reported through [DockMarkReading.unrecognised] rather than
+ * hidden. That covers a mark whose suffix is not ids at all, and — after an awakener upgrade over
+ * standing docks, or a [DockMarkScheme] flip — a mark written under the other scheme, which is
+ * how such a dock is diagnosable rather than merely lost.
+ *
+ * A node carrying more than one dock mark of its own takes the first; nothing awakener does
+ * produces that, since it writes one mark per dock and each names the dock it is on.
  */
-internal fun Node.dockMark(prefix: String): DockMarkReading {
+internal fun Node.dockMark(prefix: String, scheme: DockMarkScheme): DockMarkReading {
     var surface: SurfaceId? = null
-    val unparsed = mutableListOf<String>()
+    val unrecognised = mutableListOf<String>()
     for (mark in marks) {
         if (!mark.startsWith(prefix)) continue
-        val boundTo = mark.removePrefix(prefix).toLongOrNull()
+        val boundTo = boundSurface(mark.removePrefix(prefix), scheme)
         when {
-            boundTo == null -> unparsed += mark
-            surface == null -> surface = SurfaceId(boundTo)
+            boundTo == null -> unrecognised += mark
+            surface == null -> surface = boundTo
         }
     }
-    return DockMarkReading(surface, unparsed)
+    return DockMarkReading(surface, unrecognised)
+}
+
+/** The surface a dock mark's [suffix] names, or null if it is not this node's dock mark. */
+private fun Node.boundSurface(suffix: String, scheme: DockMarkScheme): SurfaceId? = when (scheme) {
+    DockMarkScheme.SURFACE -> suffix.toLongOrNull()?.let(::SurfaceId)
+    DockMarkScheme.DOCK_AND_SURFACE -> {
+        val parts = suffix.split(DOCK_MARK_INFIX)
+        parts.takeIf { it.size == 2 && it[0].toLongOrNull() == id }
+            ?.get(1)?.toLongOrNull()?.let(::SurfaceId)
+    }
 }

@@ -161,7 +161,8 @@ object WmFlags {
         "wm.dock.mark_prefix",
         "awakener_dock_",
         "Prefix for the sway mark identifying a dock. Docks are real tree nodes, and a dock " +
-            "mark — this prefix followed by the bound surface's con_id, nothing else — is what " +
+            "mark — this prefix followed by whatever wm.dock.mark_scheme says, and nothing " +
+            "else — is what " +
             "keeps them out of surface enumeration and focus scripting across an awakener " +
             "restart, while sway keeps running. Changing it against a running desktop orphans " +
             "less than it looks and hides more. It orphans only a dock nothing has enumerated " +
@@ -172,6 +173,41 @@ object WmFlags {
             "sharp edge: a genuine window hidden by a prefix-shaped user mark under the old " +
             "value stays hidden under the new one, and removing the mark does not release it " +
             "either. Moving the prefix is a restart with no docks standing, not a flip.",
+    )
+
+    val dockMarkScheme = Flags.enum(
+        "wm.dock.mark_scheme",
+        DockMarkScheme.DOCK_AND_SURFACE,
+        "What a dock's mark says after the prefix. DOCK_AND_SURFACE writes " +
+            "<dockCon_id>_for_<surfaceCon_id> and recognises that mark only on the node whose " +
+            "con_id it names. Two properties follow, and both are defects closed rather than " +
+            "preferences. A sway mark identifier is globally unique — marking a second container " +
+            "with an existing identifier removes it from the first — so a mark naming only the " +
+            "surface is a name two docks of one surface both want, and a second attach silently " +
+            "unmarked the first dock (#14): after an awakener restart that dock is then an " +
+            "ordinary bindable window a hotkey mints an agent for, and the orphan sweep cannot " +
+            "see it to take it down. And because the mark now says which node it belongs on, a " +
+            "mark on any other node is not a dock mark, which is what stops a user's own mark " +
+            "under this prefix from hiding their window and — since a sweep runs on every window " +
+            "close — from getting it killed when the con_id in it closes (#15). That narrows who " +
+            "can trip #15, not what tripping it costs: a user mark that is this prefix, the " +
+            "marked window's own con_id, _for_, and any con_id still passes the check, and the " +
+            "sweep destroys that window when the con_id after _for_ closes. Measured on sway " +
+            "1.12. SURFACE is the previous <surfaceCon_id>, and its price is that same destroyed " +
+            "window reached far more easily: under it this prefix plus any live con_id is a dock " +
+            "mark on whatever window wears it, so a user's own 'awakener_dock_7' hides that " +
+            "window and the sweep destroys it when node 7 closes — measured on sway 1.12, which " +
+            "is what #15 is. It is here because it is the whole of the recovery if an upgrade " +
+            "lands while docks are standing, and it is worth that price only in a session with " +
+            "no marks under this prefix that awakener did not write. This decides reading and " +
+            "writing together, so an upgrade over standing docks — or a flip against a live " +
+            "desktop — strands every dock marked under the other value: those marks stop being " +
+            "recognised, the docks become bindable surfaces a hotkey will mint an agent for, and " +
+            "their names are reported through the manager's unrecognised dock marks rather than " +
+            "passed over. A stranded dock is never reaped and a mark of one scheme is never read " +
+            "as a dock mark of the other, so that costs a leak and never a kill: close the " +
+            "stranded panels by hand, or flip to the value they were marked under, close them, " +
+            "and flip back. Move it with no docks standing.",
     )
 
     val dockRecognition = Flags.enum(
@@ -186,10 +222,11 @@ object WmFlags {
             "direction only, the record being ahead of the mark during an attach and the mark " +
             "outliving an awakener restart the record cannot. Recognising a dock by its mark " +
             "adds it to the record, so a dock adopted after a restart stays recognised even " +
-            "once a second attach on that surface moves the mark off it — and nothing " +
-            "withdraws that record, so under MARK_OR_TABLE a node that carried a dock-shaped " +
-            "mark at any single read is a dock for the life of the process whatever its marks " +
-            "say afterwards. MARK_ONLY is the previous behaviour and the debuggable one — the " +
+            "once something takes that mark off it — a hand-run unmark, or, under " +
+            "wm.dock.mark_scheme=SURFACE, a second attach on the same surface (#14). Nothing " +
+            "withdraws that record, so under MARK_OR_TABLE a node that carried a dock mark of " +
+            "its own at any single read is a dock for the life of the process whatever its " +
+            "marks say afterwards. MARK_ONLY is the previous behaviour and the debuggable one — the " +
             "whole truth is then in `swaymsg -t get_tree` with nothing held in process memory " +
             "— and it is the lever to reach for if the record is ever suspected of hiding a " +
             "real window, being the only thing that releases one live. It also stops a pending " +
@@ -221,18 +258,25 @@ object WmFlags {
         "wm.dock.reap_evidence",
         ReapEvidence.CURRENT,
         "What the orphan sweep must see before it kills a node it believes is a dock. " +
-            "Recognising a dock by its mark records it, which is what keeps an adopted dock " +
-            "recognised after a second attach moves that mark (#14) — and that record is never " +
-            "withdrawn, so recognition outlives the mark that produced it. A genuine window " +
-            "carrying a user's own mark that happens to be the dock prefix plus a live con_id " +
-            "(#15) is therefore hidden from enumeration for the life of the process even after " +
-            "the mark is removed. Being hidden is recoverable — wm.dock.recognition=MARK_ONLY, " +
+            "Recognising a dock by its mark records it, and that record is never withdrawn, so " +
+            "recognition outlives the mark that produced it. A genuine window carrying a user's " +
+            "own mark that happens to be shaped exactly like that window's dock mark (#15's " +
+            "residual) is therefore hidden from enumeration for the life of the process even " +
+            "after the mark is removed. Being hidden is recoverable — " +
+            "wm.dock.recognition=MARK_ONLY, " +
             "or an awakener restart — and being killed is not, so CURRENT will not reap on that " +
             "latched recognition alone: it kills only a node carrying a dock mark at the moment " +
-            "of the sweep, or one this process recorded when it stood the dock up itself. What " +
-            "that costs is the single case with neither, a dock adopted after a restart whose " +
-            "mark a later attach then took: it stays out of enumeration but its panel is left " +
-            "standing when its surface closes, to be closed by hand. RECOGNITION reaps " +
+            "of the sweep, or one this process recorded when it stood the dock up itself. That " +
+            "bounds the latch and not the mark, and it is worth being exact about which: while " +
+            "that user's mark is still on the window it is precisely the evidence CURRENT asks " +
+            "for, so CURRENT reaps on it and the window is destroyed. Removing the mark is what " +
+            "this flag makes survivable. See wm.dock.mark_scheme, which is where that residual " +
+            "and its cost are stated. What " +
+            "that costs is the case with neither — a dock adopted after a restart whose mark " +
+            "something has since taken off it, which stays out of enumeration but is left " +
+            "standing when its surface closes, to be closed by hand. Under the default " +
+            "wm.dock.mark_scheme that needs a hand-run unmark; under SURFACE a second attach on " +
+            "the same surface does it (#14). RECOGNITION reaps " +
             "everything enumeration calls a dock, which closes that gap at the price of the " +
             "user's window.",
     )

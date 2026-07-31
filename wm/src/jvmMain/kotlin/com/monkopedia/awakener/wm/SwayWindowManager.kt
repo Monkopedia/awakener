@@ -70,7 +70,7 @@ class SwayWindowManager(
      */
     internal val docks = DockTable()
 
-    private val unparsedMarks = MutableStateFlow<Set<String>>(emptySet())
+    private val unrecognisedMarks = MutableStateFlow<Set<String>>(emptySet())
 
     private val repairState = MutableStateFlow(DockRepairStatus())
 
@@ -83,15 +83,20 @@ class SwayWindowManager(
     val repairs: StateFlow<DockRepairStatus> = repairState.asStateFlow()
 
     /**
-     * Marks under [WmFlags.dockMarkPrefix] whose suffix is not a `con_id`, as seen by every
-     * enumeration and every sweep this instance has run.
+     * Marks under [WmFlags.dockMarkPrefix] that are not the marked node's own dock mark, as seen
+     * by every enumeration and every sweep this instance has run.
      *
      * Such a mark is a user's own — sway's mark namespace is one global, user-facing set — so the
      * window keeps being enumerated and is named here instead of being silently hidden. Names
      * accumulate for the lifetime of this instance and are never pruned, so a mark that has since
      * been removed is still listed.
+     *
+     * It is also where a dock marked under the other [WmFlags.dockMarkScheme] shows up — after an
+     * awakener upgrade over standing docks, or a flip of that flag — since such a mark is under
+     * the prefix and is not a mark this build recognises. That is the whole of the diagnosis for
+     * a dock the flip stranded.
      */
-    val unrecognisedDockMarks: StateFlow<Set<String>> = unparsedMarks.asStateFlow()
+    val unrecognisedDockMarks: StateFlow<Set<String>> = unrecognisedMarks.asStateFlow()
 
     /** Whether awakener's own memory counts as evidence, or only what it wrote into the tree. */
     private val Config.consultsTable: Boolean
@@ -107,13 +112,14 @@ class SwayWindowManager(
      * is deliberate.
      *
      * **Recognising a dock from its mark records it.** Adoption has to materialise, not merely be
-     * answered: sway moves a dock mark to the next dock attached to the same surface (#14), so a
-     * union computed afresh on every read has nothing left once it does. Measured, two managers
-     * against one sway: attach, restart awakener, enumerate — correct either way — then attach a
-     * second dock to that surface, and a non-recording union hands the first agent panel back as
-     * a bindable surface. That is this note's expensive false negative arriving through the
-     * mechanism built to prevent it, and it is worse than the original: the panel is invisible to
-     * [reapOrphans] for the same reason, so nothing can take it down again.
+     * answered: a mark can be taken off a dock by a hand that is not awakener's, and a union
+     * computed afresh on every read has nothing left when it is. Measured, two managers against
+     * one sway: attach, restart awakener, enumerate — correct either way — then take the mark off
+     * the dock, and a non-recording union hands the agent panel back as a bindable surface. That
+     * is this note's expensive false negative arriving through the mechanism built to prevent it,
+     * and it is worse than the original: the panel is invisible to [reapOrphans] for the same
+     * reason, so nothing can take it down again. Under [DockMarkScheme.SURFACE] awakener produced
+     * that loss itself, by a second attach on the same surface (#14).
      *
      * The mark is therefore read *before* the table is consulted rather than after. That costs a
      * list scan on a hit and buys two things: an adopted entry, and a user's mark under the
@@ -121,27 +127,40 @@ class SwayWindowManager(
      * made depend on when in a dock's life it was looked at.
      *
      * Writing on a read path is deliberate and is not a lock: [DockTable] is a compare-and-set
-     * over an immutable snapshot, the same one [unparsedMarks] already does two lines up. A
+     * over an immutable snapshot, the same one [unrecognisedMarks] already does two lines up. A
      * concurrent `attach` that has just evicted a failed dock's entry can be immediately followed
      * here by an adoption of that same node — correctly, since it is a node still wearing the
      * mark, which is exactly what adoption is for.
      *
-     * Reports rather than hides a mark under the prefix that does not parse: that is a user's
-     * mark on a genuine window, and treating it as a dock is what made such a window unreachable
-     * by every code path at once (#15).
+     * Reports rather than hides a mark under the prefix that is not this node's own dock mark:
+     * that is a user's mark on a genuine window, and treating it as a dock is what made such a
+     * window unreachable by every code path at once, and — once a sweep ran on every window close
+     * — destroyed by one (#15).
      *
      * **What recording costs, stated where the recording happens.** It is one-way: a node
      * recognised here stays recognised whatever its marks say afterwards. So the residual #15
-     * leaves — a user's own mark that happens to be the prefix plus a *live* `con_id` on a real
-     * window — stops being transient. Before this, `swaymsg unmark` handed the window straight
+     * leaves — a user's own mark shaped exactly like that window's own dock mark — stops being
+     * transient. Before this, `swaymsg unmark` handed the window straight
      * back to enumeration; now it does not, and only `wm.dock.recognition=MARK_ONLY` or an
-     * awakener restart releases it. That is a window hidden, which is recoverable. It is not a
-     * window destroyed: [reapOrphans] does not kill on this recognition alone under the default
-     * [WmFlags.reapEvidence].
+     * awakener restart releases it. **That latch is a window hidden, which is recoverable, and it
+     * is not a window destroyed:** [reapOrphans] does not kill on this recognition alone under the
+     * default [WmFlags.reapEvidence].
+     *
+     * **That sentence is about the latch, and the residual itself is worse than the latch.** While
+     * the user's mark is still on the window it is exactly the evidence
+     * [WmFlags.reapEvidence]`=CURRENT` asks for, so when the `con_id` after `_for_` closes the
+     * sweep **destroys** that window — and #18 gave the sweep a caller on every window close.
+     * Measured on sway 1.12 through this class: `SwayBindingTest.the residual the self-check
+     * leaves is a destroyed window, not a hidden one`. Recognising the mark on the node it names
+     * narrows *who* can trip that — the user has to have written their own window's `con_id` into
+     * the mark, where before any live `con_id` under the prefix on any window would do — and it
+     * does not change what happens once they have. Closing it needs a mark shape a user cannot
+     * write by accident; see [DockMarkScheme].
      */
     private fun dockedTo(node: Node, table: DockTableSnapshot, cfg: Config): SurfaceId? {
-        val reading = node.dockMark(cfg[WmFlags.dockMarkPrefix])
-        if (reading.unparsed.isNotEmpty()) unparsedMarks.update { it + reading.unparsed }
+        val reading = node.dockMark(cfg[WmFlags.dockMarkPrefix], cfg[WmFlags.dockMarkScheme])
+        val unrecognised = reading.unrecognised
+        if (unrecognised.isNotEmpty()) unrecognisedMarks.update { it + unrecognised }
         if (!cfg.consultsTable) return reading.surface
         table.entries[node.id]?.let { return it.surface }
         val adopted = reading.surface ?: return null
@@ -164,7 +183,8 @@ class SwayWindowManager(
         when (cfg[WmFlags.reapEvidence]) {
             ReapEvidence.RECOGNITION -> true
             ReapEvidence.CURRENT ->
-                node.dockMark(cfg[WmFlags.dockMarkPrefix]).surface != null ||
+                node.dockMark(cfg[WmFlags.dockMarkPrefix], cfg[WmFlags.dockMarkScheme])
+                    .surface != null ||
                     table.entries[node.id]?.origin == DockOrigin.STOOD_UP
         }
 
@@ -691,7 +711,16 @@ class SwayWindowManager(
                     docks.record(dockId, surface, DockOrigin.STOOD_UP)
                     recorded = dockId
 
-                    val mark = "${cfg[WmFlags.dockMarkPrefix]}${surface.raw}"
+                    // Names the dock as well as the surface, under the default scheme. A sway
+                    // mark identifier is globally unique, so a mark naming only the surface is
+                    // one two docks of that surface both want and the second attach takes it off
+                    // the first (#14).
+                    val mark = dockMarkFor(
+                        dockId,
+                        surface,
+                        cfg[WmFlags.dockMarkPrefix],
+                        cfg[WmFlags.dockMarkScheme],
+                    )
                     run("[con_id=${dockId.raw}] mark --add $mark")
                     if (cfg[WmFlags.dockSide] == DockSide.LEFT) {
                         run("[con_id=${dockId.raw}] move left")
@@ -942,11 +971,13 @@ class SwayWindowManager(
      * Which nodes are docks is [dockedTo]'s union, the same one enumeration answers from — but a
      * sweep kills, so under the default [WmFlags.reapEvidence] it will not act on a recognition
      * with nothing behind it any more (see [currentlyADock]). A dock this process stood up is
-     * reaped whatever became of its mark, including the #14 case where a later attach took it; a
-     * dock adopted after a restart is reaped while it still carries the mark that identified it,
-     * and left standing if that mark has since moved. A dock an attach has reserved but not yet
-     * identified is not swept either: nothing knows yet which surface it belongs to, so nothing
-     * can know it is an orphan.
+     * reaped whatever became of its mark; a dock adopted after a restart is reaped while it still
+     * carries the mark that identified it, and left standing if that mark has since gone. Under
+     * the default [WmFlags.dockMarkScheme] the only thing that takes a dock's mark away is a hand
+     * doing it, since the mark names the dock rather than the surface — under
+     * [DockMarkScheme.SURFACE] a second attach on the same surface does it (#14). A dock an attach
+     * has reserved but not yet identified is not swept either: nothing knows yet which surface it
+     * belongs to, so nothing can know it is an orphan.
      */
     suspend fun reapOrphans() {
         val cfg = config
