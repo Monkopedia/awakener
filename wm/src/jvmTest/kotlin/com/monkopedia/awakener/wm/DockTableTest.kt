@@ -93,6 +93,96 @@ class DockTableTest {
         )
     }
 
+    /**
+     * The default scheme, and the property that makes it usable at all: the nonce is verified by
+     * **shape**, so a reader that never saw the mark written still recognises it. A mark exists to
+     * outlive the awakener process that wrote it — that is the whole of what adoption reads — so a
+     * check against a remembered value would strand every standing dock on every restart.
+     */
+    @Test
+    fun `the default mark ends in a nonce a reader verifies by shape, not by value`() {
+        val mark = dockMarkFor(SurfaceId(9), SurfaceId(7), PREFIX, NONCE_SCHEME)
+
+        assertTrue(
+            Regex("${PREFIX}9_for_7_[0-9a-f]{16}").matches(mark),
+            "the shape is the contract: $mark",
+        )
+        assertEquals(
+            SurfaceId(7),
+            window(9, marks = listOf(mark)).dockMark(PREFIX, NONCE_SCHEME).surface,
+            "nothing here knows which nonce was drawn, and it does not need to",
+        )
+    }
+
+    /** Two docks marked in one process must not collide either, so the draw has to be a draw. */
+    @Test
+    fun `each dock's nonce is drawn afresh`() {
+        val marks = (1..32).map { dockMarkFor(SurfaceId(9), SurfaceId(7), PREFIX, NONCE_SCHEME) }
+
+        assertEquals(marks.size, marks.toSet().size, "a constant would be no barrier at all")
+    }
+
+    /**
+     * What the nonce field costs a mark that has not got one — which is every mark a hand writes
+     * without meaning to write a dock mark. The shapes here are the near misses: the previous
+     * scheme's mark, a trailing word, the wrong length, and hex in the wrong case.
+     */
+    @Test
+    fun `a mark whose trailing field is not nonce-shaped is not a dock mark, and is reported`() {
+        val marks = listOf(
+            "${PREFIX}9_for_7",
+            "${PREFIX}9_for_7_notes",
+            "${PREFIX}9_for_7_0f1e2d3c4b5a697",
+            "${PREFIX}9_for_7_0F1E2D3C4B5A6978",
+        )
+        val reading = window(9, marks = marks).dockMark(PREFIX, NONCE_SCHEME)
+
+        assertNull(reading.surface, "each of these is an ordinary window's mark")
+        assertEquals(marks, reading.unrecognised, "and each is named rather than passed over")
+    }
+
+    /**
+     * #35's shape, at the level where it is decided. A mark carrying the marked window's own
+     * `con_id` passes the self-check the previous scheme was the whole of, and the sweep kills on
+     * a mark it accepts — so what stops that here is the nonce field being absent.
+     */
+    @Test
+    fun `the shape that cost a window under the previous scheme is not a dock mark now`() {
+        val forged = dockMarkFor(SurfaceId(9), SurfaceId(7), PREFIX, DockMarkScheme.DOCK_AND_SURFACE)
+
+        assertEquals(
+            SurfaceId(7),
+            window(9, marks = listOf(forged)).dockMark(PREFIX, DockMarkScheme.DOCK_AND_SURFACE)
+                .surface,
+            "under the previous scheme it is a dock mark, which is #35",
+        )
+        assertNull(
+            window(9, marks = listOf(forged)).dockMark(PREFIX, NONCE_SCHEME).surface,
+            "and under the default it is not, so the sweep has nothing to act on",
+        )
+    }
+
+    /**
+     * The migration rule, in all three directions at once: a scheme decides reading and writing
+     * together, so an upgrade or a flip strands the marks written under another value. Stranding
+     * has to cost a leak and never a kill, and that holds only if no scheme ever reads another's
+     * mark as one of its own.
+     */
+    @Test
+    fun `no scheme reads another scheme's mark as a dock mark`() {
+        val schemes = DockMarkScheme.entries
+        for (written in schemes) {
+            val mark = dockMarkFor(SurfaceId(9), SurfaceId(7), PREFIX, written)
+            for (read in schemes.filter { it != written }) {
+                assertNull(
+                    window(9, marks = listOf(mark)).dockMark(PREFIX, read).surface,
+                    "$read read $written's mark '$mark' as a dock mark: a stranded dock would " +
+                        "then be reaped on a mark this build did not write",
+                )
+            }
+        }
+    }
+
     @Test
     fun `marks outside the prefix say nothing either way`() {
         val reading = window(9, marks = listOf("notes", "urgent")).dockMark(PREFIX, SCHEME)
@@ -190,6 +280,14 @@ class DockTableTest {
 
     private companion object {
         const val PREFIX = "awakener_dock_"
+
+        /**
+         * The scheme the tests above pin, which is deliberately **not** the default: what they are
+         * about is the dock-naming self-check, and it reads more plainly without a nonce in every
+         * expected string. The default's own additions have their own tests.
+         */
         val SCHEME = DockMarkScheme.DOCK_AND_SURFACE
+
+        val NONCE_SCHEME = DockMarkScheme.DOCK_SURFACE_AND_NONCE
     }
 }

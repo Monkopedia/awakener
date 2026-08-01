@@ -1,5 +1,6 @@
 package com.monkopedia.awakener.wm
 
+import kotlin.random.Random
 import kotlin.time.Duration
 import kotlin.time.TimeSource
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -92,18 +93,19 @@ internal data class DockTableSnapshot(
  *
  * **Recording is one-way.** Nothing here un-records a node whose mark went away, so recognition
  * outlives the evidence that produced it: a genuine application window that carried a mark shaped
- * exactly like its own dock mark — a user's own mark, #15's residual — at any single
- * enumeration stays out of `surfaces()` for the life of this process, and `swaymsg unmark` does
- * not bring it back. `wm.dock.recognition=MARK_ONLY` does, live, and so does restarting awakener;
- * those are the whole of the recovery. What the latch is *not* allowed to do is destroy that
- * window, which is why the orphan sweep asks [DockEntry.origin] rather than trusting the entry —
- * see [WmFlags.reapEvidence].
+ * exactly like its own dock mark — somebody else's mark, #15's residual and then #35's — at any
+ * single enumeration stays out of `surfaces()` for the life of this process, and `swaymsg unmark`
+ * does not bring it back. `wm.dock.recognition=MARK_ONLY` does, live, and so does restarting
+ * awakener; those are the whole of the recovery. What the latch is *not* allowed to do is destroy
+ * that window, which is why the orphan sweep asks [DockEntry.origin] rather than trusting the
+ * entry — see [WmFlags.reapEvidence].
  *
- * That bounds the **latch** and nothing wider. While the user's mark is still on the window it is
- * evidence the sweep accepts, and the sweep destroys that window when the surface the mark names
- * closes — measured, and stated at [DockMarkScheme.DOCK_AND_SURFACE], which is where the residual
- * belongs. Recording is what makes the *hiding* outlast the mark; it is not what makes the kill
- * possible.
+ * That bounds the **latch** and nothing wider. While a mark is still on the window it is evidence
+ * the sweep accepts, whoever wrote it, and the sweep destroys that window when the surface the mark
+ * names closes. Recording is what makes the *hiding* outlast the mark; it is not what makes the
+ * kill possible. What bounds the kill is the shape the mark has to have — see
+ * [DockMarkScheme.DOCK_SURFACE_AND_NONCE], which is why one cannot be written by accident — and,
+ * for a desktop that wants no tree evidence to be destructive at all, [ReapEvidence.STOOD_UP].
  *
  * Authoritative for exactly that one predicate. It never says a window exists — the tree keeps
  * that, and a node the tree has dropped is simply never asked about — and it is never consulted
@@ -209,6 +211,28 @@ internal data class DockMarkReading(
 /** What a dock's mark names. */
 enum class DockMarkScheme {
     /**
+     * The dock's own `con_id`, the surface's, and a nonce this attach drew:
+     * `<prefix><dockId>_for_<surfaceId>_<16 hex digits>`.
+     *
+     * Everything [DOCK_AND_SURFACE] does, plus the one thing it does not: a shape nobody writes by
+     * accident. It is verified by **shape and not by value** — sixteen lowercase hex digits, that
+     * is the whole check — which is what lets a process that did not draw the nonce still read the
+     * mark. That property is not a detail: a mark exists to survive an awakener restart while sway
+     * keeps running, so a successor that had to recognise the *value* would strand every standing
+     * dock on every restart.
+     *
+     * **It is not unforgeable, and nothing can be.** sway offers exactly one way to set a mark —
+     * `RUN_COMMAND` — on the socket `swaymsg` uses, with the same parser, so every mark awakener
+     * can write a hand can write too. Measured on sway 1.12: a hand-run
+     * `swaymsg '[con_id=5] mark --add awakener_dock_5_for_5_9f3a1c7e0b2d8465'` returns
+     * `success:true` and the mark reads back verbatim. Nor is there a structural substitute — the
+     * tree's layout is `swaymsg`'s to write as well. So what this buys is the *accident*: a nonce
+     * copied out of `swaymsg -t get_tree` and re-marked onto another window still reaches the
+     * sweep, and [ReapEvidence.STOOD_UP] is the flag that closes that, at its own price.
+     */
+    DOCK_SURFACE_AND_NONCE,
+
+    /**
      * The dock's own `con_id` and the surface's: `<prefix><dockId>_for_<surfaceId>`.
      *
      * Unique per dock by construction, which is the whole point — sway's mark identifiers are one
@@ -220,33 +244,64 @@ enum class DockMarkScheme {
      * other node is not a dock mark at all. That is what narrows #15 from "any `<prefix><live
      * con_id>`, on any window" to a mark whose user wrote their own window's `con_id` into it.
      *
-     * **The narrowing is of the trigger, not of the consequence.** What is left still ends in a
-     * destroyed window: a mark that passes the self-check is on the node when the sweep looks, so
-     * `wm.dock.reap_evidence=CURRENT` is satisfied, and the sweep kills that window when the
-     * `con_id` after `_for_` closes. Measured on sway 1.12 — `SwayBindingTest.the residual the
-     * self-check leaves is a destroyed window, not a hidden one`.
+     * **The narrowing is of the trigger, not of the consequence**, and that residual is why this is
+     * no longer the default: a mark that passes the self-check is on the node when the sweep looks,
+     * so `wm.dock.reap_evidence=CURRENT` is satisfied, and the sweep kills that window when the
+     * `con_id` after `_for_` closes. Measured on sway 1.12 (#35) — `SwayBindingTest.a user mark
+     * naming its own window and a dead con_id no longer costs that window` drives exactly that
+     * shape and is red against `0e2446b7`.
      */
     DOCK_AND_SURFACE,
 
     /**
-     * The surface's `con_id` alone: `<prefix><surfaceId>`. The previous behaviour, with both of
-     * the above holes open — so under it any `<prefix><live con_id>` the user has written on any
-     * window of their own is a dock mark, and the sweep destroys that window when the `con_id` in
-     * it closes. Measured on sway 1.12, which is what #15 is.
+     * The surface's `con_id` alone: `<prefix><surfaceId>`. The original behaviour, with every hole
+     * the two values above close still open — so under it any `<prefix><live con_id>` the user has
+     * written on any window of their own is a dock mark, and the sweep destroys that window when
+     * the `con_id` in it closes. Measured on sway 1.12, which is what #15 is.
      */
     SURFACE,
 }
 
-/** Separates the two ids in a [DockMarkScheme.DOCK_AND_SURFACE] mark. */
+/** Separates the two ids in a mark that names the dock as well as the surface. */
 private const val DOCK_MARK_INFIX = "_for_"
 
-/** The mark [dock] carries to say it is [surface]'s dock. */
+/** How many hex digits a [DockMarkScheme.DOCK_SURFACE_AND_NONCE] mark ends in. */
+private const val NONCE_LENGTH = 16
+
+/**
+ * A fresh nonce for one dock's mark.
+ *
+ * Per dock rather than per process, because a per-process nonce would be a field with no reader:
+ * the only question it could answer — "did *this* awakener stand that dock up" — is the one
+ * [DockOrigin.STOOD_UP] already answers, from memory, without depending on a string the desktop
+ * can write.
+ *
+ * Sixty-four bits, from the ordinary random source rather than a cryptographic one, because what
+ * it has to survive is a coincidence and not an adversary — see [DockMarkScheme] for why an
+ * adversary is not on the table at all.
+ */
+private fun newDockMarkNonce(): String =
+    Random.nextLong().toULong().toString(16).padStart(NONCE_LENGTH, '0')
+
+/** Whether [this] is the sixteen lowercase hex digits a dock mark's nonce field is. */
+private fun String.isDockMarkNonce(): Boolean =
+    length == NONCE_LENGTH && all { it in '0'..'9' || it in 'a'..'f' }
+
+/**
+ * The mark [dock] carries to say it is [surface]'s dock.
+ *
+ * [nonce] is a parameter only so that a test can write a stable forgery; production draws one per
+ * call, and the schemes that carry no nonce ignore it.
+ */
 internal fun dockMarkFor(
     dock: SurfaceId,
     surface: SurfaceId,
     prefix: String,
     scheme: DockMarkScheme,
+    nonce: String = newDockMarkNonce(),
 ): String = when (scheme) {
+    DockMarkScheme.DOCK_SURFACE_AND_NONCE ->
+        "$prefix${dock.raw}$DOCK_MARK_INFIX${surface.raw}_$nonce"
     DockMarkScheme.DOCK_AND_SURFACE -> "$prefix${dock.raw}$DOCK_MARK_INFIX${surface.raw}"
     DockMarkScheme.SURFACE -> "$prefix${surface.raw}"
 }
@@ -260,10 +315,13 @@ internal fun dockMarkFor(
  * enumeration by one and skipped by the other, leaving it unreachable by any code path and
  * reported by none (#15).
  *
- * Under [DockMarkScheme.DOCK_AND_SURFACE] the node has to be the one the mark names. That is the
+ * Under both schemes that name the dock, the node has to be the one the mark names. That is the
  * rest of #15: a mark is a string in a namespace the user writes into too, so the question worth
  * asking is not "does this look like a dock mark" but "does this look like *this node's* dock
- * mark", and only awakener knows a node's `con_id` at the moment it marks it.
+ * mark", and only awakener knows a node's `con_id` at the moment it marks it. Under the default
+ * scheme the mark must also end in a nonce-shaped field, which is what makes the shape one nobody
+ * arrives at by accident (#35); the *value* is never checked, because the reader is routinely a
+ * later awakener that never saw it written.
  *
  * Anything else under the prefix is reported through [DockMarkReading.unrecognised] rather than
  * hidden. That covers a mark whose suffix is not ids at all, and — after an awakener upgrade over
@@ -288,11 +346,15 @@ internal fun Node.dockMark(prefix: String, scheme: DockMarkScheme): DockMarkRead
 }
 
 /** The surface a dock mark's [suffix] names, or null if it is not this node's dock mark. */
-private fun Node.boundSurface(suffix: String, scheme: DockMarkScheme): SurfaceId? = when (scheme) {
-    DockMarkScheme.SURFACE -> suffix.toLongOrNull()?.let(::SurfaceId)
-    DockMarkScheme.DOCK_AND_SURFACE -> {
-        val parts = suffix.split(DOCK_MARK_INFIX)
-        parts.takeIf { it.size == 2 && it[0].toLongOrNull() == id }
-            ?.get(1)?.toLongOrNull()?.let(::SurfaceId)
-    }
+private fun Node.boundSurface(suffix: String, scheme: DockMarkScheme): SurfaceId? {
+    if (scheme == DockMarkScheme.SURFACE) return suffix.toLongOrNull()?.let(::SurfaceId)
+    // Both remaining schemes name this node before the infix, and a mark naming another node is
+    // not a dock mark at all — that is the self-check, and it is the same one either way.
+    val parts = suffix.split(DOCK_MARK_INFIX)
+    val tail = parts.takeIf { it.size == 2 && it[0].toLongOrNull() == id }?.get(1) ?: return null
+    if (scheme == DockMarkScheme.DOCK_AND_SURFACE) return tail.toLongOrNull()?.let(::SurfaceId)
+    // Shape, not value: the process that reads this is routinely not the one that wrote it, so
+    // "sixteen hex digits are there" is the whole of what can be checked and the whole of what is.
+    if (!tail.substringAfterLast('_', "").isDockMarkNonce()) return null
+    return tail.substringBeforeLast('_', "").toLongOrNull()?.let(::SurfaceId)
 }

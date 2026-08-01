@@ -147,15 +147,16 @@ class SwayWindowManager(
      * default [WmFlags.reapEvidence].
      *
      * **That sentence is about the latch, and the residual itself is worse than the latch.** While
-     * the user's mark is still on the window it is exactly the evidence
-     * [WmFlags.reapEvidence]`=CURRENT` asks for, so when the `con_id` after `_for_` closes the
-     * sweep **destroys** that window — and #18 gave the sweep a caller on every window close.
-     * Measured on sway 1.12 through this class: `SwayBindingTest.the residual the self-check
-     * leaves is a destroyed window, not a hidden one`. Recognising the mark on the node it names
-     * narrows *who* can trip that — the user has to have written their own window's `con_id` into
-     * the mark, where before any live `con_id` under the prefix on any window would do — and it
-     * does not change what happens once they have. Closing it needs a mark shape a user cannot
-     * write by accident; see [DockMarkScheme].
+     * a mark is still on the window it is exactly the evidence [WmFlags.reapEvidence]`=CURRENT`
+     * asks for, so when the `con_id` after `_for_` closes the sweep **destroys** that window — and
+     * #18 gave the sweep a caller on every window close. What the default
+     * [WmFlags.dockMarkScheme] buys is that such a mark is not one anybody writes by accident: it
+     * has to carry a nonce-shaped field as well as this node's own `con_id` (#35). It does not
+     * make the mark unforgeable, because no mark is — sway sets marks through the same
+     * `RUN_COMMAND` `swaymsg` sends, measured on 1.12 — so a nonce copied out of the tree and
+     * re-marked still reaches the sweep. `SwayBindingTest.a nonce-shaped user mark is still
+     * destroyed, and only the reap evidence closes that` pins that, and
+     * [ReapEvidence.STOOD_UP] is what closes it, at the price stated there.
      */
     private fun dockedTo(node: Node, table: DockTableSnapshot, cfg: Config): SurfaceId? {
         val reading = node.dockMark(cfg[WmFlags.dockMarkPrefix], cfg[WmFlags.dockMarkScheme])
@@ -178,15 +179,24 @@ class SwayWindowManager(
      * applying unchanged here: a user's window *is not recoverable at all*.
      *
      * Costs a second mark scan of the node, on the sweep's candidates only.
+     *
+     * [ReapEvidence.STOOD_UP] is the value that does not ask the tree anything. Every mark sway
+     * holds is writable from `swaymsg` — the same `RUN_COMMAND` and the same parser awakener uses,
+     * measured on 1.12 — so a mark is evidence that is only ever *unlikely* to be somebody else's,
+     * never impossible; awakener's own record of standing the dock up is the one thing here that a
+     * desktop cannot write. What it costs is stated at the flag, and it is the mark's own purpose:
+     * a dock adopted after a restart is then never reaped.
      */
-    private fun currentlyADock(node: Node, table: DockTableSnapshot, cfg: Config): Boolean =
-        when (cfg[WmFlags.reapEvidence]) {
+    private fun currentlyADock(node: Node, table: DockTableSnapshot, cfg: Config): Boolean {
+        val stoodUp = table.entries[node.id]?.origin == DockOrigin.STOOD_UP
+        return when (cfg[WmFlags.reapEvidence]) {
             ReapEvidence.RECOGNITION -> true
-            ReapEvidence.CURRENT ->
+            ReapEvidence.CURRENT -> stoodUp ||
                 node.dockMark(cfg[WmFlags.dockMarkPrefix], cfg[WmFlags.dockMarkScheme])
-                    .surface != null ||
-                    table.entries[node.id]?.origin == DockOrigin.STOOD_UP
+                    .surface != null
+            ReapEvidence.STOOD_UP -> stoodUp
         }
+    }
 
     /**
      * Whether an attach in flight has reserved the `app_id` [node] reports.
@@ -711,10 +721,11 @@ class SwayWindowManager(
                     docks.record(dockId, surface, DockOrigin.STOOD_UP)
                     recorded = dockId
 
-                    // Names the dock as well as the surface, under the default scheme. A sway
-                    // mark identifier is globally unique, so a mark naming only the surface is
-                    // one two docks of that surface both want and the second attach takes it off
-                    // the first (#14).
+                    // Names the dock as well as the surface, and under the default scheme carries
+                    // a nonce besides. A sway mark identifier is globally unique, so a mark naming
+                    // only the surface is one two docks of that surface both want and the second
+                    // attach takes it off the first (#14); the nonce is what keeps the shape out
+                    // of reach of a mark somebody wrote for their own purposes (#35).
                     val mark = dockMarkFor(
                         dockId,
                         surface,
@@ -975,9 +986,10 @@ class SwayWindowManager(
      * carries the mark that identified it, and left standing if that mark has since gone. Under
      * the default [WmFlags.dockMarkScheme] the only thing that takes a dock's mark away is a hand
      * doing it, since the mark names the dock rather than the surface — under
-     * [DockMarkScheme.SURFACE] a second attach on the same surface does it (#14). A dock an attach
-     * has reserved but not yet identified is not swept either: nothing knows yet which surface it
-     * belongs to, so nothing can know it is an orphan.
+     * [DockMarkScheme.SURFACE] a second attach on the same surface does it (#14). Under
+     * [ReapEvidence.STOOD_UP] no mark is evidence for a kill at all and an adopted dock is never
+     * reaped. A dock an attach has reserved but not yet identified is not swept either: nothing
+     * knows yet which surface it belongs to, so nothing can know it is an orphan.
      */
     suspend fun reapOrphans() {
         val cfg = config
