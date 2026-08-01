@@ -1,5 +1,6 @@
 package com.monkopedia.awakener.wm
 
+import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.io.path.absolutePathString
@@ -28,21 +29,89 @@ class SwayHarness private constructor(
     fun windowCommand(appId: String): String = "$FOOT -a $appId -- sleep 3600"
 
     /**
+     * Every process belonging to this session: the terminals sway launched, and what each runs.
+     *
+     * Found by the environment rather than by descent, because descent is not stable. sway 1.12
+     * keeps a window it execs as its own child, while the 1.9 on the CI runner double forks and
+     * the window belongs to init before it has drawn anything — both measured, and a reaper that
+     * turns on which sway is installed is not one. Nor is the process group any use: sway calls
+     * `setsid` before it execs, and `foot` does the same for the command it hosts, so a terminal
+     * and its `sleep` sit in two sessions of their own.
+     *
+     * What all of them do carry is [socket], inherited from the compositor that spawned them,
+     * unique to this harness, and untouched by anything that later happens to the compositor. So
+     * this answers the same after sway has been killed as before, and it reaches processes no
+     * tree can name — the `sleep` behind a terminal, and a window exec'd but not yet mapped.
+     */
+    fun spawned(): List<ProcessHandle> {
+        // NUL-terminated because that is how `environ` separates its entries, and because
+        // this path is a prefix of the one a longer temp directory name would give.
+        val mark = "SWAYSOCK=${socket.absolutePathString()}\u0000"
+        return ProcessHandle.allProcesses()
+            .filter { it.pid() != process.pid() && environOf(it.pid()).contains(mark) }
+            .toList()
+    }
+
+    /**
      * SIGKILLs sway and waits for it to be gone, which is a compositor crash as a client sees it.
      *
      * `destroyForcibly` is SIGKILL on Unix, and the signal matters: anything sway could catch
      * would let it shut its listeners down tidily, and a test that closes the socket politely is
      * testing the deliberate-close path it is supposed to be distinguishing itself from.
+     *
+     * The windows are deliberately left standing, so that what a client meets here is still a
+     * compositor vanishing under it. [close] is what takes them down, and it can still find them
+     * afterwards because [spawned] does not go through the compositor.
      */
     fun kill() {
         process.destroyForcibly().waitFor()
     }
 
+    /**
+     * Ends the session, and takes everything sway launched down with it.
+     *
+     * The compositor goes first: it is the only thing that can start another window, so once it
+     * has been waited for the session cannot grow again and one pass of [spawned] is the whole of
+     * it. Asking it to leave rather than killing it also gives the windows that are still
+     * listening the chance to exit on their own, which most of them take.
+     *
+     * SIGKILL for what is left: `close` is also how a session with a wedged client ends, and a
+     * stopped process is woken for a kill and for nothing else. The `sleep` behind a terminal is
+     * killed in its own right rather than left to the terminal, since a killed process reaps
+     * nothing.
+     */
     override fun close() {
         process.destroy()
         if (!process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) process.destroyForcibly()
+        val clients = spawned()
+        clients.forEach { it.destroyForcibly() }
+        awaitGone(clients)
         socket.deleteIfExists()
         runtimeDir.toFile().deleteRecursively()
+    }
+
+    /**
+     * A process's environment as the kernel lays it out, or empty when it cannot be read.
+     *
+     * Unreadable covers both a process belonging to somebody else and one that left between being
+     * listed and being asked, and neither is this session's.
+     */
+    private fun environOf(pid: Long): String =
+        runCatching { File("/proc/$pid/environ").readText() }.getOrDefault("")
+
+    /**
+     * Waits until nothing in [clients] is running, or until [REAP_TIMEOUT_NANOS] is up.
+     *
+     * SIGKILL takes a process off the scheduler at once but not out of the process table, so what
+     * this waits on is whichever parent it has left getting round to reaping it. It reports
+     * nothing — the bound is there so that a process no signal can shift costs a delay rather than
+     * a hang, and a caller that needs the guarantee has to check for itself.
+     */
+    private fun awaitGone(clients: List<ProcessHandle>) {
+        val deadline = System.nanoTime() + REAP_TIMEOUT_NANOS
+        while (clients.any(ProcessHandle::isAlive) && System.nanoTime() < deadline) {
+            Thread.sleep(REAP_POLL_MS)
+        }
     }
 
     companion object {
@@ -134,5 +203,10 @@ class SwayHarness private constructor(
         }
 
         private const val STARTUP_TIMEOUT_NANOS = 15_000_000_000L
+
+        /** How long [awaitGone] will wait for the processes it killed to leave the table. */
+        private const val REAP_TIMEOUT_NANOS = 5_000_000_000L
+
+        private const val REAP_POLL_MS = 10L
     }
 }

@@ -42,9 +42,6 @@ class SwayRepairTest {
     private lateinit var stateDir: Path
     private lateinit var wm: SwayWindowManager
 
-    /** Clients that have to be killed rather than asked to leave. */
-    private val frozen = mutableListOf<Int>()
-
     private val enabled get() = SwayHarness.available()
 
     @BeforeTest
@@ -65,11 +62,6 @@ class SwayRepairTest {
     @AfterTest
     fun tearDown() {
         if (!enabled) return
-        frozen.forEach { pid ->
-            runCatching { ProcessBuilder("pkill", "-KILL", "-P", "$pid").start().waitFor() }
-            runCatching { ProcessBuilder("kill", "-KILL", "$pid").start().waitFor() }
-        }
-        frozen.clear()
         scope.cancel()
         sway.close()
         stateDir.toFile().deleteRecursively()
@@ -358,7 +350,6 @@ class SwayRepairTest {
     /** Stops the client behind [window] so it can no longer service a close request. */
     private suspend fun freeze(window: SurfaceId) {
         val pid = assertNotNull(wm.tree().find(window.raw)?.pid, "no pid for ${window.raw}")
-        frozen += pid
         assertEquals(
             0,
             ProcessBuilder("kill", "-STOP", pid.toString()).start().waitFor(),
