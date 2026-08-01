@@ -1,7 +1,7 @@
 # Design note: who owns a dock node
 
-**Date:** 2026-07-30, revised 2026-07-31 (three times, then amended for #20, again for #18, and
-again for #14/#15) ·
+**Date:** 2026-07-30, revised 2026-07-31 (three times, then amended for #20, again for #18, again
+for #14/#15, and again for #35) ·
 **Scope:** `:wm` only · **Status:** decided; binds issues #4, #6, #7, #9, and requires #18 —
 which has since landed the collector, in part. What it does and does not drive is stated under
 "The third outcome's owner, half built". The mark predicate it pins was amended by #14/#15's fix;
@@ -141,11 +141,19 @@ entry with `origin = STOOD_UP`. `wm.dock.reap_evidence` carries the choice, defa
 (`CURRENT`); `RECOGNITION` is the older, wider behaviour.
 
 **That gate bounds the latch and nothing wider, and the difference is a window.** It is about a
-recognition whose mark has *gone*. While the user's mark is still on the node, it is precisely the
+recognition whose mark has *gone*. While a mark is still on the node, it is precisely the
 evidence `CURRENT` asks for, so the sweep kills on it — measured on the current head, probe J7.
 `CURRENT` is what makes removing the mark survivable; it is not what makes the mark itself safe.
 The residual that survives it is stated under "What it does not close", on the destructive side of
 this note's bar rather than the recoverable one.
+
+> **Amended 2026-07-31 by #35, which added a third value.** `STOOD_UP` reaps only on an entry this
+> process wrote when it stood the dock up, so under it *no mark is evidence for a kill at all* —
+> the only value for which that is true, and the only answer to the residual below that does not
+> depend on how hard a mark is to write. Its price is what the mark is for: a dock adopted after an
+> awakener restart is never reaped, so its panel stands when its surface closes. `CURRENT` remains
+> the default because the default mark scheme now makes that residual need a mark nobody writes by
+> accident. See "What it does not close", which is where the choice between the two is made.
 
 The gap `CURRENT` leaves is exactly one case, and it is the mirror of the false negative above: a
 dock **adopted** after a restart whose mark has since gone has neither kind of
@@ -191,17 +199,26 @@ writes it to the durable registry.
 "Carries the dock mark" is not a predicate, it is two of them, and today the two call sites
 disagree — which is #15. Pin it here so #9 does not get to choose:
 
-> **A dock mark is the configured prefix followed by the dock's own `con_id`, `_for_`, and its
-> surface's — and it counts only on the node whose `con_id` it names.** One predicate, used by
-> `surfaces()`, by the adoption scan, and by `reapOrphans` alike. A node carrying a
-> prefix-matching mark that is not *its own* dock mark is **not** a dock; it is reported (per
-> #15's option 4) rather than silently hidden in one place and skipped in the other.
+> **A dock mark is the configured prefix followed by the dock's own `con_id`, `_for_`, its
+> surface's, `_`, and sixteen lowercase hex digits — and it counts only on the node whose `con_id`
+> it names.** One predicate, used by `surfaces()`, by the adoption scan, and by `reapOrphans`
+> alike. A node carrying a prefix-matching mark that is not *its own* dock mark is **not** a dock;
+> it is reported (per #15's option 4) rather than silently hidden in one place and skipped in the
+> other.
 
 *(Amended 2026-07-31 by #14/#15's fix. It read "the configured prefix followed by a parseable
 `con_id`" — the surface's — which is what both issues then turned on, so the two are one repair
 and are stated as one predicate. `wm.dock.mark_scheme=SURFACE` is the old form, kept reachable.
 Below, in strikethrough-by-amendment rather than by deletion, is what that predicate did and did
 not fix, because it is the argument for the current one.)*
+
+*(Amended again 2026-07-31 by #35, which added the hex field. The two `con_id`s alone were a shape
+a hand reaches — that is the residual under "What it does not close" — so the mark now carries a
+nonce as well. **It is checked by shape and never by value**, and that is not a shortcut: the
+process that reads a mark is routinely a later awakener that never saw it written, which is the
+whole of what a mark is for, so a check against a remembered value would strand every standing
+dock on every restart. `wm.dock.mark_scheme=DOCK_AND_SURFACE` is the previous form, kept reachable
+beside `SURFACE`.)*
 
 This is #15's option 1, taken here rather than left to the implementer, because #9 rewrites both
 call sites and picking `surfaces()`'s current form would carry #15 into the new design.
@@ -228,28 +245,97 @@ fixing #14 alone — a second mark, or a `<dockId>_for_<surfaceId>` string recog
 would have left every dock carrying a mark this predicate reported as unrecognised. Requiring the
 node to be the one named is what keeps one predicate rather than two.
 
-**What it does not close, and it is on the destructive side of this note's own bar.** A user mark
+~~**What it does not close, and it is on the destructive side of this note's own bar.** A user mark
 that is `<prefix><that window's own con_id>_for_<some con_id>` passes the self-check — the mark
 does name the node it is on — so the one predicate calls that window a dock. It is hidden from
 enumeration, and hidden for the life of the process once adoption records it. It is also
 **destroyed**: the mark is on the node at the moment the sweep looks, so `reap_evidence=CURRENT`
 is satisfied, and when the `con_id` after `_for_` closes `reapOrphans` kills the user's window —
-which #18 gave a caller on every window close.
+which #18 gave a caller on every window close.~~
+
+*(**Closed 2026-07-31 by #35**, and closed in the shape stated: that mark is no longer a dock mark
+under the default `wm.dock.mark_scheme`, so the window is enumerated, its mark is named in
+`unrecognisedDockMarks`, and the sweep has nothing to act on. Both halves were run red against
+`0e2446b7` before the fix — `expected:<[5, 6]> but was:<[5]>` for the hiding, and the window gone
+from the tree for the kill. The measurement below stands as taken, against
+`wm.dock.mark_scheme=DOCK_AND_SURFACE`, which is what it is now a fact about. What replaces it is
+"What #35 closed, and what it did not", immediately after.)*
 
 Measured on this branch, through the real `SwayWindowManager` against sway 1.12 (probe J7): a
 second application window marked `awakener_dock_<its own con_id>_for_<the first window's con_id>`,
-the first window killed, one sweep, and the marked window is gone from the tree. Asserted by
-`SwayBindingTest.the residual the self-check leaves is a destroyed window, not a hidden one`,
-whose KDoc says in as many words that it records a defect rather than a fix.
+the first window killed, one sweep, and the marked window is gone from the tree. Asserted then by
+`SwayBindingTest.the residual the self-check leaves is a destroyed window, not a hidden one`, whose
+KDoc said in as many words that it recorded a defect rather than a fix; that test went red when
+#35 landed and is now `SwayBindingTest.a user mark naming its own window and a dead con_id no
+longer costs that window`, asserting the opposite.
 
 So what the self-check buys is the **trigger, not the consequence**. Before it, any
-`<prefix><live con_id>` on any window would do; now the user has to have written their own
-window's `con_id` into the mark. That is a real narrowing and it is the whole of this change's
+`<prefix><live con_id>` on any window would do; then the user had to have written their own
+window's `con_id` into the mark. That was a real narrowing and it was the whole of that change's
 claim. Everywhere else this document says *a window hidden is recoverable and a window destroyed
-is not* — this residual is the second kind, and it is filed here as such rather than under the
-recoverable half. Closing it is a separate design decision and is not taken here: it needs a mark
-shape a user cannot write by hand, which means a nonce or a shape sway will not round-trip, and
-either is a change to what a dock's identity *is* rather than to what its mark says.
+is not* — that residual was the second kind, and it was filed here as such rather than under the
+recoverable half.
+
+### What #35 closed, and what it did not
+
+The mark now ends in a nonce field, and `wm.dock.reap_evidence` has a value under which no mark is
+evidence for a kill. Both are needed, because they answer different questions, and the reason the
+first is not enough is a measurement rather than a caution:
+
+> **Nothing in sway's tree is evidence a desktop cannot write.** sway sets a mark through exactly
+> one thing — `RUN_COMMAND` — on the socket `swaymsg` speaks, with the same parser. There is no
+> privileged channel. So "a mark shape a user cannot forge" **does not exist**, and neither does a
+> structural substitute, since the layout is `swaymsg`'s to write as well.
+
+Measured directly (probe J8, raw i3-ipc against sway 1.12), because "a shape sway will not
+round-trip" was the other half of the option this issue offered and it had to be tested before
+being designed against:
+
+- **Length is not a limit.** Marks round-trip byte-identical at 8, 16, 32, 42, 64, 128, 256, 512,
+  1024, 4096 and **16384** characters. Every one came back `success:true` and compared equal.
+- **Nor is the character set.** ``- . : / @ # % [ ] { } + = ~ ^ | \ $ ` * ?``, a single quote, a
+  quoted space, a literal `\x01`, and multi-byte UTF-8 (`✦`, `ÿ`) all round-trip verbatim. The only
+  things that do not survive are the *command* parser's separators — `;`, `,` and a newline end the
+  command, and a tab collapses to a space — and those are limits on writing any command, not on
+  what a mark may hold.
+- **A hand writes awakener's exact mark.** `swaymsg '[con_id=5] mark --add
+  awakener_dock_5_for_5_9f3a1c7e0b2d8465'` returns `success:true` and reads back verbatim.
+
+So the honest statement of what the nonce buys is **accident, not forgery**: `<prefix><own
+con_id>_for_<con_id>_<16 hex>` is not a string anybody arrives at without meaning to, and that is
+the whole claim. A nonce copied out of `swaymsg -t get_tree` and re-marked onto another window is
+still a dock mark and is still destroyed by the sweep —
+`SwayBindingTest.a nonce-shaped user mark is still destroyed, and only the reap evidence closes
+that` pins that, and its KDoc says it records current behaviour rather than proving a fix, as its
+predecessor's did.
+
+**Why the nonce is per dock and not per process.** A per-process nonce is a field with no reader.
+The only question it could answer — "did *this* awakener stand that dock up" — is the one
+`origin = STOOD_UP` already answers, from memory, without depending on a string the desktop can
+write. This is the note's own rule about fields nothing reads, applied before the field existed.
+
+**And why the value is never checked.** The issue's first constraint, and it decides the design: a
+mark exists to be read by a process that did not write it. A nonce the successor does not know
+would turn every standing dock into a stranded one on every awakener restart — the exact failure
+the mark is there to prevent. Verifying the *shape* costs nothing across a restart and is what
+makes the mark still adoptable; `SwayBindingTest.a dock adopted after a restart is left standing
+under a stood-up requirement` exercises a fresh manager reading a mark it never wrote.
+
+**The consequence, narrowed as well.** `wm.dock.reap_evidence=STOOD_UP` reaps only on an entry
+this process wrote when it stood the dock up, so a forged mark — deliberate or otherwise — costs
+nothing at all. It is **not** the default, and this is the trade: its price is the mark's own
+purpose, since a dock adopted after a restart is then never reaped and its panel stands when its
+surface closes, to be closed by hand. A leaked panel against a destroyed window is the asymmetry
+this note settles everything else on, and it would select `STOOD_UP` outright were the destroyed
+window still reachable by accident. It is not, so the default stays `CURRENT` and `STOOD_UP` is
+the lever for a desktop that wants no tree evidence to be destructive at all.
+
+**Migration.** #34 established by measurement that a permissive read over the old shape re-opens
+the wider kill path; a third scheme inherits that, and does not take it. The rule is unchanged and
+now holds across three values: no scheme reads another scheme's mark as one of its own
+(`DockTableTest.no scheme reads another scheme's mark as a dock mark`, all six ordered pairs), so
+an upgrade over standing docks strands them into a **leak** — bindable, named in
+`unrecognisedDockMarks`, never reaped — and never into a kill.
 
 **A scheme flip is a restart, not a flip — and an upgrade over standing docks is one.**
 `wm.dock.mark_scheme` decides reading and writing together, so a live sway session that outlives
@@ -263,15 +349,20 @@ What an upgrade therefore costs, measured on this branch (probe J7): the strande
 **enumerated as an ordinary bindable surface**, so a hotkey on it mints a Lifeless for an agent
 panel and writes it to the durable registry; its mark is **named in `unrecognisedDockMarks`**, so
 it is diagnosable rather than silently lost; and it is **never reaped**, because a mark this build
-does not recognise is not evidence for a kill. The reverse mistake cannot happen either — neither
-scheme reads the other's mark as a dock mark, since one contains `_for_` and the other cannot
-(`DockTableTest.the surface-only mark is switchable back on`) — so a strand costs a leak and never
-a kill, which is the direction this note demands.
+does not recognise is not evidence for a kill. The reverse mistake cannot happen either — no scheme
+reads another scheme's mark as a dock mark of its own (`DockTableTest.no scheme reads another
+scheme's mark as a dock mark`, all six ordered pairs) — so a strand costs a leak and never a kill,
+which is the direction this note demands. *(Amended 2026-07-31 by #35: this said "neither scheme …
+since one contains `_for_` and the other cannot", which was the argument for two values. There are
+three now, and the property is asserted exhaustively rather than argued from one substring. The
+live half is `SwayBindingTest.a dock marked under the other scheme is reported and left standing`,
+which now drives the upgrade this change actually causes — `DOCK_AND_SURFACE` marks read by a build
+whose default wants a nonce.)*
 
-The recovery is by hand or by flag: close the stranded panels, or set
-`wm.dock.mark_scheme=SURFACE`, let the docks be recognised again, close them, and flip back.
-`SURFACE` is here for that, and it has its own price, stated at the value. Same shape as
-`wm.dock.mark_prefix`, and the same advice: move it with no docks standing.
+The recovery is by hand or by flag: close the stranded panels, or set `wm.dock.mark_scheme` to the
+value they were marked under, let the docks be recognised again, close them, and flip back.
+`DOCK_AND_SURFACE` and `SURFACE` are here for that, and each has its own price, stated at the
+value. Same shape as `wm.dock.mark_prefix`, and the same advice: move it with no docks standing.
 
 **#14's other option is not taken.** Refusing a second attach on an already-docked surface (#14's
 option 2) is a change to `attach`'s contract — it is currently documented as safe to call
@@ -279,9 +370,10 @@ concurrently, and the refusal would also forbid a deliberate second panel — ra
 of the defect, which was the mark. It stays available to whoever owns the hotkey path.
 
 `wm.dock.reap_evidence` does **not** reopen this. The two call sites still answer "is this node a
-dock" from the one predicate; what the sweep additionally asks is whether the evidence is current,
-because it is about to kill. Narrowing the *action* is not the same as the two sites disagreeing
-about the *predicate*, which is what left a window unreachable by every path at once.
+dock" from the one predicate; what the sweep additionally asks is whether the evidence is current —
+and, under `STOOD_UP`, whether it is awakener's own — because it is about to kill. Narrowing the
+*action* is not the same as the two sites disagreeing about the *predicate*, which is what left a
+window unreachable by every path at once.
 
 Two things the *pinned* predicate did not fix, both measured through the real
 `SwayWindowManager` on sway 1.12 (probe J4). **Both are closed by the amendment above; kept
@@ -315,6 +407,11 @@ because they are the argument for it.**
   recognition with no live mark and no stood-up entry behind it — but while the mark is still on,
   it is exactly the evidence `CURRENT` asks for and the sweep destroys the window. See "Recording
   is one-way", and "What it does not close" above for the residual that survives the amendment.)*
+  *(Amended again 2026-07-31 by #35: that residual is closed for the shape it named. The mark now
+  carries a nonce field as well, so `<prefix><own con_id>_for_<con_id>` is not a dock mark at all
+  and neither hides nor kills. What survives is a mark whose nonce field is well formed, which is
+  no longer a shape reached by accident — and `wm.dock.reap_evidence=STOOD_UP` is what makes even
+  that harmless. See "What #35 closed, and what it did not".)*
 
 ~~**Open question, not settled here:** whether #14's fix is a second mark
 (`<prefix><dockId>_for_<surfaceId>`), a refusal to attach twice to one surface, or both. That
@@ -371,8 +468,11 @@ There are **three** combinations, not two:
 
 - **awakener restarts, sway keeps running.** The docks and their marks are still standing, so
   the table is rebuilt by one tree scan at first use: every window matching the pinned mark
-  predicate (prefix + its own `con_id` + `_for_` + its surface's) becomes an entry, surface id
-  parsed from the suffix.
+  predicate (prefix + its own `con_id` + `_for_` + its surface's + `_` + a nonce-shaped field)
+  becomes an entry, surface id parsed from the suffix. *(Amended 2026-07-31 by #35, which added the
+  last of those. This case is exactly why the nonce is verified by shape and never by value: the
+  successor has no idea what the predecessor drew, and a check that needed one would strand every
+  dock here.)*
   That scan is the adoption rule above and it subsumes what `reapOrphans` open-codes. This is
   what the marks are *for*, now that they are no longer the primary truth. *(Amended 2026-07-31:
   this said "subject to #14, which is the one case where a dock has no mark left to be adopted
@@ -533,22 +633,33 @@ accepted it — but worth knowing before someone invents a heartbeat.
   `swaymsg -t get_tree`, with nothing hidden in process memory. It is the lever to reach for
   if the table is ever suspected of hiding a real surface — and since adoption records, it is
   the *only* thing short of a restart that releases one; see "Recording is one-way".
-- `wm.dock.reap_evidence` = `CURRENT` | `RECOGNITION`, **default `CURRENT`.** *(Added
-  2026-07-31 with #23.)* What the orphan sweep must see before it kills a node enumeration calls
-  a dock: a mark on it now or a `STOOD_UP` entry (`CURRENT`), or nothing further at all
-  (`RECOGNITION`, the wider, older behaviour). The default costs one case — an adopted dock whose
-  mark has since gone is no longer reaped — and buys the case where the alternative
-  destroys a user's window.
-- `wm.dock.mark_scheme` = `DOCK_AND_SURFACE` | `SURFACE`, **default `DOCK_AND_SURFACE`.**
-  *(Added 2026-07-31 with #14/#15.)* What a dock's mark says after the prefix, for reading and
-  writing together. The default is `<dockId>_for_<surfaceId>`, recognised only on the node it
-  names — unique per dock, which is #14, and self-checking, which is #15. `SURFACE` is the old
-  `<surfaceId>`, and its price is a destroyed window: under it any `<prefix><live con_id>` is a
-  dock mark on whatever node wears it, so a user's own `awakener_dock_7` is hidden and then killed
-  by the sweep when node 7 closes. It is the recovery path if an upgrade lands while docks are
-  standing — a flip strands every mark written under the other value — and it is worth that price
-  only in a session with no marks under this prefix that awakener did not write. The default's own
-  residual is destructive too, and narrower; see "What it does not close".
+- `wm.dock.reap_evidence` = `STOOD_UP` | `CURRENT` | `RECOGNITION`, **default `CURRENT`.** *(Added
+  2026-07-31 with #23; `STOOD_UP` added the same day with #35.)* What the orphan sweep must see
+  before it kills a node enumeration calls a dock: an entry this process wrote when it stood the
+  dock up and nothing else (`STOOD_UP`), a mark on it now or such an entry (`CURRENT`), or nothing
+  further at all (`RECOGNITION`, the wider, older behaviour). The default costs one case — an
+  adopted dock whose mark has since gone is no longer reaped — and buys the case where
+  `RECOGNITION` destroys a user's window. `STOOD_UP` is the only value under which no mark can cost
+  a window, since it asks nothing of the tree; its price is that *no* adopted dock is ever reaped,
+  which is every dock that outlived an awakener restart. It is not the default because the default
+  mark scheme already puts that kill out of accidental reach — see "What #35 closed, and what it
+  did not", where that trade is made.
+- `wm.dock.mark_scheme` = `DOCK_SURFACE_AND_NONCE` | `DOCK_AND_SURFACE` | `SURFACE`, **default
+  `DOCK_SURFACE_AND_NONCE`.** *(Added 2026-07-31 with #14/#15; the nonce value added the same day
+  with #35.)* What a dock's mark says after the prefix, for reading and writing together. The
+  default is `<dockId>_for_<surfaceId>_<16 hex digits>`, recognised only on the node it names and
+  only with a nonce-shaped trailing field — unique per dock, which is #14; self-checking, which is
+  #15; and not a shape written by accident, which is #35. The nonce is checked by shape and never
+  by value, because the reader is routinely a later awakener. `DOCK_AND_SURFACE` is the same
+  without the nonce, and its price is a destroyed window: `<prefix><that window's own
+  con_id>_for_<any con_id>` is a dock mark, and the sweep kills that window when the `con_id` after
+  `_for_` closes. `SURFACE` is the original `<surfaceId>` and is worse again: under it any
+  `<prefix><live con_id>` is a dock mark on whatever node wears it, so a user's own
+  `awakener_dock_7` is hidden and then killed by the sweep when node 7 closes. Both older values
+  are the recovery path if an upgrade lands while docks are standing — a flip strands every mark
+  written under another value — and each is worth its price only in a session with no marks under
+  this prefix that awakener did not write. The default's own residual is destructive too, and
+  narrower again; see "What #35 closed, and what it did not".
 - `wm.dock.pending_suppression` = boolean, **default `true`.** The reservation. Off is
   today's behaviour, i.e. #9 unfixed but with no over-suppression risk at all. It gates whether
   a reservation is *filed*; it never gates whether one is cleared, and neither does any other
@@ -1232,7 +1343,13 @@ rewriting the same block twice. #4's mechanism is a step in #6's transaction.
   only on the node it names. What is left of #15 is a user mark that writes their own window's
   `con_id` into it; what is left of #14 is the policy question of whether a second attach on one
   surface should be *refused*, which is `attach`'s contract rather than the mark's, and is not
-  taken.)* This note is still the single place the *recognition* predicate is decided.
+  taken.)* *(Amended 2026-07-31 by #35, which was that residual of #15 filed as its own issue and
+  is closed: the mark carries a nonce field too, so the shape #35 names is not a dock mark at all.
+  What is left after **that** is a mark whose nonce field is well formed — a deliberate copy rather
+  than an accident, since no mark sway holds is beyond a hand's reach — and it is bounded by
+  `wm.dock.reap_evidence=STOOD_UP` rather than by the mark. Stated with its measurements under
+  "What #35 closed, and what it did not".)* This note is still the single place the *recognition*
+  predicate is decided.
 - **The claim is neither filed nor read.** *(Amended 2026-07-31: this said "nothing collects
   `changes` and nothing drives `reapOrphans` (#18)", and #18 has since fixed that half — a
   collector now drives the sweep off the `close` event and discards the table at the session
@@ -1405,12 +1522,45 @@ Through the real `SwayWindowManager` (`J*`):
   1. **The residual is destructive, not hiding.** A second application window marked
      `<prefix><its own con_id>_for_<the first window's con_id>`, the first window killed, one
      sweep: the marked window is **gone from the tree**. The self-check passes, so the mark is
-     current evidence and `reap_evidence=CURRENT` is no defence. `SwayBindingTest.the residual the
-     self-check leaves is a destroyed window, not a hidden one`.
-  2. **A stranded dock leaks and is never killed.** A dock attached under `SURFACE`, then a fresh
-     `SwayWindowManager` reading `DOCK_AND_SURFACE` against the same sway session — which is an
-     upgrade over a standing dock, since the scheme decides reading and writing together. The dock
-     comes back as a **bindable surface**, its mark is **named in `unrecognisedDockMarks`**, and
-     killing its surface and sweeping **leaves it standing**. `SwayBindingTest.a dock marked under
-     the other scheme is reported and left standing`; the parse in the other direction is
-     `DockTableTest.the surface-only mark is switchable back on`.
+     current evidence and `reap_evidence=CURRENT` is no defence. Was `SwayBindingTest.the residual
+     the self-check leaves is a destroyed window, not a hidden one`. *(Amended 2026-07-31 by #35:
+     this measurement is now a fact about `wm.dock.mark_scheme=DOCK_AND_SURFACE` rather than about
+     the default, and the test that pinned it went red when the fix landed. Re-run against
+     `0e2446b7` in the shape the issue states, both halves: the enumeration one fails
+     `expected:<[5, 6]> but was:<[5]>` and the destructive one leaves the marked window gone. Now
+     `SwayBindingTest.a user mark naming its own window and a dead con_id no longer costs that
+     window`, asserting the opposite.)*
+  2. **A stranded dock leaks and is never killed.** A dock attached under one scheme, then a fresh
+     `SwayWindowManager` reading another against the same sway session — which is an upgrade over a
+     standing dock, since the scheme decides reading and writing together. The dock comes back as a
+     **bindable surface**, its mark is **named in `unrecognisedDockMarks`**, and killing its
+     surface and sweeping **leaves it standing**. `SwayBindingTest.a dock marked under the other
+     scheme is reported and left standing`, which drives `DOCK_AND_SURFACE` → the nonce default
+     since that is the upgrade #35 causes; the parse in every direction is `DockTableTest.no scheme
+     reads another scheme's mark as a dock mark`. *(Amended 2026-07-31 by #35: the live half ran
+     `SURFACE` → `DOCK_AND_SURFACE` when it was taken, and the property is the same one.)*
+- **J8 — what sway will round-trip in a mark, and who can write one.** Added by #35, and the
+  reason its design is what it is. Raw `swaymsg` against a headless 1.12, because the question is
+  about the compositor and not about awakener's client.
+
+  1. **Length is not a limit.** Marks written and read back byte-identical at 8, 16, 32, 42, 64,
+     128, 256, 512, 1024, 4096 and 16384 characters; every write `success:true`, every read equal.
+  2. **Nor is the character set.** ``- . : / @ # % [ ] { } + = ~ ^ | \ $ ` * ?``, a single quote, a
+     quoted space, a literal `\x01` and multi-byte UTF-8 (`✦`, `ÿ`) all round-trip verbatim. What
+     does not survive belongs to the *command* parser rather than to marks: `;`, `,` and a newline
+     terminate the command (the mark truncates at them), and a tab collapses to a space. Quoting
+     recovers `;` and `,` — `mark --add "aw;dock"` stores `aw;dock`.
+  3. **There is no shape awakener can write that a hand cannot.** sway sets a mark through
+     `RUN_COMMAND` and nothing else, on the socket `swaymsg` speaks. A hand-run
+     `swaymsg '[con_id=5] mark --add awakener_dock_5_for_5_9f3a1c7e0b2d8465'` returns
+     `success:true` and reads back verbatim. **So "a shape sway will not round-trip" is not
+     available, and unforgeability is not reachable through the mark at all** — which is why #35
+     ships an accident barrier *and* a `reap_evidence` value that asks the tree nothing.
+  4. **Marks survive everything awakener does to a dock.** `split horizontal`, `resize set width
+     30 ppt`, `move left`, `floating enable`/`disable`, `layout tabbed`, and moving the container
+     to another workspace and back: the mark is unchanged after each.
+  5. **Nor is the structure any different.** The alternative to a mark check was a structural one,
+     and it is not evidence either: when a surface closes, sway leaves its dock as the **sole child
+     of the `splith` container** `attach` built — measured, `kids` goes 2 → 1 with the container
+     still there — which is a shape `swaymsg` produces as readily, and which a window opened into
+     that container undoes. The tree is the user's; nothing in it is proof.

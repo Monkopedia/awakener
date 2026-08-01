@@ -60,8 +60,20 @@ enum class DockRecognition {
     MARK_OR_TABLE,
 }
 
-/** What the orphan sweep accepts as proof that a node is a dock, before it kills it. */
+/**
+ * What the orphan sweep accepts as proof that a node is a dock, before it kills it.
+ *
+ * Declared narrowest first, and the narrowest is the only one that does not rest on something the
+ * desktop can write: every mark in sway's namespace is reachable from `swaymsg`, measured on 1.12.
+ */
 enum class ReapEvidence {
+    /**
+     * An entry this process wrote when it stood the dock up itself, and nothing else. The only
+     * evidence for a kill that no mark can produce — at the price of never reaping a dock this
+     * process merely adopted, which is every dock that outlived an awakener restart.
+     */
+    STOOD_UP,
+
     /** A dock mark on the node now, or an entry written when this process stood the dock up. */
     CURRENT,
 
@@ -177,37 +189,44 @@ object WmFlags {
 
     val dockMarkScheme = Flags.enum(
         "wm.dock.mark_scheme",
-        DockMarkScheme.DOCK_AND_SURFACE,
-        "What a dock's mark says after the prefix. DOCK_AND_SURFACE writes " +
-            "<dockCon_id>_for_<surfaceCon_id> and recognises that mark only on the node whose " +
-            "con_id it names. Two properties follow, and both are defects closed rather than " +
-            "preferences. A sway mark identifier is globally unique — marking a second container " +
-            "with an existing identifier removes it from the first — so a mark naming only the " +
-            "surface is a name two docks of one surface both want, and a second attach silently " +
-            "unmarked the first dock (#14): after an awakener restart that dock is then an " +
-            "ordinary bindable window a hotkey mints an agent for, and the orphan sweep cannot " +
-            "see it to take it down. And because the mark now says which node it belongs on, a " +
-            "mark on any other node is not a dock mark, which is what stops a user's own mark " +
-            "under this prefix from hiding their window and — since a sweep runs on every window " +
-            "close — from getting it killed when the con_id in it closes (#15). That narrows who " +
-            "can trip #15, not what tripping it costs: a user mark that is this prefix, the " +
-            "marked window's own con_id, _for_, and any con_id still passes the check, and the " +
-            "sweep destroys that window when the con_id after _for_ closes. Measured on sway " +
-            "1.12. SURFACE is the previous <surfaceCon_id>, and its price is that same destroyed " +
-            "window reached far more easily: under it this prefix plus any live con_id is a dock " +
-            "mark on whatever window wears it, so a user's own 'awakener_dock_7' hides that " +
-            "window and the sweep destroys it when node 7 closes — measured on sway 1.12, which " +
-            "is what #15 is. It is here because it is the whole of the recovery if an upgrade " +
-            "lands while docks are standing, and it is worth that price only in a session with " +
-            "no marks under this prefix that awakener did not write. This decides reading and " +
-            "writing together, so an upgrade over standing docks — or a flip against a live " +
-            "desktop — strands every dock marked under the other value: those marks stop being " +
-            "recognised, the docks become bindable surfaces a hotkey will mint an agent for, and " +
-            "their names are reported through the manager's unrecognised dock marks rather than " +
-            "passed over. A stranded dock is never reaped and a mark of one scheme is never read " +
-            "as a dock mark of the other, so that costs a leak and never a kill: close the " +
-            "stranded panels by hand, or flip to the value they were marked under, close them, " +
-            "and flip back. Move it with no docks standing.",
+        DockMarkScheme.DOCK_SURFACE_AND_NONCE,
+        "What a dock's mark says after the prefix. DOCK_SURFACE_AND_NONCE writes " +
+            "<dockCon_id>_for_<surfaceCon_id>_<16 hex digits>, recognised only on the node whose " +
+            "con_id it names and only when the trailing field is nonce-shaped. The nonce is " +
+            "checked by shape and never by value: the process that reads a mark is routinely a " +
+            "later awakener that never saw it written — that is what a mark is for — so a check " +
+            "against a remembered value would strand every standing dock on every restart. What " +
+            "the shape buys is that nobody arrives at one by accident. What it does not buy is " +
+            "forgery resistance, and nothing can: sway sets a mark through RUN_COMMAND on the " +
+            "socket swaymsg speaks, with the same parser, so every mark awakener can write a " +
+            "hand can write too — measured on sway 1.12, where a hand-run swaymsg wrote a full " +
+            "nonce-shaped mark and read it back verbatim, and where marks round-trip unchanged " +
+            "to at least 16384 characters. A nonce copied out of `swaymsg -t get_tree` onto " +
+            "another window is therefore still a dock mark, and that window is still destroyed " +
+            "by the sweep when the con_id after _for_ closes; wm.dock.reap_evidence=STOOD_UP is " +
+            "what closes that, at its own stated price. DOCK_AND_SURFACE is the previous " +
+            "<dockCon_id>_for_<surfaceCon_id> without the nonce. It keeps the two properties " +
+            "that make a mark per-dock and self-checking — a sway mark identifier is globally " +
+            "unique, so a mark naming only the surface is a name two docks of one surface both " +
+            "want and the second attach silently unmarked the first (#14); and a mark naming the " +
+            "node it sits on cannot be a dock mark anywhere else (#15) — and its price is the " +
+            "shape a user reaches without meaning to: this prefix, the marked window's own " +
+            "con_id, _for_, and any con_id at all is a dock mark, and the sweep destroys that " +
+            "window when the con_id after _for_ closes (#35, measured on sway 1.12). SURFACE is " +
+            "the original <surfaceCon_id> and is worse again: under it this prefix plus any live " +
+            "con_id is a dock mark on whatever window wears it, so a user's own " +
+            "'awakener_dock_7' hides that window and the sweep destroys it when node 7 closes, " +
+            "which is what #15 is. Both older values are here because a downgrade is the whole " +
+            "of the recovery if an upgrade lands while docks are standing, and each is worth its " +
+            "price only in a session with no marks under this prefix that awakener did not " +
+            "write. This decides reading and writing together, so an upgrade over standing docks " +
+            "— or a flip against a live desktop — strands every dock marked under another value: " +
+            "those marks stop being recognised, the docks become bindable surfaces a hotkey will " +
+            "mint an agent for, and their names are reported through the manager's unrecognised " +
+            "dock marks rather than passed over. A stranded dock is never reaped and no scheme " +
+            "reads another scheme's mark as a dock mark, so that costs a leak and never a kill: " +
+            "close the stranded panels by hand, or flip to the value they were marked under, " +
+            "close them, and flip back. Move it with no docks standing.",
     )
 
     val dockRecognition = Flags.enum(
@@ -278,7 +297,17 @@ object WmFlags {
             "wm.dock.mark_scheme that needs a hand-run unmark; under SURFACE a second attach on " +
             "the same surface does it (#14). RECOGNITION reaps " +
             "everything enumeration calls a dock, which closes that gap at the price of the " +
-            "user's window.",
+            "user's window. STOOD_UP goes the other way and is the only value under which no " +
+            "mark can cost a window at all: it reaps a node only on an entry this process wrote " +
+            "when it stood that dock up, which is evidence held in awakener's own memory rather " +
+            "than in a namespace the desktop writes into. Every mark sway holds is writable from " +
+            "swaymsg, measured on 1.12, so this is the only thing that makes a forged mark " +
+            "harmless rather than merely unlikely. Its price is what the mark is for: a dock " +
+            "that outlived an awakener restart is adopted from its mark and was never stood up " +
+            "by this process, so it is never reaped — its panel stands when its surface closes " +
+            "and has to be closed by hand. That is a leaked panel against a destroyed window, " +
+            "and CURRENT stays the default because the default wm.dock.mark_scheme already makes " +
+            "the destroyed window need a mark nobody writes by accident.",
     )
 
     val orphanPolicy = Flags.enum(

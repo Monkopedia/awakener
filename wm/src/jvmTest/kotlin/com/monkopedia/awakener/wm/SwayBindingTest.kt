@@ -171,7 +171,7 @@ class SwayBindingTest {
         val app = openSurface("aw-app1")
         val handle = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1"))
 
-        command("[con_id=${handle.dockId.raw}] unmark ${markFor(handle.dockId, app)}")
+        command("[con_id=${handle.dockId.raw}] unmark ${soleMarkOf(handle.dockId)}")
 
         assertEquals(emptyList(), marksOf(handle.dockId), "the mark really is gone")
         assertEquals(
@@ -213,7 +213,7 @@ class SwayBindingTest {
             "the mark is the whole of what the new process knows, and here it is enough",
         )
 
-        command("[con_id=${first.raw}] unmark ${markFor(first, app)}")
+        command("[con_id=${first.raw}] unmark ${soleMarkOf(first)}")
 
         assertEquals(emptyList(), marksOf(first), "the mark really is gone")
         assertEquals(
@@ -235,7 +235,7 @@ class SwayBindingTest {
         val app = openSurface("aw-app1")
         val handle = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1"))
 
-        command("[con_id=${handle.dockId.raw}] unmark ${markFor(handle.dockId, app)}")
+        command("[con_id=${handle.dockId.raw}] unmark ${soleMarkOf(handle.dockId)}")
 
         assertEquals(
             setOf(app.raw, handle.dockId.raw),
@@ -274,11 +274,12 @@ class SwayBindingTest {
     /**
      * The cost side of materialising adoption, and the one place it must not be paid.
      *
-     * #15's residual is a user's own mark shaped exactly like the marked window's *own* dock
-     * mark: it hides a genuine application window. That used to be self-healing —
-     * `swaymsg unmark` handed the window straight back — and recording what a read recognises
-     * makes it permanent, because nothing withdraws a record. Enumeration keeps hiding the
-     * window here on purpose; `wm.dock.recognition=MARK_ONLY` is the lever that releases it.
+     * A mark somebody else wrote, shaped exactly like the marked window's *own* dock mark — which
+     * since #35 means a well-formed nonce and not merely two `con_id`s, but the shape is the whole
+     * of what the predicate asks either way — hides a genuine application window. That used to be
+     * self-healing — `swaymsg unmark` handed the window straight back — and recording what a read
+     * recognises makes it permanent, because nothing withdraws a record. Enumeration keeps hiding
+     * the window here on purpose; `wm.dock.recognition=MARK_ONLY` is the lever that releases it.
      *
      * What must not follow is the sweep destroying it. The window carries no dock mark at all by
      * then, and this process never stood it up, so the only thing saying "dock" is a recognition
@@ -520,25 +521,108 @@ class SwayBindingTest {
     }
 
     /**
-     * **This test documents what awakener does today; it does not prove a fix, and the behaviour
-     * it pins is a defect.** It is here so that the cost stated in `WmFlags.dockMarkScheme` and in
-     * `docs/design-notes/wm-dock-ownership.md` under "What it does not close" is measured rather
-     * than reasoned, and so that whoever closes the residual has the case already written down.
+     * #35, in the shape the issue names: a genuine window carrying `<prefix><that window's own
+     * con_id>_for_<a con_id that then closes>`.
      *
-     * The residual the self-check leaves: a user's own window carrying `<prefix><that window's own
-     * con_id>_for_<some con_id>`. The self-check passes — the mark does name this node — so the
-     * one predicate calls it a dock, and `wm.dock.reap_evidence=CURRENT` is no defence, because
-     * the mark is on the node at the moment the sweep looks. When the `con_id` after `_for_`
-     * closes, the sweep destroys the user's window.
+     * That mark passed the self-check `DOCK_AND_SURFACE` was the whole of — it does name the node
+     * it sits on — so the one predicate called the window a dock, `wm.dock.reap_evidence=CURRENT`
+     * was satisfied because the mark was on the node at the moment the sweep looked, and the sweep
+     * destroyed it. Measured against `0e2446b7`, where this assertion is red.
      *
-     * That is the destructive half of the note's own bar, not the recoverable one: everywhere else
-     * in this repo the residual is described as hiding, and hiding is what `MARK_ONLY` or a
-     * restart undoes. This is not. What the self-check narrows is the *trigger* — the user has to
-     * have written their own window's `con_id` into the mark, where before any live `con_id` under
-     * the prefix would do, which is the case the test above covers.
+     * What closes it is the default scheme's nonce field: the string above is no longer a dock
+     * mark at all, so the window is enumerated, is named in `unrecognisedDockMarks`, and nothing
+     * has evidence to kill it with. The bar is the design note's own — a window hidden is
+     * recoverable and a window destroyed is not — and this shape now clears both halves of it.
      */
     @Test
-    fun `the residual the self-check leaves is a destroyed window, not a hidden one`() = swayTest {
+    fun `a user mark naming its own window and a dead con_id no longer costs that window`() =
+        swayTest {
+            val app = openSurface("aw-app1")
+            val victim = openSurface("aw-app2")
+            val userMark = dockMarkFor(
+                victim,
+                app,
+                WmFlags.dockMarkPrefix.default,
+                DockMarkScheme.DOCK_AND_SURFACE,
+            )
+
+            command("[con_id=${victim.raw}] mark --add $userMark")
+
+            assertEquals(
+                setOf(app.raw, victim.raw),
+                wm.surfaces().map { it.id.raw }.toSet(),
+                "it is not a dock mark, so the window is not hidden either",
+            )
+            assertEquals(
+                setOf(userMark),
+                wm.unrecognisedDockMarks.value,
+                "and it is named rather than passed over, which is the whole of the diagnosis",
+            )
+
+            command("[con_id=${app.raw}] kill")
+            awaitGone(app)
+            awaitSweep()
+            // By hand as well, so that what is asserted does not rest on collector timing.
+            wm.reapOrphans()
+
+            assertNotNull(
+                wm.tree().find(victim.raw),
+                "the sweep destroyed a window on the strength of a mark whose only claim was " +
+                    "naming its own node — the shape #35 is about",
+            )
+        }
+
+    /**
+     * **This test documents what awakener does today; it does not prove a fix, and the behaviour
+     * it pins is a defect.** It is the successor to `the residual the self-check leaves is a
+     * destroyed window, not a hidden one`, which pinned the shape the test above now closes, and
+     * it is here for the same reason: so that the cost stated at `WmFlags.dockMarkScheme` and in
+     * `docs/design-notes/wm-dock-ownership.md` is measured rather than reasoned.
+     *
+     * What the nonce does not buy. It is verified by shape, and it has to be — the process that
+     * reads a mark is routinely a later awakener that never saw it written — so a well-formed
+     * nonce written by any other hand is a dock mark, and the sweep destroys that window when the
+     * `con_id` after `_for_` closes. There is no privileged channel to close this with: sway sets
+     * a mark through `RUN_COMMAND` on the socket `swaymsg` speaks, so every mark awakener can
+     * write a hand can write too, measured on sway 1.12.
+     *
+     * What is left is therefore a *deliberate* forgery — the shape is not one anybody reaches by
+     * accident — and `wm.dock.reap_evidence=STOOD_UP`, in the test below, is what makes even that
+     * harmless.
+     */
+    @Test
+    fun `a nonce-shaped user mark is still destroyed, and only the reap evidence closes that`() =
+        swayTest {
+            val app = openSurface("aw-app1")
+            val victim = openSurface("aw-app2")
+
+            command("[con_id=${victim.raw}] mark --add ${markFor(victim, app)}")
+
+            command("[con_id=${app.raw}] kill")
+            awaitGone(app)
+            awaitSweep()
+            // By hand as well, so that what is asserted does not rest on collector timing.
+            wm.reapOrphans()
+
+            assertNull(
+                wm.tree().find(victim.raw),
+                "a well-formed dock mark is current evidence whoever wrote it, and the sweep " +
+                    "kills on it",
+            )
+        }
+
+    /**
+     * The consequence narrowed rather than the trigger, which is what every fix on this defect so
+     * far has done instead. Nothing in sway's tree is evidence a desktop cannot write — marks are
+     * `swaymsg`'s to set, and so is the layout — so the only kind of proof a forged mark cannot
+     * supply is awakener's own memory of having stood the dock up.
+     *
+     * The same forgery as the test above, and under this flag it costs nothing at all. The price
+     * is in the test after it.
+     */
+    @Test
+    fun `requiring a stood-up entry stops the sweep killing on any mark at all`() = swayTest {
+        store.put(WmFlags.reapEvidence, ReapEvidence.STOOD_UP)
         val app = openSurface("aw-app1")
         val victim = openSurface("aw-app2")
 
@@ -547,15 +631,49 @@ class SwayBindingTest {
         command("[con_id=${app.raw}] kill")
         awaitGone(app)
         awaitSweep()
-        // By hand as well, so that what is asserted does not rest on collector timing.
         wm.reapOrphans()
 
-        assertNull(
+        assertNotNull(
             wm.tree().find(victim.raw),
-            "the residual is not merely hiding: the mark passes the self-check, so it is current " +
-                "evidence, and the sweep destroys a window the user marked themselves",
+            "with the flag on, no mark is evidence for a kill: the only thing that is, is an " +
+                "entry this process wrote when it stood the dock up",
         )
     }
+
+    /**
+     * What `STOOD_UP` costs, stated rather than designed around: it is the mark's own purpose. A
+     * dock that outlived an awakener restart is recognised from its mark and adopted — never stood
+     * up by *this* process — so nothing reaps it and its panel stands when its surface closes.
+     *
+     * Kept reproducible because it is the reason this is not the default: a leaked panel is
+     * recoverable by hand, and under the default mark scheme the window it would protect needs a
+     * mark nobody writes by accident.
+     */
+    @Test
+    fun `a dock adopted after a restart is left standing under a stood-up requirement`() =
+        swayTest {
+            store.put(WmFlags.reapEvidence, ReapEvidence.STOOD_UP)
+            val app = openSurface("aw-app1")
+            val dock = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1")).dockId
+
+            // awakener restarts: the mark is all a fresh manager has, and adoption is all it can do.
+            wm = SwayWindowManager({ sway.connection() }, store, bindingStore(), scope)
+            assertEquals(
+                listOf(app.raw),
+                wm.surfaces().map { it.id.raw },
+                "the dock is still recognised — a nonce is read by shape, so a process that " +
+                    "never saw it written reads the mark perfectly well",
+            )
+
+            command("[con_id=${app.raw}] kill")
+            awaitGone(app)
+            wm.reapOrphans()
+
+            assertNotNull(
+                wm.tree().find(dock.raw),
+                "and it is left standing, which is the price of refusing to kill on a mark",
+            )
+        }
 
     /**
      * **Also a record of current behaviour rather than a fix**: what an upgrade over standing
@@ -570,24 +688,27 @@ class SwayBindingTest {
      * unrecognised mark under the prefix falls: it is *named* in `unrecognisedDockMarks`, its dock
      * is enumerated as an ordinary bindable surface, and no sweep will touch it.
      *
-     * Both directions of the strand are safe in the direction that matters — a mark of the other
-     * scheme can never be *mistaken* for a dock mark of this one, since one has `_for_` in it and
-     * the other cannot — so the cost is a leak and never a kill. The recovery is
-     * `wm.dock.mark_scheme=SURFACE` and its own price, both stated at the flag.
+     * Every direction of the strand is safe in the direction that matters — no scheme reads
+     * another's mark as a dock mark of its own, which `DockTableTest.no scheme reads another
+     * scheme's mark as a dock mark` pins across all three — so the cost is a leak and never a
+     * kill. The recovery is `wm.dock.mark_scheme` set back to the value the marks were written
+     * under, with its own price, both stated at the flag.
      */
     @Test
     fun `a dock marked under the other scheme is reported and left standing`() = swayTest {
         // The manager that stood the dock up still holds a STOOD_UP entry for it and would reap
         // from that, which would say nothing about what a fresh process reads from the mark.
         store.put(WmFlags.sweepOnClose, false)
-        store.put(WmFlags.dockMarkScheme, DockMarkScheme.SURFACE)
+        store.put(WmFlags.dockMarkScheme, DockMarkScheme.DOCK_AND_SURFACE)
         val app = openSurface("aw-app1")
         val dock = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1")).dockId
-        val oldMark = dockMarkFor(dock, app, WmFlags.dockMarkPrefix.default, DockMarkScheme.SURFACE)
+        val oldMark =
+            dockMarkFor(dock, app, WmFlags.dockMarkPrefix.default, DockMarkScheme.DOCK_AND_SURFACE)
         assertEquals(listOf(oldMark), marksOf(dock), "the dock is marked as the older build did")
 
-        // The upgrade: same sway session, same standing dock, a build that reads the other scheme.
-        store.put(WmFlags.dockMarkScheme, DockMarkScheme.DOCK_AND_SURFACE)
+        // The upgrade this change is: same sway session, same standing dock, a build whose default
+        // scheme wants a nonce in the mark that the mark standing there has not got.
+        store.put(WmFlags.dockMarkScheme, DockMarkScheme.DOCK_SURFACE_AND_NONCE)
         wm = SwayWindowManager({ sway.connection() }, store, bindingStore(), scope)
 
         assertEquals(
@@ -1279,8 +1400,8 @@ class SwayBindingTest {
             "the second attach must resolve to the dock it just spawned (${dock2.dockId.raw}) " +
                 "and not to the first one (${dock1.dockId.raw})",
         )
-        assertEquals(listOf(markFor(dock1.dockId, app1)), marksOf(dock1.dockId), "one per dock")
-        assertEquals(listOf(markFor(dock2.dockId, app2)), marksOf(dock2.dockId), "one per dock")
+        assertMarkedFor(app1, dock1.dockId, "one per dock")
+        assertMarkedFor(app2, dock2.dockId, "one per dock")
         assertEquals(
             setOf(app1.raw, dock1.dockId.raw),
             assertNotNull(tabHolding(app1)).children.map { it.id }.toSet(),
@@ -1299,11 +1420,7 @@ class SwayBindingTest {
             wm.tree().find(dock2.dockId.raw),
             "detaching one surface's dock must leave the other surface's dock standing",
         )
-        assertEquals(
-            listOf(markFor(dock2.dockId, app2)),
-            marksOf(dock2.dockId),
-            "and still bound to its own",
-        )
+        assertMarkedFor(app2, dock2.dockId, "and still bound to its own")
     }
 
     /**
@@ -1334,14 +1451,13 @@ class SwayBindingTest {
                 "${dock1.dockId.raw}",
         )
         assertEquals(
-            mapOf(
-                dock1.dockId.raw to listOf(markFor(dock1.dockId, app1)),
-                dock2.dockId.raw to listOf(markFor(dock2.dockId, app2)),
-            ),
-            docksOf("aw-dock"),
-            "every window the dock program produced must be exactly one surface's dock: a node " +
-                "carrying both marks, or an unmarked orphan panel beside it, is #2 back again",
+            setOf(dock1.dockId.raw, dock2.dockId.raw),
+            docksOf("aw-dock").keys,
+            "every window the dock program produced must be one of the two docks: an unmarked " +
+                "orphan panel beside them is #2 back again",
         )
+        assertMarkedFor(app1, dock1.dockId, "and each is exactly one surface's dock")
+        assertMarkedFor(app2, dock2.dockId, "and each is exactly one surface's dock")
         assertEquals(
             setOf(app1.raw, dock1.dockId.raw),
             assertNotNull(tabHolding(app1)).children.map { it.id }.toSet(),
@@ -1433,8 +1549,8 @@ class SwayBindingTest {
 
         assertEquals("aw-dock-${app1.raw}", appIdOf(dock1.dockId))
         assertEquals("aw-dock-${app2.raw}", appIdOf(dock2.dockId))
-        assertEquals(listOf(markFor(dock1.dockId, app1)), marksOf(dock1.dockId), "one per dock")
-        assertEquals(listOf(markFor(dock2.dockId, app2)), marksOf(dock2.dockId), "one per dock")
+        assertMarkedFor(app1, dock1.dockId, "one per dock")
+        assertMarkedFor(app2, dock2.dockId, "one per dock")
     }
 
     // -- helpers ------------------------------------------------------------------------
@@ -1510,15 +1626,44 @@ class SwayBindingTest {
         assertEquals(0, exit, "kill -$name $pid failed")
     }
 
-    /** The mark [dock] carries to say it is [surface]'s dock, at stock defaults. */
+    /**
+     * A dock mark for [dock] naming [surface], at stock defaults and with a fixed nonce.
+     *
+     * For **forging** one by hand, which is what a test that plays the user does: the nonce is a
+     * constant so that the same string can be marked and then unmarked. Nothing that asks what a
+     * real dock carries may use this — production draws its own nonce, so a real dock's mark is not
+     * a string a test can predict. See [soleMarkOf] and [assertMarkedFor] for that question.
+     */
     private fun markFor(dock: SurfaceId, surface: SurfaceId) = dockMarkFor(
         dock,
         surface,
         WmFlags.dockMarkPrefix.default,
         WmFlags.dockMarkScheme.default,
+        FORGED_NONCE,
     )
 
     private suspend fun marksOf(dock: SurfaceId): List<String>? = wm.tree().find(dock.raw)?.marks
+
+    /** The one mark sway holds on [dock] — what a hand would have to name to take it off. */
+    private suspend fun soleMarkOf(dock: SurfaceId): String {
+        val marks = assertNotNull(wm.tree().find(dock.raw), "no node ${dock.raw}").marks
+        assertEquals(1, marks.size, "expected exactly one mark on ${dock.raw}, got $marks")
+        return marks.single()
+    }
+
+    /**
+     * Asserts [dock] carries exactly one mark and that it is this dock's mark for [surface].
+     *
+     * Read back and put through the production predicate rather than compared against a predicted
+     * string: the default scheme's mark carries a nonce the test did not choose, and the question
+     * worth asking was never "is the string this" but "does awakener read this node as that
+     * surface's dock, and does it wear nothing else".
+     */
+    private suspend fun assertMarkedFor(surface: SurfaceId, dock: SurfaceId, message: String) {
+        val node = assertNotNull(wm.tree().find(dock.raw), "$message: no node ${dock.raw}")
+        assertEquals(1, node.marks.size, "$message: one mark per dock, got ${node.marks}")
+        assertEquals(surface, dockMarkOf(node), "$message: ${node.marks}")
+    }
 
     /** Every window the dock program produced, against the marks it carries. */
     private suspend fun docksOf(appId: String): Map<Long, List<String>> =
@@ -1595,6 +1740,16 @@ class SwayBindingTest {
 
     private companion object {
         const val WAIT_MS = 5_000L
+
+        /**
+         * The nonce a test writes when it is playing the user rather than awakener.
+         *
+         * Nonce-shaped on purpose: the point of these tests is that a *well-formed* dock mark is
+         * still one whoever wrote it, since sway sets marks through the same `RUN_COMMAND` a hand
+         * sends and there is no privileged channel. Fixed rather than drawn so that the same
+         * string can be marked and then unmarked.
+         */
+        const val FORGED_NONCE = "0f1e2d3c4b5a6978"
 
         /**
          * How long a valved test will wait for the request it means to hold. Longer than the map
