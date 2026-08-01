@@ -55,9 +55,6 @@ class SwayBindingTest {
      */
     private var mintFails = false
 
-    /** Clients stopped by [freeze]. They have to be killed rather than asked to leave. */
-    private val frozen = mutableListOf<Int>()
-
     private val enabled get() = SwayHarness.available()
 
     @BeforeTest
@@ -90,7 +87,6 @@ class SwayBindingTest {
     @AfterTest
     fun tearDown() {
         if (!enabled) return
-        killFrozen()
         scope.cancel()
         sway.close()
         stateDir.toFile().deleteRecursively()
@@ -1506,25 +1502,7 @@ class SwayBindingTest {
      */
     private suspend fun freeze(window: SurfaceId) {
         val pid = assertNotNull(wm.tree().find(window.raw)?.pid, "no pid for ${window.raw}")
-        frozen += pid
         signal("STOP", pid)
-    }
-
-    /**
-     * Kills whatever [freeze] stopped, children first, before sway goes.
-     *
-     * Before, because a stopped client cannot notice the compositor leaving and would sit there
-     * for the hour its `sleep` has left to run. Children first, because the client is running
-     * that `sleep` as a child of itself and a killed process cannot take its children with it —
-     * the child has to go while its parent is still there to enumerate it from. SIGKILL rather
-     * than SIGTERM throughout: a stopped process is woken for a kill and for nothing else.
-     */
-    private fun killFrozen() {
-        frozen.forEach { pid ->
-            runCatching { ProcessBuilder("pkill", "-KILL", "-P", "$pid").start().waitFor() }
-            runCatching { signal("KILL", pid) }
-        }
-        frozen.clear()
     }
 
     private fun signal(name: String, pid: Int) {

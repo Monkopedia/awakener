@@ -45,9 +45,6 @@ class SwaySessionEndTest {
     private lateinit var wm: SwayWindowManager
     private lateinit var stateDir: Path
 
-    /** Clients this test opened, so none of them outlives the compositor it was talking to. */
-    private val clients = mutableListOf<Int>()
-
     private val enabled get() = SwayHarness.available()
 
     @BeforeTest
@@ -72,13 +69,6 @@ class SwaySessionEndTest {
     @AfterTest
     fun tearDown() {
         if (!enabled) return
-        // Before sway goes, and children first: a terminal whose compositor was SIGKILLed can be
-        // left holding a `sleep` that nothing else will ever reap.
-        clients.forEach { pid ->
-            runCatching { ProcessBuilder("pkill", "-KILL", "-P", "$pid").start().waitFor() }
-            runCatching { ProcessBuilder("kill", "-KILL", "$pid").start().waitFor() }
-        }
-        clients.clear()
         scope.cancel()
         sway.close()
         stateDir.toFile().deleteRecursively()
@@ -249,7 +239,6 @@ class SwaySessionEndTest {
             },
             "window '$appId' never appeared",
         )
-        node.pid?.let { clients += it }
         return SurfaceId(node.id)
     }
 
