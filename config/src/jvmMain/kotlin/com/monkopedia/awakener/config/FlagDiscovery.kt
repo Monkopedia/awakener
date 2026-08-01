@@ -164,10 +164,28 @@ object FlagDiscovery {
         get() = attributes()?.isRegularFile == true &&
             ARCHIVE_EXTENSIONS.any { extension.equals(it, ignoreCase = true) }
 
+    /**
+     * The declaring classes an exploded classpath entry holds, or a throw naming why the tree
+     * could not be read.
+     *
+     * The stat and the listing are the same fault one call apart, and only the stat was honest:
+     * [attributes] declines to read a refusal as absence, and then [FileTreeWalk] does exactly
+     * that — its default is to skip a directory whose `listFiles` failed. So a package directory
+     * that is traversable but not listable, or any locked subtree under one, contributed no
+     * flags and no problem, which is the one report a caller cannot tell apart from a module
+     * that declares none.
+     *
+     * Rethrowing hands the failure to [scan]'s per-entry handler, which names the entry and the
+     * permission — the same sentence the refused stat already produces, and the exception names
+     * the directory within. The entry then contributes nothing at all rather than whatever
+     * happened to be readable: what a partial listing is missing is precisely what nothing
+     * established, and a short list of flags reads as a complete one.
+     */
     private fun File.classesUnderPackage(): List<String> {
         val root = resolve(PACKAGE)
         if (root.attributes()?.isDirectory != true) return emptyList()
         return root.walkTopDown()
+            .onFail { _, e -> throw e }
             .filter { it.isFile }
             .map { it.relativeTo(this).path.replace(File.separatorChar, '/') }
             .filter(::declares)

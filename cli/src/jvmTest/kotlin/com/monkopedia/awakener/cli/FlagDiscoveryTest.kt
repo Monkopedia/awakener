@@ -16,6 +16,11 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 class FlagDiscoveryTest {
+    private companion object {
+        /** The package discovery scans, spelt the way a classpath entry holds it. */
+        const val PACKAGE = "com/monkopedia/awakener"
+    }
+
     private val dir = createTempDirectory("awakener-discovery")
 
     @AfterTest
@@ -531,17 +536,24 @@ class FlagDiscoveryTest {
 
     /**
      * The rest of the widening `a top-level entry that cannot be read is reported though it
-     * claims nothing` pins, kept as rows rather than as prose in a PR: neither of these is
-     * *named* as an archive, so on `main` — which decided by name and never opened anything —
-     * both were silently nothing. They are the two remaining ways the filesystem answers
-     * neither yes nor no: a mode that refuses the stat, and a link that resolves forever.
+     * claims nothing` pins, kept as rows rather than as prose in a PR: none of these is *named*
+     * as an archive, so on `main` — which decided by name and never opened anything — all were
+     * silently nothing. They are the ways the filesystem answers neither yes nor no: a mode that
+     * refuses the stat, a link that resolves forever, and a directory that stats but will not
+     * list.
+     *
+     * The last two rows are that third way, and they are the reason a refused *stat* being
+     * honest was not enough: the entry opens, the package directory stats as a directory, and
+     * then the listing is refused — one call further down than the stat, with the module's flags
+     * sitting intact inside. Both are locked after they are staged, so what a refusal costs here
+     * is a real declaring class rather than an empty tree.
      */
     private fun unreadableEntries(): Map<String, File> {
         val locked = dir.resolve("locked-package").toFile().apply {
             setReadable(true, false)
             setExecutable(true, false)
         }
-        locked.resolve("com/monkopedia/awakener").mkdirs()
+        locked.resolve(PACKAGE).mkdirs()
         locked.setReadable(false, false)
         locked.setExecutable(false, false)
 
@@ -552,6 +564,19 @@ class FlagDiscoveryTest {
         Files.createSymbolicLink(there.toPath(), back.toPath())
         Files.createSymbolicLink(back.toPath(), there.toPath())
 
+        // Traversable but not listable: the package directory itself stats fine, and a path
+        // under it opens fine if you already know the name, which a scan by definition does not.
+        val unlistable = stagedPackageDirectory("unlistable-package")
+        val unlistablePackage = unlistable.resolve(PACKAGE)
+        unlistablePackage.setReadable(false, false)
+
+        // And the same refusal one level in, under a package directory that lists perfectly well
+        // — the shape an exploded classpath entry takes when one subpackage was mangled.
+        val lockedSubtree = stagedPackageDirectory("locked-subtree")
+        val subtree = lockedSubtree.resolve("$PACKAGE/wm")
+        subtree.setReadable(false, false)
+        subtree.setExecutable(false, false)
+
         assertTrue(
             !locked.canRead(),
             "$locked is still readable, so it proves nothing — run as root?",
@@ -561,10 +586,47 @@ class FlagDiscoveryTest {
                 Files.readSymbolicLink(back.toPath()) == there.toPath(),
             "$there does not close a loop, so it proves nothing",
         )
+        // `list()` answers null for a listing that was refused, which is the exact call being
+        // pinned — `canRead` would pass a directory that lists for root anyway.
+        assertTrue(
+            unlistablePackage.list() == null && unlistablePackage.canExecute(),
+            "$unlistablePackage still lists, or is no longer traversable, so it proves " +
+                "nothing — run as root?",
+        )
+        assertTrue(
+            subtree.list() == null && lockedSubtree.resolve(PACKAGE).list() != null,
+            "$subtree still lists, or its parent no longer does, so it proves nothing — " +
+                "run as root?",
+        )
         return mapOf(
             "a directory holding the package that cannot be read" to locked,
             "a symlink loop" to there,
+            "a package directory that cannot be listed" to unlistable,
+            "a package subdirectory that cannot be listed" to lockedSubtree,
         )
+    }
+
+    /**
+     * A directory classpath entry holding a real declaring class, in the layout a compiled
+     * module directory has it in. Copied out of the running classpath rather than written by
+     * hand, so the entry is one discovery would genuinely load flags from and a fixture that
+     * loses them has lost something real.
+     *
+     * Reopened before it is staged into, so that a second call builds the fixture rather than
+     * tripping over the lock the first call left on it.
+     */
+    private fun stagedPackageDirectory(name: String): File {
+        val entry = dir.resolve(name).toFile()
+        entry.walkTopDown().forEach {
+            it.setReadable(true, false)
+            it.setExecutable(true, false)
+        }
+        val declaring = "$PACKAGE/wm/WmFlags.class"
+        val bytes = checkNotNull(javaClass.classLoader.getResourceAsStream(declaring)) {
+            "$declaring is not on the classpath, so this proves nothing"
+        }.use { it.readBytes() }
+        File(entry, declaring).apply { parentFile.mkdirs() }.writeBytes(bytes)
+        return entry
     }
 
     /**
