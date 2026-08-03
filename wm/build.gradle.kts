@@ -25,6 +25,24 @@ kotlin {
     }
 }
 
+// `:cli`'s integration suite drives the same headless sway this module's does, and SwayHarness is
+// the thing that knows how to start one and — harder — how to take every process it spawned back
+// down. Publishing the test classes is deliberate over the two alternatives: a second copy in
+// `:cli` would drift from this one, and the drift would show up as leaked compositors on a shared
+// machine rather than as a failing test; and moving the harness into `jvmMain` would ship test
+// scaffolding in the production artifact, where `org.junit.Assume` has no business being.
+val jvmTestClasses: Configuration by configurations.creating {
+    isCanBeResolved = false
+    isCanBeConsumed = true
+}
+
+val jvmTestJar by tasks.registering(Jar::class) {
+    archiveClassifier.set("jvm-test")
+    from(kotlin.jvm().compilations.getByName("test").output.allOutputs)
+}
+
+artifacts.add(jvmTestClasses.name, jvmTestJar)
+
 /** Whether every one of [tools] is an executable on this build's PATH. */
 fun onPath(vararg tools: String): Boolean {
     val entries = System.getenv("PATH").orEmpty().split(File.pathSeparator)
