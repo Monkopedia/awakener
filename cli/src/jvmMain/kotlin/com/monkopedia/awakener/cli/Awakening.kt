@@ -134,10 +134,11 @@ class Awakening(
      * reachable as `bindsym $mod+a exec awakener-invoke invoke`, with no wrapper script deriving
      * a window id that this could derive better.
      *
-     * The flag snapshot is read once. Minting reaches a spanreed subprocess and attaching waits
-     * for a window to map, so an invocation spans plenty of time for `:config` to reload
-     * underneath it — and an invocation that built its command under one dock name while
-     * attaching under another would produce a panel nothing can find.
+     * The flag snapshot is read once, so one invocation cannot act on two of them: a command
+     * built under one dock name and attached under another would leave a panel nothing can
+     * find. That is the right shape rather than a live defence — nothing calls
+     * `FileConfigStore.watch`, so no snapshot is replaced under a running process today, which
+     * is #43.
      */
     suspend fun invoke(target: SurfaceId? = null): Awakened {
         val cfg = config
