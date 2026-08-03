@@ -47,17 +47,20 @@ sealed interface SurfaceKey {
     /**
      * A short, readable, filesystem- and spanreed-safe name for this key.
      *
-     * The readable part is truncated, so it is the trailing hash that carries uniqueness. That
-     * matters more than it looks: this string becomes both the residue filename and the
-     * `SPANREED_AGENT_NAME`, and a collision there would silently hand two surfaces the same
-     * agent.
+     * This string becomes both the residue filename and the `SPANREED_AGENT_NAME`, and through
+     * that the `agent_id` spanreed routes on — so two keys sharing a slug is two surfaces
+     * sharing an agent, an inbox, and an accumulated model of Jason. The readable half cannot
+     * carry any of that uniqueness — it is truncated, and every character that is not a letter
+     * or digit is flattened to `-`. All of it rests on the trailing digest, which is taken over
+     * the injective [canonical] and is wide enough that a program choosing its own `app_id` or
+     * title cannot aim at another surface's slug.
      */
     val slug: String
         get() {
             val readable = canonical.map { c ->
                 if (c.isLetterOrDigit() || c == '-') c.lowercaseChar() else '-'
             }.joinToString("").trim('-').replace(Regex("-+"), "-").take(SLUG_READABLE_MAX)
-            return "$readable-${canonical.stableHash()}"
+            return "$readable-${canonical.stableDigest()}"
         }
 
     companion object {
@@ -142,17 +145,21 @@ private fun String.escapeSegment(): String = buildString(length) {
 private fun String.unescapeSegment(): String = replace("%3A", ":").replace("%25", "%")
 
 /**
- * FNV-1a, rendered as eight hex digits.
+ * SHA-256 over the string, truncated to 128 bits and rendered as 32 hex digits.
  *
- * Hand-rolled because `commonMain` has no hashing and pulling a crypto dependency in to
- * disambiguate filenames would be absurd. It is not used for anything where an adversary picks
- * the input — collision resistance here is about two of Jason's windows, not an attacker.
+ * The width is the point, and the input is why. Every input to [SurfaceKey.of] — `app_id` and
+ * window title — is chosen by the program that owns the window, not by awakener and not by
+ * Jason: `foot -a <anything>` sets one, and a title is whatever the program prints, including
+ * remote text a terminal echoes. So a program that can open a window picks the string that is
+ * hashed here, and the digest has to hold against a *chosen* input rather than against bad
+ * luck. The 32-bit FNV-1a this replaced did not: a chosen-victim preimage took 1.5 seconds on
+ * eight threads (#13), and since the slug becomes the `SPANREED_AGENT_NAME` and the residue
+ * filename, that bought the attacker another surface's inbox and accumulated model.
+ *
+ * 128 bits leaves the birthday bound at 2^64 and a chosen preimage at 2^128, which is not a
+ * budget a desktop application has.
  */
-private fun String.stableHash(): String {
-    var hash = 2166136261u
-    encodeToByteArray().forEach { byte ->
-        hash = hash xor (byte.toUInt() and 0xffu)
-        hash *= 16777619u
-    }
-    return hash.toString(16).padStart(8, '0')
-}
+private fun String.stableDigest(): String =
+    encodeToByteArray().sha256().copyOf(DIGEST_BYTES).toHex()
+
+private const val DIGEST_BYTES = 16
