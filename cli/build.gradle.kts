@@ -67,20 +67,32 @@ fun launcher(name: String, mainClass: String): String =
     # Edit cli/build.gradle.kts, not this file: it is overwritten on every build.
     set -eu
 
-    APP_HOME=${'$'}(CDPATH= cd -- "${'$'}(dirname -- "${'$'}0")/.." && pwd)
+    # Resolve ${'$'}0 through any symlinks before deriving APP_HOME. A hotkey is far more likely
+    # to name ~/.local/bin/$name than a path inside the install tree, and `dirname` of the
+    # *link* finds no lib/ next to it — which fails as a ClassNotFoundException naming no fix.
+    # Same loop Gradle's own start scripts use, and daisy-chained links work.
+    app_path=${'$'}0
+    while
+        app_dir=${'$'}{app_path%"${'$'}{app_path##*/}"}
+        [ -h "${'$'}app_path" ]
+    do
+        link=${'$'}(ls -ld -- "${'$'}app_path")
+        link=${'$'}{link#*' -> '}
+        case ${'$'}link in
+            /*) app_path=${'$'}link ;;
+            *) app_path=${'$'}app_dir${'$'}link ;;
+        esac
+    done
+    APP_HOME=${'$'}(CDPATH= cd -- "${'$'}{app_dir:-.}/.." && pwd)
 
-    # Java 21 or newer. Take an explicitly chosen JDK first, then the one this was built
-    # with, and only then whatever `java` means here — checking that one, because the
-    # failure it produces otherwise is an UnsupportedClassVersionError that names no fix.
-    if [ -n "${'$'}{AWAKENER_JAVA:-}" ]; then
-        JAVACMD=${'$'}AWAKENER_JAVA
-    elif [ -n "${'$'}{JAVA_HOME:-}" ]; then
-        JAVACMD=${'$'}JAVA_HOME/bin/java
-    elif [ -x '$buildJava' ]; then
-        JAVACMD='$buildJava'
-    else
-        JAVACMD=java
-        raw=${'$'}(java -version 2>&1 | sed -n '1s/.*"\(.*\)".*/\1/p')
+    # Java 21 or newer, checked against whichever branch below chose the JVM rather than only
+    # the last one. JAVA_HOME is ambient — distro profiles, sdkman/jenv and IDE-launched
+    # shells all set it, often to something older — so it is no more a deliberate 21 than PATH
+    # is, and AWAKENER_JAVA can name something that is not a JVM at all. Unchecked, every one
+    # of those becomes an UnsupportedClassVersionError that names no fix, which is the whole
+    # reason this script exists. The cost is one extra `-version` fork per press.
+    check_java() {
+        raw=${'$'}("${'$'}1" -version 2>&1 | sed -n '1s/.*"\(.*\)".*/\1/p')
         major=${'$'}{raw%%.*}
         # 1.8.0_452 and 21.0.4 both have to reduce to a number to compare.
         if [ "${'$'}{major:-}" = 1 ]; then
@@ -90,11 +102,26 @@ fun launcher(name: String, mainClass: String): String =
             '' | *[!0-9]*) major=0 ;;
         esac
         if [ "${'$'}major" -lt 21 ]; then
-            echo "$name: needs Java 21 or newer, and the java on PATH is ${'$'}{raw:-not a JVM}" >&2
-            echo "  point JAVA_HOME (or AWAKENER_JAVA) at a 21+ JDK" >&2
+            echo "$name: needs Java 21 or newer, but ${'$'}2 is ${'$'}{raw:-not a JVM}" >&2
+            echo "  point AWAKENER_JAVA or JAVA_HOME at a 21+ JDK" >&2
             exit 70
         fi
+    }
+
+    if [ -n "${'$'}{AWAKENER_JAVA:-}" ]; then
+        JAVACMD=${'$'}AWAKENER_JAVA
+        chose="AWAKENER_JAVA=${'$'}AWAKENER_JAVA"
+    elif [ -n "${'$'}{JAVA_HOME:-}" ]; then
+        JAVACMD=${'$'}JAVA_HOME/bin/java
+        chose="JAVA_HOME=${'$'}JAVA_HOME"
+    elif [ -x '$buildJava' ]; then
+        JAVACMD='$buildJava'
+        chose="the JDK this was built with"
+    else
+        JAVACMD=java
+        chose="the java on PATH"
     fi
+    check_java "${'$'}JAVACMD" "${'$'}chose"
 
     exec "${'$'}JAVACMD" -cp "${'$'}APP_HOME/lib/*" $mainClass "${'$'}@"
     """.trimIndent() + "\n"

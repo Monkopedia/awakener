@@ -31,9 +31,13 @@ its description; `awakener-registry` reads and forgets surface→agent bindings;
 bindsym $mod+a exec awakener-invoke invoke
 ```
 
-`invoke` with no argument acts on the focused window, which is all a key press carries. The
-launchers need a JDK 21 or newer and will say so rather than failing obscurely; they take one
-from `AWAKENER_JAVA`, then `JAVA_HOME`, then the JDK the build used, then `PATH`.
+`invoke` with no argument acts on the focused window, which is all a key press carries.
+
+The launchers take a JDK from `AWAKENER_JAVA`, then `JAVA_HOME`, then the JDK the build used,
+then `PATH` — and check the version of whichever one they picked, so anything older than 21
+(or not a JVM at all) is reported and exits 70 rather than failing as an
+`UnsupportedClassVersionError`. They also resolve symlinks, so `ln -s … ~/.local/bin/awakener-invoke`
+is a fine thing to name in a `bindsym`.
 
 ## Shape
 
