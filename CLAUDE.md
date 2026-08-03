@@ -151,12 +151,25 @@ From `docs/design.md`; these bind agent work here:
 - **PUBLIC repo.** Auto-merges are visible to the world, so lean conservative: when in doubt
   escalate rather than auto-merge. Being public is an argument for *review quality*, not for
   routing every change to Jason.
-- **Review tiers** (re-tiered 2026-07-30 against the real stack; see `review-policy.md` in
-  the urithiru fleet config, which is authoritative). `public_api` and `breaking_change` are
-  **tier 2** — this is an application, not a published library, so module boundaries are
-  internal contracts: surface them in the verdict, don't owner-gate them. Scaffolding is
-  **tier 1** — the Gradle skeleton, CI workflow, license, gitignore, module stubs, and docs
-  are not gated. `security` is **tier 3**.
+- **⚠️ OWNER DIRECTIVE (2026-08-02): NOTHING IS TIER 3 during standup.** Jason capped every
+  category at tier 2 until the project is stood up, so a clean review auto-merges and nothing
+  waits on him. The `security` → tier 3 rule below is **suspended**, not deleted. This is a
+  direct instruction and it is the current default; the reviewer still `request_changes` on
+  anything not clean, so the bar is unchanged — only the gate moved.
+
+  **Revisit before any of these lands, not on a date:** `:chrome` gaining the ability to
+  attach to a real browser profile, `:pairing-mcp` gaining a way for one agent to address
+  another's surface, `:bus` gaining an inbound path a local process could inject on, or
+  anything running as a daemon against Jason's live desktop. Those are the reaches the tier-3
+  rule was written for, and none of them exists yet — which is exactly why suspending it now
+  costs nothing and why it stops being free the moment one arrives. Say so and re-tier rather
+  than letting the suspension become the permanent state by inertia.
+- **Review tiers when the suspension lifts** (re-tiered 2026-07-30 against the real stack; see
+  `review-policy.md` in the urithiru fleet config, which is authoritative). `public_api` and
+  `breaking_change` are **tier 2** — this is an application, not a published library, so module
+  boundaries are internal contracts: surface them in the verdict, don't owner-gate them.
+  Scaffolding is **tier 1** — the Gradle skeleton, CI workflow, license, gitignore, module
+  stubs, and docs are not gated. `security` is **tier 3**.
 - **What counts as `security` here is wider than it looks**, and these will arrive framed as
   features. Classify all of the following as `security`, not `feature_internal`:
   - `:pairing-mcp` — how a surface proves it is the surface it claims to be; anything where
