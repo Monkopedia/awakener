@@ -133,8 +133,8 @@ not in the agent list. The peer's registry entry did read `pid_start: null` and 
 
 What that means, measured against a scratch `SPANREED_STATE_ROOT`:
 
-- **`--pid` is honoured, not ignored.** `StateStore.upsert` computes `pid_start` from the pid it
-  is *given* (`store.py`: `pid_start=pid_start_time(pid)`). Registering under a genuinely live
+- **`--pid` is honoured, not ignored.** `StateStore.register_agent` computes `pid_start` from the
+  pid it is *given* (`store.py`: `pid_start=pid_start_time(pid)`). Registering under a genuinely live
   pid that is not the caller's parent yields a non-null `pid_start` and an entry `spanreed list`
   shows as live — done twice here, once in a bare probe and once for this run's own peer:
 
@@ -234,14 +234,34 @@ appearing as "the bus stayed empty". `awakener-invoke` was launched with `SPANRE
 unset, which is what a hotkey from a session would *not* do — hence the clearing built into
 `SpanreedCli.liveAgents`.
 
-**One trap worth naming, because it silently invalidates the isolation.** `tmux new-session`
-attaches to whatever tmux *server* is already running, and that server has the environment of
-whoever started it — not the compositor's. The first attempt at this run put the panel on a
-server started hours earlier, so `SPANREED_STATE_ROOT` never reached `claude` and the Lifeless
-registered on the **real** bus; it had to be deregistered by hand. `tmux -L awakener` gives the
-panel a server of its own and the leak stops. Anything that instruments a dock command by
-inserting a process in front of the agent needs the same check: the agent's environment is only
-the compositor's if nothing in between substitutes its own.
+**One trap worth naming, because it silently invalidates the isolation — and it caught this
+work twice.** `tmux new-session` attaches to whatever tmux *server* is already running, and that
+server has the environment of whoever started it — not the compositor's. So `SPANREED_STATE_ROOT`
+never reached `claude`, and the Lifeless registered on Jason's **real** bus. That happened on the
+original run and again on the first attempt at the re-take: two separate occasions, not one.
+
+The live registry is clean now — 24 entries, no Lifeless, no probe, no demo, and no
+`~/.local/state/awakener` or `~/.config/awakener` either; the re-take's entry was deregistered
+by hand. What is *not* removable is `~/.claude/spanreed/activity-log.jsonl`, which is
+append-only and still holds
+
+```
+{"ts":"2026-08-03T21:25:20Z","agent_id":"agent-lifeless-window-demo-notes-9ae927be","kind":"status","value":"working"}
+{"ts":"2026-08-03T21:26:35Z","agent_id":"agent-lifeless-window-demo-notes-9ae927be","kind":"status","value":"idle"}
+```
+
+`9ae927be` is eight hex digits — the pre-#17 FNV-1a slug, so those lines are the *original*
+run's leak, and they are how the second occasion is known at all rather than assumed. (The log
+records only `status` and `focus`, never registration, which is why the re-take's leak left no
+line in it. Absence there is not evidence of absence.)
+
+`tmux -L awakener` gives the panel a server of its own and the leak stops; that is what every
+command quoted above ran under. But the durable lesson is not the cleanup, it is the shape:
+**anything that instruments a dock command by inserting a process in front of the agent has to
+be checked for this**, because the agent's environment is only the compositor's if nothing in
+between substitutes its own — and the failure is silent, visible only by looking at the real bus
+afterwards. Checking the real registry after a demo is now part of the method above rather than
+an afterthought, and a demo that needs to instrument the panel gets a private server for it.
 
 Three `claude` sessions were spent across the run and its re-take. Everything else was proved
 with a panel program that records the `SPANREED_AGENT_NAME` it received, which costs nothing and
