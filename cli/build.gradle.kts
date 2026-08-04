@@ -83,7 +83,9 @@ fun launcher(name: String, mainClass: String): String =
             *) app_path=${'$'}app_dir${'$'}link ;;
         esac
     done
-    APP_HOME=${'$'}(CDPATH= cd -- "${'$'}{app_dir:-.}/.." && pwd)
+    # -P so a symlinked *bin directory* resolves too: `bin` itself being the link means the
+    # loop above never fires, and a logical `cd link/..` lands outside the install tree.
+    APP_HOME=${'$'}(CDPATH= cd -P -- "${'$'}{app_dir:-.}/.." && pwd)
 
     # Java 21 or newer, checked against whichever branch below chose the JVM rather than only
     # the last one. JAVA_HOME is ambient — distro profiles, sdkman/jenv and IDE-launched
@@ -92,7 +94,12 @@ fun launcher(name: String, mainClass: String): String =
     # of those becomes an UnsupportedClassVersionError that names no fix, which is the whole
     # reason this script exists. The cost is one extra `-version` fork per press.
     check_java() {
-        raw=${'$'}("${'$'}1" -version 2>&1 | sed -n '1s/.*"\(.*\)".*/\1/p')
+        # Anchored on the `version "…"` token, not on line 1: JAVA_TOOL_OPTIONS and
+        # _JAVA_OPTIONS are as ambient as JAVA_HOME — APM agents, containers, IDE run
+        # configurations and CI images all set them — and a JVM that sees one prints
+        # `Picked up …` above the version line. Parsing line 1 then reads an empty version,
+        # degrades to 0, and rejects a perfectly good JDK 21 with advice it already follows.
+        raw=${'$'}("${'$'}1" -version 2>&1 | sed -n 's/.* version "\([^"]*\)".*/\1/p' | head -1)
         major=${'$'}{raw%%.*}
         # 1.8.0_452 and 21.0.4 both have to reduce to a number to compare.
         if [ "${'$'}{major:-}" = 1 ]; then
