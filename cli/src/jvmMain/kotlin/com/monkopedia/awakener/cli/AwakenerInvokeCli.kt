@@ -1,10 +1,6 @@
 package com.monkopedia.awakener.cli
 
 import com.monkopedia.awakener.config.ConfigCli
-import com.monkopedia.awakener.config.ConfigFlags
-import com.monkopedia.awakener.config.FileConfigStore
-import com.monkopedia.awakener.config.FlagDiscovery
-import com.monkopedia.awakener.config.Flags
 import com.monkopedia.awakener.registry.FileBindingStore
 import com.monkopedia.awakener.registry.SpanreedCli
 import com.monkopedia.awakener.wm.SurfaceId
@@ -125,19 +121,9 @@ object AwakenerInvokeCli {
  * that has to know is here.
  */
 fun main(args: Array<String>) {
-    // Same bootstrap as `awakener-config`: the flags that decide how discovery runs must be
-    // registered before the store parses anything, or their own overrides go unread.
-    Flags.requireLoaded(ConfigFlags)
-    val store = FileConfigStore(ConfigCli.defaultPath())
-    val discovery = store.config.value
-    val report = FlagDiscovery.discover(
-        discovery[ConfigFlags.discovery],
-        discovery[ConfigFlags.declarations],
-    )
-    report.problems.forEach { System.err.println("warning: flag discovery: $it") }
-    // The first snapshot was parsed against a registry holding only the bootstrap flags, so it
-    // called every other module's key unknown. Now that they exist, read it again.
-    store.reload()
+    // Warnings go to stderr rather than stdout: this one's stdout is what a hotkey press reports
+    // about the surface it acted on.
+    val store = ConfigCli.bootstrap(out = System.err::println)
 
     val spanreed = SpanreedCli(store)
     val bindings = FileBindingStore(store, spanreed)

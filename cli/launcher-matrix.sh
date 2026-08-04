@@ -155,8 +155,9 @@ GOOD_HOME=${GOOD_JAVA%/bin/java}
 #
 # The substring is matched against stdout and stderr together, and it is not optional: an exit
 # code alone does not distinguish "blocked, naming the branch the user has to fix" from
-# "blocked". Env assignments then argv is `env`'s own calling convention, so the two lists are
-# handed straight to it once the markers are dropped.
+# "blocked". A substring written `!text` requires its *absence* instead. Env assignments then
+# argv is `env`'s own calling convention, so the two lists are handed straight to it once the
+# markers are dropped.
 check() {
     label=$1
     want_exit=$2
@@ -191,12 +192,26 @@ check() {
         fail_count=$((fail_count + 1))
         return 0
     fi
-    case $got in
-        *"$want_text"*) note "ok   $label" ;;
+    case $want_text in
+        '!'*)
+            case $got in
+                *"${want_text#!}"*)
+                    note "FAIL $label: exit $rc as wanted, but the output contains '${want_text#!}'"
+                    detail "$got"
+                    fail_count=$((fail_count + 1))
+                    ;;
+                *) note "ok   $label" ;;
+            esac
+            ;;
         *)
-            note "FAIL $label: exit $rc as wanted, but the output does not contain '$want_text'"
-            detail "$got"
-            fail_count=$((fail_count + 1))
+            case $got in
+                *"$want_text"*) note "ok   $label" ;;
+                *)
+                    note "FAIL $label: exit $rc as wanted, but the output lacks '$want_text'"
+                    detail "$got"
+                    fail_count=$((fail_count + 1))
+                    ;;
+            esac
             ;;
     esac
 }
@@ -328,6 +343,36 @@ check "entry/awakener-registry runs" 0 "no surfaces bound" \
     -- "JAVA_HOME=$GOOD_HOME" -- "$REAL/awakener-registry" list
 check "entry/awakener-registry blocks" 70 "awakener-registry: needs Java 21 or newer" \
     -- "JAVA_HOME=$WORK/jvm/java8" -- "$REAL/awakener-registry" list
+
+# --- what the classpath is for: every entry point sees every module's flags (#45) ------------
+#
+# The launchers exist so all three `main`s run off `:cli`'s classpath, which is what lets flag
+# discovery see the other modules. A process is the only place that can be checked: the flag
+# registry is global and eager, so a JVM test that ran discovery once cannot then observe an
+# entry point that skips it.
+note ""
+note "# every entry point honours another module's flags rather than calling them unknown (#45)"
+mkdir -p "$WORK/cfg/awakener"
+cat >"$WORK/cfg/awakener/config.json" <<'EOF'
+{
+  "wm.dock.size_ppt": 55,
+  "config.flags.discovery": "CLASSPATH",
+  "registry.agent.name_prefix": "matrix-"
+}
+EOF
+check "flags/awakener-config applies them" 0 "wm.dock.size_ppt" \
+    -- "JAVA_HOME=$GOOD_HOME" "XDG_CONFIG_HOME=$WORK/cfg" -- "$REAL/awakener-config" list
+check "flags/awakener-config does not call them unknown" 0 '!no flag declares this key' \
+    -- "JAVA_HOME=$GOOD_HOME" "XDG_CONFIG_HOME=$WORK/cfg" -- "$REAL/awakener-config" list
+check "flags/awakener-registry does not call them unknown" 0 '!no flag declares this key' \
+    -- "JAVA_HOME=$GOOD_HOME" "XDG_CONFIG_HOME=$WORK/cfg" -- "$REAL/awakener-registry" list
+check "flags/awakener-invoke does not call them unknown" 2 '!no flag declares this key' \
+    -- "JAVA_HOME=$GOOD_HOME" "XDG_CONFIG_HOME=$WORK/cfg" -- "$REAL/awakener-invoke" not-a-command
+# And the reporting is real rather than absent: a key nothing declares still gets named.
+mkdir -p "$WORK/cfg-bad/awakener"
+printf '{"wm.dock.nonexistent": 1}\n' >"$WORK/cfg-bad/awakener/config.json"
+check "flags/awakener-registry names a key nothing declares" 0 "wm.dock.nonexistent" \
+    -- "JAVA_HOME=$GOOD_HOME" "XDG_CONFIG_HOME=$WORK/cfg-bad" -- "$REAL/awakener-registry" list
 
 # --- under other POSIX shells ----------------------------------------------------------------
 #

@@ -199,10 +199,19 @@ val launcherTest by tasks.registering(Exec::class) {
 
 tasks.named("check") { dependsOn(launcherTest) }
 
-/** Whether every one of [tools] is an executable on this build's PATH. */
-fun onPath(vararg tools: String): Boolean {
+/**
+ * A cache key naming *which* of [tools] this build found on PATH, not merely that it found any.
+ * Path, size and mtime rather than a boolean, so upgrading sway re-runs the suite instead of
+ * replaying a green recorded against the previous one. Same helper and same reason as `:wm`,
+ * where the full note lives (#29).
+ */
+fun toolFingerprint(vararg tools: String): String {
     val entries = System.getenv("PATH").orEmpty().split(File.pathSeparator)
-    return tools.all { tool -> entries.any { dir -> File(dir, tool).canExecute() } }
+    return tools.joinToString(" ") { tool ->
+        val found = entries.map { File(it, tool) }.firstOrNull { it.canExecute() }
+        val id = found?.let { "${it.absolutePath}:${it.length()}:${it.lastModified()}" }
+        "$tool=${id ?: "absent"}"
+    }
 }
 
 tasks.withType<Test>().configureEach {
@@ -223,9 +232,9 @@ tasks.withType<Test>().configureEach {
     // cache will replay a run that skipped every tool-gated test into a `clean build` that
     // demanded the tools. Same declaration as `:wm` and `:registry`, and for the same measured
     // reason — a REQUIRE=1 clean build coming back in under a second with everything skipped.
-    inputs.property("swayTooling", onPath("sway", "foot"))
+    inputs.property("swayTooling", toolFingerprint("sway", "foot"))
     inputs.property("requireSway", System.getenv("AWAKENER_REQUIRE_SWAY").orEmpty())
-    inputs.property("spanreedTooling", onPath("spanreed"))
+    inputs.property("spanreedTooling", toolFingerprint("spanreed"))
     inputs.property("requireSpanreed", System.getenv("AWAKENER_REQUIRE_SPANREED").orEmpty())
 
     testLogging {

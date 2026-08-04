@@ -138,7 +138,16 @@ class SpanreedCli(
      * awakener's own process very often has one set, inherited from the session that launched it.
      *
      * A failure is raised rather than answered as "nobody is animated": the caller's next act on
-     * a false empty list is to stand a second panel up beside one that is already there.
+     * a false empty list is to stand a second panel up beside one that is already there. That is
+     * why silence is refused too. A zero exit is not enough on its own — [ProcessCommandRunner]
+     * stops waiting on the drain after a grace period and returns what arrived, so a child that
+     * exits 0 while its output is still in flight yields a short read. A short read of a JSON
+     * array is either blank or unparseable, and both now raise; what must never happen is the
+     * one shape that would parse into a plausible answer, and an empty string papered into `[]`
+     * was exactly that shape.
+     *
+     * That the *runner* cannot say it read short is #51, and it is not fixed here — `agent-id`
+     * has the same exposure with worse consequences, since a truncated id is a valid string.
      */
     override suspend fun liveAgents(): List<LiveAgent> {
         val result = withContext(Dispatchers.IO) {
@@ -150,9 +159,13 @@ class SpanreedCli(
         check(result.succeeded) {
             "spanreed list failed (${result.exitCode}): ${result.stderr.ifBlank { result.stdout }}"
         }
-        // Lenient: this list is spanreed's shape, not awakener's, and a field added there must
-        // not stop a hotkey working.
-        return busJson.decodeFromString(result.stdout.ifBlank { "[]" })
+        val listing = result.stdout.ifBlank {
+            error("spanreed list exited 0 but printed nothing; refusing to read that as an empty bus")
+        }
+        // Lenient about *fields*: this list is spanreed's shape, not awakener's, and one added
+        // there must not stop a hotkey working. Not lenient about the document, which is what
+        // distinguishes an empty bus from an unread one.
+        return busJson.decodeFromString(listing)
     }
 
     /**

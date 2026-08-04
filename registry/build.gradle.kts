@@ -22,10 +22,19 @@ kotlin {
     }
 }
 
-/** Whether every one of [tools] is an executable on this build's PATH. */
-fun onPath(vararg tools: String): Boolean {
+/**
+ * A cache key naming *which* of [tools] this build found on PATH, not merely that it found any.
+ * Path, size and mtime rather than a boolean, so upgrading spanreed re-runs the suite instead of
+ * replaying a green recorded against the previous one. Same helper and same reason as `:wm`,
+ * where the full note lives (#29).
+ */
+fun toolFingerprint(vararg tools: String): String {
     val entries = System.getenv("PATH").orEmpty().split(File.pathSeparator)
-    return tools.all { tool -> entries.any { dir -> File(dir, tool).canExecute() } }
+    return tools.joinToString(" ") { tool ->
+        val found = entries.map { File(it, tool) }.firstOrNull { it.canExecute() }
+        val id = found?.let { "${it.absolutePath}:${it.length()}:${it.lastModified()}" }
+        "$tool=${id ?: "absent"}"
+    }
 }
 
 tasks.withType<Test>().configureEach {
@@ -37,7 +46,7 @@ tasks.withType<Test>().configureEach {
     // Neither PATH nor the environment is a test input as far as Gradle is concerned, so
     // without these the build cache will serve a run that skipped the real-spanreed test to a
     // run that required it. See the same note in :wm.
-    inputs.property("spanreedTooling", onPath("spanreed"))
+    inputs.property("spanreedTooling", toolFingerprint("spanreed"))
     inputs.property("requireSpanreed", System.getenv("AWAKENER_REQUIRE_SPANREED").orEmpty())
 
     testLogging {

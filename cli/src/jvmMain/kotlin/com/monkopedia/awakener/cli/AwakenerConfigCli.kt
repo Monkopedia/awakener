@@ -1,10 +1,6 @@
 package com.monkopedia.awakener.cli
 
 import com.monkopedia.awakener.config.ConfigCli
-import com.monkopedia.awakener.config.ConfigFlags
-import com.monkopedia.awakener.config.FileConfigStore
-import com.monkopedia.awakener.config.FlagDiscovery
-import com.monkopedia.awakener.config.Flags
 import java.nio.file.Path
 import kotlin.system.exitProcess
 
@@ -21,22 +17,7 @@ object AwakenerConfigCli {
         path: Path,
         out: (String) -> Unit,
         environment: Map<String, String> = System.getenv(),
-    ): Int {
-        // Bootstrap: the flags that decide how discovery runs must be registered before the
-        // store is built, or their own environment overrides would not be picked up.
-        Flags.requireLoaded(ConfigFlags)
-        val store = FileConfigStore(path, environment)
-        val config = store.config.value
-        val report = FlagDiscovery.discover(
-            config[ConfigFlags.discovery],
-            config[ConfigFlags.declarations],
-        )
-        report.problems.forEach { out("warning: flag discovery: $it") }
-        // That first snapshot was parsed against a registry holding only the bootstrap flags,
-        // so it called every other module's key unknown. Now that they exist, read it again.
-        store.reload()
-        return ConfigCli.run(args, store, out)
-    }
+    ): Int = ConfigCli.run(args, ConfigCli.bootstrap(path, environment, out), out)
 }
 
 fun main(args: Array<String>) {

@@ -1,9 +1,10 @@
 package com.monkopedia.awakener.registry
 
 import com.monkopedia.awakener.config.InMemoryConfigStore
+import java.io.File
 import java.nio.file.Path
 import kotlin.io.path.absolutePathString
-import kotlin.io.path.exists
+import kotlin.io.path.isExecutable
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -176,6 +177,33 @@ class SpanreedCliTest {
     }
 
     /**
+     * The two shapes a short read can take, and the reason they are worth their own tests: a
+     * non-zero exit is not how truncation presents. `ProcessCommandRunner` gives up on the
+     * drain after a grace period, so the child can exit 0 with its output still in flight — and
+     * then `check(result.succeeded)` passes. The list this method returns decides whether a
+     * hotkey press stands a second panel beside one already there, so anything short of the
+     * whole document has to raise. See #51 for the runner-level defect underneath.
+     */
+    @Test
+    fun `a silent list is raised rather than read as an empty bus`() = runTest {
+        response = ProcessResult(0, "", "")
+        assertTrue(
+            assertFailsWith<IllegalStateException> { cli.liveAgents() }
+                .message!!.contains("printed nothing"),
+        )
+    }
+
+    @Test
+    fun `a truncated list is raised rather than read as a shorter one`() = runTest {
+        response = ProcessResult(
+            0,
+            """[{"agent_id": "agent-lifeless-a", "name": "lifeless-a"}, {"agent_id": "age""",
+            "",
+        )
+        assertFailsWith<Exception> { cli.liveAgents() }
+    }
+
+    /**
      * The one test that touches the real thing. `agent-id` only prints a derivation — it does
      * not write to the registry — so this is safe to run against an installed spanreed, and it
      * is the only way to catch the derivation rule changing underneath us.
@@ -248,7 +276,9 @@ class SpanreedCliTest {
         return spanreed
     }
 
-    private fun onPath(tool: String): Path? = System.getenv("PATH").orEmpty().split(':')
-        .map { Path.of(it, tool) }
-        .firstOrNull { it.exists() }
+    /** Same predicate as `toolFingerprint` in the build scripts — see the note in `:wm` (#29). */
+    private fun onPath(tool: String): Path? =
+        System.getenv("PATH").orEmpty().split(File.pathSeparator)
+            .map { Path.of(it, tool) }
+            .firstOrNull { it.isExecutable() }
 }
