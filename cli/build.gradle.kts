@@ -156,7 +156,7 @@ val launchers by tasks.registering {
     }
 }
 
-tasks.register<Sync>("installDist") {
+val installDist by tasks.registering(Sync::class) {
     group = "distribution"
     description = "Lays out runnable CLIs under build/install/awakener: put its bin/ on PATH."
     into(layout.buildDirectory.dir("install/awakener"))
@@ -169,6 +169,35 @@ tasks.register<Sync>("installDist") {
         filePermissions { unix("rwxr-xr-x") }
     }
 }
+
+// The launcher's own suite. It is shell rather than Kotlin because the thing under test is a
+// shell script and the interesting axes are process environment — JAVA_HOME, PATH, an ambient
+// JAVA_TOOL_OPTIONS, invocation through a symlink — which a JVM test would have to shell out to
+// vary anyway. It runs the *shipped* scripts, so it catches defects in what `installDist` lays
+// down rather than in what this file reads like.
+//
+// Three review rounds found three defects here by hand, which is two more than a script this
+// small should get to have.
+val launcherTest by tasks.registering(Exec::class) {
+    group = LifecycleBasePlugin.VERIFICATION_GROUP
+    description = "Runs the shipped launchers under a JDK, PATH and symlink matrix."
+    val script = layout.projectDirectory.file("launcher-matrix.sh")
+    val report = layout.buildDirectory.file("reports/launcher-matrix.txt")
+    inputs.file(script)
+    // Carries the dependency on installDist as well as the up-to-date check.
+    inputs.files(installDist)
+    outputs.file(report)
+    commandLine(
+        "sh",
+        script.asFile.absolutePath,
+        layout.buildDirectory.dir("install/awakener").get().asFile.absolutePath,
+        buildJava,
+        layout.buildDirectory.dir("launcher-matrix").get().asFile.absolutePath,
+        report.get().asFile.absolutePath,
+    )
+}
+
+tasks.named("check") { dependsOn(launcherTest) }
 
 /** Whether every one of [tools] is an executable on this build's PATH. */
 fun onPath(vararg tools: String): Boolean {
