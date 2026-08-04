@@ -36,8 +36,14 @@ bindsym $mod+a exec awakener-invoke invoke
 The launchers take a JDK from `AWAKENER_JAVA`, then `JAVA_HOME`, then the JDK the build used,
 then `PATH` — and check the version of whichever one they picked, so anything older than 21
 (or not a JVM at all) is reported and exits 70 rather than failing as an
-`UnsupportedClassVersionError`. They also resolve symlinks, so `ln -s … ~/.local/bin/awakener-invoke`
-is a fine thing to name in a `bindsym`.
+`UnsupportedClassVersionError`. The version is read from the `version "…"` token rather than from
+the first line, so an ambient `JAVA_TOOL_OPTIONS` or `_JAVA_OPTIONS` — which makes a JVM print a
+`Picked up …` banner first — does not turn a good JDK into a rejected one. They also resolve
+symlinks, so `ln -s … ~/.local/bin/awakener-invoke` is a fine thing to name in a `bindsym`, and
+symlinking the whole `bin` directory works too.
+
+All of that is covered by `gradlew :cli:launcherTest`, which runs the shipped scripts over that
+matrix; `check` depends on it.
 
 ## Shape
 
