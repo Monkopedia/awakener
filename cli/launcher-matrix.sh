@@ -139,13 +139,22 @@ mkdir -p "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$XDG_DATA_HOME"
 # what the launcher is allowed to depend on: add one and the matrix goes red until it is listed.
 BARE_PATH=$WORK/bin
 mkdir -p "$BARE_PATH"
+# `command -v` answers with a bare name for a shell builtin — `printf` is one in dash, bash and
+# busybox — and linking that to itself makes a cycle, which is fatal to anything that later walks
+# the build directory. A builtin needs no entry here: every shell that could run the launcher
+# already has it.
+link_tool() {
+    resolved=$(command -v "$1" 2>/dev/null) || return 1
+    case $resolved in
+        /*) ln -s "$resolved" "$BARE_PATH/$1" ;;
+        *) ;;
+    esac
+}
 for tool in ls sed head cut printf; do
-    resolved=$(command -v "$tool" 2>/dev/null) || die "no $tool on PATH to build the harness with"
-    ln -s "$resolved" "$BARE_PATH/$tool"
+    link_tool "$tool" || die "no $tool available to build the harness with"
 done
 for shell in dash busybox; do
-    resolved=$(command -v "$shell" 2>/dev/null) || continue
-    ln -s "$resolved" "$BARE_PATH/$shell"
+    link_tool "$shell" || continue
 done
 
 GOOD_HOME=${GOOD_JAVA%/bin/java}
