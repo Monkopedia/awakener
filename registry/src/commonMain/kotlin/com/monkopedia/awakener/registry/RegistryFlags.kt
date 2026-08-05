@@ -39,6 +39,44 @@ enum class AgentIdSource {
     DERIVED,
 }
 
+/**
+ * What a bind does when `registry.agent.id_source=SPANREED` and spanreed cannot be run at all.
+ *
+ * Scoped to *cannot be run* — a missing executable, or a typo in
+ * [RegistryFlags.spanreedCommand] — and to nothing else. A spanreed that ran and exited non-zero
+ * is a bus that is present with something else wrong; deriving past that would hide it. Neither
+ * value covers a run whose output came back short, because that is a spanreed which answered and
+ * the answer is the thing in doubt.
+ */
+enum class UnreachableIdSource {
+    /**
+     * Refuse to mint. This is what awakener has always done, and it is the value that never
+     * writes a durable binding under an id spanreed did not issue — the binding outlives the
+     * outage, so an id invented during one is an id the surface keeps.
+     */
+    FAIL,
+
+    /**
+     * Apply [AgentIdSource.DERIVED]'s rule for this mint, and say so on stderr.
+     *
+     * The bind then works with the bus down, which is a real thing to want from a hotkey. The
+     * cost is that the id is a *pin* of spanreed's documented rule rather than a reading of it,
+     * so a surface bound during an outage disagrees with spanreed forever if that rule ever
+     * changes. Reporting it is not decoration: substituting one id source for another in
+     * silence is precisely the quiet behaviour change #62 was about.
+     *
+     * **This gets the mint through, not the whole press.** Under the default
+     * `invoke.when_animated=REUSE` the hotkey also asks the bus whether this Lifeless is
+     * already animated, and that question raises on an unreadable bus by design — a false
+     * "nobody is animated" stands a second panel beside one already there. So a press that has
+     * to work with spanreed absent wants `invoke.when_animated=SECOND_DOCK` as well, which is
+     * the flag that says "do not ask". Verified against sway 1.12: the pair stands the dock up
+     * and exits 0 with no spanreed on `PATH`; this value alone mints, warns, and then stops at
+     * the bus.
+     */
+    DERIVE,
+}
+
 /** What a window that reports no `app_id` — an xwayland window, usually — is keyed on. */
 enum class MissingAppId {
     /**
@@ -196,11 +234,32 @@ object RegistryFlags {
             "applied locally without a subprocess.",
     )
 
+    val idSourceUnreachable = Flags.enum(
+        "registry.agent.id_source_unreachable",
+        UnreachableIdSource.FAIL,
+        "What a bind does when id_source=SPANREED and the spanreed executable cannot be run at " +
+            "all — spanreed not installed, or a typo in registry.agent.spanreed_command. FAIL " +
+            "refuses to mint, which is the existing behaviour and the one that never writes a " +
+            "durable binding under an id spanreed did not issue. DERIVE applies spanreed's " +
+            "documented agent-<name> rule locally so a hotkey still works with the bus down, " +
+            "and reports the substitution on stderr. Only a command that cannot run is covered: " +
+            "a spanreed that ran and failed is a present bus with something else wrong, and a " +
+            "run whose output came back short is an answer that cannot be trusted — both still " +
+            "refuse under either value. DERIVE covers the mint, not the whole press: the " +
+            "default invoke.when_animated=REUSE also asks the bus who is animated, and that " +
+            "question raises on an unreadable bus by design, so pair it with SECOND_DOCK for a " +
+            "hotkey that never asks.",
+    )
+
     val spanreedCommand = Flags.string(
         "registry.agent.spanreed_command",
         "spanreed",
         "The spanreed executable. spanreed's CLI is its public contract; its registry file and " +
             "lockfile are not, so this is the only way awakener is allowed to reach the bus.",
+        // Blank is not a spanreed that might exist, it is an argv whose first element is the
+        // empty string — so it degrades to the default and is reported, rather than reaching
+        // ProcessBuilder to come back as "could not run ''".
+        Flags.nonBlank(),
     )
 
     val registerOnMint = Flags.boolean(

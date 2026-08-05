@@ -1,16 +1,20 @@
 package com.monkopedia.awakener.registry
 
+import com.monkopedia.awakener.config.Config
 import com.monkopedia.awakener.config.InMemoryConfigStore
 import java.io.File
+import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.io.path.absolutePathString
 import kotlin.io.path.isExecutable
+import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.json.JsonPrimitive
 import org.junit.AssumptionViolatedException
 
 /**
@@ -123,6 +127,27 @@ class SpanreedCliTest {
         assertEquals("/opt/spanreed/bin/spanreed", calls.single().first.first())
     }
 
+    /**
+     * Blank is not a spanreed that might exist — it is an argv whose first element is the empty
+     * string, which reaches `ProcessBuilder` only to come back as `could not run ''`. Declared
+     * on the flag rather than coerced here, so `awakener-config list` prints the rule and a
+     * hand-edited file that breaks it degrades and says so instead of failing at the hotkey.
+     */
+    @Test
+    fun `a blank spanreed command degrades to the default and is reported`() {
+        val snapshot = Config.of(
+            mapOf(RegistryFlags.spanreedCommand.key to JsonPrimitive("")),
+        )
+
+        assertEquals("spanreed", snapshot[RegistryFlags.spanreedCommand])
+        assertTrue(
+            snapshot.problems.single { it.key == RegistryFlags.spanreedCommand.key }
+                .reason.contains("blank"),
+            "a value that degraded silently is the failure that costs most to diagnose: " +
+                snapshot.problems,
+        )
+    }
+
     @Test
     fun `listing the bus asks under no agent name at all`() = runTest {
         response = ProcessResult(0, "[]", "")
@@ -201,6 +226,166 @@ class SpanreedCliTest {
             "",
         )
         assertFailsWith<Exception> { cli.liveAgents() }
+    }
+
+    /**
+     * And it is refused for *being* short rather than for happening to be unparseable — which
+     * is what stops the guard depending on the decoder's luck. There is no prefix of a JSON
+     * array that parses, so today the two coincide; a `list` that ever grew a line-oriented
+     * form would separate them, and this is the assertion that survives it.
+     */
+    @Test
+    fun `a list the runner says it read short is refused even when it parses`() = runTest {
+        response = ProcessResult(0, "[]", "", shortRead = "the output was cut off")
+        assertTrue(
+            assertFailsWith<IllegalStateException> { cli.liveAgents() }
+                .message!!.contains("cut off"),
+        )
+    }
+
+    // ------------------------------------------------------------ minting against a real child
+    //
+    // A recorded runner cannot reach the defect these cover: it is the *runner* that decides
+    // whether what it read is all of it, so a fake one asserting on argv would be asserting on
+    // the fake. These drive a real subprocess — a shell script standing in for spanreed, so no
+    // throwaway agent lands on anybody's live bus — through the whole `mint` path.
+
+    /**
+     * **The one this whole change is about.**
+     *
+     * A truncated agent id is a *valid* agent id: it is a plausible string that addresses some
+     * other surface's Lifeless, or nothing at all, and neither the caller nor the row it gets
+     * written into can tell it from the real one afterwards. One window is then handed another
+     * window's agent — and with it the accumulated model of the user that agent holds, which is
+     * the failure the registry exists to prevent.
+     *
+     * The script here reproduces the shape exactly: a child that exits 0 leaving a background
+     * job holding its stdout, so the second half of the id lands after the drain has given up.
+     * Against unchanged `main` (`d0dd60a`) this minted, successfully and silently,
+     * `AgentIdentity(id=AgentId(raw=agent-lifeless-fire), spanreedName=lifeless-window-firefox-…)`
+     * from a spanreed that said `agent-lifeless-firefox`.
+     *
+     * The child exits *immediately*, unlike the one in `ProcessCommandRunnerTest`, and that is
+     * the point of running it here as well: it is the timing under which the runner's own signal
+     * sometimes misses, because the JVM drains and replaces a child's pipe the moment it exits.
+     * What catches it every time is the framing — `agent-lifeless-fire` is not a whole line,
+     * because a whole line ends in a newline and a prefix of one does not. So this refuses for
+     * one of two reasons depending on which thread won, and both are correct; asserting on
+     * either alone would be asserting on the race.
+     */
+    @Test
+    fun `an id whose read came up short is refused rather than minted`() = runTest {
+        val cli = againstScript("{ printf 'agent-lifeless-fire'; sleep 5; printf 'fox'; } &\nexit 0")
+
+        val raised = assertFailsWith<IllegalStateException> { cli.mint(SurfaceKey.Window("firefox")) }
+        assertTrue(
+            raised.message!!.let { "cut off" in it || "prefix of an id" in it },
+            "and refused for arriving incomplete, not for some other reason: ${raised.message}",
+        )
+    }
+
+    /**
+     * The framing check on its own, with no race to hide behind: a runner that swears the read
+     * was whole, handing back an id with no line terminator. Nothing about the plumbing can
+     * reject this, and nothing about the string can either — `agent-lifeless-fire` is a
+     * perfectly good agent id, just not the one spanreed was in the middle of printing.
+     */
+    @Test
+    fun `an id with no line terminator is refused even when the read looked whole`() = runTest {
+        response = ProcessResult(0, "agent-lifeless-fire", "")
+
+        assertTrue(
+            assertFailsWith<IllegalStateException> { cli.mint(SurfaceKey.Window("firefox")) }
+                .message!!.contains("prefix of an id"),
+        )
+    }
+
+    /**
+     * The control for the test above, through the same harness. Without it, an implementation
+     * that simply refused to mint anything at all would pass — and that implementation is not
+     * hypothetical, it is what a too-eager guard on this path looks like.
+     */
+    @Test
+    fun `a whole read through the same path still mints exactly what spanreed said`() = runTest {
+        val cli = againstScript("printf 'agent-from-a-real-child\\n'")
+
+        assertEquals(AgentId("agent-from-a-real-child"), cli.mint(SurfaceKey.Window("firefox")).id)
+    }
+
+    // --------------------------------------------------------- #68: a spanreed that cannot run
+
+    /**
+     * The default, and the behaviour that predates the flag: an id spanreed did not issue is not
+     * minted. It matters more here than for a transient failure because the binding is durable —
+     * an id invented during an outage is one the surface keeps after it.
+     */
+    @Test
+    fun `an unrunnable spanreed fails the mint by default`() = runTest {
+        config.put(RegistryFlags.spanreedCommand, "awakener-no-such-spanreed")
+
+        val raised = assertFailsWith<IllegalStateException> {
+            SpanreedCli(config).mint(SurfaceKey.Window("firefox"))
+        }
+        assertTrue(
+            RegistryFlags.spanreedCommand.key in raised.message.orEmpty(),
+            "the refusal has to name the flag that chose the command: ${raised.message}",
+        )
+    }
+
+    @Test
+    fun `DERIVE mints spanreed's documented id locally and says that it did`() = runTest {
+        config.put(RegistryFlags.spanreedCommand, "awakener-no-such-spanreed")
+        config.put(RegistryFlags.idSourceUnreachable, UnreachableIdSource.DERIVE)
+        val warnings = mutableListOf<String>()
+
+        val identity = SpanreedCli(config, warn = { warnings += it })
+            .mint(SurfaceKey.Window("firefox"))
+
+        assertEquals(AgentId("agent-${identity.spanreedName}"), identity.id)
+        // Silence here would be the quiet substitution #62 was about: the flag still reads
+        // SPANREED, and the id did not come from spanreed.
+        assertTrue(
+            warnings.single().let {
+                RegistryFlags.idSourceUnreachable.key in it && "awakener-no-such-spanreed" in it
+            },
+            "the substitution has to name itself and what could not be run: $warnings",
+        )
+    }
+
+    /**
+     * The scoping, which is the whole of why this is not simply "fall back on any failure".
+     *
+     * A spanreed that ran and exited non-zero is a bus that is *present* with something else
+     * wrong, and a short read is a spanreed that answered where the answer is the thing in
+     * doubt. Deriving past either would mint a plausible id over a live problem — the same
+     * class of failure the truncation above is, arrived at deliberately.
+     */
+    @Test
+    fun `DERIVE does not cover a spanreed that ran and failed, or one that read short`() =
+        runTest {
+            config.put(RegistryFlags.idSourceUnreachable, UnreachableIdSource.DERIVE)
+
+            response = ProcessResult(1, "", "spanreed: registry is locked")
+            assertTrue(
+                assertFailsWith<IllegalStateException> { cli.mint(SurfaceKey.Window("firefox")) }
+                    .message!!.contains("registry is locked"),
+            )
+
+            response = ProcessResult(0, "agent-lifeless-fire", "", shortRead = "the output was cut off")
+            assertTrue(
+                assertFailsWith<IllegalStateException> { cli.mint(SurfaceKey.Window("firefox")) }
+                    .message!!.contains("cut off"),
+            )
+        }
+
+    /** A `SpanreedCli` driving [script] as its spanreed, through the real subprocess runner. */
+    private fun againstScript(script: String): SpanreedCli {
+        val path = Files.createTempDirectory("awakener-fake-spanreed").resolve("spanreed")
+        path.writeText("#!/bin/sh\n$script\n")
+        assertTrue(path.toFile().setExecutable(true))
+        return SpanreedCli(
+            InMemoryConfigStore().put(RegistryFlags.spanreedCommand, path.absolutePathString()),
+        )
     }
 
     /**
