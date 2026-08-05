@@ -6,6 +6,10 @@ import java.io.InputStream
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+
+/** spanreed's registry is its shape to grow, so an unknown field must never fail a hotkey. */
+private val busJson = Json { ignoreUnknownKeys = true }
 
 /** The outcome of running a subprocess. */
 data class ProcessResult(val exitCode: Int, val stdout: String, val stderr: String) {
@@ -15,9 +19,16 @@ data class ProcessResult(val exitCode: Int, val stdout: String, val stderr: Stri
 /**
  * Runs a command. A seam, so tests can assert on the exact argv awakener sends to spanreed
  * without registering throwaway agents on the developer's live bus.
+ *
+ * [environment] is applied *over* the inherited environment, and **a null value removes the
+ * variable** rather than setting it empty. Removal is not a convenience: awakener's own process
+ * routinely runs with `SPANREED_AGENT_NAME` set — the hotkey path is reached from a session that
+ * has one, and `awakener-invoke` is a child of whatever launched it — so a read of the whole bus
+ * issued without clearing it would be issued *as* some other agent. Setting it empty is not the
+ * same thing either, since spanreed's override is on presence.
  */
 fun interface CommandRunner {
-    fun run(command: List<String>, environment: Map<String, String>): ProcessResult
+    fun run(command: List<String>, environment: Map<String, String?>): ProcessResult
 }
 
 /**
@@ -31,9 +42,14 @@ fun interface CommandRunner {
  * constant so a test can prove the timeout fires without spending the production budget waiting.
  */
 class ProcessCommandRunner(private val timeoutMs: Long = DEFAULT_TIMEOUT_MS) : CommandRunner {
-    override fun run(command: List<String>, environment: Map<String, String>): ProcessResult {
+    override fun run(command: List<String>, environment: Map<String, String?>): ProcessResult {
         val process = ProcessBuilder(command)
-            .apply { environment().putAll(environment) }
+            .apply {
+                val inherited = environment()
+                environment.forEach { (name, value) ->
+                    if (value == null) inherited.remove(name) else inherited[name] = value
+                }
+            }
             .start()
         // Nothing awakener runs is fed on stdin, and a child that reads it would otherwise wait
         // forever for input that is never coming.
@@ -108,8 +124,49 @@ class SpanreedCli(
     private val configStore: ConfigStore,
     private val runner: CommandRunner = ProcessCommandRunner(),
     private val ownPid: () -> Long = { ProcessHandle.current().pid() },
-) : AgentIdentities {
+) : AgentIdentities, AgentBus {
     private val config: Config get() = configStore.config.value
+
+    /**
+     * Every agent spanreed currently considers live.
+     *
+     * Run under **no** `SPANREED_AGENT_NAME` at all, which is the one interaction here that is
+     * not about an identity: `list` is a read of the whole registry, and awakener asking it while
+     * wearing a name would be asking as somebody. Every other call in this class sets the name
+     * because the name is the whole point of the call; this one clears it for the same reason.
+     * The clearing is real removal rather than an empty value — see [CommandRunner] — because
+     * awakener's own process very often has one set, inherited from the session that launched it.
+     *
+     * A failure is raised rather than answered as "nobody is animated": the caller's next act on
+     * a false empty list is to stand a second panel up beside one that is already there. That is
+     * why silence is refused too. A zero exit is not enough on its own — [ProcessCommandRunner]
+     * stops waiting on the drain after a grace period and returns what arrived, so a child that
+     * exits 0 while its output is still in flight yields a short read. A short read of a JSON
+     * array is either blank or unparseable, and both now raise; what must never happen is the
+     * one shape that would parse into a plausible answer, and an empty string papered into `[]`
+     * was exactly that shape.
+     *
+     * That the *runner* cannot say it read short is #51, and it is not fixed here — `agent-id`
+     * has the same exposure with worse consequences, since a truncated id is a valid string.
+     */
+    override suspend fun liveAgents(): List<LiveAgent> {
+        val result = withContext(Dispatchers.IO) {
+            runner.run(
+                listOf(config[RegistryFlags.spanreedCommand], "list"),
+                mapOf("SPANREED_AGENT_NAME" to null),
+            )
+        }
+        check(result.succeeded) {
+            "spanreed list failed (${result.exitCode}): ${result.stderr.ifBlank { result.stdout }}"
+        }
+        val listing = result.stdout.ifBlank {
+            error("spanreed list exited 0 but printed nothing; refusing to read that as an empty bus")
+        }
+        // Lenient about *fields*: this list is spanreed's shape, not awakener's, and one added
+        // there must not stop a hotkey working. Not lenient about the document, which is what
+        // distinguishes an empty bus from an unread one.
+        return busJson.decodeFromString(listing)
+    }
 
     /**
      * Mints the identity for a surface.

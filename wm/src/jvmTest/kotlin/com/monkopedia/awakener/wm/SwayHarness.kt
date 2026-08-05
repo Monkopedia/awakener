@@ -6,6 +6,7 @@ import java.nio.file.Path
 import kotlin.io.path.absolutePathString
 import kotlin.io.path.deleteIfExists
 import kotlin.io.path.exists
+import kotlin.io.path.isExecutable
 import kotlin.io.path.writeText
 import kotlin.test.fail
 import org.junit.Assume.assumeTrue
@@ -157,10 +158,15 @@ class SwayHarness private constructor(
             assumeTrue("sway and/or foot are not installed", available())
         }
 
+        /**
+         * Executable and `File.pathSeparator`, matching `toolFingerprint` in the build scripts.
+         * They used to disagree: a present but non-executable `sway` was here to this and absent
+         * to the cache key, which is the skew that key exists to remove (#29).
+         */
         private fun which(tool: String): String? =
-            System.getenv("PATH").orEmpty().split(':')
+            System.getenv("PATH").orEmpty().split(File.pathSeparator)
                 .map { Path.of(it, tool) }
-                .firstOrNull { it.exists() }
+                .firstOrNull { it.isExecutable() }
                 ?.absolutePathString()
 
         fun start(): SwayHarness {

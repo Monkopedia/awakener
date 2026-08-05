@@ -585,7 +585,7 @@ class SwayWindowManager(
         val table = docks.snapshot()
         return windows
             .filter { dockedTo(it, table, cfg) == null && !reserved(it, table, cfg) }
-            .map { Surface(SurfaceId(it.id), it.appId, it.name, it.pid) }
+            .map { Surface(SurfaceId(it.id), it.appId, it.name, it.pid, it.focused) }
     }
 
     override suspend fun resolve(surface: SurfaceId): AgentId? =
@@ -816,7 +816,13 @@ class SwayWindowManager(
                         "new" -> trySend(
                             SurfaceChange.Appeared(
                                 id,
-                                Surface(id, container.appId, container.name, container.pid),
+                                Surface(
+                                    id,
+                                    container.appId,
+                                    container.name,
+                                    container.pid,
+                                    container.focused,
+                                ),
                             ),
                         )
                         "close" -> trySend(SurfaceChange.Vanished(id))
