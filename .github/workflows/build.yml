@@ -5,13 +5,39 @@ on:
     branches: [main]
   pull_request:
 
+# Cancelling a superseded run is right for a pull request and wrong for main.
+#
+# On a PR, a new push replaces the commit the in-flight run was measuring, so that run has
+# nothing left to say and killing it is free. On main, every merge is a commit somebody may
+# need to bisect to or revert to, and a commit with no run is not a known-good point.
+#
+# Sharing one group across main pushes loses runs two separate ways, and #73 names only the
+# first: cancel-in-progress kills the run in flight, and *even with it off* GitHub keeps at
+# most one pending run per group — "any existing pending job or workflow in the same
+# concurrency group will be canceled and the new queued job or workflow will take its place".
+# Three merges inside three minutes is exactly the shape that trips the second one, and that
+# is the shape #73 was filed about. Scoping cancel-in-progress alone would not have saved
+# 3d779d9; it would have been cancelled while pending instead of while running.
+#
+# Giving each main commit its own group is what stops both, because runs then never contend
+# and every merge gets its own verdict. The expression on cancel-in-progress is redundant
+# while the group is per-sha, and is kept anyway: it states the intent, and it still holds if
+# the group is ever simplified back to the ref.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # A red on this check means the code is red. Every step in it is compile, test, or a
+  # prerequisite without which the tests cannot run at all; nothing in it can fail for a
+  # reason with no bearing on whether the code works. Uploading the evidence used to live
+  # here, and #57 is the run where it hit a symlink loop and reported the build as broken
+  # while every test passed. That step now reports under its own name, below.
   build:
     runs-on: ubuntu-latest
+    outputs:
+      xml-upload: ${{ steps.upload-xml.outcome }}
+      html-upload: ${{ steps.upload-html.outcome }}
     steps:
       - uses: actions/checkout@v4
 
@@ -26,6 +52,7 @@ jobs:
       # and does not collapse. Headless wlroots needs no GPU, seat, or display, so the runner
       # can host a genuine sway rather than a stub that would only test itself.
       - name: Install sway and foot
+        id: install-sway
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends sway foot
@@ -33,11 +60,13 @@ jobs:
       # :registry shells out to the spanreed CLI, and its suite skips silently without it —
       # the same false-green trap as :wm without sway, in a second module.
       - name: Install spanreed
+        id: install-spanreed
         run: |
           pipx install spanreed-bus || pip install --user spanreed-bus
           spanreed --help > /dev/null
 
       - name: Build and test
+        id: gradle
         env:
           # Turn "the tool is missing" from a silent skip into a failure. A green run that
           # skipped every window-management or registry test reads as coverage that does not
@@ -46,10 +75,136 @@ jobs:
           AWAKENER_REQUIRE_SPANREED: '1'
         run: ./gradlew build --stacktrace
 
-      - name: Upload test results
+      # A red `build` now means the build is red, but it still does not say *which* phase went
+      # red, and "the runner could not be provisioned" is a different thing to read than "a
+      # test failed". Name the failing phase in the run summary so that is one click rather
+      # than an excavation through the log.
+      - name: Name the phase that failed
+        if: failure()
+        env:
+          SWAY: ${{ steps.install-sway.outcome }}
+          SPANREED: ${{ steps.install-spanreed.outcome }}
+          GRADLE: ${{ steps.gradle.outcome }}
+        run: |
+          {
+            echo "### Which phase failed"
+            echo
+            echo "| phase | outcome |"
+            echo "|---|---|"
+            echo "| install sway and foot | \`${SWAY:-did-not-run}\` |"
+            echo "| install spanreed | \`${SPANREED:-did-not-run}\` |"
+            echo "| build and test | \`${GRADLE:-did-not-run}\` |"
+            echo
+            if [ "$GRADLE" = "failure" ]; then
+              echo "The compile-and-test phase failed. This red is about the code."
+            else
+              echo "The build never ran. This red is about provisioning the runner; it establishes nothing either way about the tree."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # tests=/skipped=/failures= are the doctrine's control for a run that verified nothing.
+      # Put them in the run summary and in the step log, so applying that control needs no
+      # download — the summary for a human, the log because that is the one an API can read
+      # back, and the reader here is as often an agent as a person. The script says why it
+      # reports rather than gates.
+      - name: Summarise test counts
         if: always()
+        run: .github/scripts/test-summary.sh
+
+      # Two artifacts rather than one, because the two want different answers to
+      # if-no-files-found, and because the XML is kilobytes where the HTML is megabytes — the
+      # machine-readable evidence should not cost an HTML download to fetch.
+      #
+      # Both globs are anchored at <module>/build/… rather than starting with `**/`. A leading
+      # `**/` walks the whole tree, which is how a symlink loop left under cli/build/ by a
+      # test fixture became an ELOOP and a red build (#57). An anchored prefix descends only
+      # into directories that can hold results.
+      - name: Upload JUnit XML
+        id: upload-xml
+        if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: test-results
-          path: '**/build/reports/tests/**'
+          name: test-results-xml
+          path: '*/build/test-results/*/*.xml'
+          # warn, not ignore. If the build died before any test ran, an empty artifact is
+          # expected and a warning is the right volume — but a path that silently matches
+          # nothing is exactly how #65 survived: an artifact named test-results had contained
+          # no test results for its whole life and never said so.
+          if-no-files-found: warn
+          # 90 days is the maximum a public repo may set, and today's default. Naming it pins
+          # it, so a change to the repo default cannot silently shorten it. An intermittent
+          # needs weeks to accumulate instances — #56 was diagnosable only because two runs'
+          # artifacts happened to still exist.
+          retention-days: 90
+
+      - name: Upload HTML test report
+        id: upload-html
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report-html
+          path: '*/build/reports/tests/**'
+          # ignore is right here: the HTML is the convenience copy for reading a stack trace,
+          # the XML above is the evidence, and the XML's warn already covers misconfiguration.
           if-no-files-found: ignore
+          retention-days: 90
+
+  # The upload steps above carry continue-on-error so they cannot misattribute their own
+  # failure to the build. On its own that would make them silent, which #57 rules out — so
+  # this job re-raises the same failure under a name that says what actually broke. The
+  # failure stays exactly as visible; only the label on it changes.
+  #
+  # It has to be a separate job to get a separate check name, and the upload itself cannot
+  # move here: the files live on the build job's runner, and getting them off it is the very
+  # thing being reported on.
+  test-artifacts:
+    needs: build
+    # `!cancelled()` and not `always()`, and the difference is the whole subject of this PR.
+    #
+    # The upload steps carry `if: always()`, so on a cancelled run they still execute and can
+    # still fail — and under `always()` this job would then go **red**. A red check is a
+    # positive claim that something went wrong with the artifacts, and a cancelled run is an
+    # *absence of evidence*, not a fault. Reporting one as the other is the same defect as
+    # #57 and #73, one level down, in the very check meant to fix them. Observed, not
+    # theorised: run 30998115901 on #77's branch came back `build: cancelled` +
+    # `test-artifacts: failure`.
+    #
+    # `!cancelled()` still runs the job when `build` fails — which is the case that matters,
+    # since a failed build with intact evidence must show green here — and skips it when the
+    # run is cancelled, so the check reads "no verdict" rather than asserting one.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report whether the test evidence was captured
+        env:
+          BUILD: ${{ needs.build.result }}
+          XML: ${{ needs.build.outputs.xml-upload }}
+          HTML: ${{ needs.build.outputs.html-upload }}
+        run: |
+          echo "This check reports one thing: whether an artifact upload step failed."
+          echo "It is not a claim that the evidence is complete — read the build check for that."
+          echo "build job: ${BUILD:-unknown}"
+          echo "JUnit XML upload: ${XML:-no-outcome-reported}"
+          echo "HTML report upload: ${HTML:-no-outcome-reported}"
+          if [ -z "$XML" ] && [ -z "$HTML" ]; then
+            # The build job ended without either upload step reporting an outcome — a lost
+            # runner, or a failure before the steps were reached. Nothing was measured, so
+            # say that rather than passing silently as though it had been.
+            echo "::notice title=No upload outcome::The build job (result: ${BUILD:-unknown}) reported no upload outcome at all, so this check measured nothing."
+            exit 0
+          fi
+          rc=0
+          if [ "$XML" = "failure" ]; then
+            echo "::error title=JUnit XML not uploaded::The test-results-xml artifact failed to upload. The build's own result is unaffected; what is missing is the evidence for it."
+            rc=1
+          fi
+          if [ "$HTML" = "failure" ]; then
+            echo "::error title=HTML report not uploaded::The test-report-html artifact failed to upload."
+            rc=1
+          fi
+          if [ "$rc" = "1" ] && [ "$BUILD" != "success" ]; then
+            echo "::notice title=Read both checks::The build job's own result was $BUILD. That is a separate fact from the upload failure above; neither one implies the other."
+          fi
+          exit $rc
