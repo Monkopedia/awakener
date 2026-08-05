@@ -253,6 +253,29 @@ class BindingStoreTest {
         assertEquals("{ this is not json", path.readText(), "the unreadable file is left alone")
     }
 
+    /**
+     * The same refusal, but arriving *after* the store came up clean — which is the shape it
+     * takes in practice, because the file is what someone edits when they want to inspect what
+     * an agent knows. The store must not empty out, must not rewrite what it cannot read, and
+     * must say so.
+     */
+    @Test
+    fun `a file corrupted mid-session makes the store read-only without going blank`() = runTest {
+        val store = store()
+        store.bind(SurfaceKey.Window("firefox"))
+        store.path.writeText("{ no longer json")
+
+        store.bind(SurfaceKey.Window("foot"))
+
+        assertNotNull(store.loadError, "the store noticed on its next operation")
+        assertEquals("{ no longer json", store.path.readText(), "and never wrote over it")
+        assertEquals(
+            setOf(SurfaceKey.Window("firefox"), SurfaceKey.Window("foot")),
+            store.bindings.value.keys,
+            "the live map keeps serving rather than collapsing to empty",
+        )
+    }
+
     @Test
     fun `a file from a newer awakener is refused rather than reinterpreted`() = runTest {
         val path = dir.resolve("future.json")

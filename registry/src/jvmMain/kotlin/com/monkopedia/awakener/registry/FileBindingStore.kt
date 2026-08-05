@@ -61,11 +61,28 @@ class FileBindingStore(
      * Serialises read-modify-write within this JVM. Keyed on the file rather than held per
      * instance because two stores over one file are two writers — and because a second
      * [FileChannel.lock] on a file this process already holds throws rather than waiting.
+     *
+     * The key is textual, so two spellings of one file — through a symlink, say — would take two
+     * mutexes and then hit exactly that exception. Unreachable with the one store path a
+     * deployment has, and normalising harder would mean touching the filesystem per store.
      */
     private val lock = lockFor(this.path)
 
     /** The lock file. A getter, so the property is read rather than the constructor parameter. */
     private val lockPath: Path get() = path.resolveSibling("${path.name}.lock")
+
+    /**
+     * The staging file the write is renamed from, named per process.
+     *
+     * A single fixed `<file>.tmp` is a race in its own right: two processes writing it at once
+     * interleave, and one can rename it away between the other's write and its own rename, which
+     * surfaces as `NoSuchFileException` on a path that plainly exists. The lock above makes that
+     * unreachable on the normal path — but the unlocked degradation in [withFileLock] is a real
+     * path, and a defect that is merely masked by another mechanism is still a defect. With a
+     * per-process name the worst the unlocked path can do is lose an update.
+     */
+    private val tmpPath: Path
+        get() = path.resolveSibling("${path.name}.${ProcessHandle.current().pid()}.tmp")
 
     @Volatile
     private var snapshot: Loaded = load()
@@ -106,8 +123,12 @@ class FileBindingStore(
         // unused mint — never a wrong write.
         if (config[RegistryFlags.storeReload].onRead) refresh()
         val couldRevive = held != null && config.holderWinsForget
-        // Minted outside the lock: it can shell out to spanreed, and holding the write lock
-        // across a subprocess would serialise every other surface behind one process spawn.
+        // Minted outside the lock where the answer is already knowable: it can shell out to
+        // spanreed, and holding the write lock across a subprocess would serialise every other
+        // surface behind one process spawn. The fallback inside `mutate` covers the narrow case
+        // where a forget lands between this read and the one under the lock, and pays exactly
+        // that cost — rare enough to be worth a subprocess under the lock, and the only
+        // alternative is minting speculatively on every bind.
         val preMinted = if (agent == null && state.value[key] == null && !couldRevive) {
             identities.mint(key, residueLocation(key))
         } else {
@@ -176,6 +197,15 @@ class FileBindingStore(
      *
      * A separate lock file rather than the bindings file itself, because the write replaces that
      * file by rename — a lock on the old inode would stop meaning anything the moment it landed.
+     *
+     * **Both ways of not getting the lock degrade to running without it**, deliberately the same
+     * way: a state directory that will not take a lock file, and a filesystem that will not lock
+     * one (some network mounts), are the same situation from here. Refusing to bind would take
+     * the hotkey down on a live desktop, which is a worse failure than a possible lost update —
+     * and the write is atomic by rename over a per-process temporary, so the unlocked path can
+     * lose an update but cannot tear or corrupt the file. `OverlappingFileLockException` is
+     * *not* caught: that one means this process already holds the lock, which is a bug in the
+     * mutex above rather than a fact about the filesystem, and it should be loud.
      */
     private suspend fun <T> withFileLock(block: suspend () -> T): T {
         val channel = try {
@@ -185,13 +215,21 @@ class FileBindingStore(
                 StandardOpenOption.CREATE,
                 StandardOpenOption.WRITE,
             )
-        } catch (e: IOException) {
-            // A state directory this process cannot create a lock file in is one it cannot write
-            // bindings to either. Let the write report that, rather than failing the whole
-            // read-modify-write before it has read anything — resolution still works read-only.
+        } catch (_: IOException) {
             return block()
         }
-        return channel.use { open -> open.lock().use { block() } }
+        return channel.use { open ->
+            val held = try {
+                open.lock()
+            } catch (_: IOException) {
+                null
+            }
+            try {
+                block()
+            } finally {
+                held?.release()
+            }
+        }
     }
 
     /**
@@ -229,7 +267,7 @@ class FileBindingStore(
             bindings = bindings.mapKeys { (key, _) -> key.canonical } + snapshot.unreadable,
         )
         path.createParentDirectories()
-        val tmp = path.resolveSibling("${path.name}.tmp")
+        val tmp = tmpPath
         Files.writeString(tmp, json.encodeToString(file))
         // fsync before the rename, or the rename can land while the contents it points at are
         // still in page cache: a power loss then leaves an empty file where the bindings were,

@@ -143,7 +143,9 @@ object RegistryFlags {
         StoreReload.BEFORE_READ,
         "How often a store re-reads its bindings file. The file has a second writer whenever " +
             "`awakener-registry forget` runs, so re-reading is what keeps a forget from being " +
-            "undone; NEVER is the old single-writer store, cheapest and unsafe beside a CLI.",
+            "undone; NEVER is the old single-writer store, cheapest and unsafe beside a CLI. " +
+            "BEFORE_WRITE keeps the file correct but not the answers: a holder goes on " +
+            "resolving to an agent that was forgotten until something makes it write.",
     )
 
     val forgetConflict = Flags.enum(
