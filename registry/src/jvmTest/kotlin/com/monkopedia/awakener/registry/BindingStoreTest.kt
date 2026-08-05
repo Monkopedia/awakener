@@ -14,7 +14,11 @@ import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
 
 class BindingStoreTest {
     private val dir = createTempDirectory("awakener-registry")
@@ -95,6 +99,119 @@ class BindingStoreTest {
     }
 
     /**
+     * `forget` is the module's advertised repair path, and it has to hold against the process
+     * that is *using* the binding — which is the shape this actually runs in: a live holder,
+     * plus an `awakener-registry forget` beside it. A store that wrote its whole in-memory map
+     * back would resurrect the entry on the holder's next bind, and the user would have no
+     * reason to check.
+     */
+    @Test
+    fun `a forget by another process is not undone by the holder's next bind`() = runTest {
+        val key = SurfaceKey.Window("firefox")
+        val holder = store()
+        val original = holder.bind(key)
+
+        assertTrue(store().unbind(key), "awakener-registry forget, in its own process")
+
+        val rebound = holder.bind(key)
+        assertNotEquals(original.agent, rebound.agent, "the forgotten agent must not come back")
+        assertEquals(2, minted, "the surface gets a fresh Lifeless, which is what forget promises")
+        assertEquals(rebound.agent, store().resolve(key)?.agent, "and the file agrees")
+    }
+
+    /** The clobber is not even about the forgotten key: a whole-map write-back takes everything. */
+    @Test
+    fun `a forget of one surface survives a bind of another`() = runTest {
+        val forgotten = SurfaceKey.Window("firefox")
+        val other = SurfaceKey.Window("foot")
+        val holder = store()
+        holder.bind(forgotten)
+
+        assertTrue(store().unbind(forgotten))
+        holder.bind(other)
+
+        assertNull(store().resolve(forgotten), "an unrelated bind must not resurrect it")
+    }
+
+    /** Two live stores are two writers, and neither may drop what the other put on disk. */
+    @Test
+    fun `two stores binding different surfaces both survive`() = runTest {
+        val first = store()
+        val second = store()
+        first.bind(SurfaceKey.Window("firefox"))
+        second.bind(SurfaceKey.Window("foot"))
+
+        assertEquals(
+            setOf(SurfaceKey.Window("firefox"), SurfaceKey.Window("foot")),
+            store().bindings.value.keys,
+        )
+    }
+
+    /**
+     * The locking is the point of the read-modify-write, not decoration: a store that read the
+     * file outside the lock would lose whichever of two overlapping updates landed second.
+     */
+    @Test
+    fun `concurrent binds through two stores all reach the file`() = runTest {
+        val first = store()
+        val second = store()
+        val keys = (0 until 20).map { SurfaceKey.Window("app-$it") }
+
+        withContext(Dispatchers.Default) {
+            keys.mapIndexed { index, key ->
+                async { (if (index % 2 == 0) first else second).bind(key) }
+            }.awaitAll()
+        }
+
+        assertEquals(keys.toSet(), store().bindings.value.keys)
+    }
+
+    /** A holder that keeps answering with a forgotten binding is the same failure, read side. */
+    @Test
+    fun `resolve stops answering with a binding another process forgot`() = runTest {
+        val key = SurfaceKey.Origin("https://github.com")
+        val holder = store()
+        holder.bind(key)
+
+        assertTrue(store().unbind(key))
+        assertNull(holder.resolve(key))
+    }
+
+    /**
+     * The other half of the flag: a Lifeless is live and mid-session, so re-establishing the
+     * identity the holder is carrying is a defensible answer to a forget that was a mistake.
+     * Not the default — `forget` is an explicit instruction and honouring it is the point.
+     */
+    @Test
+    fun `the holder can be told to win over a forget instead`() = runTest {
+        val key = SurfaceKey.Window("firefox")
+        val holder = store()
+        val original = holder.bind(key)
+        config.put(RegistryFlags.forgetConflict, ForgetConflict.HOLDER_WINS)
+
+        assertTrue(store().unbind(key))
+        val rebound = holder.bind(key)
+
+        assertEquals(original.agent, rebound.agent, "the live agent keeps its surface")
+        assertEquals(1, minted, "and no fresh Lifeless is minted")
+    }
+
+    /**
+     * The single-writer store is still reachable, for a run that wants no per-operation file
+     * read at all — and pinning it here keeps what the default protects against visible.
+     */
+    @Test
+    fun `the single-writer store is still available by flag`() = runTest {
+        val key = SurfaceKey.Window("firefox")
+        config.put(RegistryFlags.storeReload, StoreReload.NEVER)
+        val holder = store()
+        val original = holder.bind(key)
+
+        assertTrue(store().unbind(key))
+        assertEquals(original.agent, holder.bind(key).agent, "the stale map wins, as documented")
+    }
+
+    /**
      * A binding is on disk before `bind` returns. There is no batching mode: with no daemon to
      * own a flush point, a policy that deferred the write would mean bindings that are never
      * written at all — the exact failure this module exists to prevent.
@@ -142,8 +259,9 @@ class BindingStoreTest {
         path.writeText("""{"version": 99, "bindings": {}}""")
         val store = store("future.json")
 
-        assertNotNull(store.loadError)
-        assertTrue(store.loadError.contains("99"))
+        // Read once: `loadError` now tracks the latest read, so it is a getter rather than a val.
+        val error = assertNotNull(store.loadError)
+        assertTrue(error.contains("99"), error)
     }
 
     /** Downgrading must not silently delete the bindings the newer build was using. */
