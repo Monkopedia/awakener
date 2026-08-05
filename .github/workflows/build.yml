@@ -102,6 +102,20 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # THROWAWAY PROOF STEP — never merged. Plants #57's mechanism on purpose. Two shapes,
+      # because they behave differently: a cycle that resolves to a real directory is pruned
+      # by @actions/glob's revisit detection and uploads fine, while a self-referential link
+      # never lands on an inode and the kernel refuses the path with ELOOP.
+      - name: PROOF ONLY — plant symlink loops under the report tree
+        if: always()
+        run: |
+          mkdir -p cli/build/reports/tests/jvmTest/resolvable
+          ln -s ../../jvmTest cli/build/reports/tests/jvmTest/resolvable/self
+          mkdir -p cli/build/reports/tests/jvmTest/eloop
+          ln -s self cli/build/reports/tests/jvmTest/eloop/self
+          ls -l cli/build/reports/tests/jvmTest/resolvable/ cli/build/reports/tests/jvmTest/eloop/
+          stat cli/build/reports/tests/jvmTest/eloop/self || echo "stat refused it, as intended"
+
       # tests=/skipped=/failures= are the doctrine's control for a run that verified nothing.
       # Put them in the run summary and in the step log, so applying that control needs no
       # download — the summary for a human, the log because that is the one an API can read
