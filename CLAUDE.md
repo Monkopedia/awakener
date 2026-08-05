@@ -73,10 +73,11 @@ the `:wm` integration suite against a real headless sway.
   forgotten `git fetch`, and the reviewer has to treat the two the same way. Judge reach by
   what the merge touches, not by how small it looks: a shared build script, a test harness, or
   `:config` reaches everything and never qualifies, however few lines it is. Positively, what
-  *does* qualify is a merge whose every changed path is one nothing under test reads — docs and
-  findings notes, or a module neither the suite nor anything it depends on compiles against.
-  `44c03f3` qualifies because `CLAUDE.md` sits on no compile or runtime classpath and no test
-  opens it. If you cannot name that property for every path in the merge, it does not qualify.
+  *does* qualify is a merge whose every changed path is one **neither the build nor the tests
+  read** — docs and findings notes, or a module neither the suite nor anything it depends on
+  compiles against. `44c03f3` qualifies because `CLAUDE.md` sits on no compile or runtime
+  classpath, is read by no build script, and is opened by no test. If you cannot name that
+  property for every path in the merge, it does not qualify.
 
   **Same shape as the known-flake exemption** (#56): both claim a diff *cannot reach* a result,
   both are argued per case from what the diff actually touches, and neither is ever discharged
@@ -135,11 +136,22 @@ conversation, not a local workaround.
   `/var/log/kaladin-load.log`. Cause unproven. Keep concurrent heavy work modest and prefer
   targeted module tests over repeated full builds.
 - **adolin** — the desktop, and awakener's actual target. GPU, active seat0 on tty2, running
-  **GNOME Shell**. Installed: `google-chrome-stable`, `xorg-xwayland`, `sway 1.12`,
-  `foot 1.27.0`, `waydroid 1.6.3`, `jq`, `qemu`. Absent: `chromium`, `spanreed`. Reachable by
-  passwordless ssh from kaladin, but **sudo there requires a password** — Jason runs any
-  *further* installs himself. **Check before asking**: most of what the open work needs is
-  already on the box, and this list has twice claimed otherwise.
+  **GNOME Shell**. Known present: `google-chrome-stable`, `xorg-xwayland`, `sway 1.12`,
+  `foot 1.27.0`, `waydroid 1.6.3`, `spanreed`, `jq`, `qemu`. Reachable by passwordless ssh
+  from kaladin, but **sudo there requires a password** — Jason runs any *further* installs
+  himself.
+
+  **This file does not say what adolin is missing. Check, don't assume:**
+  `ssh adolin 'bash -lc "command -v <tool>"'`. The **login shell is load-bearing** — some
+  tools are per-user `uv` installs under `~/.local/bin`, invisible to `pacman -Q` and off
+  `PATH` in a non-login ssh. `spanreed` is one, and reading it as absent is how you end up
+  asking Jason for a password-gated install of something already there.
+
+  The asymmetry is why there is no absent list. A **present** entry is self-confronting: you
+  act on it by using the tool, so a wrong one fails loudly at the point of use. An asserted
+  **absence** is the one shape no use can falsify, because you act on it by not trying, and a
+  wrong one is discharged by silence. This bullet claimed three tools absent that were
+  installed — the third while correcting the first two.
 - **Neither host runs a tabbed WM as its session** — adolin's is GNOME Shell on seat0,
   kaladin has no seat at all. The dock design depends on i3/sway tree semantics, so it has
   nowhere to run *for real* yet. Installed is a different question, and the answer is **both
