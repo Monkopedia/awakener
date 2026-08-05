@@ -571,24 +571,28 @@ class SwayWindowManager(
      * Both flags are re-read on every iteration rather than captured, because `:config` reloads
      * against a live daemon and a wait can outlive the snapshot it started under. [timeoutMs] is
      * necessarily read once by the caller: it is the deadline's own definition, and a deadline
-     * that moved while being waited on would not be one. Negative values are coerced rather than
-     * rejected, so that a hand-edited config cannot make this throw where a total snapshot
-     * promises a degraded value.
+     * that moved while being waited on would not be one.
+     *
+     * **Nothing is coerced here**, deliberately. Each flag declares `Flags.atLeast(0)`, so a
+     * negative is rejected in `Config.of`, reported through `Config.problems`, and resolved by
+     * `wm`-agnostic policy — degraded to the default or clamped, per `config.invalid_value`.
+     * Coercing again at the read site is what #69 removed elsewhere and for the reason that
+     * applies here too: it silently supplies a value the operator did not type while
+     * `awakener-config` reports a clean file.
      *
      * Nothing here is the design's forbidden unattended action: this runs only inside a call a
      * caller made, and it ends when that call does.
      */
     private suspend fun <T : Any> pollTree(timeoutMs: Long, read: suspend () -> T?): T? =
-        withTimeoutOrNull(timeoutMs.coerceAtLeast(0)) {
+        withTimeoutOrNull(timeoutMs) {
             val started = TimeSource.Monotonic.markNow()
             while (true) {
                 read()?.let { return@withTimeoutOrNull it }
                 val cfg = config
-                val spin = cfg[WmFlags.pollSpinMs].coerceAtLeast(0).milliseconds
-                if (started.elapsedNow() < spin) {
+                if (started.elapsedNow() < cfg[WmFlags.pollSpinMs].milliseconds) {
                     yield()
                 } else {
-                    delay(cfg[WmFlags.pollIntervalMs].coerceAtLeast(0).milliseconds)
+                    delay(cfg[WmFlags.pollIntervalMs].milliseconds)
                 }
             }
             @Suppress("UNREACHABLE_CODE")
@@ -800,7 +804,7 @@ class SwayWindowManager(
                         reservation = docks.reserve(
                             appId,
                             standing,
-                            cfg[WmFlags.reservationGraceMs].coerceAtLeast(0).milliseconds,
+                            cfg[WmFlags.reservationGraceMs].milliseconds,
                         )
                     }
                     // Filed before the exec for the reason above it: from the moment the command

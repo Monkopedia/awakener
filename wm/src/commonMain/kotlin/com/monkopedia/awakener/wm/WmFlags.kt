@@ -502,8 +502,9 @@ object WmFlags {
             "Raising it lengthens the tree lock an attach holds, since the wait happens inside " +
             "it, so every other attach and detach queues behind the slowest dock. Lowering it " +
             "risks the case the unwind exists for — a dock that maps just after the deadline, " +
-            "which is then a window the attach spawned and did not identify. Negative or absent " +
-            "degrades to the default; zero fails every attach immediately.",
+            "which is then a window the attach spawned and did not identify. Zero fails every " +
+            "attach immediately.",
+        requires = Flags.atLeast(0L),
     )
 
     val unmapWaitMs = Flags.long(
@@ -515,8 +516,8 @@ object WmFlags {
             "detach, the orphan sweep and an unwind's compensating kill alike, and a detach " +
             "holds the tree lock across it. Its consequence is wm.dock.wedged_dock_fails_detach's " +
             "— expiring is what makes a dock 'still standing' — so shortening it turns a panel " +
-            "that is merely slow to exit into a reported failure sooner. Negative or absent " +
-            "degrades to the default.",
+            "that is merely slow to exit into a reported failure sooner.",
+        requires = Flags.atLeast(0L),
     )
 
     val reservationGraceMs = Flags.long(
@@ -526,12 +527,40 @@ object WmFlags {
             "it. attach evicts its own in a finally, which is what normally ends one, so this " +
             "only bounds a reservation whose attach died without running that — a process " +
             "killed mid-attach leaves no other way to clear it, and a stale one hides every " +
-            "window under the dock's app_id for the life of the process. Keep it at or above " +
-            "wm.wait.map_ms: a grace shorter than the map deadline expires while the attach it " +
-            "belongs to is still waiting, which reopens the gap wm.dock.pending_suppression " +
-            "closes — enumeration reporting the agent panel as bindable. Read once, when the " +
-            "reservation is filed. Negative or absent degrades to the default.",
+            "window under the dock's app_id for the life of the process. It has to be at or " +
+            "above wm.wait.map_ms, and that is a declared constraint rather than advice: a " +
+            "grace shorter than the map deadline expires while the attach it belongs to is " +
+            "still waiting, which reopens the gap wm.dock.pending_suppression closes — " +
+            "enumeration reporting the agent panel as bindable. One constant held that by " +
+            "construction until the two were separated, so it is stated here because splitting " +
+            "them is what made it violable. Read once, when the reservation is filed.",
+        requires = Flags.atLeast(0L),
     )
+
+    /**
+     * The pair rule the split created.
+     *
+     * Neither value is wrong alone — a short grace and a long deadline are each defensible — so
+     * this reports rather than degrading either, which is exactly what [Flags.constraint] is
+     * for. Keyed on the grace because that is the one a reader should move: lowering the map
+     * deadline to match would shorten every attach, which is not what anybody setting a grace
+     * meant to do.
+     */
+    val reservationOutlastsMap = Flags.constraint(
+        reservationGraceMs.key,
+        "at least wm.wait.map_ms",
+    ) { config ->
+        val grace = config[reservationGraceMs]
+        val map = config[mapWaitMs]
+        if (grace >= map) {
+            null
+        } else {
+            "wm.wait.reservation_grace_ms ($grace) is below wm.wait.map_ms ($map), so an " +
+                "attach's reservation expires while that attach is still waiting for its dock " +
+                "— which hands the agent panel back to surfaces() as a bindable window for the " +
+                "rest of the map wait"
+        }
+    }
 
     val pollSpinMs = Flags.long(
         "wm.wait.poll_spin_ms",
@@ -550,7 +579,9 @@ object WmFlags {
             "which is where the round trips stop being worth anything. Counted at the socket, a " +
             "5s deadline that expires costs 1,719 tree reads at the stock defaults against about " +
             "27,500 spun. Set it to zero to pace from the first read, or above the wait itself " +
-            "to get the old pure spin back. Negative or absent degrades to the default.",
+            "to get the old pure spin back exactly — that is the value to use for the previous " +
+            "behaviour, rather than a zero interval.",
+        requires = Flags.atLeast(0L),
     )
 
     val pollIntervalMs = Flags.long(
@@ -561,7 +592,12 @@ object WmFlags {
             "is about 40 reads a second instead of the ten thousand a bare spin manages. It is " +
             "also the worst-case latency added to detecting a dock that maps after the spin " +
             "window, which is why the spin exists rather than this being the whole policy. Zero " +
-            "is a yield, which is the old busy-poll. Negative or absent degrades to the default.",
+            "does not sleep and is not a yield — kotlinx's delay returns without suspending at " +
+            "or below zero — so it does not restore the old busy-poll, it removes the pacing " +
+            "and leaves the tree read as the only suspension point in the loop. That is " +
+            "marginally more aggressive than the yield the old loop had. Use " +
+            "wm.wait.poll_spin_ms above the wait for the previous behaviour exactly.",
+        requires = Flags.atLeast(0L),
     )
 
     val socketPath = Flags.string(
