@@ -1,5 +1,6 @@
 package com.monkopedia.awakener.config
 
+import java.nio.file.Path
 import kotlin.io.path.Path
 import kotlinx.coroutines.runBlocking
 
@@ -18,6 +19,38 @@ object ConfigCli {
             ?: "${System.getenv("XDG_CONFIG_HOME") ?: "${System.getProperty("user.home")}/.config"}" +
             "/awakener/config.json",
     )
+
+    /**
+     * Opens the config store with every flag on the classpath registered.
+     *
+     * Three steps that are only correct together, which is why every JVM entry point calls this
+     * instead of spelling them out. The bootstrap flags have to be registered before the store
+     * parses anything, or `config.flags.*`'s own overrides go unread. Discovery then loads every
+     * other module's declarations. And the snapshot the first parse produced was read against a
+     * registry holding only the bootstrap flags — so it called every other module's key unknown,
+     * and has to be read again now that they exist.
+     *
+     * Doing only the first step is a quiet wrong rather than a loud one: the store still answers,
+     * with a snapshot that disowns every key outside the caller's own module. `awakener-registry`
+     * did exactly that until #45, in a repo whose stated reason for `:cli` existing is that a
+     * `main` which cannot see the other modules reports their flags as nonexistent.
+     */
+    fun bootstrap(
+        path: Path = defaultPath(),
+        environment: Map<String, String> = System.getenv(),
+        out: (String) -> Unit,
+    ): FileConfigStore {
+        Flags.requireLoaded(ConfigFlags)
+        val store = FileConfigStore(path, environment)
+        val config = store.config.value
+        val report = FlagDiscovery.discover(
+            config[ConfigFlags.discovery],
+            config[ConfigFlags.declarations],
+        )
+        report.problems.forEach { out("warning: flag discovery: $it") }
+        store.reload()
+        return store
+    }
 
     fun run(args: Array<String>, store: FileConfigStore, out: (String) -> Unit): Int {
         val config = store.config.value

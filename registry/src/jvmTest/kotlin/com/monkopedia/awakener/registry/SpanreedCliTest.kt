@@ -1,9 +1,10 @@
 package com.monkopedia.awakener.registry
 
 import com.monkopedia.awakener.config.InMemoryConfigStore
+import java.io.File
 import java.nio.file.Path
 import kotlin.io.path.absolutePathString
-import kotlin.io.path.exists
+import kotlin.io.path.isExecutable
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -23,7 +24,7 @@ import org.junit.AssumptionViolatedException
  */
 class SpanreedCliTest {
     private val config = InMemoryConfigStore()
-    private val calls = mutableListOf<Pair<List<String>, Map<String, String>>>()
+    private val calls = mutableListOf<Pair<List<String>, Map<String, String?>>>()
     private var response = ProcessResult(0, "agent-from-spanreed\n", "")
 
     private val cli = SpanreedCli(
@@ -122,6 +123,86 @@ class SpanreedCliTest {
         assertEquals("/opt/spanreed/bin/spanreed", calls.single().first.first())
     }
 
+    @Test
+    fun `listing the bus asks under no agent name at all`() = runTest {
+        response = ProcessResult(0, "[]", "")
+        assertEquals(emptyList(), cli.liveAgents())
+
+        val (command, environment) = calls.single()
+        assertEquals(listOf("spanreed", "list"), command)
+        assertTrue(
+            "SPANREED_AGENT_NAME" in environment,
+            "the variable has to be named to be cleared; leaving it out inherits it instead",
+        )
+        assertEquals(
+            null,
+            environment["SPANREED_AGENT_NAME"],
+            "null is removal — awakener's own process usually has one set, and asking the bus " +
+                "who is live while wearing a name asks as somebody",
+        )
+    }
+
+    @Test
+    fun `an agent is animated when the bus lists its id`() = runTest {
+        response = ProcessResult(
+            0,
+            """
+            [
+              {"agent_id": "agent-lifeless-a", "name": "lifeless-a", "pid": 7, "focus": "x"},
+              {"agent_id": "agent-jason", "name": "jason", "working_dir": "/home/jmonk"}
+            ]
+            """.trimIndent(),
+            "",
+        )
+
+        assertEquals(
+            listOf("agent-lifeless-a", "agent-jason"),
+            cli.liveAgents().map { it.agentId },
+        )
+        assertTrue(cli.isAnimated(AgentId("agent-lifeless-a")))
+        assertTrue(!cli.isAnimated(AgentId("agent-lifeless-b")))
+    }
+
+    /**
+     * A bus that cannot be read must not read as an empty bus: the next act on "nobody is
+     * animated" is standing a second panel up beside one that is already there.
+     */
+    @Test
+    fun `a failing list is raised rather than read as an empty bus`() = runTest {
+        response = ProcessResult(2, "", "spanreed: registry is locked")
+        assertTrue(
+            assertFailsWith<IllegalStateException> { cli.liveAgents() }
+                .message!!.contains("registry is locked"),
+        )
+    }
+
+    /**
+     * The two shapes a short read can take, and the reason they are worth their own tests: a
+     * non-zero exit is not how truncation presents. `ProcessCommandRunner` gives up on the
+     * drain after a grace period, so the child can exit 0 with its output still in flight — and
+     * then `check(result.succeeded)` passes. The list this method returns decides whether a
+     * hotkey press stands a second panel beside one already there, so anything short of the
+     * whole document has to raise. See #51 for the runner-level defect underneath.
+     */
+    @Test
+    fun `a silent list is raised rather than read as an empty bus`() = runTest {
+        response = ProcessResult(0, "", "")
+        assertTrue(
+            assertFailsWith<IllegalStateException> { cli.liveAgents() }
+                .message!!.contains("printed nothing"),
+        )
+    }
+
+    @Test
+    fun `a truncated list is raised rather than read as a shorter one`() = runTest {
+        response = ProcessResult(
+            0,
+            """[{"agent_id": "agent-lifeless-a", "name": "lifeless-a"}, {"agent_id": "age""",
+            "",
+        )
+        assertFailsWith<Exception> { cli.liveAgents() }
+    }
+
     /**
      * The one test that touches the real thing. `agent-id` only prints a derivation — it does
      * not write to the registry — so this is safe to run against an installed spanreed, and it
@@ -149,6 +230,30 @@ class SpanreedCliTest {
     }
 
     /**
+     * Also against the real thing, and also read-only: `list` prints the registry and writes
+     * nothing. What it catches is the half a recorded runner cannot — that spanreed's actual
+     * output still decodes into [LiveAgent]. The fields asserted on are only the ones awakener
+     * depends on, so spanreed adding to the shape stays a non-event, which is the point of
+     * `ignoreUnknownKeys`.
+     */
+    @Test
+    fun `the real spanreed list decodes into live agents`() = runTest {
+        val spanreed = spanreedOrSkip()
+        val real = SpanreedCli(
+            InMemoryConfigStore().put(
+                RegistryFlags.spanreedCommand,
+                spanreed.absolutePathString(),
+            ),
+        )
+
+        // Every entry `list` returns is one spanreed considers live, so the id must be there to
+        // compare a binding against. Asserting on a count would assert on Jason's live bus.
+        real.liveAgents().forEach {
+            assertTrue(it.agentId.isNotBlank(), "an entry with no id cannot be matched to a binding")
+        }
+    }
+
+    /**
      * The installed spanreed, or a skip the test report actually shows.
      *
      * The skip has to throw. A test method that returns normally is recorded as PASSED, so the
@@ -171,7 +276,9 @@ class SpanreedCliTest {
         return spanreed
     }
 
-    private fun onPath(tool: String): Path? = System.getenv("PATH").orEmpty().split(':')
-        .map { Path.of(it, tool) }
-        .firstOrNull { it.exists() }
+    /** Same predicate as `toolFingerprint` in the build scripts — see the note in `:wm` (#29). */
+    private fun onPath(tool: String): Path? =
+        System.getenv("PATH").orEmpty().split(File.pathSeparator)
+            .map { Path.of(it, tool) }
+            .firstOrNull { it.isExecutable() }
 }

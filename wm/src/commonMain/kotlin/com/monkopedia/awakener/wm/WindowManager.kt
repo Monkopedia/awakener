@@ -10,6 +10,21 @@ data class Surface(
     val appId: String?,
     val title: String?,
     val pid: Int?,
+    /**
+     * Whether the compositor considers this the surface the user is working in.
+     *
+     * Here because the hotkey has no other way to say "this window". A binding invoked from a
+     * key press names no surface at all — the user's answer to "which one" is where their focus
+     * already is — so without this the entry point would need either an argument the hotkey
+     * cannot supply or a fourth compositor call to ask. It is a fact about the snapshot rather
+     * than a durable one, which is why it is deliberately absent from [descriptor]: two windows
+     * of one app are the same surface whichever of them is focused right now.
+     *
+     * Defaulted so that every existing construction site keeps compiling and, more to the point,
+     * so that an implementation with no notion of focus reports the honest answer rather than
+     * having to invent one.
+     */
+    val focused: Boolean = false,
 ) {
     /**
      * The compositor-agnostic facts `:registry` keys a durable binding on.
