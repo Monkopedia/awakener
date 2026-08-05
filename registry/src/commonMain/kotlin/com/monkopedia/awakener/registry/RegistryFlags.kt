@@ -64,6 +64,57 @@ enum class RebindPolicy {
     REPLACE,
 }
 
+/**
+ * How often a durable store re-reads the file underneath it.
+ *
+ * The bindings file has more than one writer whether or not the code admits it: a long-lived
+ * holder plus an `awakener-registry forget` beside it is the normal shape, not an exotic one.
+ */
+enum class StoreReload {
+    /**
+     * Never. The snapshot taken at construction is treated as the whole truth, so every write
+     * puts that snapshot back — which silently undoes anything another process did in between,
+     * including a `forget`. Kept because it is the only setting with no per-operation file
+     * read at all, not because it is safe with a second writer around.
+     */
+    NEVER,
+
+    /**
+     * Re-read under the file lock immediately before each write, so a write only ever
+     * contributes the entry it means to change. Durable state is then correct, but a holder
+     * can still *answer* with a binding that has since been forgotten.
+     */
+    BEFORE_WRITE,
+
+    /**
+     * Also re-read before each resolve. Costs a small file read on the hotkey path and buys
+     * the property the repair path actually promises: once `forget` returns, nothing resolves
+     * to the old agent any more.
+     */
+    BEFORE_READ,
+    ;
+
+    internal val onWrite: Boolean get() = this != NEVER
+
+    internal val onRead: Boolean get() = this == BEFORE_READ
+}
+
+/** What a holder's bind does with a binding that was forgotten underneath it. */
+enum class ForgetConflict {
+    /**
+     * The forget stands: the surface is unbound, so binding it again mints a fresh Lifeless.
+     * `forget` is an explicit instruction from the user and this is what it advertises.
+     */
+    FORGET_WINS,
+
+    /**
+     * The holder re-establishes the identity it is carrying. A Lifeless that is up and
+     * mid-session keeps its surface, which is the kinder answer to a forget that was a
+     * mistake — at the cost that the repair path stops repairing anything still in use.
+     */
+    HOLDER_WINS,
+}
+
 /** How a surface's durable residue is laid out on disk. */
 enum class ResidueLayout {
     /** One file per surface, `<slug>.md`. Simplest thing that stays readable by hand. */
@@ -85,6 +136,34 @@ object RegistryFlags {
         "registry.store.path",
         "",
         "Path to the bindings file. Empty means \$XDG_STATE_HOME/awakener/bindings.json.",
+    )
+
+    val storeReload = Flags.enum(
+        "registry.store.reload",
+        StoreReload.BEFORE_READ,
+        "How often a store re-reads its bindings file. The file has a second writer whenever " +
+            "`awakener-registry forget` runs, so re-reading is what keeps a forget from being " +
+            "undone; NEVER is the old single-writer store, cheapest and unsafe beside a CLI. " +
+            "BEFORE_WRITE keeps the file correct but not the answers: a holder goes on " +
+            "resolving to an agent that was forgotten until something makes it write.",
+    )
+
+    val lockRequired = Flags.boolean(
+        "registry.store.lock_required",
+        false,
+        "Whether a store refuses to write when it cannot take the cross-process lock on its " +
+            "bindings file. Off keeps the hotkey working on a filesystem that will not lock (an " +
+            "NFS home without lockd), reporting the degradation rather than hiding it, at the " +
+            "cost that a concurrent `awakener-registry forget` can be lost. On refuses to bind " +
+            "at all rather than write without exclusion.",
+    )
+
+    val forgetConflict = Flags.enum(
+        "registry.binding.forget_conflict",
+        ForgetConflict.FORGET_WINS,
+        "What a holder's bind does with a binding forgotten underneath it: honour the forget " +
+            "and mint a fresh Lifeless, or re-establish the identity the holder is carrying so " +
+            "a live agent keeps its surface.",
     )
 
     val windowIdentity = Flags.enum(

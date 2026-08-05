@@ -1,6 +1,7 @@
 package com.monkopedia.awakener.registry
 
 import com.monkopedia.awakener.config.InMemoryConfigStore
+import java.nio.file.Files
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.readText
 import kotlin.io.path.writeText
@@ -57,6 +58,26 @@ class RegistryCliTest {
         assertEquals(0, run(store, "forget", key.canonical))
         assertNull(store.resolve(key))
         assertEquals("prefers dark mode", residue.readText())
+    }
+
+    /**
+     * The repair path is the last place a degradation should be invisible: a `forget` made with
+     * no cross-process exclusion is one a live holder can undo, which is the bug this command
+     * exists to fix. Non-fatal, so the exit code still says the forget happened.
+     */
+    @Test
+    fun `a forget made without the lock warns rather than looking clean`() = runTest {
+        val key = SurfaceKey.Window("firefox")
+        // A directory where the lock file goes: the one way to make locking fail on a host whose
+        // filesystems all lock. Created before anything writes, or the first write makes the file.
+        Files.createDirectories(dir.resolve("bindings.json.lock"))
+        val store = store()
+        store.bind(key)
+
+        assertEquals(0, run(store, "forget", key.canonical))
+
+        val warning = out.singleOrNull { it.startsWith("warning:") }
+        assertTrue(warning?.contains("without cross-process exclusion") == true, out.toString())
     }
 
     @Test

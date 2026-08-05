@@ -10,6 +10,13 @@ import kotlinx.serialization.Serializable
  * Everything here has to survive a reboot, so nothing in it may reference a live process or a
  * compositor handle. [spanreedName] is stored rather than recomputed so that changing
  * [RegistryFlags.agentNamePrefix] cannot orphan agents that are already carrying residue.
+ *
+ * The corollary is the cost of that trade, and it is general: **a stored identity is
+ * authoritative and is never re-derived.** [agentId] and [spanreedName] are read back as
+ * written, and `bind` prefers the stored pair over minting a fresh one — so changing how
+ * identities are derived (the name prefix, the id source, [SurfaceKey.slug] itself) applies to
+ * what will be minted and never to what has been. Correcting an existing binding means editing
+ * or deleting the entry: `awakener-registry forget <key>`, or the file.
  */
 @Serializable
 data class Binding(
@@ -59,7 +66,14 @@ interface BindingStore {
      */
     suspend fun bind(key: SurfaceKey, agent: AgentIdentity? = null): Binding
 
-    /** Forgets a binding. Returns whether there was one. Does not delete residue. */
+    /**
+     * Forgets a binding. Returns whether there was one. Does not delete residue.
+     *
+     * This is the repair path, so it has to hold against a process that is still holding the
+     * binding it removed. A durable implementation must not let such a holder write its own
+     * view of the file back over this — see [RegistryFlags.storeReload] for how, and
+     * [RegistryFlags.forgetConflict] for what a holder's next `bind` then does.
+     */
     suspend fun unbind(key: SurfaceKey): Boolean
 
     /**

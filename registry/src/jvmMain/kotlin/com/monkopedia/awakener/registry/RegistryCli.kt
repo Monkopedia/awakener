@@ -21,7 +21,7 @@ object RegistryCli {
         }
         store.unreadableKeys.forEach { out("warning: unreadable key '$it' (kept, not resolved)") }
 
-        return when (args.firstOrNull() ?: "list") {
+        val code = when (args.firstOrNull() ?: "list") {
             "list" -> {
                 val bindings = store.bindings.value
                 if (bindings.isEmpty()) out("no surfaces bound (${store.path})")
@@ -59,6 +59,11 @@ object RegistryCli {
 
             else -> usage(out, "unknown command '${args[0]}'")
         }
+        // After the command, not before: a store only finds out it cannot lock when it writes.
+        // Non-fatal — the write did happen — but a `forget` that ran with no cross-process
+        // exclusion is one another process can undo, and that is the whole of #50.
+        store.lockError?.let { out("warning: $it") }
+        return code
     }
 
     private fun usage(out: (String) -> Unit, error: String): Int {
