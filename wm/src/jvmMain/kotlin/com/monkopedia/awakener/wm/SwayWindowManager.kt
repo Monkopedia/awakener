@@ -7,10 +7,12 @@ import com.monkopedia.awakener.registry.BindingStore
 import com.monkopedia.awakener.registry.SurfaceKey
 import com.monkopedia.awakener.registry.asIdentity
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.TimeSource
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -276,7 +278,7 @@ class SwayWindowManager(
 
         /**
          * Kills the window [id] and waits for it to leave the tree; false if it was still there
-         * after [WINDOW_WAIT_MS].
+         * after [WmFlags.unmapWaitMs].
          *
          * The acknowledgement is not the thing to check in either direction, which is why the
          * wait belongs in the primitive rather than at whichever call site remembers it.
@@ -442,8 +444,8 @@ class SwayWindowManager(
          * and the message has to say which dock, since nothing under here does.
          */
         private suspend fun killDock(dock: SurfaceId) = check(kill(dock)) {
-            "dock ${dock.raw} was still in the tree ${WINDOW_WAIT_MS}ms after the unwind killed " +
-                "it; its client is not servicing the close request"
+            "dock ${dock.raw} was still in the tree ${config[WmFlags.unmapWaitMs]}ms after the " +
+                "unwind killed it; its client is not servicing the close request"
         }
 
         /**
@@ -528,37 +530,102 @@ class SwayWindowManager(
          * Waits for a window with [appId] that is not one of [standing] to appear.
          *
          * Polls rather than listening for the `new` event so that [attach] does not depend on
-         * [WmFlags.eventsEnabled]; attaching a dock has to keep working with events off.
+         * [WmFlags.eventsEnabled]; attaching a dock has to keep working with events off. What
+         * the polling costs, and why it is not a bare spin, is [pollTree]'s.
          */
         suspend fun awaitWindow(
             appId: String,
             standing: Set<Long>,
-            timeoutMs: Long = WINDOW_WAIT_MS,
-        ): Node? = withTimeoutOrNull(timeoutMs) {
+            timeoutMs: Long = config[WmFlags.mapWaitMs],
+        ): Node? = pollTree(timeoutMs) {
+            tree().windows.firstOrNull { it.appId == appId && it.id !in standing }
+        }
+
+        suspend fun awaitGone(id: SurfaceId, timeoutMs: Long = config[WmFlags.unmapWaitMs]): Boolean =
+            pollTree(timeoutMs) { if (tree().find(id.raw) == null) true else null } ?: false
+    }
+
+    /**
+     * Re-reads the tree until [read] answers, or until [timeoutMs] is up.
+     *
+     * **Paced, not spun**, and the pacing is the whole of #49. A loop whose only concession was
+     * `yield()` issued 6,637–11,085 `get_tree` round trips per second against headless sway 1.12,
+     * for 59% of a compositor core and 41% of a client core against a 0.0%/0.0% idle control — so
+     * a 5s deadline that expired cost roughly 33,000 round trips, 200 MB of JSON and 2.9s of
+     * compositor CPU to establish that a dock had not appeared. Every one of those reads is a
+     * full serialisation of the layout tree, and they are issued on the same connection every
+     * other read shares.
+     *
+     * **The obvious hypothesis was tested and refuted, so this is a trade rather than a free
+     * win.** Spinning does not starve the compositor of the time it needs to map the very window
+     * being waited for: over 8 alternated trials the spin detected a dock at a median of 16.5ms
+     * against 26.1ms at a 25ms poll — about 10ms *sooner*. That 10ms is on the hotkey path, which
+     * is why the default keeps it where it is worth having: [WmFlags.pollSpinMs] of unpaced reads
+     * covers the window in which a dock almost always maps, and [WmFlags.pollIntervalMs] takes
+     * over for the long tail, where the reads are buying nothing but heat. Counted at the socket
+     * on the same headless sway 1.12 — see `a dock that never maps costs a paced poll, not a
+     * spin`, which is what does the counting — a 5s deadline that expires costs **1,719** tree
+     * reads at the stock defaults against **~27,500** spun, and 43 against 5,516 over a 1s
+     * deadline paced from the first read.
+     *
+     * Both flags are re-read on every iteration rather than captured, because `:config` reloads
+     * against a live daemon and a wait can outlive the snapshot it started under. [timeoutMs] is
+     * necessarily read once by the caller: it is the deadline's own definition, and a deadline
+     * that moved while being waited on would not be one.
+     *
+     * **Nothing is coerced here**, deliberately. Each flag declares `Flags.atLeast(0)`, so a
+     * negative is rejected in `Config.of`, reported through `Config.problems`, and resolved by
+     * `wm`-agnostic policy — degraded to the default or clamped, per `config.invalid_value`.
+     * Coercing again at the read site is what #69 removed elsewhere and for the reason that
+     * applies here too: it silently supplies a value the operator did not type while
+     * `awakener-config` reports a clean file.
+     *
+     * Nothing here is the design's forbidden unattended action: this runs only inside a call a
+     * caller made, and it ends when that call does.
+     */
+    private suspend fun <T : Any> pollTree(timeoutMs: Long, read: suspend () -> T?): T? =
+        withTimeoutOrNull(timeoutMs) {
+            val started = TimeSource.Monotonic.markNow()
             while (true) {
-                tree().windows.firstOrNull { it.appId == appId && it.id !in standing }
-                    ?.let { return@withTimeoutOrNull it }
-                yield()
+                read()?.let { return@withTimeoutOrNull it }
+                val cfg = config
+                if (started.elapsedNow() < cfg[WmFlags.pollSpinMs].milliseconds) {
+                    yield()
+                } else {
+                    delay(cfg[WmFlags.pollIntervalMs].milliseconds)
+                }
             }
             @Suppress("UNREACHABLE_CODE")
             null
         }
 
-        suspend fun awaitGone(id: SurfaceId, timeoutMs: Long = WINDOW_WAIT_MS): Boolean =
-            withTimeoutOrNull(timeoutMs) {
-                while (tree().find(id.raw) != null) yield()
-                true
-            } ?: false
-    }
-
     suspend fun tree(): Node =
         swayJson.decodeFromString(commands.request(I3Ipc.Request.GET_TREE))
 
     /**
-     * The durable key for a live window, or null if the window has gone.
+     * A tree node as the compositor-agnostic thing above this module sees.
      *
-     * The whole translation from compositor handle to durable identity happens here and nowhere
-     * else, which is what keeps `:registry` from ever learning what a `con_id` is.
+     * One conversion for both readers, which is the point of it existing: [surfaces] wants the
+     * whole [Surface] — [Surface.focused] included, which is what the hotkey entry point reads
+     * to mean "this window" (#55) — and [resolve] wants only [Surface.descriptor], where
+     * `focused` is deliberately absent because two windows of one app are the same surface
+     * whichever is focused now. Keeping them one function is what stops the two from drifting
+     * on which fields a node contributes.
+     */
+    private fun Node.asSurface(): Surface = Surface(SurfaceId(id), appId, name, pid, focused)
+
+    /**
+     * The durable key for a live **bindable** window, or null if it has gone or is a dock.
+     *
+     * The whole translation from compositor handle to durable identity happens here and in
+     * [resolve], and nowhere else, which is what keeps `:registry` from ever learning what a
+     * `con_id` is.
+     *
+     * This is the enumerating form, and `attach` is what wants it: standing a dock beside a dock
+     * is not an attach, so the filter is the precondition rather than an accident of reuse — a
+     * `keyFor` that answered for any node at all would turn `attach`'s "no such surface" check
+     * into one that passes on the agent panel. `resolve` deliberately does **not** come through
+     * here under the default [WmFlags.resolveKeySource]; see there.
      */
     suspend fun keyFor(surface: SurfaceId): SurfaceKey? =
         surfaces().firstOrNull { it.id == surface }
@@ -585,11 +652,43 @@ class SwayWindowManager(
         val table = docks.snapshot()
         return windows
             .filter { dockedTo(it, table, cfg) == null && !reserved(it, table, cfg) }
-            .map { Surface(SurfaceId(it.id), it.appId, it.name, it.pid, it.focused) }
+            .map { it.asSurface() }
     }
 
-    override suspend fun resolve(surface: SurfaceId): AgentId? =
-        keyFor(surface)?.let { registry.resolve(it)?.agent }
+    /**
+     * The agent bound to [surface], from the durable registry.
+     *
+     * **The dock table is not in this path**, which is the design note's tripwire made
+     * mechanical rather than promised (#52). Under the default [WmFlags.resolveKeySource] the
+     * whole of `resolve` is: read the tree, derive the key from facts that outlive the window,
+     * ask `:registry`. Nothing in it can reach [docks], so no future edit can quietly make the
+     * answer depend on this compositor session — a `con_id` table is meaningless after a reboot
+     * and the binding it would be answering about is not.
+     *
+     * That it was previously reached *through* `surfaces()` was not a durability defect — the
+     * answer was always the registry's, since the table holds no agent — but it did make the set
+     * of windows `resolve` would answer for depend on session state, in the direction that
+     * costs: a surface the table is hiding resolved as a Drab however durably it was bound, and
+     * a caller acting on that mints a second agent for a surface that already has one. The two
+     * ways to be hidden are a recognition the table latched at some past read (see
+     * [WmFlags.reapEvidence], where that latch is the stated residual) and an in-flight attach's
+     * reservation over a shared dock `app_id` (see [WmFlags.dockIdentity]).
+     *
+     * What it gives up is that `resolve` used to answer nothing for a dock. Under `TREE` a dock
+     * is an ordinary node and resolves to whatever the registry holds under the key its `app_id`
+     * yields — nothing, unless something bound that key. Callers obtain surface ids from
+     * [surfaces], which excludes docks under both values, so this is a difference in what the
+     * call *would* say rather than in what any caller asks it.
+     */
+    override suspend fun resolve(surface: SurfaceId): AgentId? {
+        val cfg = config
+        val key = when (cfg[WmFlags.resolveKeySource]) {
+            ResolveKeySource.TREE -> tree().windows.firstOrNull { it.id == surface.raw }
+                ?.let { SurfaceKey.of(it.asSurface().descriptor, cfg) }
+            ResolveKeySource.ENUMERATION -> keyFor(surface)
+        } ?: return null
+        return registry.resolve(key)?.agent
+    }
 
     /**
      * Stands a dock up beside [surface], as a transaction over the tree.
@@ -702,7 +801,11 @@ class SwayWindowManager(
                     // con_id is minted when the dock maps, so nothing keyed on one can cover the
                     // dock at the moment it becomes visible to a reader of the tree.
                     if (cfg[WmFlags.dockPendingSuppression]) {
-                        reservation = docks.reserve(appId, standing, WINDOW_WAIT_MS.milliseconds)
+                        reservation = docks.reserve(
+                            appId,
+                            standing,
+                            cfg[WmFlags.reservationGraceMs].milliseconds,
+                        )
                     }
                     // Filed before the exec for the reason above it: from the moment the command
                     // goes out this attach may have a window in the tree, and the map deadline
@@ -1067,8 +1170,9 @@ class SwayWindowManager(
                     // the panel.
                     if (cfg[WmFlags.wedgedDockFailsDetach]) {
                         error(
-                            "dock ${dockId.raw} was still in the tree ${WINDOW_WAIT_MS}ms after " +
-                                "it was killed; its client is not servicing the close request",
+                            "dock ${dockId.raw} was still in the tree " +
+                                "${cfg[WmFlags.unmapWaitMs]}ms after it was killed; its client " +
+                                "is not servicing the close request",
                         )
                     }
                     return@treeEdit
@@ -1096,8 +1200,6 @@ class SwayWindowManager(
     }
 
     private companion object {
-        const val WINDOW_WAIT_MS = 5_000L
-
         /**
          * How many times an unwind will try to flatten the container it is taking back while the
          * dock it spawned is still unidentified. Two, and the second is what covers a dock that

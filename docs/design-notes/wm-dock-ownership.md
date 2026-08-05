@@ -79,9 +79,34 @@ makes two sources of truth safe is:
 | **Which agent is bound to a surface, durably** | `:registry`, keyed on `SurfaceKey` |
 
 The table never asserts that a window exists, never asserts geometry or parenthood, and is
-**never consulted by `resolve`**. `resolve` continues to answer from the durable registry via
-`keyFor`; a session-scoped `con_id` table has no business in an answer that must survive a
-reboot. If the table ever appears in `resolve`'s path, the durability story has rotted.
+**not reachable from `resolve`**. `resolve` derives its key from the tree and answers from the
+durable registry; a session-scoped `con_id` table has no business in an answer that must survive
+a reboot. If the table ever appears in `resolve`'s path, the durability story has rotted.
+
+> **Amended 2026-08-04 by #52.** The tripwire fired, on code that was not wrong. As built, the
+> path was `resolve → keyFor → surfaces() → dockedTo`, and `dockedTo` both reads *and writes* the
+> table. Durability was intact throughout — the table holds no agent, so the answer was always
+> `:registry`'s — which is exactly the problem with a tripwire phrased as "does this function
+> appear in that call path": it cried wolf about the property the whole registry exists for, and
+> a tripwire that cries wolf gets switched off.
+>
+> Restated **and** made true, rather than either alone. What was genuinely session-dependent was
+> narrower than the wording suggested and worth fixing on its own: `surfaces()` filters out docks
+> and reserved windows, so a surface the table was hiding resolved as a **Drab** however durably
+> it was bound — and a caller acting on that mints a second agent for a surface that already has
+> one. Two ways to be hidden, both real: a recognition the table latched at some past read (the
+> stated residual under `wm.dock.reap_evidence`), and an in-flight attach's reservation over a
+> shared dock `app_id` (`wm.dock.identity=NEW_NODE`). So `resolve` now reads the node out of
+> `get_tree` and derives the key from it directly. Its whole path is one tree read and one
+> registry lookup, the table is unreachable from it, and the tripwire is now a grep somebody can
+> run rather than a promise somebody has to keep.
+>
+> The cost, disclosed: `resolve` no longer answers *nothing* for a dock. A dock is an ordinary
+> node to it and resolves to whatever the registry holds under the key its `app_id` gives —
+> nothing, unless something bound that key. Callers get their surface ids from `surfaces()`,
+> which excludes docks either way. `wm.resolve.key_source=ENUMERATION` restores the old route for
+> a caller who wants `resolve` to refuse a dock outright, at the price of the session dependence
+> it comes with.
 
 ### What it keys on
 
@@ -1160,6 +1185,18 @@ re-reading a config awakener does not own clears the set. So the design does not
   client behaving that way are separate facts — the flicker `REFOCUS_AFTER_MAP` costs is an
   order of magnitude smaller than the argument for it assumed, which strengthens the default
   rather than weakening it.
+
+  > **Amended 2026-08-04 by #49.** "A tight loop" is no longer the whole of it: the loop spins
+  > for `wm.wait.poll_spin_ms` (250 ms by default) and paces itself at `wm.wait.poll_interval_ms`
+  > afterwards. Every latency figure above is inside that first 250 ms, so they stand as taken.
+  > What changed is the cost of a wait that *expires*, which is where the reads were buying
+  > nothing: 6,637–11,085 round trips per second and 59% of a compositor core, so ~33,000 round
+  > trips and ~2.9 s of compositor CPU to establish that a dock never appeared. Spinning does
+  > earn its ~10 ms — the hypothesis that it starved the compositor of the time to map the very
+  > window being waited for was tested and refuted, 8 alternated trials, median 16.5 ms spinning
+  > against 26.1 ms at a flat 25 ms poll — so the spin is kept where it pays and dropped where it
+  > does not. Counted at the socket rather than estimated: a 5 s deadline that expires costs
+  > **1,719** `get_tree` round trips at the stock defaults against **~27,500** spun.
 - Under `NO_FOCUS_RULE`, `attach`'s unwind contract **explicitly excludes the rule**, and the
   flag description must say so. What can still be fixed is the *cumulative* half of #4: the
   table also remembers which `app_id`s already carry a rule, so a rule is issued at most once

@@ -108,9 +108,20 @@ internal data class DockTableSnapshot(
  * for a desktop that wants no tree evidence to be destructive at all, [ReapEvidence.STOOD_UP].
  *
  * Authoritative for exactly that one predicate. It never says a window exists — the tree keeps
- * that, and a node the tree has dropped is simply never asked about — and it is never consulted
- * by `resolve`, which answers from the durable registry: a `con_id` is meaningless after a
- * reboot and the binding it resolves is not.
+ * that, and a node the tree has dropped is simply never asked about — and **nothing here is
+ * reachable from `resolve`**, which derives its key from the tree and answers from the durable
+ * registry: a `con_id` is meaningless after a reboot and the binding it resolves is not.
+ *
+ * That last clause is the note's tripwire, and it is worth stating in the form it can be
+ * *checked* in, because for a while it could not be. It read "the table is never consulted by
+ * `resolve`", and `resolve` reached its key through `surfaces()`, which enumerates — so the
+ * check fired on code that was never wrong about durability, since no agent is held here and the
+ * answer was always `:registry`'s (#52). What was true is narrower and is what the wording now
+ * says: the *set of windows* `resolve` would answer for depended on this session's table, so a
+ * surface the table was hiding read as unbound however durably it was bound. `resolve` now takes
+ * the tree route, so the property is structural — grep `resolve` and no path from it arrives
+ * here. `wm.resolve.key_source=ENUMERATION` is the one thing that puts the table back in that
+ * path, and it says so.
  *
  * Deliberately not persisted, and deliberately no longer lived than the IPC connection it was
  * built against. sway allocates `con_id`s from a counter that restarts with the compositor, so an
