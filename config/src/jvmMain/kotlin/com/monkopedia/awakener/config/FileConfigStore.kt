@@ -50,6 +50,15 @@ class FileConfigStore(
      */
     val loadError: MutableStateFlow<String?> = MutableStateFlow(null)
 
+    /**
+     * The last contents [load] managed to read out of [path].
+     *
+     * Kept separate from the snapshot because the snapshot has environment overrides merged into
+     * it, and a rewrite built from that would bake a one-off `AWAKENER_*` variable into the
+     * user's file permanently. Declared before [state] for the same reason as [loadError].
+     */
+    private var lastGoodFile: Map<String, JsonElement> = emptyMap()
+
     private val state = MutableStateFlow(load(fallback = Config.EMPTY))
 
     override val config: StateFlow<Config> = state.asStateFlow()
@@ -95,7 +104,7 @@ class FileConfigStore(
 
     override suspend fun set(key: String, raw: String) {
         val flag = requireNotNull(Flags.byKey(key)) { "unknown flag '$key'" }
-        val parsed = flag.parseRaw(raw)
+        val parsed = flag.parseChecked(raw)
         mutate { it + (key to parsed) }
     }
 
@@ -107,7 +116,7 @@ class FileConfigStore(
     private suspend fun mutate(transform: (Map<String, JsonElement>) -> Map<String, JsonElement>) {
         writeLock.withLock {
             withContext(Dispatchers.IO) {
-                val next = transform(readRaw())
+                val next = transform(currentForWrite())
                 path.createParentDirectories()
                 val tmp = path.resolveSibling("${path.name}.tmp")
                 Files.writeString(tmp, json.encodeToString(JsonObject(next)))
@@ -125,30 +134,107 @@ class FileConfigStore(
     }
 
     /**
+     * What a write starts from: whatever is on disk, so a `set` preserves the keys around the
+     * one it changes rather than the subset this process happens to hold.
+     *
+     * The read is guarded because everything else here is. [load] has always kept the last good
+     * snapshot when the file cannot be read, so the same unreadable file that is a warning on
+     * the read path used to reach `main` from the write path as an unhandled `IOException` — a
+     * stack trace where the contract promises a report. Only the *malformed* case survived, and
+     * by accident: `SerializationException` extends `IllegalArgumentException`, which
+     * [ConfigCli] happens to catch. Neither half is decided by luck now.
+     */
+    private fun currentForWrite(): Map<String, JsonElement> = try {
+        readRaw()
+    } catch (e: Exception) {
+        loadError.value = "$path: ${e.message}"
+        when (config.value[ConfigFlags.unreadableWrite]) {
+            // The remedy names the *environment*, not `set`: recording this flag with `set`
+            // would have to read the file, which is the thing that cannot be read. Advertising
+            // the flag without saying that sent the operator round a circle.
+            UnreadableWrite.REFUSE -> throw IllegalStateException(
+                "$path could not be read (${e.message}), so it cannot be rewritten without " +
+                    "discarding whatever it holds. Fix the file, or re-run with " +
+                    "${ConfigFlags.unreadableWrite.key.toEnvName()}=REWRITE to replace it with " +
+                    "the last contents this process read.",
+                e,
+            )
+
+            UnreadableWrite.REWRITE -> lastGoodFile
+        }
+    }
+
+    /**
      * @param fallback the snapshot to keep if the file cannot be read. Callers after
      * construction pass the currently live snapshot, so a malformed edit changes nothing.
      */
     private fun load(fallback: Config = state.value): Config {
-        val fromFile = try {
-            readRaw().also { loadError.value = null }
+        val base = try {
+            readRaw().also { loadError.value = null; lastGoodFile = it }
         } catch (e: Exception) {
             loadError.value = "$path: ${e.message}"
-            // Keep whatever is already live rather than collapsing to defaults.
-            return fallback
+            // Keep whatever is already live rather than collapsing to defaults — but keep
+            // *building a snapshot*, rather than returning the old one whole. Returning early
+            // skipped the environment entirely, so on an unreadable file no `AWAKENER_*`
+            // variable applied at all: a store built in that state read every flag at its
+            // default however the environment was set. That is worst for the one flag whose
+            // whole job is to be readable when the file is not — `config.store.unreadable_write`
+            // could not be set on the path that consults it, so its escape hatch was inert in
+            // `awakener-config` while the refusal message advertised it. The environment is the
+            // only source still standing here, which is exactly why it has to be read.
+            fallback.overrides()
         }
-        return Config.of(fromFile + environmentOverrides())
+        val environment = environmentOverrides()
+        return Config.of(base + environment.values, environment.problems) { key ->
+            environment.names[key]
+        }
     }
 
     /**
      * Environment overrides, which win over the file. This is what lets a test or a CI job
      * pin behaviour without racing the watcher, and lets a one-off run try a flag without
      * editing the user's real config.
+     *
+     * Only a value that will not *parse* is dropped here, and dropping it is now said out loud:
+     * an unusable variable that vanished silently left the file's value in effect while the
+     * environment appeared to override it, which is a difference nothing could see. A value that
+     * parses goes through as an override whatever it says, so anything out of range is reported
+     * and degraded by [Config.of] like every other stored value rather than by a second rule.
+     *
+     * [Applied.names] is what lets a problem about one of these say so. A key reported without
+     * it sends the reader to grep a config file that does not contain the value.
      */
-    private fun environmentOverrides(): Map<String, JsonElement> =
-        Flags.all().mapNotNull { flag ->
-            val raw = environment[flag.key.toEnvName()] ?: return@mapNotNull null
-            runCatching { flag.key to flag.parseRaw(raw) }.getOrNull()
-        }.toMap()
+    private fun environmentOverrides(): Applied {
+        val values = mutableMapOf<String, JsonElement>()
+        val names = mutableMapOf<String, String>()
+        val problems = mutableListOf<Config.Problem>()
+        Flags.all().forEach { flag ->
+            val name = flag.key.toEnvName()
+            val raw = environment[name] ?: return@forEach
+            runCatching { flag.parseRaw(raw) }
+                .onSuccess { values[flag.key] = it; names[flag.key] = name }
+                .onFailure {
+                    problems += Config.Problem(
+                        flag.key,
+                        "$name='$raw' does not parse (${it.message}), so it was ignored",
+                    )
+                }
+        }
+        return Applied(values, names, problems)
+    }
+
+    /**
+     * What the environment contributed: the overrides, which variable supplied each, and what
+     * had to be dropped to get there.
+     *
+     * Returned rather than filled in through an out-parameter, so this reads like the rest of
+     * the file — everything else here answers with what it computed.
+     */
+    private class Applied(
+        val values: Map<String, JsonElement>,
+        val names: Map<String, String>,
+        val problems: List<Config.Problem>,
+    )
 
     private companion object {
         const val RELOAD_DEBOUNCE_MS = 40L

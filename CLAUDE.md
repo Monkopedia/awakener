@@ -158,6 +158,16 @@ behaviours, *build both and add the switch* rather than asking which he wants.
 - A snapshot is total: a bad value degrades to that flag's default and is reported through
   `Config.problems`. The config file gets hand-edited against a running desktop, so a typo
   must not take the process down.
+- **"Bad value" includes one that decodes and is out of range.** A flag whose sane values are
+  narrower than its type says so — `Flags.int(key, default, description, Flags.within(1..100))`,
+  `Flags.atLeast(0L)`, or `Flags.requires("…") { … }` for anything else. `Config.of` then reports
+  it and `Config.get` degrades it exactly like a value that will not parse, `set` refuses it
+  outright, and `awakener-config list` prints the range. Declare the requirement rather than
+  coercing at the read site: coercing keeps the process up and tells nobody, which is the
+  failure that costs the most to diagnose. For a rule spanning two flags — one flag's grace
+  period outlasting another's wait — use `Flags.constraint(key, description) { config -> … }`
+  from the same `*Flags` object; it reports and degrades nothing, because a pair that
+  contradicts itself has no single key to degrade.
 
 ## Working agreements
 

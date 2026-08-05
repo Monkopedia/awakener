@@ -17,7 +17,7 @@ class InMemoryConfigStore(initial: Config = Config.EMPTY) : ConfigStore {
 
     override suspend fun set(key: String, raw: String) {
         val flag = requireNotNull(Flags.byKey(key)) { "unknown flag '$key'" }
-        state.value = state.value.with(key, flag.parseRaw(raw))
+        state.value = state.value.with(key, flag.parseChecked(raw))
     }
 
     override suspend fun unset(key: String) {
