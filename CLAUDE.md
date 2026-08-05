@@ -72,7 +72,11 @@ the `:wm` integration suite against a real headless sway.
   nothing on the page separates a considered "this merge cannot reach the suite" from a
   forgotten `git fetch`, and the reviewer has to treat the two the same way. Judge reach by
   what the merge touches, not by how small it looks: a shared build script, a test harness, or
-  `:config` reaches everything and never qualifies, however few lines it is.
+  `:config` reaches everything and never qualifies, however few lines it is. Positively, what
+  *does* qualify is a merge whose every changed path is one nothing under test reads — docs and
+  findings notes, or a module neither the suite nor anything it depends on compiles against.
+  `44c03f3` qualifies because `CLAUDE.md` sits on no compile or runtime classpath and no test
+  opens it. If you cannot name that property for every path in the merge, it does not qualify.
 
   **Same shape as the known-flake exemption** (#56): both claim a diff *cannot reach* a result,
   both are argued per case from what the diff actually touches, and neither is ever discharged
@@ -130,14 +134,18 @@ conversation, not a local workaround.
   (`~/kaladin-netconsole/kernel.log`), and a 15s load/thermal sampler at
   `/var/log/kaladin-load.log`. Cause unproven. Keep concurrent heavy work modest and prefer
   targeted module tests over repeated full builds.
-- **adolin** — the desktop, and awakener's actual target. GPU, active seat0, running
-  **GNOME Shell**. `google-chrome-stable` and `xorg-xwayland` installed. Reachable by
-  passwordless ssh from kaladin, but **sudo there requires a password** — Jason runs
-  installs on adolin himself.
-- **Neither host runs a tabbed WM as its session** — adolin's is GNOME, kaladin has no seat
-  at all. The dock design depends on i3/sway tree semantics, so it has nowhere to run *for
-  real* yet. Installed is a different question and the answer is yes: `sway 1.12` is on
-  kaladin, CI installs it, and the `:wm` and `:cli` suites drive it on every build.
+- **adolin** — the desktop, and awakener's actual target. GPU, active seat0 on tty2, running
+  **GNOME Shell**. Installed: `google-chrome-stable`, `xorg-xwayland`, `sway 1.12`,
+  `foot 1.27.0`, `waydroid 1.6.3`, `jq`, `qemu`. Absent: `chromium`, `spanreed`. Reachable by
+  passwordless ssh from kaladin, but **sudo there requires a password** — Jason runs any
+  *further* installs himself. **Check before asking**: most of what the open work needs is
+  already on the box, and this list has twice claimed otherwise.
+- **Neither host runs a tabbed WM as its session** — adolin's is GNOME Shell on seat0,
+  kaladin has no seat at all. The dock design depends on i3/sway tree semantics, so it has
+  nowhere to run *for real* yet. Installed is a different question, and the answer is **both
+  hosts, not one**: `sway 1.12` and `foot 1.27.0` are on kaladin *and* on adolin, explicitly
+  installed there on 2026-07-30 — the same day this section was first written and marked
+  verified. CI installs them too, and the `:wm` and `:cli` suites drive sway on every build.
   `WLR_BACKENDS=headless sway` gives a genuine sway tree drivable entirely over ssh via
   `swaymsg` — that is how structural probes should run, and it needs no display and no change
   to Jason's GNOME session.
@@ -146,8 +154,11 @@ conversation, not a local workaround.
   module**: the LTS kernel's `CONFIG_ANDROID_BINDER_IPC_RUST=y` driver serves Waydroid
   unmodified, `/dev/binderfs` is mounted, and `/usr/bin/waydroid` is installed. What remains
   open is narrower — both runs were software-rendered, so buffer back-pressure from a
-  gbm/DRM-backed Waydroid is untested and needs adolin's real GPU, which means Jason installs
-  it, because sudo there wants a password.
+  gbm/DRM-backed Waydroid is untested and needs adolin's real GPU. **That is no longer an
+  install.** Waydroid 1.6.3 has been on adolin since 2026-07-31, `/var/lib/waydroid` is
+  initialised, and `waydroid-container` is active with the session stopped. What is left is a
+  session started against Jason's live seat — his call to make, not a package for him to
+  fetch.
 
 ## Flags first (owner directive, 2026-07-30)
 
@@ -231,10 +242,20 @@ From `docs/design.md`; these bind agent work here:
 - **`:wm` needs a live compositor**, so "no automated test for this window-management
   behavior" is *not* the defect it would be in a pure-JVM module. But a PR touching it must
   state what was exercised against a live compositor, and at which version.
-- **All bot writes go through the `coderbot` wrapper by its FULL path**
-  (`/home/jmonk/git/urithiru/coder-bot/coderbot`), never bare `coderbot` and never plain
-  `gh` — plain `gh` runs as `Monkopedia` and silently misattributes bot actions to the
-  owner.
+- **Every bot write goes through a wrapper by its FULL path**, never bare and never plain
+  `gh` — plain `gh` runs as `Monkopedia` and silently misattributes bot actions to the owner.
+  **Which wrapper depends on whether you are authoring or reviewing, and they are not
+  interchangeable:**
+  - **Authoring** — commits, pushes, `pr create`, issue writes:
+    `/home/jmonk/git/urithiru/coder-bot/coderbot`.
+  - **Reviewing** — `pr review`, review comments, and the merge:
+    `/home/jmonk/git/urithiru/reviewer-bot/reviewerbot`.
+
+  A reviewer that reaches for `coderbot` **cannot review a PR the coder bot authored**: GitHub
+  rejects it with *"Can not request changes on your own pull request."* That failure lands at
+  the moment the verdict is posted — after the entire review is done — so it reads as a broken
+  tool rather than the wrong identity. Two identities is what makes the trail a real second
+  pair of eyes instead of the author signing off their own work.
 - **Commit style**: subject ≤ 70 chars, present tense; body explains *why*. Co-author
   trailer on agent commits.
 - **A reviewer must be explicitly spawned.** Opening a PR with `--reviewer` sets an inert
