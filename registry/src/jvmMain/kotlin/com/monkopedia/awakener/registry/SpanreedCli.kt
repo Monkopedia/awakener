@@ -2,6 +2,7 @@ package com.monkopedia.awakener.registry
 
 import com.monkopedia.awakener.config.Config
 import com.monkopedia.awakener.config.ConfigStore
+import java.io.IOException
 import java.io.InputStream
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
@@ -36,21 +37,36 @@ fun interface CommandRunner {
  *
  * Every call here is on the hotkey path — the default [AgentIdSource] shells out to mint an
  * identity, and `attach` awaits it — so the contract is that [run] returns within [timeoutMs]
- * whatever the child does.
+ * whatever the child does, and returns at all whether or not there is a child to run.
  *
  * @param timeoutMs how long the child gets before it is killed. A parameter rather than a
  * constant so a test can prove the timeout fires without spending the production budget waiting.
  */
 class ProcessCommandRunner(private val timeoutMs: Long = DEFAULT_TIMEOUT_MS) : CommandRunner {
     override fun run(command: List<String>, environment: Map<String, String?>): ProcessResult {
-        val process = ProcessBuilder(command)
+        val builder = ProcessBuilder(command)
             .apply {
                 val inherited = environment()
                 environment.forEach { (name, value) ->
                     if (value == null) inherited.remove(name) else inherited[name] = value
                 }
             }
-            .start()
+        // A command that does not exist is a config value, not a defect: the executable comes
+        // from registry.agent.spanreed_command, which is hand-edited against a running desktop,
+        // and a typo in it used to leave `start` throwing an IOException that nothing on the
+        // hotkey path caught. Answering it as a failed run puts it where every other way this
+        // can go wrong already goes, and where the caller's own message can name the flag —
+        // rather than a stack trace from a line that mentions neither.
+        val process = try {
+            builder.start()
+        } catch (e: IOException) {
+            return ProcessResult(
+                NOT_RUNNABLE,
+                "",
+                "could not run '${command.firstOrNull().orEmpty()}' " +
+                    "(${RegistryFlags.spanreedCommand.key}): ${e.message}",
+            )
+        }
         // Nothing awakener runs is fed on stdin, and a child that reads it would otherwise wait
         // forever for input that is never coming.
         process.outputStream.close()
@@ -108,6 +124,9 @@ class ProcessCommandRunner(private val timeoutMs: Long = DEFAULT_TIMEOUT_MS) : C
 
         /** Distinguishable from any real exit code, which is 0..255. */
         const val TIMED_OUT = -1
+
+        /** Likewise, and distinct from [TIMED_OUT]: nothing ran, so nothing timed out. */
+        const val NOT_RUNNABLE = -2
     }
 }
 
