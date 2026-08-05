@@ -26,6 +26,14 @@ JAVA_HOME=/usr/lib/jvm/java-21-openjdk ./gradlew build
 That is the full autonomous check — it compiles every module and runs all tests, including
 the `:wm` integration suite against a real headless sway.
 
+**Every bullet below is one failure wearing a different coat.** None of these instruments was
+broken; each answered its own question correctly and was read as answering a different one.
+`BUILD SUCCESSFUL` was reached by a run that skipped everything. `skipped="0"` was written by a
+gate that returned early. `git status` answered about a tree six commits old. A signal is
+evidence about the thing you care about only if something on the path between them confronted
+it with reality — so when you cite one, say which question it actually answers, and prefer the
+check that reads back the artefact you are making a claim about.
+
 - **The REQUIRE flags are the protection.** `AWAKENER_REQUIRE_SWAY=1` — and
   `AWAKENER_REQUIRE_SPANREED=1` for `:registry` — are mandatory for any run whose result you
   intend to report. Without them a machine lacking `sway`/`foot`/`spanreed` skips those tests
@@ -83,6 +91,45 @@ the `:wm` integration suite against a real headless sway.
   both are argued per case from what the diff actually touches, and neither is ever discharged
   by looking the case up on a list of things previously agreed to be harmless. An agent who
   understands one should recognise the other on sight.
+- **Do not read the shared checkout for anything load-bearing.** `/home/jmonk/git/awakener` is
+  the tree the `agent-*` worktrees hang off, and **nothing pulls it on a schedule** — checked
+  2026-08-05: kaladin has no cron at all (no `crontab` binary, no `/etc/cron.*`), and nothing
+  in `systemctl list-timers`, system or user, names this repo or runs a `git fetch`. #71 is the
+  corroboration, since a scheduled pull would have prevented what it describes. So the checkout
+  sits on whatever commit it was last left on, and `git status` reports **clean** the entire
+  time, because it *is* clean — relative to its own stale `HEAD`. That
+  command answers "are there uncommitted changes"; it never answers "is this current", and the
+  second is what it keeps getting read as. #71: the checkout sat six commits back overnight
+  with `cli/build.gradle.kts` at 34 lines against 244 on `origin/main`, and an agent checking a
+  claim from #66 read it and nearly filed a **correct** report as wrong — the inversion is what
+  makes this one dangerous, since a false report is argued down rather than shipped. Work in
+  your own worktree. When a claim turns on file contents, `git fetch` and read them at a named
+  ref — `git show origin/main:<path>` — and **quote the SHA in the finding**, which is the part
+  that does not depend on the next reader remembering the rule: with provenance in the output,
+  a stale read is a diff of two SHAs instead of a judgement call about whether a file looks the
+  way the repository says it should.
+- **A local write that succeeded tells you nothing about what GitHub now holds.** Worktrees
+  isolate source trees and nothing else. The scratchpad path is keyed on the project and
+  session — `/tmp/claude-1000/-home-jmonk-git-awakener/<session-id>/scratchpad` — so every
+  agent in a session shares one directory (on 2026-08-05, twenty `agent-*` worktrees to a
+  single scratchpad holding `pr.md`, `body.md`, `review.md`, `squash.md`, and a symlink into
+  another agent's build output). PR bodies, review bodies and issue text are staged there,
+  which is exactly the material that must not cross. #61 wrote its description to `pr.md`; so
+  did the agent on #70. #61 published **#70's body verbatim**, closing keyword and all, opening
+  `Fixes #66` — it would have merged closing the wrong issue and leaving #52 and #49 open. The
+  edit that overwrote it reported success: `s.replace('## Scope', new + '## Scope', 1)`, and
+  Python's `str.replace` returns the string **unchanged** when the anchor is absent, so "already
+  applied" and "wrong file entirely" produce the same output and the same `ok`. Two rules, the
+  second of which holds whatever the cause:
+  - **Name scratch files for the artefact and the agent** — PR number plus worktree id, as in
+    `pr61-body-agent-a8a1d92943819cc6d.md`. Never `pr.md`, `body.md`, `review.md`: those are
+    the names everyone independently picks, which is what makes them collide.
+  - **Read the result back from the platform and assert on it.** After any body upload,
+    `gh pr view <n> --json closingIssuesReferences` (a read, so no wrapper needed) must return
+    exactly the issues you meant to close. It has to be the **description** you check, because
+    that is what the merge acts on and what `closingIssuesReferences` is derived from; a
+    curated squash body can *add* a closure but cannot retract one the description already
+    promised. This is the check that catches a wrong body regardless of how it got there.
 - `:wm` needs a live compositor, so "no automated test for this window behaviour" is not the
   defect it would be elsewhere — but a PR must say what it exercised and against which sway
   version.
