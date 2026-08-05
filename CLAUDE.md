@@ -45,6 +45,21 @@ the `:wm` integration suite against a real headless sway.
   environment as an input, so `wm/build.gradle.kts` and `registry/build.gradle.kts` name the
   tool presence and the REQUIRE flags explicitly. Without that the build cache will replay a
   run that skipped everything into a `clean build` that demanded the tools.
+- **A run measures one tree, and `main` moves under you.** Every count above describes the
+  tree the run ran against. Counts from a branch that `main` has since left describe a tree
+  that will not exist after the merge, and nothing in the output says so. A PR's numbers are
+  only meaningful if `origin/main`'s tip is an ancestor of its head — one line, run by the
+  implementer before opening and by the reviewer before believing any number in the body:
+
+  ```sh
+  git fetch origin && git merge-base --is-ancestor origin/main HEAD && echo current || echo STALE
+  ```
+
+  On `STALE`, rebase or merge and **re-run**, then report the new counts. `mergeStateStatus:
+  CLEAN` does **not** imply this — that field answers whether the merge would conflict, which
+  is a different question. #59 merged `CLEAN` reporting an honest, XML-read 176 tests /
+  skipped=0 / failures=0 against a tree `main` had already advanced past to 201. A conflict
+  announces itself; staleness does not.
 - `:wm` needs a live compositor, so "no automated test for this window behaviour" is not the
   defect it would be elsewhere — but a PR must say what it exercised and against which sway
   version.
@@ -105,9 +120,13 @@ conversation, not a local workaround.
   semantics, so it has nowhere to run for real yet. `WLR_BACKENDS=headless sway` gives a
   genuine sway tree drivable entirely over ssh via `swaymsg` — that is how structural probes
   should run, and it needs no display and no change to Jason's GNOME session.
-- **No Waydroid and no binder module** (`binder_linux` absent). Test 1 (occlusion lifecycle)
-  is gated on a DKMS kernel module on Jason's daily driver, so it is not something to set up
-  autonomously.
+- **Waydroid runs on kaladin, and Test 1 (occlusion lifecycle) is answered** — under qemu on
+  2026-07-30 and natively on 07-31; see `docs/findings/`. **Nothing was gated on a DKMS
+  module**: the LTS kernel's `CONFIG_ANDROID_BINDER_IPC_RUST=y` driver serves Waydroid
+  unmodified, `/dev/binderfs` is mounted, and `/usr/bin/waydroid` is installed. What remains
+  open is narrower — both runs were software-rendered, so buffer back-pressure from a
+  gbm/DRM-backed Waydroid is untested and needs adolin's real GPU, which means Jason installs
+  it, because sudo there wants a password.
 
 ## Flags first (owner directive, 2026-07-30)
 
@@ -121,10 +140,17 @@ behaviours, *build both and add the switch* rather than asking which he wants.
   self-documenting instead of a hand-maintained list that drifts.
 - **The name and the package are load-bearing**: `FlagDiscovery` finds declaring classes by
   scanning the classpath for `com.monkopedia.awakener.**` classes whose name ends in `Flags`,
-  and `:cli` depends on every module in the build. Give it a prefix — a class named exactly
-  `Flags` is the registry itself and is skipped. Follow the convention and a new module's
-  flags show up in `list` with no registration step anywhere; deviate and they are invisible
-  until someone names the class in `config.flags.declarations`.
+  and `:cli` depends on every module in the build. Exactly one class is excluded, and it is
+  excluded by its **whole path** — `com.monkopedia.awakener.config.Flags`, the registry, which
+  registers nothing. A prefix is conventional, not required: `Flags` is a simple name any
+  package may mint, so `com.monkopedia.awakener.chrome.Flags` is a declarer and *is*
+  discovered. Excluding by *simple* name was a bug — it dropped exactly that class with
+  nothing in `FlagDiscovery.Report.problems` to say so — and a fixture wired to nothing
+  (`cli/src/jvmTest/kotlin/com/monkopedia/awakener/futuremodule/Flags.kt`) plus its test hold
+  the fix. Follow the convention and a new module's flags show up in `list` with no
+  registration step anywhere; deviate — a package outside `com.monkopedia.awakener`, or a name
+  that does not end in `Flags` — and they are invisible until someone names the class in
+  `config.flags.declarations`.
 - Defaults must be the behaviour you would have hard-coded, so an unconfigured system is
   correct.
 - `:config` reloads on file change, so a flag flip applies to a live daemon. Never cache a
