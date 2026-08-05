@@ -100,7 +100,11 @@ object ConfigCli {
                     out("$key = $raw")
                     0
                 } catch (e: Exception) {
-                    usage(out, e.message ?: "invalid value")
+                    // `e.toString()` rather than a stand-in like "invalid value": catching
+                    // broadly also catches things that are not about the argument, and naming
+                    // one of those as a bad value would be a wrong answer rather than a vague
+                    // one. A message-less exception at least says what it was.
+                    usage(out, e.message ?: e.toString())
                 }
             }
 

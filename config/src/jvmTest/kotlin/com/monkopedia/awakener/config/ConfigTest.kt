@@ -1,5 +1,6 @@
 package com.monkopedia.awakener.config
 
+import java.nio.file.Path
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.writeText
 import kotlin.test.AfterTest
@@ -320,6 +321,41 @@ class ConfigTest {
         )
     }
 
+    /**
+     * The one cross-flag rule in production, rather than another throwaway. Every other
+     * constraint test declares its own, so nothing went red if `FlagDiscoveryMode` handling or
+     * `config.flags.declarations`' default moved — and this single registration is the whole
+     * argument for the cross-flag half being shipped at all.
+     */
+    @Test
+    fun `DECLARED discovery with no declarations is reported`() {
+        val config = snapshot("config.flags.discovery" to "DECLARED")
+        val problem = config.problems.single { it.key == ConfigFlags.declarations.key }
+        assertTrue(
+            ConfigFlags.discovery.key in problem.reason && "DECLARED" in problem.reason,
+            "the problem does not say which pair contradicts itself: ${problem.reason}",
+        )
+        assertEquals(
+            FlagDiscoveryMode.DECLARED,
+            config[ConfigFlags.discovery],
+            "a cross-flag rule degraded a value it can only report on",
+        )
+    }
+
+    @Test
+    fun `DECLARED discovery with a declaration named is quiet`() {
+        val config = snapshot(
+            "config.flags.discovery" to "DECLARED",
+            "config.flags.declarations" to "com.monkopedia.awakener.config.ConfigFlags",
+        )
+        assertEquals(emptyList(), config.problems)
+    }
+
+    @Test
+    fun `the default discovery mode does not trip the rule`() {
+        assertEquals(emptyList(), snapshot("config.flags.declarations" to "").problems)
+    }
+
     // ---- #62: typing a bad value at something that can answer ----
 
     /**
@@ -344,7 +380,13 @@ class ConfigTest {
             environment = mapOf("AWAKENER_TEST_PPT" to "150"),
         )
         assertEquals(30, store.config.value[TestFlags.ppt])
-        assertEquals(listOf("test.ppt"), store.config.value.problems.map { it.key })
+        val problem = store.config.value.problems.single()
+        assertEquals("test.ppt", problem.key)
+        // Without this the reader is sent to grep a config file that does not contain 150.
+        assertTrue(
+            "AWAKENER_TEST_PPT" in problem.reason,
+            "the problem does not say the value came from the environment: ${problem.reason}",
+        )
     }
 
     /** Dropping it silently left the file's value in effect while the variable looked applied. */
@@ -380,10 +422,31 @@ class ConfigTest {
         val failure = assertFailsWith<IllegalStateException> { store.set("test.name", "x") }
         assertTrue(
             failure.message.orEmpty().contains(path.toString()) &&
-                failure.message.orEmpty().contains(ConfigFlags.unreadableWrite.key),
-            "the refusal names neither the file nor the way out: ${failure.message}",
+                // The environment variable, not the flag key: recording the flag with `set`
+                // would have to read the same file, so naming `set` sends the operator round
+                // a circle.
+                failure.message.orEmpty().contains("AWAKENER_CONFIG_STORE_UNREADABLE_WRITE"),
+            "the refusal names neither the file nor a way out that works: ${failure.message}",
         )
         assertEquals(3, store.config.value[TestFlags.count], "the live snapshot was disturbed")
+    }
+
+    /**
+     * The CLI's own order of operations, which is the only one the product ever performs:
+     * `ConfigCli.bootstrap` builds the store *after* the file has gone bad, per invocation. The
+     * tests above build it while the file is still readable and break it afterwards, which is
+     * the daemon's order — and under it every environment override was already in the snapshot,
+     * so they could not see that the unreadable branch of `load` skipped the environment
+     * entirely. Everything through [ConfigCli] below is deliberately in this order.
+     */
+    private fun cli(
+        vararg args: String,
+        path: Path,
+        environment: Map<String, String>,
+    ): Pair<Int, List<String>> {
+        val lines = mutableListOf<String>()
+        val store = ConfigCli.bootstrap(path, environment, lines::add)
+        return ConfigCli.run(arrayOf(*args), store, lines::add) to lines
     }
 
     /** And the CLI answers rather than propagating, which is what `main` has no handler for. */
@@ -391,20 +454,64 @@ class ConfigTest {
     fun `the CLI reports an unwritable file instead of letting it out`() {
         val path = dir.resolve("locked-cli.json")
         path.writeText("""{"test.count": 3}""")
-        val store = FileConfigStore(path, environment = emptyMap())
         assertTrue(path.toFile().setReadable(false), "could not drop read permission")
 
-        val lines = mutableListOf<String>()
-        val code = ConfigCli.run(arrayOf("set", "test.name", "x"), store, lines::add)
+        val (code, lines) = cli("set", "test.name", "x", path = path, environment = emptyMap())
         assertEquals(2, code)
         assertTrue(
             lines.any { it.startsWith("error:") && path.toString() in it },
             "the failure was not reported to the user: $lines",
         )
+        assertTrue(
+            lines.any { "AWAKENER_CONFIG_STORE_UNREADABLE_WRITE=REWRITE" in it },
+            "the refusal points at `set`, which would have to read the same file: $lines",
+        )
+    }
+
+    /**
+     * The escape hatch the refusal above advertises, reached the way an operator reaches it.
+     *
+     * This failed as first shipped: `load` returned the fallback snapshot before merging the
+     * environment, and `ConfigCli.bootstrap` builds a store per invocation, so the override
+     * never arrived and the flag read REFUSE however it was set. REWRITE was reachable only
+     * from a process that had already read the file — which described the test and not
+     * `awakener-config`.
+     */
+    @Test
+    fun `REWRITE is reachable in the order the CLI builds the store`() {
+        val path = dir.resolve("rewrite-cli.json")
+        path.writeText("""{"test.count": 3}""")
+        assertTrue(path.toFile().setReadable(false), "could not drop read permission")
+
+        val (code, lines) = cli(
+            "set",
+            "test.name",
+            "x",
+            path = path,
+            environment = mapOf("AWAKENER_CONFIG_STORE_UNREADABLE_WRITE" to "REWRITE"),
+        )
+        assertEquals(0, code, "the escape hatch was inert on the path that consults it: $lines")
+        assertTrue(path.toFile().setReadable(true), "could not restore read permission")
+        assertTrue(""""test.name": "x"""" in path.toFile().readText(), "nothing was written")
+    }
+
+    /**
+     * The root cause, stated as its own property: an unreadable file used to cost *every*
+     * environment override, not only the one that decides what to do about it.
+     */
+    @Test
+    fun `environment overrides still apply when the file cannot be read`() {
+        val path = dir.resolve("env-over-locked.json")
+        path.writeText("""{"test.count": 3}""")
+        assertTrue(path.toFile().setReadable(false), "could not drop read permission")
+
+        val store = FileConfigStore(path, environment = mapOf("AWAKENER_TEST_COUNT" to "99"))
+        assertEquals(99, store.config.value[TestFlags.count])
+        assertTrue(store.loadError.value != null, "the unreadable file went unmentioned")
     }
 
     @Test
-    fun `REWRITE replaces a file nothing can read with the values in effect`() = runTest {
+    fun `REWRITE keeps the last contents this process read, without the environment`() = runTest {
         val path = dir.resolve("rewrite.json")
         path.writeText("""{"test.count": 3}""")
         val store = FileConfigStore(

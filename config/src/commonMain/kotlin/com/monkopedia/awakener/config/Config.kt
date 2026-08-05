@@ -65,8 +65,15 @@ class Config internal constructor(
          * @param found problems the caller established before the values reached here — an
          * override it had to discard to build [raw] at all. They are carried rather than
          * re-derived because nothing downstream can see what was dropped.
+         * @param origin where a key's value came from, when it is somewhere other than the
+         * caller's own file — an `AWAKENER_*` variable, say. A problem reported without it
+         * names a key and sends the reader to grep a file that does not contain the value.
          */
-        fun of(raw: Map<String, JsonElement>, found: List<Problem> = emptyList()): Config {
+        fun of(
+            raw: Map<String, JsonElement>,
+            found: List<Problem> = emptyList(),
+            origin: (String) -> String? = { null },
+        ): Config {
             // Built first and without problems so that the reports below can say what [get]
             // will actually answer — which depends on config.validation.invalid_value, and so
             // is not knowable from the flag and the stored value alone.
@@ -74,11 +81,12 @@ class Config internal constructor(
             val problems = found.toMutableList()
             raw.forEach { (key, value) ->
                 val flag = Flags.byKey(key)
-                if (flag == null) {
-                    problems += Problem(key, "no flag declares this key")
+                val problem = if (flag == null) {
+                    Problem(key, "no flag declares this key")
                 } else {
-                    flag.problemWith(value, staged)?.let { problems += it }
+                    flag.problemWith(value, staged)
                 }
+                problem?.let { problems += it.setBy(origin(key)) }
             }
             Flags.allConstraints().forEach { constraint ->
                 // A constraint that throws is a defect in the module that declared it, and a
@@ -98,6 +106,10 @@ class Config internal constructor(
             val rejection = rejection(decoded) ?: return null
             return Problem(key, "value $value $rejection; using ${staged[this]}")
         }
+
+        /** Names where the value came from, when it is not where the reader would look. */
+        private fun Problem.setBy(origin: String?): Problem =
+            if (origin == null) this else copy(reason = "$reason (set by $origin)")
     }
 }
 

@@ -104,10 +104,17 @@ object ConfigFlags {
             "it. REFUSE says so and changes nothing, because a file that is unreadable this " +
             "second — a permission put on by hand, a filesystem hiccup — still holds every " +
             "value that was typed into it, and a rewrite from memory is how those are lost. " +
-            "REWRITE replaces it with the values currently live, which is the way back when the " +
-            "file is genuinely damaged and `set` would otherwise be unusable until it is " +
-            "repaired by hand. Neither can take the process down: this used to be an unhandled " +
-            "IOException on the write path.",
+            "REWRITE replaces it with the last contents this process read out of it, plus the " +
+            "change being made — and with nothing but the change if it has never managed to " +
+            "read the file at all, which is the case for a fresh `awakener-config` and is the " +
+            "destructive one to know about. That is the way back when the file is genuinely " +
+            "damaged and `set` would otherwise be unusable until it is repaired by hand. It is " +
+            "the file's last contents rather than the values currently in effect on purpose: " +
+            "those have AWAKENER_* overrides merged into them, and rewriting from them would " +
+            "make a one-off environment variable permanent. Set it through the environment " +
+            "(AWAKENER_CONFIG_STORE_UNREADABLE_WRITE=REWRITE) when the file is the thing that " +
+            "cannot be read — `set` would have to read the file to record it there. Neither " +
+            "value can take the process down: this used to be an unhandled IOException.",
     )
 
     /**
