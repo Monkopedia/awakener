@@ -1055,10 +1055,50 @@ class SwayWindowManager(
      * the session ends, when a sweep raises under [SweepFailure.STOP], or on any other failure
      * under [CollectorFailure.REPORT] — and in every one of those cases [repairs] says which. The
      * only lever a caller has for stopping a collector before then is cancelling the scope it gave,
-     * which retires everything else on that scope too. That is deliberate rather than missing: two
-     * managers built on one scope both collect, and both sweeps are idempotent against the same
-     * tree, so there is nothing yet that a per-manager shutdown would buy. Restarting one is
-     * reconnection (#33).
+     * which retires everything else on that scope too.
+     *
+     * **So a caller that will ever replace a manager must give each one a scope of its own** — a
+     * child of the caller's, cancelled as the replacement is built, rather than one scope shared by
+     * both. Skipping that leaves the outgoing manager subscribed and sweeping, and the two sweeps
+     * do *not* agree. Restarting a manager is reconnection (#33), and that is where this stops
+     * being a rule about tests.
+     *
+     * **Two managers over one tree are not harmless, and their sweeps are not idempotent (#72).**
+     * This said the opposite — that both sweeps were idempotent against the same tree, so a
+     * per-manager shutdown bought nothing — and that was measurably false. A sweep asks
+     * [currentlyADock], which answers partly from the *asking* manager's [DockTable]: a dock is
+     * [DockOrigin.STOOD_UP] to the manager that stood it up and [DockOrigin.ADOPTED], or nothing at
+     * all, to every other manager, which has only the tree to read. One close event therefore gets
+     * two different answers — one manager reaps the dock, the other refuses — and whichever sweep
+     * lands first decides, with nothing recording that the other disagreed. That is not
+     * idempotence; it is a race whose result is manager-relative.
+     *
+     * **It is reachable at stock flags, not only under [ReapEvidence.STOOD_UP].** Stated here
+     * because the first correction of this KDoc got it wrong in the same direction the original
+     * was wrong — it claimed `STOOD_UP` was the only [WmFlags.reapEvidence] value with the
+     * property, which reads as "you have to opt in to be exposed". You do not. Under the default
+     * [ReapEvidence.CURRENT] the test is `stoodUp || <a dock mark readable now>`, and the first
+     * disjunct is memory. Any node a manager stood up is reapable *by that manager* however
+     * unreadable the tree has become, so a successor that cannot recognise the node at all still
+     * has a predecessor that will kill it. Measured, at stock flags, with two managers left
+     * overlapping and the race forced: a dock marked under a scheme this build no longer reads is
+     * left standing by the manager that adopted nothing and reaped by the manager that stood it
+     * up — 3 runs out of 3, in `a dock marked under the other scheme is reported and left
+     * standing`. What `STOOD_UP` changes is the *size* of the divergence, not its existence: there
+     * every adopted dock diverges rather than only the ones whose mark has gone or changed shape,
+     * which is why #56 surfaced there first and nowhere else.
+     *
+     * That was the mechanism behind #56, the repo's one known flaky test: it simulated an awakener
+     * restart by building a second manager and leaving the first collecting, and the leaked
+     * collector killed the dock the manager under test had correctly left standing. `a retired
+     * manager sweeps nothing, so a restart cannot race it` holds the retirement that fixes it.
+     *
+     * Whether the product should *prevent* overlap rather than requiring a caller to retire — a
+     * `close()` that unsubscribes and abandons the table, a sweep reading durable state instead of
+     * the asking manager's table, or overlap declared unsupported and enforced — is open in #72 and
+     * is deliberately not settled here. **Whoever settles it should know the blast radius is the
+     * default configuration**, not an opt-in: every argument for leaving overlap to the caller has
+     * to hold for a desktop that has changed no flags at all.
      */
     internal val repairing: Job = scope.launch { collectRepairs() }
 

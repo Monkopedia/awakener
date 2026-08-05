@@ -26,6 +26,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.job
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -39,6 +40,21 @@ import kotlinx.coroutines.yield
 class SwayBindingTest {
     private lateinit var sway: SwayHarness
     private lateinit var scope: CoroutineScope
+
+    /**
+     * The lifetime of the manager [wm] currently holds, and of nothing else.
+     *
+     * A child of [scope], so `tearDown` still takes everything down in one call — but cancellable
+     * on its own, which is what lets [restartAwakener] retire the manager it replaces. That is #56:
+     * `SwayWindowManager` starts its repair collector in its constructor and offers no `close()`,
+     * so rebinding [wm] over a manager built on the shared scope leaves the old collector
+     * subscribed to the same sway. Two collectors do not agree: a sweep answers partly from the
+     * asking manager's table, so a manager that stood a dock up reaps it while a manager that
+     * merely adopted it — or that cannot recognise it at all — refuses (#72). That holds at stock
+     * flags and is only *widest* under [ReapEvidence.STOOD_UP]. Which answer the tree ends up with
+     * was decided by timing.
+     */
+    private lateinit var wmScope: CoroutineScope
     private lateinit var wm: SwayWindowManager
     private lateinit var store: InMemoryConfigStore
     private lateinit var stateDir: Path
@@ -76,7 +92,40 @@ class SwayBindingTest {
         store = InMemoryConfigStore()
         stateDir = createTempDirectory("awakener-wm-bindings")
         registry = bindingStore()
-        wm = SwayWindowManager({ sway.connection() }, store, registry, scope)
+        wmScope = managerScope()
+        wm = SwayWindowManager({ sway.connection() }, store, registry, wmScope)
+    }
+
+    /** One manager's lifetime, granted from [scope] so that cancelling [scope] still ends it. */
+    private fun managerScope() = CoroutineScope(SupervisorJob(scope.coroutineContext.job))
+
+    /**
+     * An awakener restart: the running manager is retired and a fresh one comes up over the same
+     * sway session, the same marks and the same standing docks — which is all a restarted process
+     * would have.
+     *
+     * **Retiring the predecessor is the point, not tidiness.** A restart that leaves the old
+     * manager's collector subscribed is not a restart; it is two awakeners, and #56 is what that
+     * costs — the predecessor's sweep and the assertion race for the same dock, and under
+     * [ReapEvidence.STOOD_UP] they want opposite things. Cancelling the outgoing manager's scope is
+     * the only lever `SwayWindowManager` offers for stopping a collector, which is why each manager
+     * gets its own.
+     *
+     * Returns the retired manager, because what it does *after* being retired — nothing — is worth
+     * asserting on.
+     */
+    private suspend fun restartAwakener(): SwayWindowManager {
+        val outgoing = wm
+        // The scope's job rather than `repairing` alone, and joined rather than merely cancelled.
+        // `repairing` is the root the #56 race was measured through, but a manager launches two
+        // others on the scope it was given — the subscription behind `changes`, and a `detach` a
+        // closed handle starts — and joining the scope covers all three for one line. The join is
+        // the part that is load-bearing either way: `cancel` only asks, and returning while the
+        // old collector is still inside a sweep leaves the same race, just narrower.
+        wmScope.coroutineContext.job.cancelAndJoin()
+        wmScope = managerScope()
+        wm = SwayWindowManager({ sway.connection() }, store, bindingStore(), wmScope)
+        return outgoing
     }
 
     /**
@@ -218,7 +267,7 @@ class SwayBindingTest {
 
         // awakener restarts: a fresh manager with an empty table, over a tree and marks sway
         // has kept untouched.
-        wm = SwayWindowManager({ sway.connection() }, store, bindingStore(), scope)
+        restartAwakener()
         assertEquals(
             listOf(app.raw),
             wm.surfaces().map { it.id.raw },
@@ -365,14 +414,15 @@ class SwayBindingTest {
      */
     @Test
     fun `a dock adopted after a restart is still reaped when its surface closes`() = swayTest {
-        // What is under test is the *restarted* manager's sweep, working from the mark alone. The
-        // manager that stood the dock up is still collecting close events on this scope and would
-        // otherwise reap it from its own table first, which would prove nothing about adoption.
-        store.put(WmFlags.sweepOnClose, false)
+        // What is under test is the *restarted* manager's sweep, working from the mark alone. That
+        // used to need `sweep_on_close=false`, because the manager that stood the dock up was still
+        // collecting and would have reaped it from its own table first — proving nothing about
+        // adoption. `restartAwakener` retires it instead, so the event-driven path stays live and
+        // every sweep here is the adopting manager's.
         val app = openSurface("aw-app1")
         val dock = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1")).dockId
 
-        wm = SwayWindowManager({ sway.connection() }, store, bindingStore(), scope)
+        restartAwakener()
         assertEquals(
             listOf(app.raw),
             wm.surfaces().map { it.id.raw },
@@ -405,9 +455,10 @@ class SwayBindingTest {
      */
     @Test
     fun `a second attach on one surface leaves the first dock its own mark`() = swayTest {
-        // The manager that stood the docks up is still collecting close events on this scope and
-        // would reap from its own table, which would prove nothing about what the marks carry.
-        store.put(WmFlags.sweepOnClose, false)
+        // What the marks carry is the whole point here, so the manager that stood these docks up
+        // must not be the one that reaps them from its own table. That used to be bought with
+        // `sweep_on_close=false`; `restartAwakener` retires the manager instead, which buys it
+        // without also turning off the event-driven path this test then runs through.
         val app = openSurface("aw-app1")
         val first = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1")).dockId
         val second = wm.attach(app, dockFor("aw-dock2"), AgentId("agent-1")).dockId
@@ -429,7 +480,7 @@ class SwayBindingTest {
 
         // awakener restarts. The marks are the whole of what a fresh process knows, which is what
         // makes them worth being per-dock.
-        wm = SwayWindowManager({ sway.connection() }, store, bindingStore(), scope)
+        restartAwakener()
         assertEquals(
             listOf(app.raw),
             wm.surfaces().map { it.id.raw },
@@ -669,7 +720,7 @@ class SwayBindingTest {
             val dock = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1")).dockId
 
             // awakener restarts: the mark is all a fresh manager has, and adoption is all it can do.
-            wm = SwayWindowManager({ sway.connection() }, store, bindingStore(), scope)
+            restartAwakener()
             assertEquals(
                 listOf(app.raw),
                 wm.surfaces().map { it.id.raw },
@@ -686,6 +737,67 @@ class SwayBindingTest {
                 "and it is left standing, which is the price of refusing to kill on a mark",
             )
         }
+
+    /**
+     * #56 as its mechanism rather than as its symptom, and the reason [restartAwakener] retires the
+     * manager it replaces.
+     *
+     * The test above is the one that flaked — about 1 run in 20, in CI and on kaladin — because
+     * under [ReapEvidence.STOOD_UP] *every* adopted dock is a disagreement: the manager that stood
+     * the dock up holds `DockOrigin.STOOD_UP` for it and reaps, while the manager that adopted it
+     * from its mark holds `ADOPTED` and refuses. Leave both collecting and one close event gets
+     * both answers, with the assertion racing the predecessor's sweep for the same window.
+     *
+     * `STOOD_UP` is where that is *total*, not where it is possible. The default
+     * [ReapEvidence.CURRENT] reads `stoodUp || <a mark readable now>`, so two managers diverge
+     * there too wherever the successor cannot read the mark — measured in `a dock marked under the
+     * other scheme is reported and left standing`, which sets no `reap_evidence` at all and fails
+     * 3 runs out of 3 with the leak reintroduced and the race forced. Anything here that reads as
+     * "only under an opt-in" is wrong; this test is pinned at `STOOD_UP` because that is the
+     * cheapest place to observe the race, not the only one.
+     *
+     * So this one does not race it. The window is held open with [LEAKED_SWEEP_GRACE_MS] — the
+     * instrument from #56, where a delay in exactly this position turned a 1-in-20 flake into every
+     * run failing — and the retired manager is then asked directly what it swept. Reintroduce the
+     * leak by rebinding `wm` without retiring, and this fails every run instead of occasionally,
+     * which is the whole difference between a guard and a second lottery ticket.
+     *
+     * It says nothing about whether the *product* should stop two managers overlapping. That is
+     * #72's second half and it is open: this asserts only that a caller which retires one gets what
+     * retirement is for.
+     */
+    @Test
+    fun `a retired manager sweeps nothing, so a restart cannot race it`() = swayTest {
+        store.put(WmFlags.reapEvidence, ReapEvidence.STOOD_UP)
+        val app = openSurface("aw-app1")
+        val dock = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1")).dockId
+
+        val retired = restartAwakener()
+        assertTrue(
+            retired.repairing.isCompleted,
+            "retiring a manager has to stop its collector: a subscription that outlives the " +
+                "manager is a second opinion on every close event for the rest of the session",
+        )
+
+        command("[con_id=${app.raw}] kill")
+        awaitGone(app)
+        // The live manager's own sweep, which proves the close event reached a collector rather
+        // than that this test outran it — and then time enough for a leaked one to have acted.
+        awaitSweep()
+        delay(LEAKED_SWEEP_GRACE_MS)
+
+        assertEquals(
+            0,
+            retired.repairs.value.sweeps,
+            "a retired manager must sweep nothing: its table says it stood this dock up, so its " +
+                "sweep would kill the dock the live manager has just refused to",
+        )
+        assertNotNull(
+            wm.tree().find(dock.raw),
+            "and the dock stands, which is the decision the manager under test made and the " +
+                "only decision there is anybody left to make",
+        )
+    }
 
     /**
      * **Also a record of current behaviour rather than a fix**: what an upgrade over standing
@@ -708,9 +820,9 @@ class SwayBindingTest {
      */
     @Test
     fun `a dock marked under the other scheme is reported and left standing`() = swayTest {
-        // The manager that stood the dock up still holds a STOOD_UP entry for it and would reap
-        // from that, which would say nothing about what a fresh process reads from the mark.
-        store.put(WmFlags.sweepOnClose, false)
+        // The manager that stands this dock up holds a STOOD_UP entry for it and would reap from
+        // that, saying nothing about what a fresh process reads from the mark. `restartAwakener`
+        // retires it below, which is what leaves the assertion about the mark alone.
         store.put(WmFlags.dockMarkScheme, DockMarkScheme.DOCK_AND_SURFACE)
         val app = openSurface("aw-app1")
         val dock = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1")).dockId
@@ -721,7 +833,7 @@ class SwayBindingTest {
         // The upgrade this change is: same sway session, same standing dock, a build whose default
         // scheme wants a nonce in the mark that the mark standing there has not got.
         store.put(WmFlags.dockMarkScheme, DockMarkScheme.DOCK_SURFACE_AND_NONCE)
-        wm = SwayWindowManager({ sway.connection() }, store, bindingStore(), scope)
+        restartAwakener()
 
         assertEquals(
             setOf(app.raw, dock.raw),
@@ -1354,7 +1466,7 @@ class SwayBindingTest {
 
         command("[con_id=${app.raw}] kill")
         awaitGone(app)
-        wm = SwayWindowManager({ sway.connection() }, store, bindingStore(), scope)
+        restartAwakener()
         val reopened = openSurface("aw-app1")
 
         assertTrue(reopened != app, "sway must have minted a new con_id for the new window")
@@ -1920,6 +2032,17 @@ class SwayBindingTest {
 
     private companion object {
         const val WAIT_MS = 5_000L
+
+        /**
+         * How long a retired manager is given to misbehave before the one test that watches for it
+         * concludes it did not.
+         *
+         * A wait rather than a poll because what is being asserted is an *absence*, and the only
+         * honest instrument for an absence is time. 1.5s is the figure #56 was diagnosed with: a
+         * delay of it in that position took the flake from roughly 1 run in 20 to every run, on two
+         * trees and by two people, so it is comfortably wider than the window the race lives in.
+         */
+        const val LEAKED_SWEEP_GRACE_MS = 1_500L
 
         /**
          * The nonce a test writes when it is playing the user rather than awakener.
