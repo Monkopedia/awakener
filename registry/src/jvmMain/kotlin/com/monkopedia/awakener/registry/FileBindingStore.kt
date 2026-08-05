@@ -104,6 +104,20 @@ class FileBindingStore(
      */
     val unreadableKeys: List<String> get() = snapshot.unreadable.keys.toList()
 
+    @Volatile
+    private var unlocked: String? = null
+
+    /**
+     * Why the last write went ahead without the cross-process lock, if it did.
+     *
+     * The same shape as [loadError] and for the same reason: a store in this condition still
+     * answers, but it is degraded in a way only it can see. Unlocked writing *is* #50 — a holder
+     * putting its own view back over another process's `forget` — so it is reported wherever a
+     * degraded store is reported, and `awakener-registry` prints it beside its other warnings.
+     * Cleared as soon as a write does get the lock.
+     */
+    val lockError: String? get() = unlocked
+
     private val state = MutableStateFlow(snapshot.bindings)
 
     override val bindings: StateFlow<Map<SurfaceKey, Binding>> = state.asStateFlow()
@@ -198,14 +212,19 @@ class FileBindingStore(
      * A separate lock file rather than the bindings file itself, because the write replaces that
      * file by rename — a lock on the old inode would stop meaning anything the moment it landed.
      *
-     * **Both ways of not getting the lock degrade to running without it**, deliberately the same
-     * way: a state directory that will not take a lock file, and a filesystem that will not lock
-     * one (some network mounts), are the same situation from here. Refusing to bind would take
-     * the hotkey down on a live desktop, which is a worse failure than a possible lost update —
-     * and the write is atomic by rename over a per-process temporary, so the unlocked path can
-     * lose an update but cannot tear or corrupt the file. `OverlappingFileLockException` is
-     * *not* caught: that one means this process already holds the lock, which is a bug in the
-     * mutex above rather than a fact about the filesystem, and it should be loud.
+     * **Both ways of not getting the lock are the same situation from here**: a state directory
+     * that will not take a lock file, and a filesystem that will not lock one (an NFS home
+     * without `lockd`). What happens then is [RegistryFlags.lockRequired]'s call. By default the
+     * write goes ahead unlocked, because refusing to bind takes the hotkey down on a live
+     * desktop, and the write is atomic by rename over a per-process temporary — so the unlocked
+     * path can lose an update but cannot tear or corrupt the file. **That state is reported
+     * through [lockError] rather than assumed**: writing with no cross-process exclusion is #50's
+     * own failure mode, so a store doing it silently would reproduce the property that made #50
+     * severe — nothing tells the user to check.
+     *
+     * `OverlappingFileLockException` is *not* caught either way: that one means this process
+     * already holds the lock, which is a bug in the mutex above rather than a fact about the
+     * filesystem, and it should be loud.
      */
     private suspend fun <T> withFileLock(block: suspend () -> T): T {
         val channel = try {
@@ -215,21 +234,33 @@ class FileBindingStore(
                 StandardOpenOption.CREATE,
                 StandardOpenOption.WRITE,
             )
-        } catch (_: IOException) {
-            return block()
+        } catch (e: IOException) {
+            return degrade("cannot create the lock file", e) { block() }
         }
         return channel.use { open ->
             val held = try {
                 open.lock()
-            } catch (_: IOException) {
-                null
+            } catch (e: IOException) {
+                return@use degrade("the filesystem will not lock it", e) { block() }
             }
+            unlocked = null
             try {
                 block()
             } finally {
-                held?.release()
+                held.release()
             }
         }
+    }
+
+    /**
+     * Records that this store is about to write without cross-process exclusion, and does it —
+     * unless [RegistryFlags.lockRequired], in which case [cause] is the answer instead.
+     */
+    private suspend fun <T> degrade(why: String, cause: IOException, block: suspend () -> T): T {
+        if (config[RegistryFlags.lockRequired]) throw cause
+        unlocked = "$lockPath: $why (${cause.message}); binding without cross-process " +
+            "exclusion, so a concurrent `awakener-registry forget` can be undone"
+        return block()
     }
 
     /**

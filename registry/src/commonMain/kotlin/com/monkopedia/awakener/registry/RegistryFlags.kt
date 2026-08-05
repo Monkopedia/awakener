@@ -148,6 +148,16 @@ object RegistryFlags {
             "resolving to an agent that was forgotten until something makes it write.",
     )
 
+    val lockRequired = Flags.boolean(
+        "registry.store.lock_required",
+        false,
+        "Whether a store refuses to write when it cannot take the cross-process lock on its " +
+            "bindings file. Off keeps the hotkey working on a filesystem that will not lock (an " +
+            "NFS home without lockd), reporting the degradation rather than hiding it, at the " +
+            "cost that a concurrent `awakener-registry forget` can be lost. On refuses to bind " +
+            "at all rather than write without exclusion.",
+    )
+
     val forgetConflict = Flags.enum(
         "registry.binding.forget_conflict",
         ForgetConflict.FORGET_WINS,

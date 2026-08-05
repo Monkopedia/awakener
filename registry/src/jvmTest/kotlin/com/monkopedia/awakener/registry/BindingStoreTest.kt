@@ -1,6 +1,8 @@
 package com.monkopedia.awakener.registry
 
 import com.monkopedia.awakener.config.InMemoryConfigStore
+import java.io.IOException
+import java.nio.file.Files
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.exists
 import kotlin.io.path.isDirectory
@@ -9,6 +11,7 @@ import kotlin.io.path.writeText
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
@@ -209,6 +212,36 @@ class BindingStoreTest {
 
         assertTrue(store().unbind(key))
         assertEquals(original.agent, holder.bind(key).agent, "the stale map wins, as documented")
+    }
+
+    /**
+     * A store that cannot lock is writing the way the pre-fix store did, so it has to say so —
+     * silently trading the guarantee back is #50's own property, where nothing tells the user to
+     * look. The lock file is a *directory* here, which is the one way to make `FileChannel.open`
+     * fail on a host whose filesystems all lock; the acquisition arm degrades identically and
+     * needs an NFS mount without `lockd` to reach.
+     */
+    @Test
+    fun `a store that cannot take the lock still binds and reports it`() = runTest {
+        val store = store()
+        Files.createDirectories(dir.resolve("bindings.json.lock"))
+
+        store.bind(SurfaceKey.Window("firefox"))
+
+        val degraded = assertNotNull(store.lockError, "an unlocked write must not be silent")
+        assertTrue(degraded.contains("forget"), degraded)
+        assertTrue(store.path.readText().contains("window:firefox"), "and the bind still happened")
+    }
+
+    /** The other half of the trade: refuse the write rather than make it without exclusion. */
+    @Test
+    fun `an operator can require the lock instead of degrading`() = runTest {
+        config.put(RegistryFlags.lockRequired, true)
+        val store = store()
+        Files.createDirectories(dir.resolve("bindings.json.lock"))
+
+        assertFailsWith<IOException> { store.bind(SurfaceKey.Window("firefox")) }
+        assertFalse(store.path.exists(), "nothing was written")
     }
 
     /**

@@ -51,8 +51,13 @@ object CrossProcessBindProbe {
  * this module runs in one JVM, where the per-path `Mutex` alone is enough — delete the
  * `FileChannel.lock` and the rest of the suite stays green. This test is the guard on the file
  * lock itself: two JVMs, one bindings file, every write a read-modify-write, and nothing may be
- * lost. Without the lock it fails two ways at once, both observed: about half the bindings go
- * missing, and a process dies on the staging file another one renamed out from under it.
+ * lost.
+ *
+ * Without the lock it fails exactly one way, measured: **roughly 40% of the bindings are lost,
+ * every round**. Only lost — the per-process staging file means an unlocked write cannot tear
+ * the file or take a probe down with it, so `exitValue() == 0` and a parseable file both hold
+ * on the way to the failure. Those two assertions stay because they guard other defects; a
+ * counterfactual that trips three at once would say less about which mechanism broke, not more.
  */
 class CrossProcessBindingTest {
     private val dir = createTempDirectory("awakener-cross-process")
@@ -115,8 +120,11 @@ class CrossProcessBindingTest {
 
     private companion object {
         /**
-         * Enough overlap that an unlocked run loses bindings every time rather than sometimes:
-         * at 150 each it was 5 for 5, losing about half and taking a process down with it.
+         * Enough overlap that an unlocked run loses bindings every round rather than on a lucky
+         * interleaving. At 150 each, removing `FileChannel.lock` lost 101–126 of the 300 across
+         * three rounds here and 111–126 across three more on the reviewer's host: six for six,
+         * never near the zero-loss boundary, so the constant is not sitting on a threshold. It
+         * costs about 2.5s locked, which is what stops it going higher.
          */
         const val BINDS_PER_PROCESS = 150
         const val BARRIER_DELAY_MS = 2000L
