@@ -31,7 +31,23 @@ object RegistryPaths {
      */
     fun residueDir(config: Config, storePath: Path): Path =
         config[RegistryFlags.residueDir].takeIf { it.isNotBlank() }?.let(::Path)
-            ?: storePath.parent.resolve("residue")
+            ?: storePath.holder().resolve("residue")
+
+    /**
+     * The directory [this] sits in, for a path that may be relative.
+     *
+     * `Path.getParent` answers null for a bare filename — `registry.store.path: "bindings.json"`
+     * is a perfectly reasonable thing to type — and Kotlin sees `Path!` back from the Java API,
+     * so nothing at the call site was nullable and the NPE landed on the bind path, one module
+     * and several calls away from the line that was edited. Resolving against the working
+     * directory first is also what the value meant: a relative bindings file is relative to
+     * somewhere, and that somewhere is where its residue belongs too.
+     *
+     * A path with no parent even when absolute is a filesystem root, which is not a bindings
+     * file at all; it keeps itself, so the failure is a report about a directory rather than a
+     * throw about a null.
+     */
+    private fun Path.holder(): Path = toAbsolutePath().let { it.parent ?: it }
 
     fun residueLocation(config: Config, storePath: Path, key: SurfaceKey): Path =
         residueDir(config, storePath)

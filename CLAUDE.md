@@ -23,7 +23,7 @@ is the ephemeral per-task coordinator.
 JAVA_HOME=/usr/lib/jvm/java-21-openjdk ./gradlew build
 ```
 
-That is the full autonomous check — it compiles both modules and runs all tests, including
+That is the full autonomous check — it compiles every module and runs all tests, including
 the `:wm` integration suite against a real headless sway.
 
 - **The REQUIRE flags are the protection.** `AWAKENER_REQUIRE_SWAY=1` — and
@@ -42,9 +42,47 @@ the `:wm` integration suite against a real headless sway.
 - "BUILD SUCCESSFUL" alone still distinguishes nothing. If you add a tool-gated test, gate it
   with an assumption, never with a bare `return` — and if you add a new gate, declare what it
   reads as a test input. `org.gradle.caching=true`, and Gradle treats neither `PATH` nor the
-  environment as an input, so `wm/build.gradle.kts` and `registry/build.gradle.kts` name the
-  tool presence and the REQUIRE flags explicitly. Without that the build cache will replay a
-  run that skipped everything into a `clean build` that demanded the tools.
+  environment as an input, so every build script whose tests can be tool-gated names the tool
+  presence and the REQUIRE flags explicitly as task inputs. Without that the build cache will
+  replay a run that skipped everything into a `clean build` that demanded the tools. That is a
+  property each such build script has to hold for itself; there is no list of them here,
+  because a list is one more thing to forget to update when a module gains its first gated
+  test.
+- **A run measures one tree, and `main` moves under you.** Every count above describes the
+  tree the run ran against. Counts from a branch that `main` has since left describe a tree
+  that will not exist after the merge, and nothing in the output says so. A PR's numbers are
+  only meaningful if `origin/main`'s tip is an ancestor of its head — one line, run by the
+  implementer before opening and by the reviewer before believing any number in the body:
+
+  ```sh
+  git fetch origin && git merge-base --is-ancestor origin/main HEAD && echo current || echo STALE
+  ```
+
+  On `STALE`, rebase or merge and **re-run**, then report the new counts. `mergeStateStatus:
+  CLEAN` does **not** imply this — that field answers whether the merge would conflict, which
+  is a different question. #59 merged `CLEAN` reporting an honest, XML-read 176 tests /
+  skipped=0 / failures=0 against a tree `main` had already advanced past to 201. A conflict
+  announces itself; staleness does not.
+
+  **The check is ancestry, but the question is reach.** An intervening merge that cannot reach
+  what the numbers measure does not invalidate them, and re-running against it spends a full
+  build to reproduce the same figure. The exemption is the *argument*, though, and the argument
+  has to be **stated**: *"`44c03f3` is `CLAUDE.md` only, so #61's 205 tests / skipped=0 still
+  describe the merged tree."* Unstated it is indistinguishable from never having checked —
+  nothing on the page separates a considered "this merge cannot reach the suite" from a
+  forgotten `git fetch`, and the reviewer has to treat the two the same way. Judge reach by
+  what the merge touches, not by how small it looks: a shared build script, a test harness, or
+  `:config` reaches everything and never qualifies, however few lines it is. Positively, what
+  *does* qualify is a merge whose every changed path is one **neither the build nor the tests
+  read** — docs and findings notes, or a module neither the suite nor anything it depends on
+  compiles against. `44c03f3` qualifies because `CLAUDE.md` sits on no compile or runtime
+  classpath, is read by no build script, and is opened by no test. If you cannot name that
+  property for every path in the merge, it does not qualify.
+
+  **Same shape as the known-flake exemption** (#56): both claim a diff *cannot reach* a result,
+  both are argued per case from what the diff actually touches, and neither is ever discharged
+  by looking the case up on a list of things previously agreed to be harmless. An agent who
+  understands one should recognise the other on sight.
 - `:wm` needs a live compositor, so "no automated test for this window behaviour" is not the
   defect it would be elsewhere — but a PR must say what it exercised and against which sway
   version.
@@ -97,17 +135,42 @@ conversation, not a local workaround.
   (`~/kaladin-netconsole/kernel.log`), and a 15s load/thermal sampler at
   `/var/log/kaladin-load.log`. Cause unproven. Keep concurrent heavy work modest and prefer
   targeted module tests over repeated full builds.
-- **adolin** — the desktop, and awakener's actual target. GPU, active seat0, running
-  **GNOME Shell**. `google-chrome-stable` and `xorg-xwayland` installed. Reachable by
-  passwordless ssh from kaladin, but **sudo there requires a password** — Jason runs
-  installs on adolin himself.
-- **No tabbed WM is installed on either host.** The dock design depends on i3/sway tree
-  semantics, so it has nowhere to run for real yet. `WLR_BACKENDS=headless sway` gives a
-  genuine sway tree drivable entirely over ssh via `swaymsg` — that is how structural probes
-  should run, and it needs no display and no change to Jason's GNOME session.
-- **No Waydroid and no binder module** (`binder_linux` absent). Test 1 (occlusion lifecycle)
-  is gated on a DKMS kernel module on Jason's daily driver, so it is not something to set up
-  autonomously.
+- **adolin** — the desktop, and awakener's actual target. GPU, active seat0 on tty2, running
+  **GNOME Shell**. Known present: `google-chrome-stable`, `xorg-xwayland`, `sway 1.12`,
+  `foot 1.27.0`, `waydroid 1.6.3`, `spanreed`, `jq`, `qemu`. Reachable by passwordless ssh
+  from kaladin, but **sudo there requires a password** — Jason runs any *further* installs
+  himself.
+
+  **This file does not say what adolin is missing. Check, don't assume:**
+  `ssh adolin 'bash -lc "command -v <tool>"'`. The **login shell is load-bearing** — some
+  tools are per-user `uv` installs under `~/.local/bin`, invisible to `pacman -Q` and off
+  `PATH` in a non-login ssh. `spanreed` is one, and reading it as absent is how you end up
+  asking Jason for a password-gated install of something already there.
+
+  The asymmetry is why there is no absent list. A **present** entry is self-confronting: you
+  act on it by using the tool, so a wrong one fails loudly at the point of use. An asserted
+  **absence** is the one shape no use can falsify, because you act on it by not trying, and a
+  wrong one is discharged by silence. This bullet claimed three tools absent that were
+  installed — the third while correcting the first two.
+- **Neither host runs a tabbed WM as its session** — adolin's is GNOME Shell on seat0,
+  kaladin has no seat at all. The dock design depends on i3/sway tree semantics, so it has
+  nowhere to run *for real* yet. Installed is a different question, and the answer is **both
+  hosts, not one**: `sway 1.12` and `foot 1.27.0` are on kaladin *and* on adolin, explicitly
+  installed there on 2026-07-30 — the same day this section was first written and marked
+  verified. CI installs them too, and the `:wm` and `:cli` suites drive sway on every build.
+  `WLR_BACKENDS=headless sway` gives a genuine sway tree drivable entirely over ssh via
+  `swaymsg` — that is how structural probes should run, and it needs no display and no change
+  to Jason's GNOME session.
+- **Waydroid runs on kaladin, and Test 1 (occlusion lifecycle) is answered** — under qemu on
+  2026-07-30 and natively on 07-31; see `docs/findings/`. **Nothing was gated on a DKMS
+  module**: the LTS kernel's `CONFIG_ANDROID_BINDER_IPC_RUST=y` driver serves Waydroid
+  unmodified, `/dev/binderfs` is mounted, and `/usr/bin/waydroid` is installed. What remains
+  open is narrower — both runs were software-rendered, so buffer back-pressure from a
+  gbm/DRM-backed Waydroid is untested and needs adolin's real GPU. **That is no longer an
+  install.** Waydroid 1.6.3 has been on adolin since 2026-07-31, `/var/lib/waydroid` is
+  initialised, and `waydroid-container` is active with the session stopped. What is left is a
+  session started against Jason's live seat — his call to make, not a package for him to
+  fetch.
 
 ## Flags first (owner directive, 2026-07-30)
 
@@ -121,10 +184,17 @@ behaviours, *build both and add the switch* rather than asking which he wants.
   self-documenting instead of a hand-maintained list that drifts.
 - **The name and the package are load-bearing**: `FlagDiscovery` finds declaring classes by
   scanning the classpath for `com.monkopedia.awakener.**` classes whose name ends in `Flags`,
-  and `:cli` depends on every module in the build. Give it a prefix — a class named exactly
-  `Flags` is the registry itself and is skipped. Follow the convention and a new module's
-  flags show up in `list` with no registration step anywhere; deviate and they are invisible
-  until someone names the class in `config.flags.declarations`.
+  and `:cli` depends on every module in the build. Exactly one class is excluded, and it is
+  excluded by its **whole path** — `com.monkopedia.awakener.config.Flags`, the registry, which
+  registers nothing. A prefix is conventional, not required: `Flags` is a simple name any
+  package may mint, so `com.monkopedia.awakener.chrome.Flags` is a declarer and *is*
+  discovered. Excluding by *simple* name was a bug — it dropped exactly that class with
+  nothing in `FlagDiscovery.Report.problems` to say so — and a fixture wired to nothing
+  (`cli/src/jvmTest/kotlin/com/monkopedia/awakener/futuremodule/Flags.kt`) plus its test hold
+  the fix. Follow the convention and a new module's flags show up in `list` with no
+  registration step anywhere; deviate — a package outside `com.monkopedia.awakener`, or a name
+  that does not end in `Flags` — and they are invisible until someone names the class in
+  `config.flags.declarations`.
 - Defaults must be the behaviour you would have hard-coded, so an unconfigured system is
   correct.
 - `:config` reloads on file change, so a flag flip applies to a live daemon. Never cache a
@@ -132,6 +202,16 @@ behaviours, *build both and add the switch* rather than asking which he wants.
 - A snapshot is total: a bad value degrades to that flag's default and is reported through
   `Config.problems`. The config file gets hand-edited against a running desktop, so a typo
   must not take the process down.
+- **"Bad value" includes one that decodes and is out of range.** A flag whose sane values are
+  narrower than its type says so — `Flags.int(key, default, description, Flags.within(1..100))`,
+  `Flags.atLeast(0L)`, or `Flags.requires("…") { … }` for anything else. `Config.of` then reports
+  it and `Config.get` degrades it exactly like a value that will not parse, `set` refuses it
+  outright, and `awakener-config list` prints the range. Declare the requirement rather than
+  coercing at the read site: coercing keeps the process up and tells nobody, which is the
+  failure that costs the most to diagnose. For a rule spanning two flags — one flag's grace
+  period outlasting another's wait — use `Flags.constraint(key, description) { config -> … }`
+  from the same `*Flags` object; it reports and degrades nothing, because a pair that
+  contradicts itself has no single key to degrade.
 
 ## Working agreements
 
@@ -184,10 +264,20 @@ From `docs/design.md`; these bind agent work here:
 - **`:wm` needs a live compositor**, so "no automated test for this window-management
   behavior" is *not* the defect it would be in a pure-JVM module. But a PR touching it must
   state what was exercised against a live compositor, and at which version.
-- **All bot writes go through the `coderbot` wrapper by its FULL path**
-  (`/home/jmonk/git/urithiru/coder-bot/coderbot`), never bare `coderbot` and never plain
-  `gh` — plain `gh` runs as `Monkopedia` and silently misattributes bot actions to the
-  owner.
+- **Every bot write goes through a wrapper by its FULL path**, never bare and never plain
+  `gh` — plain `gh` runs as `Monkopedia` and silently misattributes bot actions to the owner.
+  **Which wrapper depends on whether you are authoring or reviewing, and they are not
+  interchangeable:**
+  - **Authoring** — commits, pushes, `pr create`, issue writes:
+    `/home/jmonk/git/urithiru/coder-bot/coderbot`.
+  - **Reviewing** — `pr review`, review comments, and the merge:
+    `/home/jmonk/git/urithiru/reviewer-bot/reviewerbot`.
+
+  A reviewer that reaches for `coderbot` **cannot review a PR the coder bot authored**: GitHub
+  rejects it with *"Can not request changes on your own pull request."* That failure lands at
+  the moment the verdict is posted — after the entire review is done — so it reads as a broken
+  tool rather than the wrong identity. Two identities is what makes the trail a real second
+  pair of eyes instead of the author signing off their own work.
 - **Commit style**: subject ≤ 70 chars, present tense; body explains *why*. Co-author
   trailer on agent commits.
 - **A reviewer must be explicitly spawned.** Opening a PR with `--reviewer` sets an inert

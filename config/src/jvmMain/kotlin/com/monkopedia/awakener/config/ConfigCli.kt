@@ -68,6 +68,12 @@ object ConfigCli {
                     if (flag.choices.isNotEmpty()) {
                         out("  ${" ".repeat(width)}  one of: ${flag.choices.joinToString(", ")}")
                     }
+                    // Printed for the same reason `choices` is: a range that only exists in the
+                    // declaring module is a range the person editing the file finds out about
+                    // by getting it wrong.
+                    if (flag.requirement.isNotEmpty()) {
+                        out("  ${" ".repeat(width)}  must be ${flag.requirement}")
+                    }
                 }
                 out("")
                 out("* = overridden; edit ${defaultPath()} or use `set`. Changes apply live.")
@@ -81,6 +87,11 @@ object ConfigCli {
                 0
             }
 
+            // Both write arms catch Exception rather than IllegalArgumentException. The write
+            // path touches the filesystem, so the reachable failures are not all about the
+            // argument — an unreadable file, a directory that has gone — and the one guarantee
+            // this CLI owes a hand-edited config is that it answers instead of printing a stack
+            // trace. A refusal that names the file is a report; an escaping IOException is not.
             "set" -> {
                 val key = args.getOrNull(1) ?: return usage(out, "set needs a flag key")
                 val raw = args.getOrNull(2) ?: return usage(out, "set needs a value")
@@ -88,8 +99,12 @@ object ConfigCli {
                     runBlocking { store.set(key, raw) }
                     out("$key = $raw")
                     0
-                } catch (e: IllegalArgumentException) {
-                    usage(out, e.message ?: "invalid value")
+                } catch (e: Exception) {
+                    // `e.toString()` rather than a stand-in like "invalid value": catching
+                    // broadly also catches things that are not about the argument, and naming
+                    // one of those as a bad value would be a wrong answer rather than a vague
+                    // one. A message-less exception at least says what it was.
+                    usage(out, e.message ?: e.toString())
                 }
             }
 
@@ -99,7 +114,7 @@ object ConfigCli {
                     runBlocking { store.unset(key) }
                     out("$key reset to default")
                     0
-                } catch (e: IllegalArgumentException) {
+                } catch (e: Exception) {
                     usage(out, e.message ?: "unknown flag")
                 }
             }
