@@ -161,7 +161,20 @@ jobs:
   # thing being reported on.
   test-artifacts:
     needs: build
-    if: always()
+    # `!cancelled()` and not `always()`, and the difference is the whole subject of this PR.
+    #
+    # The upload steps carry `if: always()`, so on a cancelled run they still execute and can
+    # still fail — and under `always()` this job would then go **red**. A red check is a
+    # positive claim that something went wrong with the artifacts, and a cancelled run is an
+    # *absence of evidence*, not a fault. Reporting one as the other is the same defect as
+    # #57 and #73, one level down, in the very check meant to fix them. Observed, not
+    # theorised: run 30998115901 on #77's branch came back `build: cancelled` +
+    # `test-artifacts: failure`.
+    #
+    # `!cancelled()` still runs the job when `build` fails — which is the case that matters,
+    # since a failed build with intact evidence must show green here — and skips it when the
+    # run is cancelled, so the check reads "no verdict" rather than asserting one.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - name: Report whether the test evidence was captured
@@ -170,9 +183,18 @@ jobs:
           XML: ${{ needs.build.outputs.xml-upload }}
           HTML: ${{ needs.build.outputs.html-upload }}
         run: |
+          echo "This check reports one thing: whether an artifact upload step failed."
+          echo "It is not a claim that the evidence is complete — read the build check for that."
           echo "build job: ${BUILD:-unknown}"
-          echo "JUnit XML upload: ${XML:-did-not-run}"
-          echo "HTML report upload: ${HTML:-did-not-run}"
+          echo "JUnit XML upload: ${XML:-no-outcome-reported}"
+          echo "HTML report upload: ${HTML:-no-outcome-reported}"
+          if [ -z "$XML" ] && [ -z "$HTML" ]; then
+            # The build job ended without either upload step reporting an outcome — a lost
+            # runner, or a failure before the steps were reached. Nothing was measured, so
+            # say that rather than passing silently as though it had been.
+            echo "::notice title=No upload outcome::The build job (result: ${BUILD:-unknown}) reported no upload outcome at all, so this check measured nothing."
+            exit 0
+          fi
           rc=0
           if [ "$XML" = "failure" ]; then
             echo "::error title=JUnit XML not uploaded::The test-results-xml artifact failed to upload. The build's own result is unaffected; what is missing is the evidence for it."
@@ -182,7 +204,7 @@ jobs:
             echo "::error title=HTML report not uploaded::The test-report-html artifact failed to upload."
             rc=1
           fi
-          if [ "$BUILD" = "cancelled" ] || [ "$BUILD" = "skipped" ]; then
-            echo "The build job did not run to completion ($BUILD), so there was nothing to capture."
+          if [ "$rc" = "1" ] && [ "$BUILD" != "success" ]; then
+            echo "::notice title=Read both checks::The build job's own result was $BUILD. That is a separate fact from the upload failure above; neither one implies the other."
           fi
           exit $rc
