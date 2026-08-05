@@ -598,8 +598,17 @@ class SwayWindowManager(
     suspend fun tree(): Node =
         swayJson.decodeFromString(commands.request(I3Ipc.Request.GET_TREE))
 
-    /** A tree node as the compositor-agnostic thing above this module sees. */
-    private fun Node.asSurface(): Surface = Surface(SurfaceId(id), appId, name, pid)
+    /**
+     * A tree node as the compositor-agnostic thing above this module sees.
+     *
+     * One conversion for both readers, which is the point of it existing: [surfaces] wants the
+     * whole [Surface] — [Surface.focused] included, which is what the hotkey entry point reads
+     * to mean "this window" (#55) — and [resolve] wants only [Surface.descriptor], where
+     * `focused` is deliberately absent because two windows of one app are the same surface
+     * whichever is focused now. Keeping them one function is what stops the two from drifting
+     * on which fields a node contributes.
+     */
+    private fun Node.asSurface(): Surface = Surface(SurfaceId(id), appId, name, pid, focused)
 
     /**
      * The durable key for a live **bindable** window, or null if it has gone or is a dock.
@@ -906,7 +915,13 @@ class SwayWindowManager(
                         "new" -> trySend(
                             SurfaceChange.Appeared(
                                 id,
-                                Surface(id, container.appId, container.name, container.pid),
+                                Surface(
+                                    id,
+                                    container.appId,
+                                    container.name,
+                                    container.pid,
+                                    container.focused,
+                                ),
                             ),
                         )
                         "close" -> trySend(SurfaceChange.Vanished(id))

@@ -1,8 +1,6 @@
 package com.monkopedia.awakener.registry
 
 import com.monkopedia.awakener.config.ConfigCli
-import com.monkopedia.awakener.config.FileConfigStore
-import com.monkopedia.awakener.config.Flags
 import kotlin.system.exitProcess
 import kotlinx.coroutines.runBlocking
 
@@ -71,8 +69,15 @@ object RegistryCli {
 }
 
 fun main(args: Array<String>) {
-    Flags.requireLoaded(RegistryFlags)
-    val configStore = FileConfigStore(ConfigCli.defaultPath())
+    // The shared bootstrap, not `Flags.requireLoaded(RegistryFlags)` alone: registering this
+    // module's own flags and stopping there leaves a snapshot that calls every `wm.*` and
+    // `config.*` key in the file one no flag declares (#45). It is launched off `:cli`'s
+    // classpath precisely so discovery can see them.
+    val configStore = ConfigCli.bootstrap(out = ::println)
+    // Same reporting `awakener-config` gives: a snapshot is total, so a bad value silently
+    // becomes its default unless somebody says so. This is also what makes the bootstrap above
+    // observable — without it, every key of another module's was called unknown in silence.
+    configStore.config.value.problems.forEach { println("warning: ${it.key}: ${it.reason}") }
     val store = FileBindingStore(configStore, SpanreedCli(configStore))
     exitProcess(RegistryCli.run(args, store, ::println))
 }
