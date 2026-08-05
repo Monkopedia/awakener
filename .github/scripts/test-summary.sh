@@ -19,7 +19,16 @@ set -uo pipefail
 
 cd "${1:-.}" || exit 0
 
-summary=${GITHUB_STEP_SUMMARY:-/dev/stdout}
+# Everything goes to stdout, and to the step summary as well when there is one. The summary
+# is where a human will look; the log is the only one of the two an API can read back, which
+# matters when the reader is an agent asked to confirm what a run established.
+emit() {
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    tee -a "$GITHUB_STEP_SUMMARY"
+  else
+    cat
+  fi
+}
 
 shopt -s nullglob
 files=(*/build/test-results/*/*.xml)
@@ -34,7 +43,7 @@ if [ ${#files[@]} -eq 0 ]; then
     echo "### Test counts (from the JUnit XML)"
     echo
     echo 'No JUnit XML found under `*/build/test-results/*/*.xml`.'
-  } >> "$summary"
+  } | emit
   exit 0
 fi
 
@@ -85,6 +94,6 @@ read -r _ tot_suites tot_tests tot_skipped tot_failures tot_errors <<< "$total"
   else
     echo '> `skipped` is zero, so every tool-gated test executed rather than opting out.'
   fi
-} >> "$summary"
+} | emit
 
 exit 0

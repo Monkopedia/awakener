@@ -103,8 +103,10 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       # tests=/skipped=/failures= are the doctrine's control for a run that verified nothing.
-      # Put them in the run summary so applying that control does not require downloading
-      # anything at all. The script says why it reports rather than gates.
+      # Put them in the run summary and in the step log, so applying that control needs no
+      # download — the summary for a human, the log because that is the one an API can read
+      # back, and the reader here is as often an agent as a person. The script says why it
+      # reports rather than gates.
       - name: Summarise test counts
         if: always()
         run: .github/scripts/test-summary.sh
