@@ -28,6 +28,28 @@ enum class WhenAnimated {
     SECOND_DOCK,
 }
 
+/** How much a hotkey press prints when something on the bind path raises. */
+enum class FailureDetail {
+    /**
+     * The message alone, on stderr, as `error: <message>`.
+     *
+     * The default because the raises this catches are largely *deliberate* — `liveAgents`
+     * refuses to answer an unreadable bus as an empty one, and says why in its message — and a
+     * sentence saying what went wrong is the whole of what a person who just pressed a key can
+     * use. A stack trace on a hotkey press is a report nobody reads.
+     */
+    MESSAGE,
+
+    /**
+     * The message, and the stack trace under it.
+     *
+     * For the other half of the same problem: a message is what makes a hotkey say something
+     * useful, and a trace is what makes it debuggable. Both are wanted, at different times, by
+     * the same person — which is exactly the shape a flag is for.
+     */
+    TRACE,
+}
+
 /**
  * How a hotkey turns a Drab into a Lifeless.
  *
@@ -87,6 +109,23 @@ object InvokeFlags {
             "Reusing declines to stand a second panel, since two sessions under one identity " +
             "accumulate two divergent residues; SECOND_DOCK stands another anyway, which is the " +
             "deliberate second view onto one agent.",
+    )
+
+    /**
+     * How much a press that raised prints, and where.
+     *
+     * See [FailureDetail] for why both answers are wanted by the same person at different
+     * times. What makes this a `:cli` flag rather than a `:registry` one is that the raises it
+     * governs come from every layer at once — `:wm`, `:registry` and `:config` — and the
+     * composition root is the only place that sees all of them.
+     */
+    val failureDetail = Flags.enum(
+        "invoke.failure.detail",
+        FailureDetail.MESSAGE,
+        "How much a failed hotkey press prints to stderr. MESSAGE prints `error: <message>`, " +
+            "which is what the deliberate refusals on this path — an unreadable bus, an id " +
+            "spanreed did not issue — already say in as many words. TRACE adds the stack trace " +
+            "under it, which is the same failure made debuggable rather than merely legible.",
     )
 
     /**

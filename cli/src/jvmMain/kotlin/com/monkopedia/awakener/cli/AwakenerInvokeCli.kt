@@ -1,6 +1,7 @@
 package com.monkopedia.awakener.cli
 
 import com.monkopedia.awakener.config.ConfigCli
+import com.monkopedia.awakener.config.FileConfigStore
 import com.monkopedia.awakener.registry.FileBindingStore
 import com.monkopedia.awakener.registry.SpanreedCli
 import com.monkopedia.awakener.wm.SurfaceId
@@ -114,17 +115,52 @@ object AwakenerInvokeCli {
 }
 
 /**
+ * The entry point, and the one place that turns a raised failure into something a person can
+ * read. See [awaken] for the wiring; the only thing that happens here is the decision about
+ * what a hotkey press says when the bind path refuses.
+ */
+fun main(args: Array<String>) {
+    // Warnings go to stderr rather than stdout: this one's stdout is what a hotkey press reports
+    // about the surface it acted on.
+    //
+    // Outside the handler below, and it is the one thing that is: the handler reads
+    // `invoke.failure.detail` off this store, so there is nothing for it to consult until this
+    // returns. It is also the one call here that is contracted not to raise — `:config`'s whole
+    // rule is that a hand-edited file degrades to defaults and reports through `loadError` and
+    // `Config.problems` rather than taking the process down.
+    val store = ConfigCli.bootstrap(out = System.err::println)
+
+    val status = try {
+        awaken(args, store)
+    } catch (e: Exception) {
+        // The composition root is the only place that can see every raise from `:wm`,
+        // `:registry` and `:config` at once, so it is where the decision belongs. Some of what
+        // arrives here is deliberate — `liveAgents` refuses to answer an unreadable bus as an
+        // empty one, and `mint` refuses an id spanreed did not issue — and a deliberate refusal
+        // that reaches the user as a JVM stack trace on a key press is a report nobody reads.
+        //
+        // `Exception` and not `Throwable`, the same width `ConfigCli` uses: everything raised on
+        // purpose is one, and an `Error` is not a thing this process can report its way out of.
+        System.err.println("error: ${e.message ?: e.toString()}")
+        if (store.config.value[InvokeFlags.failureDetail] == FailureDetail.TRACE) {
+            e.printStackTrace(System.err)
+        }
+        1
+    }
+    exitProcess(status)
+}
+
+/**
  * The composition root, and the only place that knows both which store and which compositor.
  *
  * [Awakening] is handed a `WindowManager` and two lambdas rather than the concrete types, so the
  * loop itself stays incurious about sway and about how residue is laid out on disk. Everything
  * that has to know is here.
+ *
+ * Split out of [main] so that every raise inside it — from `:wm`, `:registry` or `:config`, and
+ * including the ones made on purpose — passes through one handler on the way out.
  */
-fun main(args: Array<String>) {
-    // Warnings go to stderr rather than stdout: this one's stdout is what a hotkey press reports
-    // about the surface it acted on.
-    val store = ConfigCli.bootstrap(out = System.err::println)
-
+private fun awaken(args: Array<String>, store: FileConfigStore): Int {
     val spanreed = SpanreedCli(store)
     val bindings = FileBindingStore(store, spanreed)
     bindings.loadError?.let {
@@ -140,7 +176,7 @@ fun main(args: Array<String>) {
     val socket = store.config.value[WmFlags.socketPath].ifBlank { null }
     val wm = SwayWindowManager({ SwayConnection.open(socket) }, store, bindings, scope)
 
-    val status = try {
+    return try {
         runBlocking {
             AwakenerInvokeCli.run(
                 args,
@@ -160,5 +196,4 @@ fun main(args: Array<String>) {
         // manager retires the collector and its connection and leaves every panel standing.
         scope.cancel()
     }
-    exitProcess(status)
 }

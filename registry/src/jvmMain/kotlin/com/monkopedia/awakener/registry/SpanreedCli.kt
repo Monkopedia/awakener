@@ -12,9 +12,77 @@ import kotlinx.serialization.json.Json
 /** spanreed's registry is its shape to grow, so an unknown field must never fail a hotkey. */
 private val busJson = Json { ignoreUnknownKeys = true }
 
-/** The outcome of running a subprocess. */
-data class ProcessResult(val exitCode: Int, val stdout: String, val stderr: String) {
-    val succeeded: Boolean get() = exitCode == 0
+/**
+ * The outcome of running a subprocess.
+ *
+ * ### Why [shortRead] exists
+ *
+ * A child's exit does not close a pipe a grandchild inherited, so the collecting side has to be
+ * able to stop waiting and keep what arrived — see the drain inside [ProcessCommandRunner]. That
+ * leaves a result whose [stdout] is a *prefix* of what the child meant to say, on a run that
+ * exited 0.
+ * Until this field existed there was no way to tell the two apart, and the consequence was not
+ * cosmetic: `spanreed agent-id` prints one line, and a prefix of an agent id is itself a
+ * perfectly valid agent id. A surface bound under one addresses somebody else's Lifeless — and
+ * with it the accumulated model of the user that agent holds. Truncation of a JSON array is
+ * caught by the decoder; truncation of an identifier is caught by nothing at all (#51).
+ */
+data class ProcessResult(
+    val exitCode: Int,
+    val stdout: String,
+    val stderr: String,
+    /**
+     * Why [stdout] may be only part of what the child wrote, or null when it is all of it.
+     *
+     * About stdout alone, because stdout is the *answer* and stderr is the explanation: a
+     * diagnostic that arrived half-written is still a diagnostic, and failing an otherwise good
+     * run over one would take the hotkey down for a reason that has nothing to do with the
+     * result. A short read on stderr is noted inside [stderr] instead.
+     *
+     * **A positive signal, not a total one, and callers must not treat null as proof.** The JVM
+     * drains whatever is available on a child's pipe the moment it exits and substitutes a
+     * buffer for the pipe itself, so a reader that had not yet blocked when that happened gets
+     * a *clean EOF over a truncated read* — indistinguishable from a whole one at this level.
+     * Measured at roughly one run in twenty-five on kaladin against a child leaving a background
+     * job holding its stdout; the other twenty-four are caught. Anything whose correctness turns
+     * on completeness therefore needs its own framing check as well, which is why
+     * [SpanreedCli] requires an `agent-id` answer to carry the line terminator a whole line has.
+     */
+    val shortRead: String? = null,
+) {
+    /** Ran to completion, exited zero, and [stdout] is the whole of what it wrote. */
+    val succeeded: Boolean get() = exitCode == 0 && shortRead == null
+
+    /**
+     * Nothing ran at all — the command named by `registry.agent.spanreed_command` is not there.
+     *
+     * Worth distinguishing from every other failure because it is the one that says nothing
+     * about the bus: a spanreed that ran and exited non-zero is a bus that is present with
+     * something else wrong. See [RegistryFlags.idSourceUnreachable], which is scoped to this.
+     */
+    val notRunnable: Boolean get() = exitCode == NOT_RUNNABLE
+
+    /**
+     * Why this run cannot be believed, phrased to follow the name of what was run, or null when
+     * it can. Kept here rather than at each call site so a caller cannot report a short read as
+     * a clean exit simply by writing the obvious message.
+     */
+    val problem: String? get() = when {
+        shortRead != null -> "$shortRead (exit $exitCode): ${detail()}"
+        exitCode != 0 -> "exited $exitCode: ${detail()}"
+        else -> null
+    }
+
+    private fun detail(): String =
+        stderr.ifBlank { stdout }.trim().ifBlank { "and said nothing about why" }
+
+    companion object {
+        /** Distinguishable from any real exit code, which is 0..255. */
+        const val TIMED_OUT = -1
+
+        /** Likewise, and distinct from [TIMED_OUT]: nothing ran, so nothing timed out. */
+        const val NOT_RUNNABLE = -2
+    }
 }
 
 /**
@@ -61,12 +129,39 @@ class ProcessCommandRunner(private val timeoutMs: Long = DEFAULT_TIMEOUT_MS) : C
             builder.start()
         } catch (e: IOException) {
             return ProcessResult(
-                NOT_RUNNABLE,
+                ProcessResult.NOT_RUNNABLE,
                 "",
                 "could not run '${command.firstOrNull().orEmpty()}' " +
                     "(${RegistryFlags.spanreedCommand.key}): ${e.message}",
             )
         }
+        // Every exit from here on has to go past the child: leaving without reaping abandons a
+        // running process holding the pipes it inherited.
+        //
+        // **Not because of coroutine cancellation** — that was this comment's first claim and it
+        // is false. Cancelling a job does *not* interrupt a thread already blocked in a JDK call
+        // on `Dispatchers.IO`; `runInterruptible` exists precisely because it does not. Probed
+        // both shapes rather than reasoning about it: a cancelled `Thread.sleep` and a cancelled
+        // `Process.waitFor` each reported `interrupted=false, returnedEarly=false`. The claim was
+        // inherited from #51's text, where it is also wrong, and a note there says so.
+        //
+        // What can actually leave by this path, and is why the guard stays: `outputStream.close()`
+        // throwing `IOException`; either `Thread.start()` in a `Drain` failing under resource
+        // pressure, which strands an already-started child and possibly a first drain; and
+        // `waitFor` throwing `InterruptedException` when the thread is *genuinely* interrupted —
+        // by `ExecutorService.shutdownNow`, by `runInterruptible`, or by any caller that
+        // interrupts directly. `Dispatchers.IO` threads are pooled and outlive a single call, so
+        // an interrupt raised for one task can surface inside another's. `a child is reaped when
+        // the call is interrupted` covers that arm.
+        return try {
+            drainAndWait(process)
+        } catch (e: Throwable) {
+            process.destroyForcibly()
+            throw e
+        }
+    }
+
+    private fun drainAndWait(process: Process): ProcessResult {
         // Nothing awakener runs is fed on stdin, and a child that reads it would otherwise wait
         // forever for input that is never coming.
         process.outputStream.close()
@@ -81,9 +176,39 @@ class ProcessCommandRunner(private val timeoutMs: Long = DEFAULT_TIMEOUT_MS) : C
             process.destroyForcibly()
             // Killing the child closes its pipes, which is what lets the drains finish.
             process.waitFor()
-            return ProcessResult(TIMED_OUT, stdout.collect(), "timed out after ${timeoutMs}ms")
+            val out = stdout.collect()
+            // The child's own stderr is kept rather than replaced by the timeout note. It is the
+            // one piece of evidence that says *why* a spanreed was slow, and discarding it left
+            // an operator with a wrong-looking answer and nothing to diagnose it from.
+            return ProcessResult(
+                ProcessResult.TIMED_OUT,
+                out.text,
+                listOf(stderr.collect().noted(), "timed out after ${timeoutMs}ms")
+                    .filter { it.isNotEmpty() }
+                    .joinToString("\n"),
+                shortRead = out.shortBy,
+            )
         }
-        return ProcessResult(process.exitValue(), stdout.collect(), stderr.collect())
+        val out = stdout.collect()
+        return ProcessResult(
+            process.exitValue(),
+            out.text,
+            stderr.collect().noted(),
+            shortRead = out.shortBy,
+        )
+    }
+
+    /** What one pipe yielded, and — [shortBy] — why that may not be the whole of it. */
+    private class Read(val text: String, val shortBy: String?) {
+        /**
+         * The text with the reason folded in, for a pipe whose completeness is not modelled.
+         * Only stderr is read this way; see [ProcessResult.shortRead].
+         */
+        fun noted(): String = when {
+            shortBy == null -> text
+            text.isEmpty() -> "[$shortBy]"
+            else -> "$text\n[$shortBy]"
+        }
     }
 
     /**
@@ -92,19 +217,41 @@ class ProcessCommandRunner(private val timeoutMs: Long = DEFAULT_TIMEOUT_MS) : C
      * Partial rather than all-or-nothing on purpose: a child's exit does not close a pipe a
      * grandchild inherited, so the collecting side has to be able to stop waiting and still keep
      * what arrived — an unbounded wait here would put back exactly the unbounded call above.
+     *
+     * What it must not do is stay quiet about having stopped early, which is what it did until
+     * #51: the join returned whatever had arrived, and a `runCatching {}` around the read loop
+     * made a mid-read `IOException` look identical to a clean EOF. Both now come back as a
+     * reason on [Read.shortBy], and it is the caller's to decide about.
      */
     private class Drain(stream: InputStream) {
         private val text = StringBuilder()
 
+        /**
+         * Set only after the read loop saw EOF. Volatile because the collector reads it from
+         * another thread, and checked *first* in [collect] so that a thread finishing during
+         * the join is read as complete rather than as short.
+         */
+        @Volatile
+        private var atEnd = false
+
+        /** Why the read stopped before EOF on its own, when it did. */
+        @Volatile
+        private var failure: String? = null
+
         private val thread = Thread {
             val reader = stream.bufferedReader()
             val chunk = CharArray(DEFAULT_BUFFER_SIZE)
-            runCatching {
+            try {
                 while (true) {
                     val read = reader.read(chunk)
                     if (read < 0) break
                     synchronized(text) { text.appendRange(chunk, 0, read) }
                 }
+                atEnd = true
+            } catch (e: Throwable) {
+                // Throwable rather than IOException: whatever ends this loop early, the buffer
+                // below is a prefix, and a prefix reported as whole is the defect.
+                failure = "the pipe failed mid-read ($e)"
             }
         }.apply {
             name = "awakener-subprocess-drain"
@@ -112,21 +259,24 @@ class ProcessCommandRunner(private val timeoutMs: Long = DEFAULT_TIMEOUT_MS) : C
             start()
         }
 
-        fun collect(): String {
+        fun collect(): Read {
             thread.join(DRAIN_GRACE_MS)
-            return synchronized(text) { text.toString() }
+            val body = synchronized(text) { text.toString() }
+            return Read(
+                body,
+                when {
+                    atEnd -> null
+                    failure != null -> failure
+                    else -> "the output was cut off: still unread ${DRAIN_GRACE_MS}ms after " +
+                        "the child was done, so something it left behind still holds the pipe"
+                },
+            )
         }
     }
 
     private companion object {
         const val DEFAULT_TIMEOUT_MS = 10_000L
         const val DRAIN_GRACE_MS = 1_000L
-
-        /** Distinguishable from any real exit code, which is 0..255. */
-        const val TIMED_OUT = -1
-
-        /** Likewise, and distinct from [TIMED_OUT]: nothing ran, so nothing timed out. */
-        const val NOT_RUNNABLE = -2
     }
 }
 
@@ -143,6 +293,16 @@ class SpanreedCli(
     private val configStore: ConfigStore,
     private val runner: CommandRunner = ProcessCommandRunner(),
     private val ownPid: () -> Long = { ProcessHandle.current().pid() },
+    /**
+     * Where a substitution this class made on its own is reported.
+     *
+     * There is exactly one — [RegistryFlags.idSourceUnreachable] set to
+     * [UnreachableIdSource.DERIVE] — and it needs a channel because a quiet substitution of one
+     * id source for another is the failure #62 was about: the flag says `SPANREED` and the id
+     * did not come from spanreed. stderr by default because every entry point's *stdout* is its
+     * answer, and a warning printed into it is a line something downstream will try to parse.
+     */
+    private val warn: (String) -> Unit = System.err::println,
 ) : AgentIdentities, AgentBus {
     private val config: Config get() = configStore.config.value
 
@@ -165,8 +325,14 @@ class SpanreedCli(
      * one shape that would parse into a plausible answer, and an empty string papered into `[]`
      * was exactly that shape.
      *
-     * That the *runner* cannot say it read short is #51, and it is not fixed here — `agent-id`
-     * has the same exposure with worse consequences, since a truncated id is a valid string.
+     * Since #51 the runner says so itself: [ProcessResult.succeeded] is false for a run whose
+     * stdout was cut off, whatever it exited with, so the check below now covers the shape it
+     * previously only happened to catch through the decoder. The decoder is still the second
+     * line and still worth keeping — the two guards fail on different things, and only the
+     * decoder covers the residual [ProcessResult.shortRead] documents. It covers it completely:
+     * a JSON array has no proper prefix that parses, so any truncation is a parse failure
+     * whether or not the plumbing noticed. That is why no framing check is needed here and one
+     * is needed for `agent-id`, whose answer's every prefix is a valid answer.
      */
     override suspend fun liveAgents(): List<LiveAgent> {
         val result = withContext(Dispatchers.IO) {
@@ -175,9 +341,7 @@ class SpanreedCli(
                 mapOf("SPANREED_AGENT_NAME" to null),
             )
         }
-        check(result.succeeded) {
-            "spanreed list failed (${result.exitCode}): ${result.stderr.ifBlank { result.stdout }}"
-        }
+        check(result.succeeded) { "spanreed list failed — ${result.problem}" }
         val listing = result.stdout.ifBlank {
             error("spanreed list exited 0 but printed nothing; refusing to read that as an empty bus")
         }
@@ -198,8 +362,8 @@ class SpanreedCli(
         val cfg = config
         val name = spanreedNameFor(key, cfg[RegistryFlags.agentNamePrefix])
         val id = when (cfg[RegistryFlags.agentIdSource]) {
-            AgentIdSource.DERIVED -> AgentId("agent-$name")
-            AgentIdSource.SPANREED -> AgentId(agentId(cfg, name))
+            AgentIdSource.DERIVED -> derivedId(name)
+            AgentIdSource.SPANREED -> spanreedId(cfg, name)
         }
         val identity = AgentIdentity(id, name)
         if (cfg[RegistryFlags.registerOnMint]) register(identity, residuePath)
@@ -207,18 +371,58 @@ class SpanreedCli(
     }
 
     /**
+     * spanreed's documented `SPANREED_AGENT_NAME` override rule, applied without a subprocess.
+     *
+     * Shared by [AgentIdSource.DERIVED] and by the unreachable fallback so the two cannot drift
+     * apart: an id that depends on which way a surface arrived at the rule is not an identity.
+     */
+    private fun derivedId(name: String) = AgentId("agent-$name")
+
+    /**
      * Asks spanreed what id it will derive for a session running under [name].
      *
      * The environment variable is the whole mechanism: spanreed's derivation is `sha256(cwd)`,
      * and a surface has no cwd, so `SPANREED_AGENT_NAME` is what gives a Lifeless an identity
      * that is about the surface instead of about wherever awakener happened to be started.
+     *
+     * Nothing short of a whole, zero-exit run yields an id. That is [ProcessResult.succeeded]'s
+     * job now, and the reason it is worth stating: a *prefix* of an agent id is a valid agent
+     * id. It routes — to some other surface's Lifeless, or to nothing — and no caller of this
+     * method, and no row in the bindings file, can tell it from the real one afterwards. The
+     * whole point of the registry is that a surface gets its own accumulated model back.
      */
-    private suspend fun agentId(config: Config, name: String): String {
+    private suspend fun spanreedId(config: Config, name: String): AgentId {
         val result = exec(config, listOf("agent-id"), name)
-        check(result.succeeded) {
-            "spanreed agent-id failed (${result.exitCode}): ${result.stderr.ifBlank { result.stdout }}"
+        // Scoped to a command that could not be run at all, deliberately, and not to any failed
+        // run: a spanreed that ran and exited non-zero is a bus that is present with something
+        // else wrong, and deriving past that would hide it. A short read is likewise not
+        // covered — that is a spanreed that answered, and the answer is the thing in doubt.
+        if (result.notRunnable &&
+            config[RegistryFlags.idSourceUnreachable] == UnreachableIdSource.DERIVE
+        ) {
+            warn(
+                "warning: ${result.stderr.trim()}; deriving the id locally per " +
+                    "${RegistryFlags.idSourceUnreachable.key}=${UnreachableIdSource.DERIVE}",
+            )
+            return derivedId(name)
         }
-        return result.stdout.trim().ifBlank { error("spanreed agent-id printed nothing") }
+        check(result.succeeded) { "spanreed agent-id failed — ${result.problem}" }
+        // The framing check, and the one guard here that does not depend on the plumbing having
+        // noticed. `ProcessResult.shortRead` is a positive signal rather than a total one — see
+        // its documentation for the JVM behaviour that makes a truncated read occasionally
+        // arrive as a clean EOF — and this is the identity path, where "occasionally" is not
+        // good enough. A whole line from a line-oriented CLI carries its terminator; a prefix of
+        // one does not, which is precisely the distinction the id itself cannot make.
+        //
+        // The cost is a dependency on spanreed printing that newline, which it does and which
+        // `the real spanreed derives agent-name from SPANREED_AGENT_NAME` exercises on every CI
+        // run. If it ever stops, this fails loudly and says why — the outcome to prefer over a
+        // silently accepted prefix by some distance.
+        check(result.stdout.endsWith("\n")) {
+            "spanreed agent-id printed '${result.stdout}' with no line terminator, so what " +
+                "arrived is a prefix of an id and not an id — refusing to bind a surface to it"
+        }
+        return AgentId(result.stdout.trim().ifBlank { error("spanreed agent-id printed nothing") })
     }
 
     /**
