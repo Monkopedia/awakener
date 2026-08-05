@@ -7,8 +7,10 @@ import java.nio.ByteBuffer
 import java.nio.channels.ServerSocketChannel
 import java.nio.channels.SocketChannel
 import java.nio.file.Path
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.io.path.absolutePathString
 import kotlin.io.path.deleteIfExists
 import kotlin.test.fail
@@ -27,6 +29,11 @@ import kotlin.test.fail
  * Relays strictly one request to one reply, which is the whole of the i3 protocol on a connection
  * that has not subscribed to events — and the manager's command connection never does, since
  * [SwayWindowManager.changes] takes a second one.
+ *
+ * It also **counts** what goes past, which is the only place a test can see it: the cost of a
+ * poll is round trips, and round trips are invisible from either end — sway reports nothing, and
+ * a manager that issues thirty thousand of them looks from the outside exactly like one that
+ * issues thirty. See [requestCount], and `a dock that never maps costs a paced poll, not a spin`.
  */
 class SwayValve private constructor(
     private val server: ServerSocketChannel,
@@ -36,6 +43,20 @@ class SwayValve private constructor(
     /** Set while a request is still to be caught; cleared by the one that matches. */
     @Volatile
     private var hold: ((type: Int, payload: String) -> Boolean)? = null
+
+    private val counts = ConcurrentHashMap<Int, AtomicLong>()
+
+    /**
+     * How many requests of [type] have gone through this valve, over every connection it holds.
+     *
+     * Counted on the relaying thread as each request is decoded and before it is forwarded, so a
+     * request in flight is already included and one still queued in the client's socket buffer is
+     * not. A caller reading this after the call it is measuring has returned sees all of them.
+     */
+    fun requestCount(type: Int): Long = counts[type]?.get() ?: 0L
+
+    /** Forgets what has been counted, so one valve can measure two phases of a test. */
+    fun resetCounts() = counts.clear()
 
     private val held = CountDownLatch(1)
     private val released = CountDownLatch(1)
@@ -81,6 +102,7 @@ class SwayValve private constructor(
                         while (true) {
                             val request = read(client) ?: return
                             val header = I3Ipc.decodeHeader(request.first)
+                            counts.computeIfAbsent(header.type) { AtomicLong() }.incrementAndGet()
                             val caught = hold?.invoke(header.type, request.second.decodeToString())
                             if (caught == true) {
                                 hold = null

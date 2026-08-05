@@ -2,8 +2,11 @@ package com.monkopedia.awakener.wm
 
 import com.monkopedia.awakener.config.InMemoryConfigStore
 import com.monkopedia.awakener.registry.AgentId
+import com.monkopedia.awakener.registry.BindingStore
 import com.monkopedia.awakener.registry.DerivedAgentIdentities
 import com.monkopedia.awakener.registry.FileBindingStore
+import com.monkopedia.awakener.registry.SurfaceKey
+import com.monkopedia.awakener.registry.asIdentity
 import java.nio.file.Path
 import kotlin.io.path.absolutePathString
 import kotlin.io.path.createTempDirectory
@@ -39,6 +42,14 @@ class SwayBindingTest {
     private lateinit var wm: SwayWindowManager
     private lateinit var store: InMemoryConfigStore
     private lateinit var stateDir: Path
+
+    /**
+     * The same store the manager was built on, held so a test can write a durable binding
+     * directly — which is how "what does `resolve` answer for a window enumeration is hiding"
+     * becomes askable at all, since a hidden window is one no `attach` will take.
+     */
+    private lateinit var registry: BindingStore
+
     private var minted = 0
 
     /**
@@ -64,7 +75,8 @@ class SwayBindingTest {
         scope = CoroutineScope(SupervisorJob())
         store = InMemoryConfigStore()
         stateDir = createTempDirectory("awakener-wm-bindings")
-        wm = SwayWindowManager({ sway.connection() }, store, bindingStore(), scope)
+        registry = bindingStore()
+        wm = SwayWindowManager({ sway.connection() }, store, registry, scope)
     }
 
     /**
@@ -1003,6 +1015,7 @@ class SwayBindingTest {
         // As above: one hand-driven pass is what is asserted on, down to the order the sweep walks
         // the tree in, so the event-driven collector must not have run one first.
         store.put(WmFlags.sweepOnClose, false)
+        store.put(WmFlags.unmapWaitMs, WEDGE_UNMAP_WAIT_MS)
         val wedged = openSurface("aw-app1")
         val clean = openSurface("aw-app2")
         val wedgedDock = wm.attach(wedged, dockFor("aw-dock"), AgentId("agent-1"))
@@ -1052,6 +1065,7 @@ class SwayBindingTest {
     @Test
     fun `treating a wedged dock as a failed detach is switchable off`() = swayTest {
         store.put(WmFlags.wedgedDockFailsDetach, false)
+        store.put(WmFlags.unmapWaitMs, WEDGE_UNMAP_WAIT_MS)
         val app = openSurface("aw-app1")
         val handle = wm.attach(app, dockFor("aw-dock"), AgentId("agent-1"))
 
@@ -1097,10 +1111,16 @@ class SwayBindingTest {
      *
      * The failure is the dock program exiting without ever mapping a window, which is what a
      * mistyped command or a panel binary that dies on startup looks like, and it is the failure
-     * mode `attach` was already reproduced on. It costs this test the full 5s map wait.
+     * mode `attach` was already reproduced on.
+     *
+     * It costs this test one map wait, which is why it sets a short one: nothing here races the
+     * deadline — the dock program is `exit 1` and no window is ever coming — so the length of the
+     * wait is pure latency and used to be five seconds of it. That the deadline is now a flag is
+     * #49's, and this is the first thing it buys.
      */
     @Test
     fun `a failed attach leaves the tab as it found it`() = swayTest {
+        store.put(WmFlags.mapWaitMs, NO_DOCK_MAP_WAIT_MS)
         val app1 = openSurface("aw-app1")
         openSurface("aw-app2")
         val before = assertNotNull(wm.tree().workspace("1")).children.map { it.id }
@@ -1131,7 +1151,7 @@ class SwayBindingTest {
      * that never maps at all — and this is the case the unwind exists for, not a corner of it.
      *
      * `attach` learns which node its dock is only when `awaitWindow` returns, so across the whole
-     * of the 5s map deadline it holds no record of a window it may already have spawned. A dock
+     * of the map deadline it holds no record of a window it may already have spawned. A dock
      * that maps as that deadline expires is therefore a window the unwind does not know exists:
      * it is not killed, and the flatten that follows is refused on a container that has acquired
      * a second child — #6 reinstated, on the failure path #6 was reproduced on.
@@ -1144,6 +1164,10 @@ class SwayBindingTest {
      */
     @Test
     fun `a dock that maps as the map deadline expires is still taken back down`() = swayTest {
+        // The deadline is held shut by the valve rather than waited out, so its length buys this
+        // test nothing at all: what has to be true is that it expires while the read is held, and
+        // a short one expires the same way a long one does.
+        store.put(WmFlags.mapWaitMs, HELD_MAP_WAIT_MS)
         SwayValve.open(sway.socket).use { valve ->
             val manager = valved(valve)
             val app = openSurface("aw-app1")
@@ -1200,6 +1224,11 @@ class SwayBindingTest {
      */
     @Test
     fun `a dock that maps as the unwind flattens the container is taken back down`() = swayTest {
+        // Short, and [slowDock]'s sleep is set against it: what this test needs is a dock that
+        // maps *after* the deadline and *while* the valve holds the flatten, which is a gap the
+        // valve holds open for as long as it likes. Five seconds of it was five seconds of
+        // nothing happening.
+        store.put(WmFlags.mapWaitMs, HELD_MAP_WAIT_MS)
         SwayValve.open(sway.socket).use { valve ->
             val manager = valved(valve)
             val app = openSurface("aw-app1")
@@ -1358,6 +1387,151 @@ class SwayBindingTest {
     @Test
     fun `an unbound surface resolves to nothing`() = swayTest {
         assertNull(wm.resolve(openSurface("aw-app1")))
+    }
+
+    /**
+     * #52: `resolve` answers from the durable registry, and the dock table cannot make it say
+     * otherwise.
+     *
+     * The window here is a genuine application window that a hand marked with a mark shaped
+     * exactly like that window's own dock mark — #15's residual, the case the table is documented
+     * to latch and never let go of. One enumeration hides it for the life of the process, and
+     * `swaymsg unmark` does not bring it back; that latch is deliberate and is asserted here as
+     * unchanged. What must not follow from it is `resolve` calling a durably bound surface a
+     * **Drab**, because a caller acting on that mints a second agent for a surface that already
+     * has one — and until this fix that is exactly what happened, since `resolve` reached its key
+     * through `surfaces()`.
+     *
+     * The binding is written straight into the registry rather than through `attach`, because a
+     * window the table is hiding is one no `attach` will take: the point is that the binding
+     * outlives everything the table knows, so the table must not be able to hide it.
+     */
+    @Test
+    fun `a surface the table is hiding still resolves to its agent`() = swayTest {
+        val app = openSurface("aw-app1")
+        registry.bind(SurfaceKey.Window("aw-app1"), AgentId("agent-1").asIdentity())
+        command("[con_id=${app.raw}] mark --add ${markFor(app, app)}")
+
+        assertEquals(
+            emptyList(),
+            wm.surfaces().filter { it.id == app }.map { it.id },
+            "the forged mark has to hide it from enumeration, or this test proves nothing",
+        )
+        command("[con_id=${app.raw}] unmark ${markFor(app, app)}")
+        assertEquals(
+            emptyList(),
+            wm.surfaces().filter { it.id == app }.map { it.id },
+            "and the recognition is latched: unmarking does not hand it back, which is the " +
+                "documented cost of adoption recording",
+        )
+
+        assertEquals(
+            AgentId("agent-1"),
+            wm.resolve(app),
+            "resolve answers from the registry, keyed on what outlives the window — a session's " +
+                "dock table has no way to turn a bound surface into a Drab",
+        )
+    }
+
+    /**
+     * The other end of that switch, and the reason it is a flag rather than a rewrite: reaching
+     * the key through enumeration is a real behaviour somebody may want, since it makes `resolve`
+     * refuse a dock outright. It also brings the session dependence back, which is what the
+     * second half asserts.
+     */
+    @Test
+    fun `resolve reaching its key through enumeration is switchable back on`() = swayTest {
+        store.put(WmFlags.resolveKeySource, ResolveKeySource.ENUMERATION)
+        val app = openSurface("aw-app1")
+        registry.bind(SurfaceKey.Window("aw-app1"), AgentId("agent-1").asIdentity())
+        assertEquals(AgentId("agent-1"), wm.resolve(app), "an enumerable surface resolves either way")
+
+        command("[con_id=${app.raw}] mark --add ${markFor(app, app)}")
+        assertNull(
+            wm.resolve(app),
+            "and under ENUMERATION the table decides what resolve will answer for at all, so a " +
+                "hidden surface reads as a Drab however durably it is bound",
+        )
+    }
+
+    /**
+     * The same surface, seen by a manager that never reads the table at all — so that the
+     * previous test's null is attributable to the table and not to anything about the mark.
+     */
+    @Test
+    fun `a dock resolves to whatever the registry holds for its app_id`() = swayTest {
+        val app = openSurface("aw-app1")
+        val dock = wm.attach(app, dockFor("aw-dock"), AgentId("agent-1")).dockId
+
+        assertNull(wm.resolve(dock), "nothing has bound the dock's key, so there is nothing to say")
+
+        registry.bind(SurfaceKey.Window("aw-dock"), AgentId("panel-agent").asIdentity())
+        assertEquals(
+            AgentId("panel-agent"),
+            wm.resolve(dock),
+            "a dock is an ordinary node to resolve, which is the disclosed cost of taking the " +
+                "table out of its path — callers get surface ids from surfaces(), which still " +
+                "excludes docks",
+        )
+        assertEquals(
+            emptyList(),
+            wm.surfaces().filter { it.id == dock }.map { it.id },
+            "enumeration is unchanged and is what a caller actually asks",
+        )
+    }
+
+    /**
+     * #49: a wait that expires costs a paced poll, not a spin.
+     *
+     * The cost of a poll is round trips, and round trips are invisible from both ends — sway
+     * reports nothing, and a manager issuing thirty thousand of them returns the same answer, at
+     * the same moment, as one issuing thirty. [SwayValve] is the only place they can be seen, so
+     * it counts them.
+     *
+     * Both halves run here rather than one, because an absolute bound would be a number this
+     * machine happened to produce. The spin is the control: same wait, same failing attach, same
+     * unwind, with `wm.wait.poll_spin_ms` raised past the deadline so no read is ever paced.
+     * Measured on headless sway 1.12 the two differ by more than two orders of magnitude — a
+     * paced wait of this length is about `wait / interval` reads plus the unwind's handful, and
+     * the spin is several thousand.
+     */
+    @Test
+    fun `a dock that never maps costs a paced poll, not a spin`() = swayTest {
+        store.put(WmFlags.mapWaitMs, POLL_PROOF_WAIT_MS)
+        store.put(WmFlags.pollIntervalMs, POLL_PROOF_INTERVAL_MS)
+        val app = openSurface("aw-app1")
+
+        SwayValve.open(sway.socket).use { valve ->
+            val manager = valved(valve)
+            store.put(WmFlags.pollSpinMs, 0)
+            assertFailsWith<IllegalStateException>("a dock that never maps has to fail the attach") {
+                manager.attach(app, DockSpec("aw-nodock", "sh -c 'exit 1'"), AgentId("agent-1"))
+            }
+            val paced = valve.requestCount(I3Ipc.Request.GET_TREE)
+
+            valve.resetCounts()
+            // Past the deadline, so every read of the wait is an unpaced one: the old behaviour,
+            // reached through the flag rather than through a second build.
+            store.put(WmFlags.pollSpinMs, POLL_PROOF_WAIT_MS * 2)
+            assertFailsWith<IllegalStateException> {
+                manager.attach(app, DockSpec("aw-nodock", "sh -c 'exit 1'"), AgentId("agent-1"))
+            }
+            val spun = valve.requestCount(I3Ipc.Request.GET_TREE)
+
+            assertTrue(
+                paced <= POLL_PROOF_WAIT_MS / POLL_PROOF_INTERVAL_MS + POLL_PROOF_SLACK,
+                "a ${POLL_PROOF_WAIT_MS}ms wait paced at ${POLL_PROOF_INTERVAL_MS}ms cannot cost " +
+                    "more than about ${POLL_PROOF_WAIT_MS / POLL_PROOF_INTERVAL_MS} tree reads " +
+                    "plus the unwind's; it cost $paced",
+            )
+            assertTrue(
+                spun > paced * POLL_PROOF_RATIO,
+                "and the control has to show the reads were real: spinning the same wait cost " +
+                    "$spun tree reads against the paced $paced, which is not the order of " +
+                    "magnitude #49 measured — if these are close, the pacing is not what is " +
+                    "being exercised",
+            )
+        }
     }
 
     /**
@@ -1577,9 +1751,15 @@ class SwayBindingTest {
     private fun dockFor(appId: String) =
         DockSpec(appId, sway.windowCommand(DockSpec.APP_ID_PLACEHOLDER))
 
-    /** A dock program whose window maps a second after `attach` has given up waiting for it. */
+    /**
+     * A dock program whose window maps well after `attach` has given up waiting for it.
+     *
+     * The sleep is stated against [HELD_MAP_WAIT_MS] rather than against the shipped default:
+     * what makes this a *slow* dock is that it maps on the far side of whatever deadline the test
+     * set, and the only test using it sets a short one.
+     */
     private fun slowDock(appId: String) =
-        DockSpec(appId, "sh -c 'sleep 6; exec ${sway.windowCommand(appId)}'")
+        DockSpec(appId, "sh -c 'sleep $SLOW_DOCK_SLEEP_S; exec ${sway.windowCommand(appId)}'")
 
     /**
      * A manager whose commands reach sway through [valve], so that a test can hold one of them.
@@ -1759,11 +1939,46 @@ class SwayBindingTest {
         const val VALVE_WAIT_MS = 15_000L
 
         /**
-         * Held past `attach`'s 5s map wait, so that the deadline has certainly expired before the
-         * read it expired on is answered. The margin is slack, not a race: the answer cannot
-         * arrive until the valve lets it.
+         * The map deadline a valved test runs against.
+         *
+         * Short because the valve, not the clock, is what decides when the held read is answered:
+         * every one of these tests holds a request across the deadline, so the deadline's length
+         * is dead time and nothing else. It was five seconds each because the deadline was a
+         * `private const` (#49) — the tests were the first thing paying for that, and 46s of a
+         * 62s suite went on waits like these.
          */
-        const val PAST_MAP_DEADLINE_MS = 5_200L
+        const val HELD_MAP_WAIT_MS = 1_000L
+
+        /**
+         * Held past [HELD_MAP_WAIT_MS], so that the deadline has certainly expired before the read
+         * it expired on is answered. The margin is slack, not a race: the answer cannot arrive
+         * until the valve lets it.
+         */
+        const val PAST_MAP_DEADLINE_MS = 1_200L
+
+        /**
+         * How long `slowDock` sleeps before mapping: comfortably past [HELD_MAP_WAIT_MS], so the
+         * dock is certainly still absent when the deadline expires.
+         */
+        const val SLOW_DOCK_SLEEP_S = 2
+
+        /**
+         * The map deadline for a test whose dock program never maps anything.
+         *
+         * There is nothing to race — the command is `exit 1` — so this is the shortest wait that
+         * still exercises an expiry rather than a scheduling accident.
+         */
+        const val NO_DOCK_MAP_WAIT_MS = 500L
+
+        /**
+         * The unmap wait for a test whose panel is `SIGSTOP`ped.
+         *
+         * A stopped process cannot service a close however long it is given, so waiting the full
+         * default on it is waiting for something that has already been decided. Kept at a second
+         * rather than driven to nothing so that the *other* docks in the same test — real windows
+         * that do exit — are not racing it.
+         */
+        const val WEDGE_UNMAP_WAIT_MS = 1_000L
 
         /** Long enough that a second attach finishing inside it cannot be luck. */
         const val MINT_DELAY_MS = 2_000L
@@ -1782,5 +1997,30 @@ class SwayBindingTest {
          * round is nearly always enough; three is what made it every run.
          */
         const val PREMAP_ROUNDS = 3
+
+        /**
+         * The map deadline the round-trip measurement runs against, and the interval it is paced
+         * at. A second is long enough that the paced count is dominated by the poll rather than
+         * by the constant handful the unwind costs, and short enough that the *spinning* control
+         * — which is a real busy-poll against a real compositor — is a second of heat and not
+         * five.
+         */
+        const val POLL_PROOF_WAIT_MS = 1_000L
+        const val POLL_PROOF_INTERVAL_MS = 25L
+
+        /**
+         * Room above `wait / interval` for the reads that are not the poll's: the `keyFor` at the
+         * top of `attach`, the standing-docks snapshot, and the unwind's two passes. Seven on the
+         * runs measured; twenty so that a scheduler hiccup is not a failure.
+         */
+        const val POLL_PROOF_SLACK = 20L
+
+        /**
+         * How much dearer the spinning control has to be before the paced count is evidence
+         * rather than a coincidence. Measured against headless sway 1.12 the true ratio is two
+         * orders of magnitude; twenty is the floor below which this test would be asserting
+         * nothing.
+         */
+        const val POLL_PROOF_RATIO = 20L
     }
 }

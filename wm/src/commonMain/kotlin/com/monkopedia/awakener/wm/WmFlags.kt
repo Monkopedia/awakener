@@ -81,6 +81,34 @@ enum class ReapEvidence {
     RECOGNITION,
 }
 
+/**
+ * Where `resolve` gets the durable key it looks a binding up by.
+ *
+ * Both values answer from `:registry`, and neither ever reads an *agent* out of the dock table —
+ * the table holds no agent and never has. What they differ on is the set of windows `resolve`
+ * will answer for at all, and so whether that set depends on this session's state.
+ */
+enum class ResolveKeySource {
+    /**
+     * The tree node carrying that `con_id`, straight from `get_tree`.
+     *
+     * `resolve`'s whole path is then one tree read and one registry lookup, and [DockTable] is
+     * not reachable from any of it — which is what lets the note's tripwire be *checked* rather
+     * than promised.
+     */
+    TREE,
+
+    /**
+     * The window `surfaces()` reports under that `con_id`, or nothing at all.
+     *
+     * The previous behaviour. Enumeration filters out docks and the windows an in-flight attach
+     * has reserved, so under this a window the table is currently hiding resolves as a Drab
+     * whatever the durable registry says — a session-scoped answer to the one question the
+     * registry exists to answer durably.
+     */
+    ENUMERATION,
+}
+
 /** What happens to a dock whose bound surface has gone away. */
 enum class OrphanPolicy {
     /** Tear the dock down with its surface. */
@@ -250,8 +278,11 @@ object WmFlags {
             "— and it is the lever to reach for if the record is ever suspected of hiding a " +
             "real window, being the only thing that releases one live. It also stops a pending " +
             "attach's reservation from suppressing anything, for the same reason. The record is " +
-            "never written to disk and is never consulted by resolve, which answers from the " +
-            "durable registry.",
+            "never written to disk and holds no agent, so nothing this flag decides can change " +
+            "which agent a surface is bound to: that is the registry's, keyed on what outlives " +
+            "the window. What it does decide is which windows are enumerable, and under " +
+            "wm.resolve.key_source=ENUMERATION that reaches resolve too — see that flag, which " +
+            "defaults to keeping the record out of resolve's path entirely.",
     )
 
     val dockPendingSuppression = Flags.boolean(
@@ -434,6 +465,103 @@ object WmFlags {
             "process with it, but a scope that gets this must tolerate a child failing. Neither " +
             "restarts the collector, and under both the session boundary now passes unobserved, " +
             "so the dock table is no longer discarded when the compositor goes away.",
+    )
+
+    val resolveKeySource = Flags.enum(
+        "wm.resolve.key_source",
+        ResolveKeySource.TREE,
+        "Where resolve gets the durable key it looks a binding up by. Either way the answer " +
+            "comes from :registry — the dock table holds no agent — so this cannot change which " +
+            "agent a bound surface has. What it changes is which windows resolve will answer " +
+            "for. TREE reads the node out of get_tree and derives the key from it, so resolve's " +
+            "whole path is one tree read and one registry lookup and the session-scoped dock " +
+            "table is not reachable from it at all: a window is looked up by what outlives it, " +
+            "which is the property the registry exists for, and the design note's tripwire — " +
+            "'if the table ever appears in resolve's path, the durability story has rotted' — " +
+            "becomes a check somebody can run rather than a promise. ENUMERATION is the previous " +
+            "behaviour: the key comes from surfaces(), which filters out docks and the windows " +
+            "an in-flight attach has reserved, so anything the table is hiding resolves as a " +
+            "Drab however durably it is bound — a surface hidden by a latched recognition (see " +
+            "wm.dock.reap_evidence) or by a reservation under a shared dock app_id then reads as " +
+            "unbound, and a caller acting on that mints a second agent for a surface that " +
+            "already has one. Its one property TREE does not have is that resolve answers " +
+            "nothing for a dock: under TREE a dock is an ordinary node and resolves to whatever " +
+            "the registry holds under the key its app_id gives, which is nothing unless " +
+            "something bound that key. Callers get their surface ids from surfaces(), which " +
+            "excludes docks under both values.",
+    )
+
+    val mapWaitMs = Flags.long(
+        "wm.wait.map_ms",
+        5_000,
+        "How long attach waits for the dock window to appear before failing and unwinding. " +
+            "sway acknowledges an exec with nothing that says whether the program will ever " +
+            "map, so this deadline is the whole of what bounds an attach. Previously one " +
+            "hard-coded 5s shared with two unrelated waits, which is why it is here: a real " +
+            "panel program slower to start than 5s could not be accommodated without a rebuild. " +
+            "Raising it lengthens the tree lock an attach holds, since the wait happens inside " +
+            "it, so every other attach and detach queues behind the slowest dock. Lowering it " +
+            "risks the case the unwind exists for — a dock that maps just after the deadline, " +
+            "which is then a window the attach spawned and did not identify. Negative or absent " +
+            "degrades to the default; zero fails every attach immediately.",
+    )
+
+    val unmapWaitMs = Flags.long(
+        "wm.wait.unmap_ms",
+        5_000,
+        "How long a kill waits for the window to leave the tree before treating it as wedged. " +
+            "sway acknowledges a kill once it has asked the client to close, not when the " +
+            "window unmaps, so this is what turns the acknowledgement into a fact. It bounds " +
+            "detach, the orphan sweep and an unwind's compensating kill alike, and a detach " +
+            "holds the tree lock across it. Its consequence is wm.dock.wedged_dock_fails_detach's " +
+            "— expiring is what makes a dock 'still standing' — so shortening it turns a panel " +
+            "that is merely slow to exit into a reported failure sooner. Negative or absent " +
+            "degrades to the default.",
+    )
+
+    val reservationGraceMs = Flags.long(
+        "wm.wait.reservation_grace_ms",
+        5_000,
+        "How long an attach's app_id reservation keeps suppressing windows if nothing evicts " +
+            "it. attach evicts its own in a finally, which is what normally ends one, so this " +
+            "only bounds a reservation whose attach died without running that — a process " +
+            "killed mid-attach leaves no other way to clear it, and a stale one hides every " +
+            "window under the dock's app_id for the life of the process. Keep it at or above " +
+            "wm.wait.map_ms: a grace shorter than the map deadline expires while the attach it " +
+            "belongs to is still waiting, which reopens the gap wm.dock.pending_suppression " +
+            "closes — enumeration reporting the agent panel as bindable. Read once, when the " +
+            "reservation is filed. Negative or absent degrades to the default.",
+    )
+
+    val pollSpinMs = Flags.long(
+        "wm.wait.poll_spin_ms",
+        250,
+        "How long a wait on the tree re-reads it as fast as the socket will answer before " +
+            "falling back to wm.wait.poll_interval_ms. attach polls get_tree rather than " +
+            "listening for the new event, deliberately, so that it keeps working with " +
+            "wm.events.enabled off — but polling with nothing between the reads cost 6,637 to " +
+            "11,085 round trips per second against headless sway 1.12, 59% of a compositor core " +
+            "and 41% of a client core, so a 5s deadline that expired spent roughly 33,000 round " +
+            "trips and 2.9s of compositor CPU to learn that a dock did not appear (#49). " +
+            "Spinning is not free of value: the same measurement found it detects a dock about " +
+            "10ms sooner than a 25ms poll does — median 16.5ms against 26.1ms over 8 alternated " +
+            "trials — and that 10ms is hotkey responsiveness. So the default spins for the " +
+            "quarter second in which a dock almost always maps and paces itself afterwards, " +
+            "which is where the round trips stop being worth anything. Counted at the socket, a " +
+            "5s deadline that expires costs 1,719 tree reads at the stock defaults against about " +
+            "27,500 spun. Set it to zero to pace from the first read, or above the wait itself " +
+            "to get the old pure spin back. Negative or absent degrades to the default.",
+    )
+
+    val pollIntervalMs = Flags.long(
+        "wm.wait.poll_interval_ms",
+        25,
+        "How long a wait on the tree sleeps between reads once wm.wait.poll_spin_ms is up. " +
+            "This is what bounds the cost of a wait that is going to expire: at the default it " +
+            "is about 40 reads a second instead of the ten thousand a bare spin manages. It is " +
+            "also the worst-case latency added to detecting a dock that maps after the spin " +
+            "window, which is why the spin exists rather than this being the whole policy. Zero " +
+            "is a yield, which is the old busy-poll. Negative or absent degrades to the default.",
     )
 
     val socketPath = Flags.string(

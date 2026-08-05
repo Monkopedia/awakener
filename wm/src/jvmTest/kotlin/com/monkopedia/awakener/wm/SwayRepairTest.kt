@@ -158,6 +158,7 @@ class SwayRepairTest {
      */
     @Test
     fun `a sweep that fails does not cost the collector the next orphan`() = swayTest {
+        store.put(WmFlags.unmapWaitMs, WEDGE_UNMAP_WAIT_MS)
         val wedged = openSurface("aw-app1")
         val wedgedDock = wm.attach(wedged, dockFor("aw-dock"), AgentId("agent-1")).dockId
         freeze(wedgedDock)
@@ -193,6 +194,7 @@ class SwayRepairTest {
     @Test
     fun `stopping the collector on a failed sweep is switchable on`() = swayTest {
         store.put(WmFlags.sweepFailure, SweepFailure.STOP)
+        store.put(WmFlags.unmapWaitMs, WEDGE_UNMAP_WAIT_MS)
         val wedged = openSurface("aw-app1")
         val wedgedDock = wm.attach(wedged, dockFor("aw-dock"), AgentId("agent-1")).dockId
         freeze(wedgedDock)
@@ -365,9 +367,20 @@ class SwayRepairTest {
 
         /**
          * A sweep that has to give up on a wedged dock before it reaches the next one, which
-         * costs the window wait in full — so this is two of those plus room to finish.
+         * costs the window wait in full — so this is several of those plus room to finish.
          */
         const val WEDGED_SWEEP_WAIT_MS = 20_000L
+
+        /**
+         * The unmap wait a test with a `SIGSTOP`ped panel runs against.
+         *
+         * A stopped process cannot service a close however long it is given, so the default's
+         * five seconds is time spent confirming something already decided — and these tests pay
+         * it once per sweep, which is why two of them were the slowest in the suite (#49). Kept
+         * at a second rather than driven to nothing so that the *unwedged* docks in the same
+         * tests, which are real windows that do exit, are not racing it.
+         */
+        const val WEDGE_UNMAP_WAIT_MS = 1_000L
 
         /** Slack for the death to reach the collector; the socket itself signals immediately. */
         const val DEATH_WAIT_MS = 5_000L
