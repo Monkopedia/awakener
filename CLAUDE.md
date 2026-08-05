@@ -23,7 +23,7 @@ is the ephemeral per-task coordinator.
 JAVA_HOME=/usr/lib/jvm/java-21-openjdk ./gradlew build
 ```
 
-That is the full autonomous check — it compiles both modules and runs all tests, including
+That is the full autonomous check — it compiles every module and runs all tests, including
 the `:wm` integration suite against a real headless sway.
 
 - **The REQUIRE flags are the protection.** `AWAKENER_REQUIRE_SWAY=1` — and
@@ -42,9 +42,12 @@ the `:wm` integration suite against a real headless sway.
 - "BUILD SUCCESSFUL" alone still distinguishes nothing. If you add a tool-gated test, gate it
   with an assumption, never with a bare `return` — and if you add a new gate, declare what it
   reads as a test input. `org.gradle.caching=true`, and Gradle treats neither `PATH` nor the
-  environment as an input, so `wm/build.gradle.kts` and `registry/build.gradle.kts` name the
-  tool presence and the REQUIRE flags explicitly. Without that the build cache will replay a
-  run that skipped everything into a `clean build` that demanded the tools.
+  environment as an input, so every build script whose tests can be tool-gated names the tool
+  presence and the REQUIRE flags explicitly as task inputs. Without that the build cache will
+  replay a run that skipped everything into a `clean build` that demanded the tools. That is a
+  property each such build script has to hold for itself; there is no list of them here,
+  because a list is one more thing to forget to update when a module gains its first gated
+  test.
 - **A run measures one tree, and `main` moves under you.** Every count above describes the
   tree the run ran against. Counts from a branch that `main` has since left describe a tree
   that will not exist after the merge, and nothing in the output says so. A PR's numbers are
@@ -60,6 +63,21 @@ the `:wm` integration suite against a real headless sway.
   is a different question. #59 merged `CLEAN` reporting an honest, XML-read 176 tests /
   skipped=0 / failures=0 against a tree `main` had already advanced past to 201. A conflict
   announces itself; staleness does not.
+
+  **The check is ancestry, but the question is reach.** An intervening merge that cannot reach
+  what the numbers measure does not invalidate them, and re-running against it spends a full
+  build to reproduce the same figure. The exemption is the *argument*, though, and the argument
+  has to be **stated**: *"`44c03f3` is `CLAUDE.md` only, so #61's 205 tests / skipped=0 still
+  describe the merged tree."* Unstated it is indistinguishable from never having checked —
+  nothing on the page separates a considered "this merge cannot reach the suite" from a
+  forgotten `git fetch`, and the reviewer has to treat the two the same way. Judge reach by
+  what the merge touches, not by how small it looks: a shared build script, a test harness, or
+  `:config` reaches everything and never qualifies, however few lines it is.
+
+  **Same shape as the known-flake exemption** (#56): both claim a diff *cannot reach* a result,
+  both are argued per case from what the diff actually touches, and neither is ever discharged
+  by looking the case up on a list of things previously agreed to be harmless. An agent who
+  understands one should recognise the other on sight.
 - `:wm` needs a live compositor, so "no automated test for this window behaviour" is not the
   defect it would be elsewhere — but a PR must say what it exercised and against which sway
   version.
@@ -116,10 +134,13 @@ conversation, not a local workaround.
   **GNOME Shell**. `google-chrome-stable` and `xorg-xwayland` installed. Reachable by
   passwordless ssh from kaladin, but **sudo there requires a password** — Jason runs
   installs on adolin himself.
-- **No tabbed WM is installed on either host.** The dock design depends on i3/sway tree
-  semantics, so it has nowhere to run for real yet. `WLR_BACKENDS=headless sway` gives a
-  genuine sway tree drivable entirely over ssh via `swaymsg` — that is how structural probes
-  should run, and it needs no display and no change to Jason's GNOME session.
+- **Neither host runs a tabbed WM as its session** — adolin's is GNOME, kaladin has no seat
+  at all. The dock design depends on i3/sway tree semantics, so it has nowhere to run *for
+  real* yet. Installed is a different question and the answer is yes: `sway 1.12` is on
+  kaladin, CI installs it, and the `:wm` and `:cli` suites drive it on every build.
+  `WLR_BACKENDS=headless sway` gives a genuine sway tree drivable entirely over ssh via
+  `swaymsg` — that is how structural probes should run, and it needs no display and no change
+  to Jason's GNOME session.
 - **Waydroid runs on kaladin, and Test 1 (occlusion lifecycle) is answered** — under qemu on
   2026-07-30 and natively on 07-31; see `docs/findings/`. **Nothing was gated on a DKMS
   module**: the LTS kernel's `CONFIG_ANDROID_BINDER_IPC_RUST=y` driver serves Waydroid
