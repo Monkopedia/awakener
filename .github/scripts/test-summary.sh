@@ -22,6 +22,18 @@
 # total is normalised to an integer before any comparison, and the no-measurement case is
 # reported as no measurement.
 #
+# **A partial measurement is not a measurement either** (#83). "No `<testsuite>` anywhere" was
+# the only failure this distinguished at first, and the same reassurance prints just as
+# readily from a parse that read four files out of five: the unread one contributes zero, the
+# total looks like a total, and nothing in the output says a file could not be read. So `awk`
+# reports how many files it actually got a `<testsuite>` out of, that is compared against how
+# many the glob matched, and a shortfall renders the counts as a floor with the reassurance
+# withheld.
+#
+# `.github/scripts/test-summary-matrix.sh` holds this script's suite, and it is not optional
+# reading if you edit here: it asserts the behaviour above *and* asserts that each guard,
+# removed, brings a case back red. `./gradlew check` runs it.
+#
 # Deliberately mawk-compatible (that is /usr/bin/awk on ubuntu-latest): no asorti, no gawk
 # extensions, no ENDFILE.
 set -uo pipefail
@@ -78,14 +90,16 @@ counts=$(
       }
       return 0
     }
-    function flush(file,   m, parts, rest, tag) {
+    function flush(file,   m, parts, rest, tag, got) {
       if (file == "") return
       split(file, parts, "/")
       m = parts[1]
       rest = buf
+      got = 0
       while (match(rest, /<testsuite [^>]*>/)) {
         tag = substr(rest, RSTART, RLENGTH)
         rest = substr(rest, RSTART + RLENGTH)
+        got = 1
         seen[m] = 1
         suites[m] += 1;                 SUITES += 1
         t[m] += attr(tag, "tests");     T += attr(tag, "tests")
@@ -93,13 +107,16 @@ counts=$(
         f[m] += attr(tag, "failures");  F += attr(tag, "failures")
         e[m] += attr(tag, "errors");    E += attr(tag, "errors")
       }
+      # Per file, not per suite: the question downstream is "did every file the glob matched
+      # contribute", and a file holding two suites must not pay for one holding none.
+      if (got) READ += 1
     }
     FNR == 1 { flush(cur); cur = FILENAME; buf = "" }
     { buf = buf $0 " " }
     END {
       flush(cur)
       for (m in seen) printf "%s %d %d %d %d %d\n", m, suites[m], t[m], s[m], f[m], e[m]
-      printf "TOTAL %d %d %d %d %d\n", SUITES, T, S, F, E
+      printf "TOTAL %d %d %d %d %d %d\n", SUITES, T, S, F, E, READ
     }
   ' "${files[@]}" 2>/dev/null
 )
@@ -108,15 +125,16 @@ awk_rc=$?
 modules=$(printf '%s\n' "$counts" | grep -v '^TOTAL ' | sort)
 total=$(printf '%s\n' "$counts" | grep '^TOTAL ' | head -1)
 
-tot_suites=''; tot_tests=''; tot_skipped=''; tot_failures=''; tot_errors=''
+tot_suites=''; tot_tests=''; tot_skipped=''; tot_failures=''; tot_errors=''; tot_read=''
 if [ -n "$total" ]; then
-  read -r _ tot_suites tot_tests tot_skipped tot_failures tot_errors <<< "$total"
+  read -r _ tot_suites tot_tests tot_skipped tot_failures tot_errors tot_read <<< "$total"
 fi
 tot_suites=$(num "$tot_suites")
 tot_tests=$(num "$tot_tests")
 tot_skipped=$(num "$tot_skipped")
 tot_failures=$(num "$tot_failures")
 tot_errors=$(num "$tot_errors")
+tot_read=$(num "$tot_read")
 
 # The parse produced nothing usable: awk failed or is absent, or it ran and found no
 # `<testsuite>` element in files that exist. Truncated or corrupt XML from a hard-killed test
@@ -126,6 +144,18 @@ measured=yes
 if [ "$awk_rc" -ne 0 ] || [ -z "$total" ] || [ "$tot_suites" -eq 0 ]; then
   measured=no
   echo "::warning title=Test counts unreadable::${#files[@]} JUnit XML file(s) matched, but no <testsuite> element could be read from them (awk exit ${awk_rc}). The counts below are absent, not zero."
+fi
+
+# Some of it read, and some of it did not (#83). The totals below are then a sum over a subset
+# — arithmetically fine, and a lie about coverage, because nothing on the page says which
+# subset. `skipped=0` over four files out of five is the same rendering as `skipped=0` over
+# five, and the reader who could tell them apart is the one who already knew the answer.
+unread=0
+partial=no
+if [ "$measured" = yes ] && [ "$tot_read" -lt "${#files[@]}" ]; then
+  partial=yes
+  unread=$(( ${#files[@]} - tot_read ))
+  echo "::warning title=Test counts incomplete::${unread} of ${#files[@]} JUnit XML file(s) yielded no <testsuite> element. The counts below are a lower bound, not a total."
 fi
 
 {
@@ -138,8 +168,15 @@ fi
       [ -n "$m" ] || continue
       printf '| `%s` | %s | %s | %s | %s | %s |\n' "$m" "$su" "$te" "$sk" "$fa" "$er"
     done <<< "$modules"
-    printf '| **total** | **%s** | **%s** | **%s** | **%s** | **%s** |\n' \
-      "$tot_suites" "$tot_tests" "$tot_skipped" "$tot_failures" "$tot_errors"
+    # The label carries the caveat, because the table is the part that gets copied out of the
+    # summary and pasted into a PR body without the prose under it.
+    if [ "$partial" = yes ]; then
+      row_label='**total (lower bound)**'
+    else
+      row_label='**total**'
+    fi
+    printf '| %s | **%s** | **%s** | **%s** | **%s** | **%s** |\n' \
+      "$row_label" "$tot_suites" "$tot_tests" "$tot_skipped" "$tot_failures" "$tot_errors"
   else
     printf '| **total** | *unread* | *unread* | *unread* | *unread* | *unread* |\n'
   fi
@@ -148,10 +185,17 @@ fi
     echo "> **These counts were not measured.** ${#files[@]} JUnit XML file(s) were found, but no \`<testsuite>\` element could be read from them — a missing or broken \`awk\`, or truncated XML from a killed test worker. **This says nothing about whether the tests ran or skipped**; do not read it as \`skipped=0\`."
   elif [ "$tot_tests" -eq 0 ]; then
     echo "> **No tests were counted**, across ${tot_suites} suite(s). A suite element that reports zero tests is not evidence that anything executed, so the \`skipped\` figure carries no reassurance here."
-  elif [ "$tot_skipped" -gt 0 ]; then
-    echo '> `skipped` is not zero. A tool-gated test that skipped verified nothing; check which one.'
   else
-    echo '> `skipped` is zero, so every tool-gated test executed rather than opting out.'
+    # A shortfall and a non-zero skip count are separate facts, and both get said. The
+    # reassurance is the only line withheld, because it is the only one that would be false.
+    if [ "$partial" = yes ]; then
+      echo "> **${unread} of ${#files[@]} JUnit XML file(s) could not be read.** The counts above are a lower bound, not a total, and \`skipped\` carries no reassurance: a file that yielded no \`<testsuite>\` contributed zero to every column, including that one."
+    fi
+    if [ "$tot_skipped" -gt 0 ]; then
+      echo '> `skipped` is not zero. A tool-gated test that skipped verified nothing; check which one.'
+    elif [ "$partial" = no ]; then
+      echo '> `skipped` is zero, so every tool-gated test executed rather than opting out.'
+    fi
   fi
 } | emit
 
