@@ -20,8 +20,10 @@ private enum class Mode { FAST, SLOW }
  *
  * Deliberately not called `*Flags`: this suite runs `ConfigCli.bootstrap`, whose classpath scan
  * loads every `com.monkopedia.awakener.**` class with that suffix — test classes included — so
- * a holder the scan could reach might already be initialised, and the assertion would be
- * vacuous rather than wrong, which is worse.
+ * a holder the scan could reach would already be registered before the test ran. The test would
+ * then fail on its opening `assertNull` rather than pass emptily, which is the safe direction,
+ * but it would be failing about test wiring instead of about `requireLoaded`. The name keeps it
+ * failing about the thing it is named after.
  */
 private object LateDeclaration {
     val late = Flags.string("test.late", "unloaded", "declared by a holder nothing has touched")
@@ -110,7 +112,7 @@ class ConfigTest {
     }
 
     /**
-     * The config file is meant to be hand-edited against a running daemon, so one bad value
+     * The config file is meant to be hand-edited against a live desktop, so one bad value
      * must cost only that flag. Throwing here would take the process down over a typo.
      */
     @Test

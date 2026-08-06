@@ -507,8 +507,16 @@ There are **three** combinations, not two:
 - **sway restarts, awakener does not.** The dangerous one — and the reason this section is
   mechanical rather than prose.
 
-awakener is a long-lived daemon: `:config` reloads on file change precisely so a flag flip
-reaches a *live* one. sway 1.12 has no in-place restart — `restart` returns
+awakener is *designed* as a long-lived daemon, and this case is one of the reasons it has to
+be. *(Amended 2026-08-06 by #87: this said "awakener is a long-lived daemon: `:config` reloads
+on file change precisely so a flag flip reaches a live one" — present tense, on both halves,
+and neither half is true yet. `README.md` says "There is no daemon"; every entry point in the
+build starts, acts and exits. `:config` has the reload mechanism, `FileConfigStore.watch`, and
+nothing calls it, which is #43. Nothing below changes: the whole point of this section is what
+happens to an in-memory table when awakener's process outlives sway's, so it is written about
+the process this design implies rather than the one that exists. It was worth correcting
+because the sentence was being read as an established property, and was cited as one at three
+sites in `:wm`.)* sway 1.12 has no in-place restart — `restart` returns
 `Unknown/invalid command 'restart'`, and `reload` only re-reads a config awakener does not
 own — so a sway restart is always a fresh process with a fresh id counter, while awakener's
 in-memory table survives untouched. Measured end to end, one client holding its connections

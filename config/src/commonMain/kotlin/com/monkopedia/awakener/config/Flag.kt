@@ -33,7 +33,8 @@ class Requirement<T> internal constructor(
  * A single runtime-tunable knob.
  *
  * Every behavioural choice in awakener is expected to be a flag rather than a constant, so
- * that behaviour can be changed against a running daemon without a rebuild. Flags are
+ * that behaviour can be changed without a rebuild — and, once anything in the build outlives
+ * one operation, without a restart either (#43). Flags are
  * declared once, statically, and carry their own default, documentation, and codec — which
  * is what lets `config list` be self-documenting instead of a hand-maintained list that
  * drifts from the code.

@@ -7,7 +7,7 @@ import kotlinx.serialization.json.JsonElement
  * An immutable snapshot of flag values.
  *
  * A snapshot is deliberately total: [get] always returns a usable value. The config file is
- * expected to be hand-edited against a running daemon, so a typo in one flag must degrade to
+ * expected to be hand-edited against a live desktop, so a typo in one flag must degrade to
  * that flag's default rather than take the process down or leave it half-configured. What
  * went wrong is reported through [problems] instead of thrown.
  *

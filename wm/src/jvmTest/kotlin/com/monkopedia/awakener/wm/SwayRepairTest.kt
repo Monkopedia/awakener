@@ -290,8 +290,12 @@ class SwayRepairTest {
      * The other repair flags are not like that and a `store.put` at the top of a test body is late
      * for them by construction: it lands after the constructor has already launched the collector.
      * They work anyway because `collectRepairs` re-reads config per event rather than capturing a
-     * snapshot at startup — which is `:config` reloading against a live daemon, and is the property
-     * those `store.put`s are quietly relying on.
+     * snapshot at startup, and `SwayWindowManager.config` is a `StateFlow.value` read — so a `put`
+     * after the collector started is still seen by it. That, and only that, is what these tests
+     * rely on. It is *not* `FileConfigStore.watch`: [store] here is an `InMemoryConfigStore`, so
+     * no file and no watch is involved, and nothing calls `watch` in any case (#43). The two get
+     * conflated because they arrive at the same place — a snapshot replaced under a running
+     * collector — but only one of them is a mechanism this suite exercises.
      */
     private fun swayTest(events: Boolean = true, body: suspend () -> Unit) {
         SwayHarness.assumeAvailable()
