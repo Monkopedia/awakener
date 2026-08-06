@@ -65,6 +65,34 @@ enum class UnreadableWrite {
     REWRITE,
 }
 
+/** What a watching store does when the file it is watching stops existing. */
+enum class MissingFile {
+    /**
+     * Keep the values last read out of it, and report the disappearance through
+     * `FileConfigStore.loadError`.
+     *
+     * The same rule a malformed file already gets, for the same reason: against a running
+     * desktop, reverting every flag at once to its default is the most expensive thing a
+     * snapshot can do, and a file that has gone is no more evidence that the operator wanted
+     * defaults than a file that will not parse. It is also what makes the reload safe across
+     * the gap in a delete-then-write save, where the file is legitimately absent for as long
+     * as the writer takes — under [DEFAULTS] a daemon reads every flag at its default for
+     * that window and says nothing about it.
+     *
+     * Its cost is the honest one: a file deleted *on purpose* does not reset a running
+     * process, and will not until it restarts or the operator uses `unset`. That is why the
+     * disappearance is reported rather than passed over.
+     */
+    KEEP,
+
+    /**
+     * Reload as though the file were empty, so every flag returns to its declared default —
+     * for a deployment where removing the file is how a reset is performed, and for making
+     * that reset take effect without a restart.
+     */
+    DEFAULTS,
+}
+
 /** Flags governing configuration itself. */
 object ConfigFlags {
     val discovery = Flags.enum(
@@ -115,6 +143,39 @@ object ConfigFlags {
             "(AWAKENER_CONFIG_STORE_UNREADABLE_WRITE=REWRITE) when the file is the thing that " +
             "cannot be read — `set` would have to read the file to record it there. Neither " +
             "value can take the process down: this used to be an unhandled IOException.",
+    )
+
+    val watchDebounceMs = Flags.long(
+        "config.watch.debounce_ms",
+        40,
+        "How long `FileConfigStore.watch` lets change events settle before re-reading the " +
+            "file. A save is rarely one event: an atomic rewrite — which is what this store's " +
+            "own `set` performs, and what most editors do — arrives as a create, a modify and " +
+            "a delete of the temporary file followed by a create of the target, and an " +
+            "in-place write can be seen with the file truncated. This window is what makes the " +
+            "read land on a finished file rather than a half-written one. It was a hard-coded " +
+            "40ms; it is here because the right value is a property of whatever writes the " +
+            "file, which is not this program. Raising it delays every flag flip by that much " +
+            "and widens the gap in which a reader sees the old values; lowering it — 0 " +
+            "re-reads on the first event — risks a parse of a partial file, which costs " +
+            "nothing worse than a reported error and a reload on the next event, because a " +
+            "file that will not parse keeps the last good snapshot. Read from the live " +
+            "snapshot on every event, so changing it applies to the watcher already running.",
+        requires = Flags.atLeast(0L),
+    )
+
+    val watchMissingFile = Flags.enum(
+        "config.watch.missing_file",
+        MissingFile.KEEP,
+        "What a running watch does when the file it is watching stops existing. KEEP holds " +
+            "the values last read out of it and reports the disappearance, which is the rule a " +
+            "malformed file already gets and for the same reason — against a live desktop, " +
+            "reverting every flag at once is the most expensive thing a reload can do, and it " +
+            "is what the gap in a delete-then-write save would otherwise cause silently. " +
+            "DEFAULTS reloads as though the file were empty, so removing it resets a running " +
+            "process without a restart. This governs the *watch* only: a store built when the " +
+            "file does not exist reads defaults under both values, because there are no last " +
+            "values to keep.",
     )
 
     /**

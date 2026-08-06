@@ -5,9 +5,13 @@ import kotlin.io.path.Path
 import kotlinx.coroutines.runBlocking
 
 /**
- * `awakener-config` — inspect and change flags without a rebuild or a restart.
+ * `awakener-config` — inspect and change flags without a rebuild.
  *
- * The daemon watches the same file, so a `set` here takes effect in a running awakener.
+ * Without a *restart* is the half that is not true yet. `FileConfigStore.watch` is what would
+ * make a `set` here land in an already-running awakener, and nothing calls it, because nothing
+ * in the build outlives one operation (#43). So today a `set` takes effect on the next process
+ * that starts. This used to claim the opposite, which is worth correcting out loud rather than
+ * quietly: it is the property the flags-first working model rests on.
  *
  * The commands live here, next to the config machinery, but the entry point lives in `:cli`:
  * this module cannot see the modules that declare flags, so a `main` here would enumerate an
@@ -76,7 +80,10 @@ object ConfigCli {
                     }
                 }
                 out("")
-                out("* = overridden; edit ${defaultPath()} or use `set`. Changes apply live.")
+                // "on the next run", not "live": no awakener process outlives one operation
+                // yet, so nothing is holding a snapshot for a change to reach. Telling the
+                // operator otherwise sends them looking for a process that ignored them.
+                out("* = overridden; edit ${defaultPath()} or use `set`. Applies on the next run.")
                 0
             }
 
