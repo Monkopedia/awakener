@@ -33,7 +33,8 @@ class Requirement<T> internal constructor(
  * A single runtime-tunable knob.
  *
  * Every behavioural choice in awakener is expected to be a flag rather than a constant, so
- * that behaviour can be changed against a running daemon without a rebuild. Flags are
+ * that behaviour can be changed without a rebuild — and, once anything in the build outlives
+ * one operation, without a restart either (#43). Flags are
  * declared once, statically, and carry their own default, documentation, and codec — which
  * is what lets `config list` be self-documenting instead of a hand-maintained list that
  * drifts from the code.
@@ -178,6 +179,17 @@ object Flags {
      * Forces [holders] to initialise so their flags are registered. Enumerating flags without
      * this — or without discovery having run — silently reports a subset, which would make
      * `config list` lie about what exists.
+     *
+     * **The call site is the mechanism; the body is a formality.** Naming an object as an
+     * argument reads its `INSTANCE` field, and that is the active use that runs its class
+     * initialiser — so every holder is already registered by the time control reaches the line
+     * below, and would be even if this function did nothing at all. The loop exists to say
+     * that out loud. Tidying it away is right about the loop and wrong about the function:
+     * what a reader must not delete is a *call*, and `ConfigCli.bootstrap` plus four test
+     * suites depend on theirs.
+     *
+     * `ConfigTest` holds the claim rather than leaving it a sentence: it asserts that a flag
+     * key is unknown before the call that names its holder and known after it.
      */
     fun requireLoaded(vararg holders: Any) {
         holders.forEach { it.hashCode() }
@@ -313,9 +325,11 @@ object Flags {
         )
     }
 
-    /** Test seam: drops registrations so suites can declare throwaway flags in isolation. */
-    internal fun clearForTest() {
-        registered.clear()
-        constraints.clear()
-    }
+    // A `clearForTest()` stood here, offered as the seam for declaring throwaway flags in
+    // isolation. It was `internal` and unused, and a test seam with no test on it is
+    // indistinguishable from dead code — but it was also the wrong seam: registration is
+    // global and eager, so clearing it takes every other suite's flags and, since #69, every
+    // declared Constraint with it, irrecoverably, for the rest of the JVM. Isolation needs a
+    // registry a test can own rather than a global reset. Unique keys per suite is what the
+    // tests here do instead, and it costs them nothing.
 }

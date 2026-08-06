@@ -14,6 +14,21 @@ import kotlinx.serialization.json.JsonPrimitive
 
 private enum class Mode { FAST, SLOW }
 
+/**
+ * A holder named nowhere but in the one test that names it, so that test can assert its flag is
+ * *not* registered first.
+ *
+ * Deliberately not called `*Flags`: this suite runs `ConfigCli.bootstrap`, whose classpath scan
+ * loads every `com.monkopedia.awakener.**` class with that suffix — test classes included — so
+ * a holder the scan could reach would already be registered before the test ran. The test would
+ * then fail on its opening `assertNull` rather than pass emptily, which is the safe direction,
+ * but it would be failing about test wiring instead of about `requireLoaded`. The name keeps it
+ * failing about the thing it is named after.
+ */
+private object LateDeclaration {
+    val late = Flags.string("test.late", "unloaded", "declared by a holder nothing has touched")
+}
+
 class ConfigTest {
     private val dir = createTempDirectory("awakener-config")
 
@@ -97,7 +112,7 @@ class ConfigTest {
     }
 
     /**
-     * The config file is meant to be hand-edited against a running daemon, so one bad value
+     * The config file is meant to be hand-edited against a live desktop, so one bad value
      * must cost only that flag. Throwing here would take the process down over a typo.
      */
     @Test
@@ -530,6 +545,33 @@ class ConfigTest {
             "a one-off environment override was baked into the file: $written",
         )
         assertEquals("x", store.config.value[TestFlags.name])
+    }
+
+    // ---- #82: what `Flags.requireLoaded` actually does ----
+
+    /**
+     * The claim in `requireLoaded`'s documentation, as an assertion: the *call site* is the
+     * mechanism. Naming [LateDeclaration] in the argument list is what runs its class
+     * initialiser, so the key is unknown on the line before and known on the line after —
+     * and the function's body could be empty without changing either.
+     *
+     * That is worth pinning because the body reads as though it were doing the work, and a
+     * reader who tidies away an "obviously pointless" loop is right about the loop and wrong
+     * about the function. Deleting the *call* is the mistake this guards against; deleting the
+     * loop is not.
+     */
+    @Test
+    fun `a flag holder is registered by naming it in requireLoaded`() {
+        assertNull(
+            Flags.byKey("test.late"),
+            "something else loaded the holder, so this proves nothing about requireLoaded",
+        )
+        Flags.requireLoaded(LateDeclaration)
+        assertEquals(
+            "test.late",
+            Flags.byKey("test.late")?.key,
+            "naming a holder did not register its flags",
+        )
     }
 
     /** The requirement has to reach the person editing the file, not only the declaring module. */

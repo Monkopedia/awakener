@@ -568,8 +568,11 @@ class SwayWindowManager(
      * reads at the stock defaults against **~27,500** spun, and 43 against 5,516 over a 1s
      * deadline paced from the first read.
      *
-     * Both flags are re-read on every iteration rather than captured, because `:config` reloads
-     * against a live daemon and a wait can outlive the snapshot it started under. [timeoutMs] is
+     * Both flags are re-read on every iteration rather than captured, because a wait can outlive
+     * the snapshot it started under the moment anything holds one. That is a property of the
+     * design rather than of today's binary: `:config` has the reload mechanism —
+     * `FileConfigStore.watch` — and nothing calls it, because every entry point is one-shot
+     * (#43). So this is written forward, not against an observed reload. [timeoutMs] is
      * necessarily read once by the caller: it is the deadline's own definition, and a deadline
      * that moved while being waited on would not be one.
      *
@@ -983,8 +986,10 @@ class SwayWindowManager(
         try {
             changes.collect { change ->
                 // Only a close can orphan a dock, and it is the exact moment one becomes an
-                // orphan. Read per event rather than captured once, because `:config` reloads
-                // against a live daemon and a collector outlives any snapshot it took at startup.
+                // orphan. Read per event rather than captured once, because a collector outlives
+                // any snapshot it took at startup — and `config` here is a StateFlow read, so it
+                // picks up whatever replaced that snapshot, from a test's `put` today and from
+                // `FileConfigStore.watch` once something calls it (nothing does: #43).
                 if (change is SurfaceChange.Vanished && config[WmFlags.sweepOnClose]) sweep()
             }
         } catch (ended: CompositorSessionEnded) {

@@ -28,12 +28,21 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 
 /**
- * A [ConfigStore] backed by a JSON file, reloaded whenever that file changes on disk.
+ * A [ConfigStore] backed by a JSON file, re-read whenever that file changes on disk *for as
+ * long as somebody is running [watch]*.
  *
  * Editing the file by hand is a first-class way to drive awakener, so the file is treated as
  * the source of truth and never rewritten except when [set]/[unset] are called. A malformed
  * file leaves the last good snapshot in place — the alternative, reverting every flag to its
- * default on a stray keystroke, would be a far worse failure against a live desktop.
+ * default on a stray keystroke, would be a far worse failure against a live desktop. A file
+ * that disappears gets the same treatment by default; see [ConfigFlags.watchMissingFile].
+ *
+ * **Nothing in the build calls [watch] yet** (#43). Every entry point today is one-shot: it
+ * builds a store, reads the file once and exits, so no snapshot is replaced under a running
+ * process. The mechanism is here, and tested, for the first entry point that outlives a
+ * single operation — which is why code above this module reads flags out of the snapshot per
+ * operation rather than caching them at construction. That is written against the property
+ * this class provides, not against the process that exists.
  */
 class FileConfigStore(
     private val path: Path,
@@ -64,11 +73,21 @@ class FileConfigStore(
     override val config: StateFlow<Config> = state.asStateFlow()
 
     /**
-     * Watches [path] for changes until [scope] is cancelled.
+     * Watches [path] for changes until [scope] is cancelled, replacing the snapshot each time
+     * it changes. Nothing calls this yet; see the class documentation.
      *
-     * Watches the *parent directory*, because editors overwhelmingly save by writing a
-     * temporary file and renaming it over the target — which destroys a watch registered on
-     * the file itself, and would make hot reload work exactly once.
+     * Watches the *parent directory*, and has to: a `WatchService` registers directories only,
+     * and `Path.register` on a regular file raises `NotDirectoryException` rather than
+     * watching it. That is not merely an API shape to route around — it is the shape the job
+     * needs. A save is normally an atomic rewrite: write a temporary file, rename it over the
+     * target. [mutate] below does exactly that, so the target's identity does not survive its
+     * own writes, and anything bound to the file rather than to its name would stop seeing
+     * them. Both halves are pinned by tests in `FileConfigStoreWatchTest`.
+     *
+     * The events for one save are several, so they are given a settling window before the
+     * read — [ConfigFlags.watchDebounceMs], read from the live snapshot every time round, so
+     * that changing it applies to the watcher that is already running rather than to the next
+     * one. That is the same rule this module asks of everyone else.
      */
     fun watch(scope: CoroutineScope) = scope.launch(Dispatchers.IO) {
         path.createParentDirectories()
@@ -77,18 +96,42 @@ class FileConfigStore(
         dir.register(watcher, ENTRY_CREATE, ENTRY_MODIFY, ENTRY_DELETE)
         watcher.use {
             while (isActive) {
-                val key = watcher.poll(250, TimeUnit.MILLISECONDS) ?: continue
+                // A timed poll rather than a blocking take: cancelling [scope] does not
+                // interrupt the thread a WatchService is parked on, and the close that would
+                // wake it is the one this `use` performs on the way out.
+                val key = watcher.poll(POLL_INTERVAL_MS, TimeUnit.MILLISECONDS) ?: continue
                 val touched = key.pollEvents().any { event ->
+                    // By name, so the `.tmp` file [mutate] writes beside the target — and
+                    // everything else sharing the directory — does not provoke a re-read.
                     (event.context() as? Path)?.name == path.name
                 }
                 key.reset()
                 if (!touched) continue
-                // Rename-over-target arrives as several events; let them settle so we parse
-                // the finished file rather than a half-written one.
-                delay(RELOAD_DEBOUNCE_MS)
-                state.value = load()
+                delay(config.value[ConfigFlags.watchDebounceMs])
+                reloadFromWatch()
             }
         }
+    }
+
+    /**
+     * The re-read [watch] performs, which differs from [reload] in one case: a file that is no
+     * longer there.
+     *
+     * [load] treats an absent file as an empty one, which is right for a store being built —
+     * an unconfigured system has no file and must read defaults. It is not automatically right
+     * for a *running* one, where the file existed a moment ago: a delete-then-write save
+     * leaves it absent for as long as the writer takes, and reading defaults for every flag in
+     * that gap is the failure the malformed-file rule already exists to prevent. Which of the
+     * two it is is [ConfigFlags.watchMissingFile]'s to say.
+     */
+    private fun reloadFromWatch() {
+        if (!path.exists() && config.value[ConfigFlags.watchMissingFile] == MissingFile.KEEP) {
+            // Reported for the same reason an unreadable file is: the values in effect are no
+            // longer the ones anybody can look at, and nothing else would say so.
+            loadError.value = "$path no longer exists; keeping the values last read from it"
+            return
+        }
+        state.value = load()
     }
 
     /**
@@ -121,7 +164,10 @@ class FileConfigStore(
                 val tmp = path.resolveSibling("${path.name}.tmp")
                 Files.writeString(tmp, json.encodeToString(JsonObject(next)))
                 // Atomic rename: a reader either sees the old file or the new one, never a
-                // partial write. The watch then reloads us from the file we just wrote.
+                // partial write. This is also why [watch] is registered on the directory —
+                // the target's inode does not survive this, so the store's own writes are the
+                // first thing a watch bound to the file rather than the name would miss.
+                // The reload below is this process's own; a watch elsewhere sees the rename.
                 Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
                 state.value = load()
             }
@@ -237,7 +283,13 @@ class FileConfigStore(
     )
 
     private companion object {
-        const val RELOAD_DEBOUNCE_MS = 40L
+        /**
+         * How long [watch] blocks before checking whether it has been cancelled. Left a
+         * constant rather than made a flag: an event wakes the poll immediately, so this
+         * delays no reload — all it bounds is how long after `scope.cancel()` the watcher
+         * notices, which nothing yet depends on because nothing yet calls [watch].
+         */
+        const val POLL_INTERVAL_MS = 250L
 
         fun String.toEnvName(): String =
             "AWAKENER_" + uppercase().map { if (it.isLetterOrDigit()) it else '_' }.joinToString("")

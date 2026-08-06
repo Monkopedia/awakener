@@ -244,8 +244,17 @@ behaviours, *build both and add the switch* rather than asking which he wants.
   `config.flags.declarations`.
 - Defaults must be the behaviour you would have hard-coded, so an unconfigured system is
   correct.
-- `:config` reloads on file change, so a flag flip applies to a live daemon. Never cache a
-  flag value across an operation that could span a reload — read it from the snapshot.
+- **Never cache a flag value across an operation that could span a reload — read it from the
+  snapshot.** Write to that rule; it is not yet enforced by anything running. `:config` *has*
+  the reload mechanism — `FileConfigStore.watch(scope)` replaces the snapshot when the file
+  changes, and `FileConfigStoreWatchTest` holds it — but **nothing calls it**, because every
+  entry point in the build is one-shot: it reads the file, acts and exits (#43). So a flag flip
+  applies to the next run, not to a running process, and `awakener-config list` says so. The
+  per-operation re-reads in `:wm` and `:cli` are forward-looking rather than cargo, and the
+  first entry point that outlives one operation is expected to call `watch` at the composition
+  root. Until then this bullet describes a discipline, not an observed property — which is
+  exactly why it is worth keeping: re-deriving it after the first daemon exists costs more than
+  writing it this way now.
 - A snapshot is total: a bad value degrades to that flag's default and is reported through
   `Config.problems`. The config file gets hand-edited against a running desktop, so a typo
   must not take the process down.
