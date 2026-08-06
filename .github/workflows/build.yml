@@ -57,6 +57,32 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends sway foot
 
+      # The summary script below parses the JUnit XML with a hand-rolled awk program that has to
+      # stay mawk-compatible, because mawk is `/usr/bin/awk` here. `summaryMatrixTest` proves
+      # that by running its whole case list under every awk it can find, and it refuses to run
+      # against fewer than two distinct ones: a portability claim drawn from one implementation
+      # is not a portability claim. This runner ships mawk as `awk`, and its `busybox-static`
+      # already carries the awk applet, so gawk is the only one that has to be fetched.
+      # `busybox` is deliberately *not* installed: apt resolves that package by **removing**
+      # `busybox-static` and `ubuntu-standard`, which is a large change to the runner in
+      # exchange for an implementation already present.
+      #
+      # Installing gawk may or may not move the `awk` alternative onto it — that is the packaging
+      # system's decision, not this file's, so the step prints what `awk` resolves to rather than
+      # asserting it (run 31068645962 says it does move). Nothing depends on the answer: the
+      # matrix names `mawk` in its roster and runs the whole case list under it by name, which is
+      # *why* it names implementations rather than trusting the alternative to still point where
+      # it did last week.
+      - name: Install extra awk implementations
+        id: install-awks
+        run: |
+          sudo apt-get install -y --no-install-recommends gawk
+          for a in awk mawk gawk "busybox awk"; do
+            printf '%s: ' "$a"
+            $a 'BEGIN { print "ok" }' || echo "MISSING"
+          done
+          echo "awk resolves to: $(readlink -f "$(command -v awk)")"
+
       # :registry shells out to the spanreed CLI, and its suite skips silently without it —
       # the same false-green trap as :wm without sway, in a second module.
       - name: Install spanreed
@@ -83,6 +109,7 @@ jobs:
         if: failure()
         env:
           SWAY: ${{ steps.install-sway.outcome }}
+          AWKS: ${{ steps.install-awks.outcome }}
           SPANREED: ${{ steps.install-spanreed.outcome }}
           GRADLE: ${{ steps.gradle.outcome }}
         run: |
@@ -92,6 +119,7 @@ jobs:
             echo "| phase | outcome |"
             echo "|---|---|"
             echo "| install sway and foot | \`${SWAY:-did-not-run}\` |"
+            echo "| install extra awks | \`${AWKS:-did-not-run}\` |"
             echo "| install spanreed | \`${SPANREED:-did-not-run}\` |"
             echo "| build and test | \`${GRADLE:-did-not-run}\` |"
             echo
