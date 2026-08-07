@@ -115,14 +115,20 @@ class SwayConnection private constructor(private val channel: SocketChannel) : A
          * processes it spawns and honours when creating the socket.
          */
         fun open(socketPath: String? = null): SwayConnection {
-            val path = socketPath
-                ?: System.getenv("SWAYSOCK")
-                ?: throw IllegalStateException(
-                    "no sway socket: pass one explicitly or set SWAYSOCK",
-                )
+            val path = socketPath ?: System.getenv("SWAYSOCK") ?: throw noSocket()
             val channel = SocketChannel.open(StandardProtocolFamily.UNIX)
             channel.connect(UnixDomainSocketAddress.of(path))
             return SwayConnection(channel)
         }
+
+        /**
+         * The refusal when there is no path to try at all.
+         *
+         * A function rather than a `throw` inline so that [SwaySocket] can raise the same thing
+         * where it declines to look further, which keeps "there was nothing to connect to" one
+         * message with one wording however the caller got there.
+         */
+        internal fun noSocket(): IllegalStateException =
+            IllegalStateException("no sway socket: pass one explicitly or set SWAYSOCK")
     }
 }

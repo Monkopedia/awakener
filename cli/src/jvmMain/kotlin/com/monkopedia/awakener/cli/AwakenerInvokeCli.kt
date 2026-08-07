@@ -5,7 +5,7 @@ import com.monkopedia.awakener.config.FileConfigStore
 import com.monkopedia.awakener.registry.FileBindingStore
 import com.monkopedia.awakener.registry.SpanreedCli
 import com.monkopedia.awakener.wm.SurfaceId
-import com.monkopedia.awakener.wm.SwayConnection
+import com.monkopedia.awakener.wm.SwaySocket
 import com.monkopedia.awakener.wm.SwayWindowManager
 import com.monkopedia.awakener.wm.WmFlags
 import kotlin.system.exitProcess
@@ -173,27 +173,52 @@ private fun awaken(args: Array<String>, store: FileConfigStore): Int {
     // does not take the invocation down with it; the manager documents that the scope it is
     // given must tolerate a child failing under that flag.
     val scope = CoroutineScope(SupervisorJob())
-    val socket = store.config.value[WmFlags.socketPath].ifBlank { null }
-    val wm = SwayWindowManager({ SwayConnection.open(socket) }, store, bindings, scope)
+    // Resolved inside the lambda rather than once above it, because the manager calls this again
+    // for every session: this process is one-shot today, so the second call cannot happen here,
+    // but a connect that captured one path is exactly what made reconnection impossible (#33) and
+    // it should not be reintroduced by the composition root.
+    val wm = SwayWindowManager(
+        connect = {
+            val config = store.config.value
+            SwaySocket.connect(
+                config[WmFlags.socketPath].ifBlank { null },
+                config[WmFlags.socketDiscovery],
+            )
+        },
+        store = store,
+        registry = bindings,
+        scope = scope,
+    )
 
     return try {
         runBlocking {
-            AwakenerInvokeCli.run(
-                args,
-                Awakening(
-                    wm = wm,
-                    registry = bindings,
-                    bus = spanreed,
-                    store = store,
-                    prepareResidue = { bindings.prepareResidue(it) },
-                    reapOrphans = wm::reapOrphans,
-                ),
-                ::println,
-            )
+            try {
+                AwakenerInvokeCli.run(
+                    args,
+                    Awakening(
+                        wm = wm,
+                        registry = bindings,
+                        bus = spanreed,
+                        store = store,
+                        prepareResidue = { bindings.prepareResidue(it) },
+                        reapOrphans = wm::reapOrphans,
+                    ),
+                    ::println,
+                )
+            } finally {
+                // The dock is sway's child, not this process's, so retiring the manager stops its
+                // collector and gives up its connection and leaves every panel standing.
+                //
+                // Reported and not raised: a close that cannot retire its own collector is worth
+                // saying out loud, and this process is about to exit either way — turning an
+                // invocation that did its job into a failed exit status would tell the user
+                // something false about the thing they pressed a key for.
+                runCatching { wm.close() }.exceptionOrNull()?.let {
+                    System.err.println("warning: ${it.message}")
+                }
+            }
         }
     } finally {
-        // The dock is sway's child, not this process's, so ending the lifetime granted to the
-        // manager retires the collector and its connection and leaves every panel standing.
         scope.cancel()
     }
 }

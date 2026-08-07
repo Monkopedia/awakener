@@ -113,6 +113,7 @@ class WmFlagsTest {
             WmFlags.reservationGraceMs,
             WmFlags.pollSpinMs,
             WmFlags.pollIntervalMs,
+            WmFlags.closeWaitMs,
         )) {
             val config = snapshot(flag.key to -1L)
             assertTrue(

@@ -31,8 +31,10 @@ enum class CollectorFailure {
      * Record it on [DockRepairStatus.collectorFailure] and complete the collector normally.
      *
      * The scope keeps every other coroutine it holds; what is lost is this manager's repair, which
-     * was lost either way — the subscription behind the collector is gone and nothing here rebuilds
-     * it (#33).
+     * was lost either way — the subscription behind the collector is gone and nothing rebuilds it.
+     * `wm.session.reconnect` is not that thing: it restarts a collector that ended at the session
+     * boundary, where a successor connection is the missing piece, and none of the three failures
+     * that arrive here is one a fresh connection is known to fix.
      */
     REPORT,
 
@@ -71,10 +73,26 @@ data class DockRepairStatus(
      */
     val lastFailure: Throwable? = null,
     /**
-     * Non-null once the compositor session ended, at which point the dock table has been discarded
-     * and this manager can do nothing further: its commands still ride the dead connection.
+     * The compositor session boundary this manager is currently stopped at, or null if it is not
+     * stopped at one.
+     *
+     * Set when the collector sees the session end, at which point the dock table has been discarded
+     * and the dead connection closed, and **cleared again when a successor connection is acquired**
+     * — see [reconnects], which is where the history lives. Clearing it is not tidiness: the whole
+     * meaning of this field is "this manager is finished and a successor is needed", and under
+     * `wm.session.reconnect=ON_DEMAND` that stops being true the moment the next call reconnects.
+     * Under `NEVER` nothing clears it, which is that flag's whole behaviour.
      */
     val sessionEnded: CompositorSessionEnded? = null,
+    /**
+     * How many successor connections this manager has acquired since it was built.
+     *
+     * Zero on a manager that has never seen a session end, and on one that has seen one and been
+     * left at it. It counts *acquisitions* rather than boundaries because that is the observable
+     * with consequences — a fresh connection, an empty table, a restarted collector, and every
+     * [DockHandle] from before it now naming another session's `con_id`s.
+     */
+    val reconnects: Int = 0,
     /**
      * What ended the collection other than the session boundary, or null if nothing did.
      *

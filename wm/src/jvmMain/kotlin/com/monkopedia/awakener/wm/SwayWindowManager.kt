@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.sync.Mutex
@@ -33,6 +34,14 @@ import kotlinx.coroutines.yield
  *
  * Everything sway-specific lives here — criteria strings, split containers, focus memory —
  * so that nothing above [WindowManager] has to know any of it.
+ *
+ * **It has a lifecycle as well as an interface**, and the two are deliberately not the same thing:
+ * [close] retires one manager, and the compositor session it is speaking to can end and be replaced
+ * underneath it without either being visible to anything above [WindowManager]. Neither is on the
+ * interface — a caller that has to close a manager is the one that built it, and [WindowManager] is
+ * held to what `docs/design.md` says it is (see #94, which is where that agreement is being
+ * settled). What a caller above does see is [CompositorSessionEnded], which is compositor-agnostic
+ * and was already part of the change stream's contract.
  */
 class SwayWindowManager(
     private val connect: () -> SwayConnection,
@@ -52,10 +61,67 @@ class SwayWindowManager(
      * and reported through [repairs] instead — see [CollectorFailure], which is also how a caller
      * asks for the opposite. Set [WmFlags.collectorFailure] to `PROPAGATE` and this scope must
      * tolerate a child failing, since a constructor-started job leaves nowhere to put a `try`.
+     *
+     * Nothing runs on it *directly* any more: everything this manager launches goes on [lifetime],
+     * a child of this scope, so that [close] can retire one manager without touching the rest of
+     * what a caller put here. Cancelling this scope still ends the manager, which is what makes it
+     * a grant of a lifetime rather than a place to put coroutines.
      */
     private val scope: CoroutineScope,
 ) : WindowManager {
-    private val commands: SwayConnection by lazy { connect() }
+    /**
+     * This manager's own lifetime, and the reason [close] can promise anything.
+     *
+     * A child [Job] of [scope] rather than a `SupervisorJob`: the parent relationship is what makes
+     * cancelling the caller's scope still end this manager, and a plain `Job` is what keeps
+     * [CollectorFailure.PROPAGATE] meaning what it says — a supervisor here would stop a collector
+     * failure ever reaching the caller's scope, which is that flag's entire purpose.
+     *
+     * The context is otherwise inherited, so a caller's dispatcher and its
+     * `CoroutineExceptionHandler` still apply to everything launched here.
+     */
+    private val lifetime =
+        CoroutineScope(scope.coroutineContext + Job(scope.coroutineContext[Job]))
+
+    /**
+     * One compositor session as this manager sees it.
+     *
+     * The connection is the identity, not merely a field of it: the design note's rule is that the
+     * dock table's lifetime *is* the IPC connection's lifetime, and a handle or a tree edit that
+     * wants to say "the session I was made against" has nothing else to point at. [generation]
+     * exists so that a message can say which one, since a reader looking at two connections cannot
+     * tell them apart.
+     */
+    private class Session(val connection: SwayConnection, val generation: Long)
+
+    /**
+     * The live session, or null before the first command and after a boundary nothing has yet
+     * reconnected past.
+     *
+     * Volatile and read without the lock on the paths that only *compare* it — [SwayDockHandle]
+     * asking whether it is stale — so that a stale handle is refused without acquiring anything.
+     * Every write, and every read that may acquire, goes through [sessionLock].
+     */
+    @Volatile
+    private var liveSession: Session? = null
+
+    /**
+     * The boundary this manager is stopped at, or null if it is not stopped at one.
+     *
+     * Held here as well as on [repairs] because the two answer different questions and one of them
+     * has to be race-free against acquisition: this is written under [sessionLock] by the collector
+     * and cleared under it by the reconnect, so "is this an acquisition or a reacquisition" is
+     * decided by the same lock that does the acquiring. [DockRepairStatus.sessionEnded] is the
+     * reporting copy, and a reader watching it can lag this one by an instant.
+     */
+    private var boundary: CompositorSessionEnded? = null
+
+    private var generation = 0L
+
+    @Volatile
+    private var retired = false
+
+    private val sessionLock = Mutex()
 
     private val config: Config get() = store.config.value
 
@@ -66,9 +132,11 @@ class SwayWindowManager(
      * written by [attach], by a teardown, and by [dockedTo] adopting a dock it found by mark.
      *
      * `internal` rather than private only so that the tests in this module can assert on it
-     * directly. Discarding it at the session boundary has no observable consequence from outside —
-     * by then the connection every read would go through is dead — so this is the one invariant
-     * that cannot be checked through behaviour.
+     * directly. That used to be the only way to check it at all: discarding it at the session
+     * boundary had no observable consequence, because by then the connection every read would go
+     * through was dead. It does now — a manager that reconnects (see [WmFlags.sessionReconnect])
+     * enumerates the successor session against an empty table and rebuilds by adopting the marks it
+     * finds, which is exactly what the design note asks for and is behaviour a test can watch.
      */
     internal val docks = DockTable()
 
@@ -99,6 +167,163 @@ class SwayWindowManager(
      * a dock the flip stranded.
      */
     val unrecognisedDockMarks: StateFlow<Set<String>> = unrecognisedMarks.asStateFlow()
+
+    /**
+     * The session every command in this manager rides on, acquiring one if there is none.
+     *
+     * This replaced `by lazy { connect() }`, and the difference is the whole of #33's first bullet:
+     * a lazy connection is acquired once and is then whatever it was, so a manager whose compositor
+     * restarted spent the rest of the process talking to a socket nothing was listening on. Here
+     * the absence of a session is a state that can be *left*, and [WmFlags.sessionReconnect]
+     * decides whether leaving it is this manager's job or the caller's.
+     *
+     * Double-checked against [liveSession] before taking [sessionLock], because this is on the
+     * path of every tree read and enumeration takes no other lock at all.
+     */
+    private suspend fun session(): Session =
+        liveSession ?: sessionLock.withLock { liveSession ?: acquire() }
+
+    /**
+     * Opens a connection and makes it this manager's session, restarting the repair collector if
+     * this is a reconnection rather than the first one.
+     *
+     * **The collector restart belongs here and not in the collector**, which is what keeps the
+     * design's rule about unattended action intact. A collector that reconnected itself would be
+     * looping — it would wake with no compositor to read, fail, and have to decide how long to
+     * wait before trying again, which is a schedule. Reconnecting from an acquisition means the
+     * work is done because a caller asked for something, once per asking, and a desktop nobody
+     * touches does nothing at all.
+     *
+     * [connect] raising leaves this manager exactly where it was — no session, the boundary still
+     * recorded — so the next call tries again. That is the only retry there is, and a caller made
+     * it.
+     */
+    private suspend fun acquire(): Session {
+        check(!retired) {
+            "this manager has been closed and will not open another connection; build a new one"
+        }
+        val resuming = boundary != null
+        check(!resuming || config[WmFlags.sessionReconnect] == SessionReconnect.ON_DEMAND) {
+            "the compositor session this manager was built against has ended, and " +
+                "wm.session.reconnect=NEVER: this manager will not acquire a successor " +
+                "connection. Retire it with close() and build one against the new session."
+        }
+        val fresh = Session(connect(), generation + 1)
+        generation = fresh.generation
+        liveSession = fresh
+        if (resuming) {
+            boundary = null
+            // Reported before the collector is relaunched, so a reader that sees `sessionEnded`
+            // cleared cannot also see a manager with no collector.
+            repairState.update {
+                it.copy(sessionEnded = null, reconnects = it.reconnects + 1)
+            }
+            repairing = lifetime.launch { collectRepairs() }
+        }
+        return fresh
+    }
+
+    /**
+     * Drops the session the compositor has ended, closing what is left of it.
+     *
+     * Run before the table is discarded and before the boundary is reported, so that a reader who
+     * sees [DockRepairStatus.sessionEnded] set can rely on both: there is no live session, and the
+     * table is empty. The connection is closed rather than dropped because a manager that goes on
+     * to reconnect would otherwise leak one file descriptor per compositor restart, and because a
+     * caller blocked in a request on it should learn now.
+     */
+    private suspend fun invalidate(ended: CompositorSessionEnded) {
+        val dead = sessionLock.withLock {
+            boundary = ended
+            liveSession.also { liveSession = null }
+        }
+        dead?.connection?.close()
+    }
+
+    /**
+     * Retires this manager: it stops collecting, gives up its connection and abandons its table,
+     * and every later call on it raises.
+     *
+     * **What it guarantees is that the collector has stopped, not that it has been asked to**, and
+     * that distinction is the whole reason this exists rather than being left to the scope a caller
+     * handed in. `cancel` only asks: a collector inside a sweep goes on deciding what to reap until
+     * the cancellation reaches a suspension point, so a caller that cancelled and immediately built
+     * a replacement had two managers over one tree for exactly as long as that took — the race #56
+     * was, narrowed rather than closed. So this closes the command connection first, which wakes a
+     * collector blocked in a socket read, and then *joins*, bounded by [WmFlags.closeWaitMs]. A
+     * wait that expires raises, because a manager that has been asked to stop and has not is the
+     * state this call exists to make impossible.
+     *
+     * What it does not do is take the desktop apart. The docks stay standing under the default
+     * [WmFlags.closeReapsDocks]: a dock's mark is what a successor adopts it by, so an awakener
+     * restart over a live sway is meant to leave the panels where they are. That flag is the other
+     * choice, for a shutdown with nothing coming after it.
+     *
+     * **Call it from outside the scope this manager was given.** It joins its own children, so a
+     * call made *from* one of them — from inside a sweep, say — waits for itself until
+     * [WmFlags.closeWaitMs] expires and then raises.
+     *
+     * Idempotent in the ordinary sense: a second call returns having done nothing. Two concurrent
+     * first calls are a caller error, not a case this defends against.
+     */
+    suspend fun close() {
+        if (retired) return
+        // Before the retirement, not after: a teardown talks to the compositor, and a retired
+        // manager refuses to hand out the session it would need to.
+        val failure = if (config[WmFlags.closeReapsDocks]) detachAll() else null
+        retired = true
+        val job = lifetime.coroutineContext.job
+        // Asked first and woken second. The cancellation is what the collector is waiting to
+        // notice; closing the connection is what stops it waiting on a socket read to notice it.
+        job.cancel()
+        val dead = sessionLock.withLock { liveSession.also { liveSession = null } }
+        dead?.connection?.close()
+        try {
+            val wait = config[WmFlags.closeWaitMs]
+            if (wait > 0) {
+                check(withTimeoutOrNull(wait) { job.join() } != null) {
+                    "this manager's collector was still running ${wait}ms after close() " +
+                        "cancelled it; a manager that has been asked to stop and has not is the " +
+                        "overlap close() exists to prevent (wm.manager.close_wait_ms)"
+                }
+            }
+        } finally {
+            // In a `finally` so that a join that timed out still leaves the table abandoned: the
+            // entries name a session this manager has stopped speaking for either way.
+            docks.discard()
+        }
+        failure?.let { throw it }
+    }
+
+    /**
+     * Tears down every dock in this manager's table, returning what failed rather than raising.
+     *
+     * Returned rather than thrown because [close] must finish retiring whatever this does: a wedged
+     * panel is a thing to report, and a collector left running because a panel would not close is a
+     * thing that goes on reaping the desktop. Each failure names its dock for the same reason
+     * [reapOrphans] tags its own — nothing underneath knows which window a `split none` refusal
+     * came from.
+     */
+    private suspend fun detachAll(): Throwable? {
+        val session = liveSession ?: return null
+        val failures = mutableListOf<Throwable>()
+        docks.snapshot().entries.forEach { (dock, entry) ->
+            try {
+                SwayDockHandle(entry.surface, AgentId(""), SurfaceId(dock), null, session).detach()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                failures += IllegalStateException(
+                    "closing dock $dock, bound to surface ${entry.surface.raw}, failed while " +
+                        "retiring this manager",
+                    failure,
+                )
+            }
+        }
+        return failures.firstOrNull()?.also { first ->
+            failures.drop(1).forEach(first::addSuppressed)
+        }
+    }
 
     /** Whether awakener's own memory counts as evidence, or only what it wrote into the tree. */
     private val Config.consultsTable: Boolean
@@ -229,9 +454,15 @@ class SwayWindowManager(
      * entry point that exists.
      *
      * What this is not: a guarantee. `treeEdit { this }` still smuggles the receiver out, and
-     * [commands] and [connect] stay in scope for the whole class, so a determined author can still
+     * [session] and [connect] stay in scope for the whole class, so a determined author can still
      * drive sway unlocked. The claim is only that doing so takes deliberate effort rather than
      * inattention.
+     *
+     * **One tree edit is one session.** The session is acquired here, inside the lock, and every
+     * command and every tree read the block makes goes through that one — so a transaction cannot
+     * be half against a compositor that has since died and half against its successor, which is a
+     * shape that became possible the moment a manager could reconnect. It is also what lets
+     * [attach] stamp the handle it returns with the session its `con_id`s came from.
      *
      * Two things are deliberately *outside*. Reads ([tree] and everything built on it) never take
      * the lock, so enumerating surfaces does not queue behind an attach that is waiting on a dock
@@ -243,7 +474,7 @@ class SwayWindowManager(
      * section needs — `settleFocus`, called from the end of `attach`, in particular.
      */
     private suspend fun <T> treeEdit(edit: suspend TreeEdit.() -> T): T =
-        treeEditLock.withLock { TreeEdit().edit() }
+        treeEditLock.withLock { TreeEdit(session()).edit() }
 
     /**
      * What identifies the dock an `attach` has `exec`'d but has not found yet: the `app_id` it
@@ -264,7 +495,23 @@ class SwayWindowManager(
      * hold an instance in a field or return one out of the block, because either puts the receiver
      * back in scope where a caller can reach it with no lock at all.
      */
-    private inner class TreeEdit {
+    private inner class TreeEdit(
+        /**
+         * The compositor session this transaction is against, pinned by [treeEdit] as the lock was
+         * taken. Everything in here goes through it rather than through whatever is live now.
+         */
+        val session: Session,
+    ) {
+        /**
+         * The tree as this transaction's session reports it.
+         *
+         * Deliberately shadows the manager's own [SwayWindowManager.tree], so that every read
+         * inside a tree edit — the waits, the unwind's look for a stray dock, the flatten's check —
+         * is answered by the compositor the edit is being made against. An edit that read the tree
+         * from a successor connection would be reasoning about one session's ids against another's.
+         */
+        suspend fun tree(): Node = tree(session)
+
         suspend fun run(command: String) {
             val failure = attempt(command)
             check(failure == null) { "sway rejected '$command': ${failure?.error}" }
@@ -272,7 +519,7 @@ class SwayWindowManager(
 
         /** Runs [command], returning sway's complaint if it rejected it. */
         private suspend fun attempt(command: String): CommandResult? {
-            val raw = commands.request(I3Ipc.Request.RUN_COMMAND, command)
+            val raw = session.connection.request(I3Ipc.Request.RUN_COMMAND, command)
             return swayJson.decodeFromString<List<CommandResult>>(raw).firstOrNull { !it.success }
         }
 
@@ -602,8 +849,11 @@ class SwayWindowManager(
             null
         }
 
-    suspend fun tree(): Node =
-        swayJson.decodeFromString(commands.request(I3Ipc.Request.GET_TREE))
+    suspend fun tree(): Node = tree(session())
+
+    /** [tree] against one named session; see [TreeEdit.tree] for why that is ever worth naming. */
+    private suspend fun tree(session: Session): Node =
+        swayJson.decodeFromString(session.connection.request(I3Ipc.Request.GET_TREE))
 
     /**
      * A tree node as the compositor-agnostic thing above this module sees.
@@ -755,7 +1005,10 @@ class SwayWindowManager(
         var attached = false
         val suppression = cfg[WmFlags.dockFocusSuppression]
         try {
-            val dockId = treeEdit {
+            // The session comes back out with the dock id because the handle has to carry it: a
+            // `con_id` only means anything against the session that minted it, and a manager that
+            // can reconnect will outlive this one. See [WmFlags.staleHandles].
+            val (dockId, dockSession) = treeEdit {
                 // What this attach has put into the tree so far, which is what the unwind takes
                 // back. Tracked rather than re-derived: a `split none` on a container this attach
                 // did not create is a different edit, and sway would refuse it anyway.
@@ -855,7 +1108,7 @@ class SwayWindowManager(
                         focus(surface)
                     }
                     if (cfg[WmFlags.restoreFocusAfterAttach]) settleFocus(surface, dockId)
-                    dockId
+                    dockId to session
                 } catch (failure: Throwable) {
                     unwindAttach(surface, spawned, pending, container, failure)
                     throw failure
@@ -890,7 +1143,7 @@ class SwayWindowManager(
                 throw failure
             }
             attached = true
-            return SwayDockHandle(surface, bound.agent, dockId, key)
+            return SwayDockHandle(surface, bound.agent, dockId, key, dockSession)
         } finally {
             reservation?.let(docks::release)
             // The dock this entry names is a window nothing holds a handle to: either it never
@@ -907,7 +1160,7 @@ class SwayWindowManager(
             return@callbackFlow
         }
         val events = connect()
-        val job = scope.launch {
+        val job = lifetime.launch {
             // However the subscription ends, it ends this flow — and with the reason attached.
             // A job that simply finished left the channel open, so a collector saw a compositor
             // that had gone away as a desktop on which nothing was happening. Caught rather than
@@ -994,8 +1247,15 @@ class SwayWindowManager(
             }
         } catch (ended: CompositorSessionEnded) {
             // The session boundary, mechanically: connection loss *is* the boundary, and #20 is
-            // what makes it distinguishable from an idle desktop. Discard before reporting, so
-            // that a reader who sees `sessionEnded` set can rely on the table already being empty.
+            // what makes it distinguishable from an idle desktop. Drop the dead session and
+            // discard before reporting, so that a reader who sees `sessionEnded` set can rely on
+            // both — the table is empty, and there is no live connection behind it.
+            //
+            // The collection ends here whatever `wm.session.reconnect` says. A collector that
+            // reconnected itself would be a loop with a wait in it — there is nothing to connect
+            // to at the instant a compositor dies — and the design forbids exactly that. The
+            // successor is acquired by the next caller, which restarts this (see `acquire`).
+            invalidate(ended)
             docks.discard()
             repairState.update { it.copy(sessionEnded = ended) }
         } catch (cancelled: CancellationException) {
@@ -1003,6 +1263,11 @@ class SwayWindowManager(
             // be recorded as one — nor swallowed, or this job would complete rather than cancel.
             throw cancelled
         } catch (failure: Exception) {
+            // A close that took the connection away underneath its own collector is not a
+            // collector failure and must not be recorded as one: `close` cancels and then closes,
+            // so the read this collector was parked on fails on the way out. What ended the
+            // collection there is the retirement, which the caller already knows about.
+            if (retired) return
             // Everything else: a connect that raised, a subscription sway refused, a payload that
             // would not parse. The table is deliberately *not* discarded — none of these says the
             // session ended, and emptying a table that still describes a live session would make
@@ -1032,6 +1297,9 @@ class SwayWindowManager(
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (failure: Exception) {
+            // Same rule as `collectRepairs`: a sweep that failed because `close` closed the
+            // connection under it is the retirement, not a repair that went wrong.
+            if (retired) return
             repairState.update {
                 it.copy(
                     sweeps = it.sweeps + 1,
@@ -1056,17 +1324,20 @@ class SwayWindowManager(
      * [scope], which is the cost of every manager now having a collector rather than only the one
      * a daemon would have wired.
      *
-     * **This job completing is normal, and there is no `close()` to retire it early.** It ends when
-     * the session ends, when a sweep raises under [SweepFailure.STOP], or on any other failure
-     * under [CollectorFailure.REPORT] — and in every one of those cases [repairs] says which. The
-     * only lever a caller has for stopping a collector before then is cancelling the scope it gave,
-     * which retires everything else on that scope too.
+     * **This job completing is normal.** It ends when the session ends, when a sweep raises under
+     * [SweepFailure.STOP], or on any other failure under [CollectorFailure.REPORT] — and in every
+     * one of those cases [repairs] says which. It is a `var` because one of those endings is now
+     * reversible: [acquire] starts a fresh collector when a caller reconnects past a session
+     * boundary, so a manager that outlives a compositor restart has a collector again, on the
+     * successor connection. Nothing else restarts it, and nothing restarts it on a schedule.
      *
-     * **So a caller that will ever replace a manager must give each one a scope of its own** — a
-     * child of the caller's, cancelled as the replacement is built, rather than one scope shared by
-     * both. Skipping that leaves the outgoing manager subscribed and sweeping, and the two sweeps
-     * do *not* agree. Restarting a manager is reconnection (#33), and that is where this stops
-     * being a rule about tests.
+     * **Retiring one before then is [close]'s**, which is what #85 settled. A caller replacing a
+     * manager closes the outgoing one and gets a promise that its collector has *stopped* — not
+     * that it has been asked to — because the cancellation a caller can issue for itself only asks,
+     * and a predecessor still inside a sweep is the whole hazard. Giving each manager a scope of
+     * its own still works and is still what the tests do; the difference is that `close` also
+     * abandons the table and gives up the connection, and that cancelling a shared scope no longer
+     * has to be the lever.
      *
      * **Two managers over one tree are not harmless, and their sweeps are not idempotent (#72).**
      * This said the opposite — that both sweeps were idempotent against the same tree, so a
@@ -1098,14 +1369,26 @@ class SwayWindowManager(
      * collector killed the dock the manager under test had correctly left standing. `a retired
      * manager sweeps nothing, so a restart cannot race it` holds the retirement that fixes it.
      *
-     * Whether the product should *prevent* overlap rather than requiring a caller to retire — a
-     * `close()` that unsubscribes and abandons the table, a sweep reading durable state instead of
-     * the asking manager's table, or overlap declared unsupported and enforced — is open in #72 and
-     * is deliberately not settled here. **Whoever settles it should know the blast radius is the
-     * default configuration**, not an opt-in: every argument for leaving overlap to the caller has
-     * to hold for a desktop that has changed no flags at all.
+     * **What the product does about that is now decided (#85), and the decision is the first of the
+     * three candidates**: a [close] that stops the collector, gives up the connection and abandons
+     * the table. Two things make it the answer rather than the sweep-reads-durable-state one. The
+     * table is consulted *twice* on the sweep path — [dockedTo] before [currentlyADock] — so a fix
+     * aimed at the second leaves [ReapEvidence.RECOGNITION] fully exposed, where the whole
+     * divergence comes from the first; and a sweep that would not consult the table at all is a
+     * different sweep, one that stops reaping any dock whose mark it cannot read, which is a cost
+     * paid by every single-manager desktop to fix something only a second manager can cause.
+     *
+     * **The other half of the decision is that a compositor restart no longer produces a second
+     * manager at all.** That was the concrete case where a predecessor could still be subscribed:
+     * reconnection had no owner (#33), so the only way past a session boundary was to build a
+     * successor manager and hope the caller retired the old one. Under
+     * [WmFlags.sessionReconnect]`=ON_DEMAND` the manager acquires the successor connection itself
+     * and restarts this job on it, so there is one manager across the boundary and nothing to
+     * overlap. Under `NEVER` the caller builds the successor, and `close` is the lever that makes
+     * doing so safe.
      */
-    internal val repairing: Job = scope.launch { collectRepairs() }
+    internal var repairing: Job = lifetime.launch { collectRepairs() }
+        private set
 
     /**
      * Applies [OrphanPolicy] to any dock whose surface is gone.
@@ -1148,7 +1431,10 @@ class SwayWindowManager(
     suspend fun reapOrphans() {
         val cfg = config
         if (cfg[WmFlags.orphanPolicy] != OrphanPolicy.CLOSE) return
-        val root = tree()
+        // One session for the whole sweep, and it is the session the handles below are stamped
+        // with: the `con_id`s this sweep is about to act on came out of the tree it read here.
+        val session = session()
+        val root = tree(session)
         val table = docks.snapshot()
         val live = root.windows.map { it.id }.toSet()
         val failures = mutableListOf<Throwable>()
@@ -1162,8 +1448,13 @@ class SwayWindowManager(
             try {
                 // No key: the surface is already gone, so there is nothing left to derive one
                 // from. Reaping a dock is a window-tree repair and never touches the registry.
-                SwayDockHandle(SurfaceId(boundTo), AgentId(""), SurfaceId(node.id), key = null)
-                    .detach()
+                SwayDockHandle(
+                    SurfaceId(boundTo),
+                    AgentId(""),
+                    SurfaceId(node.id),
+                    key = null,
+                    session = session,
+                ).detach()
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (failure: Exception) {
@@ -1190,12 +1481,46 @@ class SwayWindowManager(
         override val dockId: SurfaceId,
         /** Captured at attach time — by detach the window may be gone and underivable. */
         private val key: SurfaceKey?,
+        /**
+         * The compositor session [dockId] and [surface] are `con_id`s of.
+         *
+         * Held so this handle can tell whether it still describes anything. A `con_id` is minted
+         * from a counter that restarts with the compositor, so across a session boundary it does
+         * not become meaningless — it becomes somebody else's window. See [WmFlags.staleHandles].
+         */
+        private val session: Session,
     ) : DockHandle {
-        override suspend fun focus() = treeEdit { focus(dockId) }
+        /**
+         * Refuses this handle if the session its ids came from has ended.
+         *
+         * Compares [liveSession] rather than asking for one, and that is the point: a stale handle
+         * must not be the thing that acquires a successor connection, since the only work it could
+         * do on one is issue a dead session's ids at a live compositor. That field is null between
+         * a boundary and the reconnect past it, which is stale as well.
+         */
+        private fun checkSession(action: String) {
+            if (config[WmFlags.staleHandles] == StaleHandle.ACT) return
+            if (liveSession === session) return
+            throw CompositorSessionEnded(
+                "refusing to $action dock ${dockId.raw}: this handle names con_ids from a " +
+                    "compositor session that has ended, and a fresh session hands those ids to " +
+                    "different windows. Obtain a new handle, or set " +
+                    "wm.session.stale_handles=ACT to issue it anyway.",
+            )
+        }
 
-        override suspend fun settleFocus() = treeEdit { settleFocus(surface, dockId) }
+        override suspend fun focus() {
+            checkSession("focus")
+            treeEdit { focus(dockId) }
+        }
+
+        override suspend fun settleFocus() {
+            checkSession("settle focus on")
+            treeEdit { settleFocus(surface, dockId) }
+        }
 
         override suspend fun detach() {
+            checkSession("detach")
             val cfg = config
             treeEdit {
                 val parent = tree().parentOf(dockId.raw)
@@ -1240,7 +1565,7 @@ class SwayWindowManager(
         }
 
         override fun close() {
-            scope.launch { detach() }
+            lifetime.launch { detach() }
         }
     }
 
