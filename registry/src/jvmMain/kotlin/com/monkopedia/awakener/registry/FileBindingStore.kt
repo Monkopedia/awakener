@@ -8,9 +8,15 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
+import java.time.Instant
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.io.path.ExperimentalPathApi
 import kotlin.io.path.createParentDirectories
+import kotlin.io.path.deleteRecursively
 import kotlin.io.path.exists
+import kotlin.io.path.isDirectory
 import kotlin.io.path.name
 import kotlin.io.path.readText
 import kotlinx.coroutines.Dispatchers
@@ -162,10 +168,102 @@ class FileBindingStore(
         }
     }
 
-    override suspend fun unbind(key: SurfaceKey): Boolean = mutate {
-        val had = key in state.value
-        if (had) write(state.value - key)
-        had
+    /**
+     * The binding first, then the residue, and deliberately not in one transaction.
+     *
+     * Nothing here can make the two atomic — one is a rename over a JSON file, the other is a
+     * rename or a delete in another directory — so the order is chosen for which way round a
+     * crash between them is survivable. Binding dropped and residue still present is the state
+     * `KEEP` produces on purpose, and it costs a stale file. Residue archived and the binding
+     * still standing would hand a live agent a surface whose model had been moved out from
+     * under it, which nothing would ever notice or repair.
+     *
+     * The disposal runs outside [mutate] for the same reason [bind] mints outside it: it is
+     * filesystem work on a different directory, and holding the bindings lock across it would
+     * serialise every other surface behind one rename.
+     */
+    override suspend fun unbind(key: SurfaceKey): Forget {
+        val wasBound = mutate {
+            val had = key in state.value
+            if (had) write(state.value - key)
+            had
+        }
+        // A surface that was not bound has had nothing forgotten, so there is nothing for the
+        // flag to act on. Disposing anyway would make `forget` a residue command that also
+        // happens to unbind, and would let a mistyped key delete a model under DELETE.
+        if (!wasBound) return Forget(false, ResidueOutcome.Kept(residueLocation(key)))
+        return Forget(true, disposeResidue(key))
+    }
+
+    /**
+     * Applies [RegistryFlags.forgetResidue] to one surface's residue.
+     *
+     * Every failure comes back as [ResidueOutcome.Failed] rather than as a throw: by the time
+     * this runs the binding is already gone durably, so raising here would report the whole
+     * `forget` as failed when its durable half succeeded — and the caller would have no way to
+     * tell that from a forget that never happened. The repair path is the last place to make
+     * those two look alike.
+     *
+     * All three flags come off **one** snapshot. Reading them one at a time would let a reload
+     * land mid-disposal and pair one snapshot's layout with another's residue directory, which
+     * is the "never cache a flag across an operation that could span a reload" rule read the
+     * right way round: the fix is to take the snapshot once, not to re-read more often.
+     */
+    @OptIn(ExperimentalPathApi::class)
+    private suspend fun disposeResidue(key: SurfaceKey): ResidueOutcome =
+        withContext(Dispatchers.IO) {
+            val cfg = config
+            val layout = cfg[RegistryFlags.residueLayout]
+            val location = RegistryPaths.residueLocation(cfg, path, key)
+            val at = location.toString()
+            when (cfg[RegistryFlags.forgetResidue]) {
+                ForgetResidue.KEEP -> ResidueOutcome.Kept(at)
+                ForgetResidue.ARCHIVE -> when {
+                    !location.exists() -> ResidueOutcome.Absent(at)
+                    else -> try {
+                        val archive = archivePath(key, layout, location)
+                        Files.move(location, archive)
+                        ResidueOutcome.Archived(at, archive.toString())
+                    } catch (e: IOException) {
+                        ResidueOutcome.Failed(at, e.message ?: e.toString())
+                    }
+                }
+                ForgetResidue.DELETE -> when {
+                    !location.exists() -> ResidueOutcome.Absent(at)
+                    else -> try {
+                        if (location.isDirectory()) {
+                            location.deleteRecursively()
+                        } else {
+                            Files.delete(location)
+                        }
+                        ResidueOutcome.Deleted(at)
+                    } catch (e: IOException) {
+                        ResidueOutcome.Failed(at, e.message ?: e.toString())
+                    }
+                }
+            }
+        }
+
+    /**
+     * A free archive path beside [location].
+     *
+     * Seconds rather than milliseconds in the name because it is read by a human choosing which
+     * archive to open, and a counter rather than more precision because that is what actually
+     * settles it: two forgets of one surface inside a second is unlikely, but `Files.move`
+     * without `REPLACE_EXISTING` would refuse rather than overwrite, and a refusal here reads
+     * as "your model could not be archived" for a reason that is nobody's fault. UTC, so the
+     * ordering of two archives does not invert across a daylight-saving boundary.
+     */
+    private fun archivePath(key: SurfaceKey, layout: ResidueLayout, location: Path): Path {
+        val stamp = ARCHIVE_STAMP.format(Instant.ofEpochMilli(clock()))
+        (0 until ARCHIVE_ATTEMPTS).forEach { attempt ->
+            val suffix = if (attempt == 0) stamp else "$stamp-$attempt"
+            val candidate = location.resolveSibling(archiveLeaf(key, layout, suffix))
+            if (!candidate.exists()) return candidate
+        }
+        // Every name in the second is taken, which is not a filesystem this can archive into.
+        // Reported as a failure by the caller rather than overwriting one of them.
+        throw IOException("no free archive name beside $location for ${key.slug} at $stamp")
     }
 
     override fun residueLocation(key: SurfaceKey): String =
@@ -345,6 +443,13 @@ class FileBindingStore(
     }
 
     private companion object {
+        /** UTC, seconds; see [archivePath] for why not milliseconds. */
+        private val ARCHIVE_STAMP: DateTimeFormatter =
+            DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").withZone(ZoneOffset.UTC)
+
+        /** How many names within one second an archive will try before giving up. */
+        private const val ARCHIVE_ATTEMPTS = 100
+
         /** Reads the same flag the same way everywhere, so the two call sites cannot drift. */
         private val Config.holderWinsForget: Boolean
             get() = get(RegistryFlags.forgetConflict) == ForgetConflict.HOLDER_WINS

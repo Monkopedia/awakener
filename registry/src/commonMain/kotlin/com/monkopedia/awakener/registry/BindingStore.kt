@@ -42,6 +42,52 @@ internal data class BindingsFile(
 }
 
 /**
+ * What a [BindingStore.unbind] did.
+ *
+ * @param wasBound whether there was a binding to drop. False means nothing was forgotten, and
+ * nothing is disposed of either: `forget` is about the binding, so a surface that has none has
+ * had nothing taken away and its residue is not the command's to touch.
+ */
+data class Forget(val wasBound: Boolean, val residue: ResidueOutcome)
+
+/**
+ * What became of a forgotten surface's residue.
+ *
+ * Every case names the [path] it is talking about, because the sentence a user reads after
+ * deciding an agent was wrong about them is the one place "the model is gone" and "the model
+ * is still there" must not look alike.
+ */
+sealed interface ResidueOutcome {
+    /** Where the residue was, whatever happened to it. */
+    val path: String
+
+    /** Left where it is — [ForgetResidue.KEEP], and what the fresh Lifeless will read. */
+    data class Kept(override val path: String) : ResidueOutcome
+
+    /** Renamed to [archive], which the fresh Lifeless does not read and a human still can. */
+    data class Archived(override val path: String, val archive: String) : ResidueOutcome
+
+    /** Removed. Nothing in awakener can bring it back. */
+    data class Deleted(override val path: String) : ResidueOutcome
+
+    /**
+     * There was nothing at [path] to dispose of — the surface was bound but never wrote
+     * anything down. Distinct from [Kept] on purpose: "nothing to archive" and "archiving is
+     * switched off" leave the same empty directory behind and mean opposite things.
+     */
+    data class Absent(override val path: String) : ResidueOutcome
+
+    /**
+     * The disposal was asked for and did not happen; the residue is still at [path].
+     *
+     * Not thrown, because the binding is already gone by then and the forget did succeed —
+     * but not silent either, since under [ForgetResidue.DELETE] this is a model the user asked
+     * to be rid of that is still on disk.
+     */
+    data class Failed(override val path: String, val reason: String) : ResidueOutcome
+}
+
+/**
  * The durable half of the memory model.
  *
  * The design brief splits what an agent holds into durable residue — preferences, decisions,
@@ -67,14 +113,20 @@ interface BindingStore {
     suspend fun bind(key: SurfaceKey, agent: AgentIdentity? = null): Binding
 
     /**
-     * Forgets a binding. Returns whether there was one. Does not delete residue.
+     * Forgets a binding, and disposes of its residue per [RegistryFlags.forgetResidue].
      *
      * This is the repair path, so it has to hold against a process that is still holding the
      * binding it removed. A durable implementation must not let such a holder write its own
      * view of the file back over this — see [RegistryFlags.storeReload] for how, and
      * [RegistryFlags.forgetConflict] for what a holder's next `bind` then does.
+     *
+     * **The residue half is reported rather than assumed** ([Forget.residue]). Dropping the
+     * binding and disposing of what the agent wrote down are two operations against two
+     * different pieces of state, and the second can fail — a read-only state directory — with
+     * the first already durable. A caller told only "forgotten" would then believe a model had
+     * been archived, or deleted, that is still sitting on disk.
      */
-    suspend fun unbind(key: SurfaceKey): Boolean
+    suspend fun unbind(key: SurfaceKey): Forget
 
     /**
      * Where this surface's distilled residue lives.
