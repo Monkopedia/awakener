@@ -153,9 +153,59 @@ link_tool() {
 for tool in ls sed head cut printf; do
     link_tool "$tool" || die "no $tool available to build the harness with"
 done
-for shell in dash busybox; do
-    link_tool "$shell" || continue
+
+# ------------------------------------------------------------------ the alternative shells
+#
+# `/bin/sh` is bash on both hosts and on the runner, and the launcher leans on expansions bash is
+# lenient about — so the rows that re-run it under a genuinely small shell are the only ones that
+# make its `#!/bin/sh` shebang an honest claim. Those rows skipped silently when `dash` or
+# `busybox` was absent, and the task declared neither as an input: measured on a PATH farm without
+# them, `:cli:launcherTest` came back **UP-TO-DATE** despite its tooling having changed, and when
+# forced ran **45 rows against 53** on the real PATH. Coverage fell 15% and the build was green
+# both times, with two `skip …` lines inside a report file nothing reads as the only trace (#98).
+#
+# Two halves, and they answer different questions. The *fingerprint* is declared as a task input
+# in `build.gradle.kts`, which is what stops the cache replaying a 45-row run onto a machine that
+# has both shells. This is the other half: say out loud, up here and again in the summary line,
+# how many of the roster answered — so a row count means coverage rather than "however many the
+# host could manage".
+#
+# Whether a missing shell should fail is a judgement and here it is: **not by default, and yes on
+# CI.** `summaryMatrixTest` dies below two distinct awks because a portability claim from one
+# implementation is not a portability claim; the same argument applies to shells, but the same
+# remedy does not, because the hosts differ — kaladin has both, adolin has neither, and dying by
+# default would make the owner's other build machine unable to run `./gradlew build` at all over a
+# suite that is not what that build is about. So this takes the shape the repo already uses for
+# exactly this problem: a skip by default, and `AWAKENER_REQUIRE_SHELLS=1` turning it into a
+# failure on any run whose result is meant to be reported. CI sets it, next to REQUIRE_SWAY and
+# REQUIRE_SPANREED, and for the same reason.
+ALT_ROSTER='dash|busybox sh'
+ALT_PRESENT=0
+ALT_TOTAL=0
+ALT_MISSING=''
+ALT_FOUND=''
+OLDIFS=$IFS
+IFS='|'
+for alt in $ALT_ROSTER; do
+    IFS=$OLDIFS
+    ALT_TOTAL=$((ALT_TOTAL + 1))
+    if link_tool "${alt%% *}"; then
+        ALT_PRESENT=$((ALT_PRESENT + 1))
+        ALT_FOUND="$ALT_FOUND $alt,"
+    else
+        ALT_MISSING="$ALT_MISSING ${alt%% *},"
+    fi
+    IFS='|'
 done
+IFS=$OLDIFS
+
+note "launcher-matrix: alternative shells ${ALT_PRESENT} of ${ALT_TOTAL} —${ALT_FOUND%,}"
+if [ -n "$ALT_MISSING" ]; then
+    if [ "${AWAKENER_REQUIRE_SHELLS:-}" = 1 ]; then
+        die "AWAKENER_REQUIRE_SHELLS=1 and${ALT_MISSING%,} is not installed. The rows that prove the launcher works under a shell that is not bash would be skipped, and the row count would report a smaller matrix as a pass."
+    fi
+    note "  not installed:${ALT_MISSING%,} — those rows will be skipped. Set AWAKENER_REQUIRE_SHELLS=1 to make that a failure instead."
+fi
 
 GOOD_HOME=${GOOD_JAVA%/bin/java}
 [ -x "$GOOD_HOME/bin/java" ] || die "good java '$GOOD_JAVA' is not <home>/bin/java"
@@ -407,4 +457,8 @@ done
 
 note ""
 note "launcher-matrix: $run_count rows, $fail_count failed"
+# Next to the row count, because the row count on its own does not say whether it is the whole
+# matrix or the part this host could manage — and those two read identically at the bottom of a
+# green log.
+note "  alternative shells: ${ALT_PRESENT} of ${ALT_TOTAL} —${ALT_FOUND%,}${ALT_MISSING:+ (missing:${ALT_MISSING%,})}"
 [ "$fail_count" -eq 0 ] || exit 1

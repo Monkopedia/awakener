@@ -99,6 +99,12 @@ jobs:
           # exist — which is worse than a red one, because nobody investigates it.
           AWAKENER_REQUIRE_SWAY: '1'
           AWAKENER_REQUIRE_SPANREED: '1'
+          # Same rule, third tool. `cli:launcherTest` re-runs a slice of its rows under `dash` and
+          # `busybox sh` to make the launcher's `#!/bin/sh` an honest claim, and skipped them
+          # silently when either was absent: 45 rows against 53, green both times (#98). Both are
+          # on ubuntu-latest — dash as /bin/sh, busybox from busybox-static — so this asserts what
+          # is already true and reddens the day it stops being true.
+          AWAKENER_REQUIRE_SHELLS: '1'
         run: ./gradlew build --stacktrace
 
       # A red `build` now means the build is red, but it still does not say *which* phase went
@@ -135,6 +141,13 @@ jobs:
       # download — the summary for a human, the log because that is the one an API can read
       # back, and the reader here is as often an agent as a person. The script says why it
       # reports rather than gates.
+      #
+      # It also gates, on `.github/scripts/test-floors`: a module that reported fewer tests than
+      # the tree says it should have, or none at all, reddens the build here. That is the only
+      # control anywhere that compares what ran against what should have run — every other one,
+      # including the REQUIRE flags and `skipped="0"`, answers a question about the tests that
+      # ran (#97). It runs after `Build and test` deliberately, so it still fires when the Gradle
+      # task that holds the same property was the thing that stopped running.
       - name: Summarise test counts
         if: always()
         run: .github/scripts/test-summary.sh
@@ -205,34 +218,16 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
+      # The body of this job is a script rather than a `run:` block, and the checkout is what that
+      # costs. #99 was found by running the block by hand over thirteen inputs — of which `''`,
+      # `skipped` and a typo'd step id all exited 0 — and a check that can only be exercised by
+      # pushing to a branch is one nobody exercises. `uploadOutcomeMatrixTest` now runs those
+      # inputs on every build, against mutants that put the defect back.
+      - uses: actions/checkout@v4
+
       - name: Report whether the test evidence was captured
         env:
           BUILD: ${{ needs.build.result }}
           XML: ${{ needs.build.outputs.xml-upload }}
           HTML: ${{ needs.build.outputs.html-upload }}
-        run: |
-          echo "This check reports one thing: whether an artifact upload step failed."
-          echo "It is not a claim that the evidence is complete — read the build check for that."
-          echo "build job: ${BUILD:-unknown}"
-          echo "JUnit XML upload: ${XML:-no-outcome-reported}"
-          echo "HTML report upload: ${HTML:-no-outcome-reported}"
-          if [ -z "$XML" ] && [ -z "$HTML" ]; then
-            # The build job ended without either upload step reporting an outcome — a lost
-            # runner, or a failure before the steps were reached. Nothing was measured, so
-            # say that rather than passing silently as though it had been.
-            echo "::notice title=No upload outcome::The build job (result: ${BUILD:-unknown}) reported no upload outcome at all, so this check measured nothing."
-            exit 0
-          fi
-          rc=0
-          if [ "$XML" = "failure" ]; then
-            echo "::error title=JUnit XML not uploaded::The test-results-xml artifact failed to upload. The build's own result is unaffected; what is missing is the evidence for it."
-            rc=1
-          fi
-          if [ "$HTML" = "failure" ]; then
-            echo "::error title=HTML report not uploaded::The test-report-html artifact failed to upload."
-            rc=1
-          fi
-          if [ "$rc" = "1" ] && [ "$BUILD" != "success" ]; then
-            echo "::notice title=Read both checks::The build job's own result was $BUILD. That is a separate fact from the upload failure above; neither one implies the other."
-          fi
-          exit $rc
+        run: .github/scripts/upload-outcome.sh

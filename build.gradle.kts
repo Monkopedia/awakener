@@ -66,3 +66,82 @@ val summaryMatrixTest by tasks.registering(Exec::class) {
 }
 
 tasks.named("check") { dependsOn(summaryMatrixTest) }
+
+// The `test-artifacts` job's body, and its suite.
+//
+// Wired to `check` for the same reason `summaryMatrixTest` is: the script is edited here, and a
+// red that only arrives after a push arrives after the change has been reported as verified. It
+// declares no tool fingerprint, and that is a decision rather than an omission — no row in it is
+// gated on a tool being present, so there is no reduced-coverage run for the cache to replay. It
+// dies outright if `awk` is missing (the splice needs one), which is the loud failure the
+// fingerprints elsewhere exist to convert a silent one into.
+val uploadOutcomeMatrixTest by tasks.registering(Exec::class) {
+    group = LifecycleBasePlugin.VERIFICATION_GROUP
+    description = "Runs .github/scripts/upload-outcome.sh against its input and mutant matrix."
+    val matrix = layout.projectDirectory.file(".github/scripts/upload-outcome-matrix.sh")
+    val script = layout.projectDirectory.file(".github/scripts/upload-outcome.sh")
+    val report = layout.buildDirectory.file("reports/upload-outcome-matrix.txt")
+    inputs.file(matrix)
+    inputs.file(script)
+    outputs.file(report)
+    commandLine(
+        "sh",
+        matrix.asFile.absolutePath,
+        script.asFile.absolutePath,
+        layout.buildDirectory.dir("upload-outcome-matrix").get().asFile.absolutePath,
+        report.get().asFile.absolutePath,
+    )
+}
+
+tasks.named("check") { dependsOn(uploadOutcomeMatrixTest) }
+
+// What this build should have run, checked against what it did run.
+//
+// `.github/scripts/test-summary.sh` holds the comparison and CI runs it as a step after the
+// build. That step is the backstop; this task is the one that matters day to day, because the
+// command CLAUDE.md names as the full autonomous check is `./gradlew build`, and #97's whole
+// point is that `BUILD SUCCESSFUL` was reachable by a run in which an entire module's suite did
+// not execute. A guard that only reds after a push reds after the reasoning that produced the
+// change has already been reported as verified.
+//
+// `dependsOn` every subproject's `check` rather than `mustRunAfter` anything: this has to run
+// after every task that writes JUnit XML, and a `Test` task that is *disabled* still satisfies a
+// dependency — which is precisely the case being caught. The build's own `subprojects` is handed
+// over as the module roster, so the floor file is checked against what the build contains rather
+// than against a list somebody keeps up to date by hand.
+//
+// One honest limit, and it is the reason the CI step is not redundant: this reads the XML that is
+// on disk, so on a repeat build without `clean` a module whose tests stopped running keeps
+// satisfying its floor from the previous run's results. `clean build` — the command the doctrine
+// names — has no stale XML, and CI checks out fresh. Nothing here can tell a stale file from a
+// current one, which is the same reason `git status` cannot tell a stale checkout from a current
+// one, and it is worth stating rather than papering over: an mtime rule would red every legitimate
+// up-to-date test task, trading a narrow blind spot for a broad false alarm.
+val verifyTestFloors by tasks.registering(Exec::class) {
+    group = LifecycleBasePlugin.VERIFICATION_GROUP
+    description = "Fails if a module ran fewer tests than .github/scripts/test-floors declares."
+    dependsOn(subprojects.map { "${it.path}:check" })
+    val script = layout.projectDirectory.file(".github/scripts/test-summary.sh")
+    val floors = layout.projectDirectory.file(".github/scripts/test-floors")
+    inputs.file(script)
+    inputs.file(floors)
+    // No outputs, and no up-to-date check to skip it with: the whole question is about the tree
+    // as it stands after this build's test tasks, and a cached answer to that question is the
+    // #28/#29 failure in the guard against #97.
+    outputs.upToDateWhen { false }
+    commandLine(
+        "env",
+        // Under `Build and test` on CI this variable is set, and the script appends its report
+        // to whatever it names. Left alone, every build would write a second test-count table
+        // into the run summary ahead of the real one — the leak #86's canary was written about,
+        // arriving through a different caller.
+        "-u", "GITHUB_STEP_SUMMARY",
+        "AWAKENER_TEST_FLOORS=${floors.asFile.absolutePath}",
+        "AWAKENER_TEST_MODULES=${subprojects.joinToString(",") { it.name }}",
+        "bash",
+        script.asFile.absolutePath,
+        rootDir.absolutePath,
+    )
+}
+
+tasks.named("check") { dependsOn(verifyTestFloors) }
