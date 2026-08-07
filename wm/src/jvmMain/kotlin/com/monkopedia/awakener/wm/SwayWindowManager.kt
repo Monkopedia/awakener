@@ -53,8 +53,8 @@ class SwayWindowManager(
      */
     private val registry: BindingStore,
     /**
-     * The lifetime this manager is granted: `DockHandle.close()` runs here, and so does the repair
-     * collector this constructor starts ([repairing]).
+     * The lifetime this manager is granted: the repair collector this constructor starts
+     * ([repairing]) runs here, and so does anything else the manager launches.
      *
      * **Under the default flags nothing this manager launches fails this scope**, so a plain
      * `CoroutineScope(Job())` is a legitimate thing to hand in. A collector failure is contained
@@ -901,7 +901,7 @@ class SwayWindowManager(
      * the time this returns — that is the deliberate trade, since enumeration is the first thing
      * a hotkey does and an attach holds the tree for as long as a dock takes to map.
      */
-    override suspend fun surfaces(): List<Surface> {
+    internal suspend fun surfaces(): List<Surface> {
         val cfg = config
         val windows = tree().windows
         // Read after the tree, not before: an attach that records its dock between the two reads
@@ -913,11 +913,13 @@ class SwayWindowManager(
     }
 
     /**
-     * The agent bound to [surface], from the durable registry.
+     * What is bound to [surface], or — with [surface] null — to every bindable window.
+     *
+     * ### The single-window form, unchanged
      *
      * **The dock table is not in this path**, which is the design note's tripwire made
      * mechanical rather than promised (#52). Under the default [WmFlags.resolveKeySource] the
-     * whole of `resolve` is: read the tree, derive the key from facts that outlive the window,
+     * whole of it is: read the tree, derive the key from facts that outlive the window,
      * ask `:registry`. Nothing in it can reach [docks], so no future edit can quietly make the
      * answer depend on this compositor session — a `con_id` table is meaningless after a reboot
      * and the binding it would be answering about is not.
@@ -933,18 +935,40 @@ class SwayWindowManager(
      *
      * What it gives up is that `resolve` used to answer nothing for a dock. Under `TREE` a dock
      * is an ordinary node and resolves to whatever the registry holds under the key its `app_id`
-     * yields — nothing, unless something bound that key. Callers obtain surface ids from
-     * [surfaces], which excludes docks under both values, so this is a difference in what the
-     * call *would* say rather than in what any caller asks it.
+     * yields — nothing, unless something bound that key. Callers obtain surface ids from the
+     * enumerating form below, which excludes docks under both values, so this is a difference in
+     * what the call *would* say rather than in what any caller asks it.
+     *
+     * ### The enumerating form puts the table back in `resolve`'s path
+     *
+     * **And that is the price of folding `surfaces()` in.** Enumeration has to exclude docks —
+     * that is what it is for — so the null-argument branch reads [docks] by construction. The
+     * tripwire above therefore no longer states a property of `resolve`; it states a property of
+     * one of `resolve`'s two branches, and "does the dock table appear in resolve's path" stops
+     * being a question a `grep` can answer. #52 moved the table out of this function on purpose;
+     * this moves half of it back, and no arrangement of the fold avoids that, because the two
+     * branches want opposite things from the table.
+     *
+     * The durability story itself is intact — the table holds no agent, so the answer is still
+     * `:registry`'s under both branches. What is lost is the mechanical check that it stays so.
      */
-    override suspend fun resolve(surface: SurfaceId): AgentId? {
+    override suspend fun resolve(surface: SurfaceId?): List<Resolution> {
         val cfg = config
-        val key = when (cfg[WmFlags.resolveKeySource]) {
-            ResolveKeySource.TREE -> tree().windows.firstOrNull { it.id == surface.raw }
-                ?.let { SurfaceKey.of(it.asSurface().descriptor, cfg) }
-            ResolveKeySource.ENUMERATION -> keyFor(surface)
-        } ?: return null
-        return registry.resolve(key)?.agent
+        if (surface == null) {
+            // One registry read per window. `BindingStore` has no batch form, and under
+            // `registry.store.reload=BEFORE_READ` (the default) every one of these re-reads the bindings file.
+            return surfaces().map {
+                Resolution(it, registry.resolve(SurfaceKey.of(it.descriptor, cfg))?.agent)
+            }
+        }
+        val window = when (cfg[WmFlags.resolveKeySource]) {
+            ResolveKeySource.TREE ->
+                tree().windows.firstOrNull { it.id == surface.raw }?.asSurface()
+            ResolveKeySource.ENUMERATION -> surfaces().firstOrNull { it.id == surface }
+        } ?: return emptyList()
+        return listOf(
+            Resolution(window, registry.resolve(SurfaceKey.of(window.descriptor, cfg))?.agent),
+        )
     }
 
     /**
@@ -1517,14 +1541,30 @@ class SwayWindowManager(
             )
         }
 
-        override suspend fun focus() {
-            checkSession("focus")
-            treeEdit { focus(dockId) }
-        }
-
-        override suspend fun settleFocus() {
-            checkSession("settle focus on")
-            treeEdit { settleFocus(surface, dockId) }
+        /**
+         * The merged `focus`/`settleFocus`.
+         *
+         * The branch is what the two methods used to be, and it is worth seeing what the merge
+         * did and did not buy. It removed a name from the interface. It did not remove a
+         * decision: the two arms differ in which node they target *and* in what they do when
+         * that node has gone — [FocusTarget.DOCK] issues the focus and lets sway's refusal
+         * raise, [FocusTarget.RESTING] checks the tree first and returns quietly. Even the
+         * refusal message differs, because a caller holding a stale handle is better served by
+         * "settle focus on" than by "focus".
+         */
+        override suspend fun focus(target: FocusTarget) {
+            checkSession(
+                when (target) {
+                    FocusTarget.DOCK -> "focus"
+                    FocusTarget.RESTING -> "settle focus on"
+                },
+            )
+            treeEdit {
+                when (target) {
+                    FocusTarget.DOCK -> focus(dockId)
+                    FocusTarget.RESTING -> settleFocus(surface, dockId)
+                }
+            }
         }
 
         override suspend fun detach() {
@@ -1570,10 +1610,6 @@ class SwayWindowManager(
             // Outside the section for the same reason as attach's bind: the registry is not the
             // tree, and the dock is already down by here.
             if (cfg[WmFlags.forgetBindingOnDetach] && key != null) registry.unbind(key)
-        }
-
-        override fun close() {
-            lifetime.launch { detach() }
         }
     }
 

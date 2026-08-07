@@ -114,10 +114,18 @@ class Awakening(
      * The bus is asked once for the whole listing rather than once per surface: `spanreed list`
      * is a subprocess, and a desktop with a dozen windows would otherwise pay a dozen spawns to
      * answer one question about a registry it reads whole each time.
+     *
+     * **`wm.resolve()`'s agent half is discarded here**, and that is the fold's cost showing up
+     * at the first caller. `Standing` carries a `Binding` — the whole row, because `list` prints
+     * the agent id *and* asks the bus about it — where `Resolution` carries an `AgentId?`. So
+     * this pays one `:registry` lookup per window inside `resolve`, throws the result away, and
+     * then makes the same lookup itself for the row it actually needs. Widening `Resolution` to
+     * carry a `Binding` would fix the waste by pushing a `:registry` row through the compositor
+     * interface, which is a worse trade than the duplicate read.
      */
     suspend fun list(): List<Standing> {
         val cfg = config
-        val surfaces = wm.surfaces()
+        val surfaces = wm.resolve().map { it.surface }
         val live = bus.liveAgents().map { it.agentId }.toSet()
         return surfaces.map { surface ->
             val key = SurfaceKey.of(surface.descriptor, cfg)
@@ -142,7 +150,13 @@ class Awakening(
      */
     suspend fun invoke(target: SurfaceId? = null): Awakened {
         val cfg = config
-        val surfaces = wm.surfaces()
+        // The whole list, even when `target` names one window: the "no such surface" answer below
+        // has to distinguish a window that is not bindable from one that is not there, and with
+        // enumeration folded into `resolve` the single-window form no longer applies the dock
+        // filter that distinction is made of. So the hotkey path enumerates, and pays one
+        // registry lookup per window for an agent it does not read — it derives the key itself
+        // and calls `registry.bind`, which is a different question from "what is bound now".
+        val surfaces = wm.resolve().map { it.surface }
         val surface = if (target == null) {
             surfaces.firstOrNull { it.focused }
                 ?: return Awakened.NoSurface(
