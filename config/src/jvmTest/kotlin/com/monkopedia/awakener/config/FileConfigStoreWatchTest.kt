@@ -7,6 +7,8 @@ import java.nio.file.StandardCopyOption
 import java.nio.file.StandardWatchEventKinds.ENTRY_CREATE
 import java.nio.file.StandardWatchEventKinds.ENTRY_DELETE
 import java.nio.file.StandardWatchEventKinds.ENTRY_MODIFY
+import java.nio.file.StandardWatchEventKinds.OVERFLOW
+import java.nio.file.WatchEvent
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.deleteExisting
 import kotlin.io.path.writeText
@@ -40,6 +42,26 @@ import kotlinx.serialization.json.JsonPrimitive
  */
 private object WatchKnobs {
     val count = Flags.int("watch.count", 7, "what a watched file is read for")
+}
+
+/**
+ * A watch event this suite can construct.
+ *
+ * The one case worth stating — `OVERFLOW` — is the one no test can provoke: it is the kernel's
+ * queue giving up under a backlog, so inducing it would be a measurement of the machine rather
+ * than of the code. Its distinguishing property is exactly what a fake can carry: the kind is
+ * `OVERFLOW` and there is no context path.
+ */
+private class FakeEvent(
+    private val kind: WatchEvent.Kind<*>,
+    private val context: Path?,
+) : WatchEvent<Path> {
+    @Suppress("UNCHECKED_CAST")
+    override fun kind(): WatchEvent.Kind<Path> = kind as WatchEvent.Kind<Path>
+
+    override fun count(): Int = 1
+
+    override fun context(): Path? = context
 }
 
 /**
@@ -280,6 +302,93 @@ class FileConfigStoreWatchTest {
             emptyList(),
             seen,
             "a file that is not the config file provoked a re-read",
+        )
+    }
+
+    /**
+     * A write under a running watch, which is the only pair in this class that contends: the
+     * store's own `set` takes the per-path mutex, and the watch's reload now takes the same one
+     * so a reload cannot publish a snapshot the write is on its way to replacing.
+     *
+     * The value has to still be there a moment later. A write that landed and was then undone by
+     * the watch's own re-read would look identical at the instant `set` returns.
+     */
+    @Test
+    fun `a set under a running watch survives the watch's own reload`() = runBlocking {
+        val watched = watching("set-under-watch.json")
+        watched.store.set(WatchKnobs.count.key, "8")
+
+        assertEquals(8, watched.store.config.value[WatchKnobs.count], "the write never landed")
+        watched.staysAt(8, QUIET_MS, "the watch's reload undid the store's own write")
+    }
+
+    // ---- What an OVERFLOW means (#43's last comment) ----
+
+    /**
+     * The decision, stated directly rather than through a provoked overflow.
+     *
+     * An `OVERFLOW` is the kernel's watch queue giving up. Nothing can ask for one, so a test
+     * that tried to induce one would be measuring how fast this machine is; the decision is
+     * pulled out of the loop into a total function of the events and the flag, and these name
+     * its four cases. What that leaves untested is the three lines wiring the answer back into
+     * the loop, which is a real gap and a small one.
+     */
+    @Test
+    fun `an overflow re-reads by default`() {
+        assertEquals(
+            FileConfigStore.Reaction.REREAD,
+            FileConfigStore.reactionTo(
+                listOf(FakeEvent(OVERFLOW, null)),
+                "config.json",
+                WatchOverflow.REREAD,
+            ),
+            "an overflow is the one event that says a change may have been lost",
+        )
+    }
+
+    @Test
+    fun `an overflow under REPORT keeps the snapshot`() {
+        assertEquals(
+            FileConfigStore.Reaction.REPORT_LOSS,
+            FileConfigStore.reactionTo(
+                listOf(FakeEvent(OVERFLOW, null)),
+                "config.json",
+                WatchOverflow.REPORT,
+            ),
+        )
+    }
+
+    /**
+     * The regression this is really about: before it was handled, an overflow failed the
+     * `as? Path` name filter — it carries no context path — and so read as "nothing here
+     * concerns me", which is the *opposite* of what it means.
+     */
+    @Test
+    fun `an event for another file is still ignored`() {
+        assertEquals(
+            FileConfigStore.Reaction.IGNORE,
+            FileConfigStore.reactionTo(
+                listOf(FakeEvent(ENTRY_MODIFY, Path.of("config.json.tmp"))),
+                "config.json",
+                WatchOverflow.REREAD,
+            ),
+        )
+    }
+
+    /**
+     * A batch holding both is a re-read whatever the flag says, and then has nothing left to
+     * report: the read the named event earned is the same read the overflow would have asked
+     * for, and it takes in the whole file either way.
+     */
+    @Test
+    fun `an overflow beside a real change re-reads even under REPORT`() {
+        assertEquals(
+            FileConfigStore.Reaction.REREAD,
+            FileConfigStore.reactionTo(
+                listOf(FakeEvent(OVERFLOW, null), FakeEvent(ENTRY_MODIFY, Path.of("config.json"))),
+                "config.json",
+                WatchOverflow.REPORT,
+            ),
         )
     }
 
