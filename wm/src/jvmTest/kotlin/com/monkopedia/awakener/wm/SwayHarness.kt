@@ -20,7 +20,7 @@ import org.junit.Assume.assumeTrue
  * server and on CI.
  */
 class SwayHarness private constructor(
-    private val process: Process,
+    private var process: Process,
     val socket: Path,
     private val runtimeDir: Path,
 ) : AutoCloseable {
@@ -66,6 +66,29 @@ class SwayHarness private constructor(
      */
     fun kill() {
         process.destroyForcibly().waitFor()
+    }
+
+    /**
+     * Kills this sway and brings a fresh one up on the same socket path.
+     *
+     * A compositor restart with awakener's process surviving it, which is the combination the
+     * design note calls the dangerous one and the only one in which reconnection means anything.
+     * sway 1.12 has no in-place restart — `restart` is not a command it knows — so this is what a
+     * restart *is*: a new process, a new `con_id` counter allocating from 5 again, and every window
+     * of the previous session gone with the compositor that was holding them.
+     *
+     * **The socket path is deliberately reused**, which a real restart would not do: with
+     * `SWAYSOCK` unset sway names its socket after its own pid, so a successor sits at a path
+     * nothing told awakener about. That half is [SwaySocket]'s and is tested there without a
+     * compositor, since it is a question about resolving a path rather than about what a client
+     * observes. What this
+     * harness supplies is the half only a real restart can: a client that held connections across
+     * the boundary meeting a genuinely fresh tree.
+     */
+    fun restart() {
+        process.destroyForcibly().waitFor()
+        socket.deleteIfExists()
+        process = launch(runtimeDir, socket)
     }
 
     /**
@@ -172,6 +195,17 @@ class SwayHarness private constructor(
         fun start(): SwayHarness {
             val runtimeDir = Files.createTempDirectory("awakener-sway")
             val socket = runtimeDir.resolve("sway-ipc.sock")
+            return SwayHarness(launch(runtimeDir, socket), socket, runtimeDir)
+        }
+
+        /**
+         * One sway process on [socket], waited for until it answers.
+         *
+         * Shared by [start] and [restart] so that a restarted compositor is the same compositor the
+         * rest of the suite runs against — a second launcher would drift, and the whole point of a
+         * restart test is that the successor is an ordinary session.
+         */
+        private fun launch(runtimeDir: Path, socket: Path): Process {
             val config = runtimeDir.resolve("sway.conf")
             // No bar, no xwayland, no autostart: the tests assert on tree shape, and anything
             // that maps a window of its own would show up as a surface.
@@ -200,7 +234,7 @@ class SwayHarness private constructor(
             val deadline = System.nanoTime() + STARTUP_TIMEOUT_NANOS
             while (System.nanoTime() < deadline) {
                 if (socket.exists() && runCatching { SwayConnection.open(socket.absolutePathString()).close() }.isSuccess) {
-                    return SwayHarness(process, socket, runtimeDir)
+                    return process
                 }
                 Thread.sleep(25)
             }

@@ -19,14 +19,20 @@ import kotlin.test.assertTrue
  * repo for exactly that shape, so this launches the real entry point on the test's own classpath
  * and reads what comes back.
  *
- * The failure it provokes is a deliberate one: with no `SWAYSOCK` and no `wm.ipc.socket_path`,
- * `SwayConnection.open` raises `no sway socket: pass one explicitly or set SWAYSOCK`, which is
- * `:wm` refusing to guess. That is the same class of raise as `liveAgents` refusing to read an
+ * The failure it provokes is a deliberate one: with no `SWAYSOCK`, no `wm.ipc.socket_path` and an
+ * empty runtime directory, `SwaySocket` raises `no reachable sway IPC socket`, which is `:wm`
+ * refusing to guess. That is the same class of raise as `liveAgents` refusing to read an
  * unreadable bus as an empty one — it just needs no compositor and no bus to reach, so it is
  * deterministic on any host.
  *
- * Everything runs against a scratch `HOME`, `AWAKENER_CONFIG` and `XDG_STATE_HOME`: nothing here
- * may read Jason's config or write his bindings file.
+ * **`XDG_RUNTIME_DIR` is scratch too, and that is load-bearing rather than hygiene.**
+ * `wm.ipc.socket_discovery` looks there when `SWAYSOCK` names nothing reachable, so on a host with
+ * a live sway session of its own this would otherwise *connect* — the trigger would evaporate on
+ * exactly the machine awakener is meant to run on, and the test would report on the developer's
+ * desktop rather than on `main`.
+ *
+ * Everything else runs against a scratch `HOME`, `AWAKENER_CONFIG` and `XDG_STATE_HOME`: nothing
+ * here may read Jason's config or write his bindings file.
  */
 class AwakenerInvokeMainTest {
     /**
@@ -37,6 +43,12 @@ class AwakenerInvokeMainTest {
      *     at com.monkopedia.awakener.wm.SwayConnection$Companion.open(SwayConnection.kt:120)
      *     … 18 more frames
      * ```
+     *
+     * The wording moved when reconnection landed: the composition root now resolves the socket
+     * through `SwaySocket`, which looks for a successor when the named path answers nothing, so
+     * the refusal says what it tried rather than only that it was not told. What is asserted is
+     * still the shape — a `error: ` line a hotkey can act on, and no trace — plus enough of the
+     * text to know it is that refusal and not another.
      */
     @Test
     fun `a raised failure is reported rather than thrown at the user`() {
@@ -44,7 +56,9 @@ class AwakenerInvokeMainTest {
 
         assertEquals(1, run.exitCode)
         assertTrue(
-            run.stderr.lineSequence().any { it == "error: no sway socket: pass one explicitly or set SWAYSOCK" },
+            run.stderr.lineSequence().any {
+                it.startsWith("error: no reachable sway IPC socket: SWAYSOCK=<unset>;")
+            },
             "the refusal's own message is what a hotkey press can act on: ${run.stderr}",
         )
         assertTrue(
@@ -65,9 +79,9 @@ class AwakenerInvokeMainTest {
         val run = invoke(config = """{"invoke.failure.detail": "TRACE"}""")
 
         assertEquals(1, run.exitCode)
-        assertTrue("error: no sway socket" in run.stderr, run.stderr)
+        assertTrue("error: no reachable sway IPC socket" in run.stderr, run.stderr)
         assertTrue(
-            "at com.monkopedia.awakener.wm.SwayConnection" in run.stderr,
+            "at com.monkopedia.awakener.wm.SwaySocket" in run.stderr,
             "TRACE has to produce the frames, not merely a longer message: ${run.stderr}",
         )
     }
@@ -88,6 +102,9 @@ class AwakenerInvokeMainTest {
         val configFile = home.resolve("config.json")
         configFile.writeText(config)
         home.resolve("state").createDirectories()
+        // Empty, and its own: discovery searches it, so a runtime directory holding the
+        // developer's live sway would connect and this test would have no failure to report on.
+        val runtime = home.resolve("run").createDirectories()
 
         val process = ProcessBuilder(
             listOf("${System.getProperty("java.home")}/bin/java", "-cp", CLASSPATH, MAIN) + args,
@@ -100,6 +117,7 @@ class AwakenerInvokeMainTest {
             environment()["AWAKENER_CONFIG"] = configFile.absolutePathString()
             environment()["XDG_CONFIG_HOME"] = home.absolutePathString()
             environment()["XDG_STATE_HOME"] = home.resolve("state").absolutePathString()
+            environment()["XDG_RUNTIME_DIR"] = runtime.absolutePathString()
         }.start()
 
         // Both pipes before waitFor, for the reason `ProcessCommandRunner` spells out: reading

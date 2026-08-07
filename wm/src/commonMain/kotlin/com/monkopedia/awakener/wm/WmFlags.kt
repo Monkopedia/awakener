@@ -109,6 +109,58 @@ enum class ResolveKeySource {
     ENUMERATION,
 }
 
+/**
+ * Who acquires the successor connection when a compositor session ends under a running manager.
+ *
+ * The two values are the two answers to #33's "reconnection has no owner": the manager, or the
+ * caller. They are not points on a scale — one of them makes a manager span sessions, and the other
+ * makes a manager the *name* of one session — so the choice reaches [DockHandle] lifetimes and the
+ * dock table alike, and both consequences are stated at the flag.
+ */
+enum class SessionReconnect {
+    /**
+     * The manager stays broken after the boundary and the caller builds a successor.
+     *
+     * The previous behaviour, kept reachable because it is a coherent design rather than a defect:
+     * a manager is then one session's, every `con_id` it ever handed out belongs to that session,
+     * and a caller that retires it with [SwayWindowManager.close] cannot end up with two managers
+     * over one tree (#85).
+     */
+    NEVER,
+
+    /**
+     * The next call that needs the compositor acquires a fresh connection, and the repair collector
+     * is restarted on it.
+     *
+     * On demand rather than eagerly, and that is the design agreement rather than laziness: the
+     * product does not act unattended, so a reconnection is one act in reaction to a caller — a
+     * hotkey press — and never a retry loop or a schedule. Nothing reconnects on a desktop nobody
+     * is using, which is the correct amount of work to do on one.
+     */
+    ON_DEMAND,
+}
+
+/** What a [DockHandle] does when the session its `con_id`s belong to has ended. */
+enum class StaleHandle {
+    /**
+     * Refuse, with [CompositorSessionEnded].
+     *
+     * `con_id`s are minted from a counter that restarts with the compositor, so after a reconnect
+     * the id a handle holds is not merely dead — it names whatever window the new session gave it
+     * to, which is why refusing is the default rather than the tidy option.
+     */
+    REFUSE,
+
+    /**
+     * Issue the command anyway, against whatever session is live now.
+     *
+     * The previous behaviour: before reconnection existed, a stale handle could only reach a dead
+     * socket and fail, so nothing had to decide. With a successor connection in place the same code
+     * path reaches a live compositor with a dead session's ids, and `detach` on one is a `kill`.
+     */
+    ACT,
+}
+
 /** What happens to a dock whose bound surface has gone away. */
 enum class OrphanPolicy {
     /** Tear the dock down with its surface. */
@@ -464,7 +516,13 @@ object WmFlags {
             "louder, and reasonable if a manager that has stopped repairing should take the " +
             "process with it, but a scope that gets this must tolerate a child failing. Neither " +
             "restarts the collector, and under both the session boundary now passes unobserved, " +
-            "so the dock table is no longer discarded when the compositor goes away.",
+            "so the dock table is no longer discarded when the compositor goes away. " +
+            "wm.session.reconnect does not rescue this either, and deliberately: it restarts a " +
+            "collector that ended at the *boundary*, where a successor connection is exactly the " +
+            "missing thing, and none of these three failures — a connect that raised, a " +
+            "subscription sway refused, a payload that will not parse — is one a fresh " +
+            "connection is known to fix. Reconnecting on them would be a retry loop wearing " +
+            "another name.",
     )
 
     val resolveKeySource = Flags.enum(
@@ -603,7 +661,103 @@ object WmFlags {
     val socketPath = Flags.string(
         "wm.ipc.socket_path",
         "",
-        "Path to sway's IPC socket. Empty means use SWAYSOCK from the environment.",
+        "Path to sway's IPC socket. Empty means use SWAYSOCK from the environment. Set, it is " +
+            "authoritative: wm.ipc.socket_discovery is not consulted for it, because a path an " +
+            "operator typed names the compositor they meant and falling back from it would talk " +
+            "to a different one.",
+    )
+
+    val socketDiscovery = Flags.boolean(
+        "wm.ipc.socket_discovery",
+        true,
+        "Find sway's socket in XDG_RUNTIME_DIR when SWAYSOCK does not name a reachable one. " +
+            "This is what makes wm.session.reconnect mean anything on an ordinary desktop, and " +
+            "the reason is that SWAYSOCK cannot be re-read: a process's environment is fixed at " +
+            "exec, and with SWAYSOCK unset sway names its socket " +
+            "\$XDG_RUNTIME_DIR/sway-ipc.<uid>.<pid>.sock — so the successor session's path " +
+            "differs from the dead one's by a pid awakener was never told. Without this a " +
+            "long-lived awakener can only ever reconnect where an operator pinned " +
+            "wm.ipc.socket_path or where a supervisor re-execs it. Consulted only after the " +
+            "named socket fails to connect, so a live desktop's behaviour is unchanged, and only " +
+            "over sockets in this user's own runtime directory — it widens what the manager will " +
+            "talk to from one path to whichever sway of yours is up, which is the point and is " +
+            "worth knowing. Newest first, since that is the successor. Off restores the previous " +
+            "behaviour exactly: SWAYSOCK or nothing.",
+    )
+
+    val sessionReconnect = Flags.enum(
+        "wm.session.reconnect",
+        SessionReconnect.ON_DEMAND,
+        "Who acquires the successor connection when the compositor session ends under a running " +
+            "manager. ON_DEMAND makes it the manager's: the boundary closes the dead connection " +
+            "and discards the dock table as it always did, and then the next call that needs the " +
+            "compositor — an enumeration, a resolve, an attach — opens a fresh one and restarts " +
+            "the repair collector on it. Nothing happens on a schedule and nothing retries in a " +
+            "loop: a reconnection is one act in reaction to a caller, which is the design's rule " +
+            "about unattended action and is why there is no backoff to configure. So a desktop " +
+            "whose sway has restarted repairs itself at the next hotkey press and not before, " +
+            "and a manager whose next call arrives before sway is back raises from that call " +
+            "rather than reconnecting behind it. What it costs is that a manager now spans " +
+            "sessions, which makes every con_id a caller is holding a fact about a session that " +
+            "may be over — see wm.session.stale_handles, which is what stops that costing a " +
+            "window. NEVER is the previous behaviour: the manager stays broken after the " +
+            "boundary, every call against it raises, and the caller retires it with close() and " +
+            "builds a successor. That is a coherent design and not a defect — under it a manager " +
+            "is one session's, and the overlap two managers over one tree produce cannot arise " +
+            "from a restart at all. Neither value restarts a collector that ended for any other " +
+            "reason: see wm.repair.collector_failure, none of whose three failures a successor " +
+            "connection fixes. With wm.events.enabled off nothing observes the boundary, so " +
+            "nothing reconnects under either value.",
+    )
+
+    val staleHandles = Flags.enum(
+        "wm.session.stale_handles",
+        StaleHandle.REFUSE,
+        "What a dock handle does once the compositor session its con_ids came from has ended. " +
+            "sway allocates con_ids from a counter that restarts with the compositor — measured " +
+            "across two sequential sessions under one client, session A's dock id was session " +
+            "B's browser — so a handle that outlives its session does not name a dead window, it " +
+            "names somebody else's live one. REFUSE fails focus, settleFocus and detach on such " +
+            "a handle with the same compositor-agnostic CompositorSessionEnded the change stream " +
+            "reports, which tells a caller holding it exactly what it is holding. ACT is the " +
+            "previous behaviour and was harmless only because it was unreachable: before " +
+            "wm.session.reconnect existed a stale handle could reach nothing but a dead socket, " +
+            "so it failed on its own. With a successor connection in place the same call reaches " +
+            "a live compositor carrying a dead session's ids, and detach's first act is a kill. " +
+            "Turn it on only where the ids are known to still mean what they meant.",
+    )
+
+    val closeWaitMs = Flags.long(
+        "wm.manager.close_wait_ms",
+        5_000,
+        "How long close() waits for a retired manager's collector to actually stop. Cancelling " +
+            "only *asks*: a collector inside a sweep keeps sweeping until the cancellation " +
+            "reaches a suspension point, and a close that returned before then would leave the " +
+            "caller building a replacement while the predecessor was still deciding what to " +
+            "reap — which is the overlap close() exists to remove, narrowed rather than closed. " +
+            "So the default waits, having first closed the command connection so that a " +
+            "collector blocked in a socket read is woken rather than waited on. A wait that " +
+            "expires raises, because a manager that has been asked to stop and has not is " +
+            "precisely the state that must not pass silently. Zero does not wait at all and is " +
+            "the previous behaviour — the caller gets the cancellation and no promise about when " +
+            "it lands — and is the value to use where a close must not be able to block a hotkey.",
+        requires = Flags.atLeast(0L),
+    )
+
+    val closeReapsDocks = Flags.boolean(
+        "wm.manager.close_reaps_docks",
+        false,
+        "Tear this manager's docks down when it is closed. Off by default because a mark is " +
+            "what a successor adopts a standing dock by: an awakener restart over a live sway is " +
+            "the case the marks exist for, and a close that killed every panel would make each " +
+            "restart cost the user their agent panels and the residue on screen with them. Off, " +
+            "a closed manager leaves the tree exactly as it found it and the docks are adopted " +
+            "by whatever comes next, or closed by hand if nothing does. On is for a shutdown " +
+            "with nothing coming after it, where a standing panel nothing holds a handle to is a " +
+            "leak rather than an inheritance. It tears down every dock in this manager's table, " +
+            "adopted ones included, and a teardown that fails is raised once the rest have been " +
+            "attempted — the retirement itself still completes, since a wedged panel must not " +
+            "leave a collector running.",
     )
 
     val eventsEnabled = Flags.boolean(
@@ -620,6 +774,8 @@ object WmFlags {
             "only at its next use, which cannot make a command wrong — a reply that arrives " +
             "describes the session that produced it — but is late. Attaching a dock is " +
             "unaffected: it polls the tree rather than listening, deliberately, so it keeps " +
-            "working with events off.",
+            "working with events off. Nothing reconnects either, for the same reason and not as " +
+            "a fourth cost: wm.session.reconnect acquires a successor connection when the " +
+            "boundary is *observed*, and with events off it never is.",
     )
 }

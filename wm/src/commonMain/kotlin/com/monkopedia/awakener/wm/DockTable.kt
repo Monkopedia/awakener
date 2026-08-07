@@ -191,9 +191,13 @@ internal class DockTable {
      * a `no_focus` rule cannot outlive the compositor holding it, so keeping the record would
      * suppress the next session's first attach from issuing one it genuinely needs.
      *
-     * What this does not do is make the manager usable again: the connection its commands ride on
-     * is still the dead one. Emptying the table is the half of the boundary that is ours; acquiring
-     * a successor connection is reconnection, which is not designed (#33).
+     * What this does not do is make the manager usable again — emptying the table is the half of
+     * the boundary that is ours, and acquiring a successor connection is the other half. That half
+     * exists now: `SwayWindowManager` drops the dead connection alongside this discard, and
+     * `wm.session.reconnect` decides whether the next caller gets a successor connection or a
+     * refusal (#33). Either way what a successor starts with is this — nothing — and it rebuilds by
+     * adopting the marks it finds in whatever tree it is looking at, which is what the marks are
+     * for.
      */
     fun discard() {
         state.update { DockTableSnapshot() }
