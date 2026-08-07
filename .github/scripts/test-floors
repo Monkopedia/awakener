@@ -21,8 +21,20 @@
 # `AWAKENER_TEST_MODULES` and fails if this file and that roster disagree in either direction,
 # so a new module cannot reach `main` without someone stating what it is expected to run.
 #
-# Counts as of `3d16851` (CI run 31221639237, attempt 1): 29 suites, 321 tests, skipped=0.
+# Counts as of `4b2eed0` (CI run 31226978882, job 93023157970): 31 suites, 331 tests, skipped=0
+# — per module, `cli` 5/55, `config` 5/60, `registry` 10/102, `wm` 11/114, read off that run's
+# summary table rather than a local tree. The floors below are those counts.
+#
+# The previous line named `3d16851` (321 tests), and was behind `main` before it landed. Nothing
+# miscounted, and the ordering is the whole point: those floors came from run 31221639237 on
+# `3d16851`, and #119's own CI (run 31226010044, `ce1ba8c`) began at 23:05:27Z — **neither tree
+# contained #118**, which merged at 23:09:50Z, 4m23s *after* that run began and 13m36s before
+# #119 itself merged. #118's two test classes were therefore never in the counts these floors
+# were written from; the counter was right and the tree was simply a different one. So `main`
+# ran 331 the moment #119 landed, and `test-summary.sh` printed its drift note on every run from
+# the first. A note that has never been silent is a note nobody reads, so when it names a
+# module, refresh this file and this line together.
 cli 55
-config 58
-registry 94
+config 60
+registry 102
 wm 114
