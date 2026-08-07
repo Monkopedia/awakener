@@ -55,10 +55,15 @@ class WindowManagerShapeTest {
      * Synthetic members are the bridges and default-argument thunks Kotlin generates, and static
      * ones are `DefaultImpls`-style dispatch; neither is a call anybody makes, so neither counts
      * against the agreement.
+     *
+     * The trailing `-<hash>` is Kotlin's mangling for a signature mentioning an inline value
+     * class, which every member of both interfaces does — `SurfaceId` and `AgentId` are both
+     * `@JvmInline`. It is dropped rather than matched, because the hash is derived from the
+     * signature and would turn a parameter's type changing into a failure of the *count*.
      */
     private fun membersOf(type: Class<*>): Set<String> =
         type.declaredMethods
             .filterNot { it.isSynthetic || Modifier.isStatic(it.modifiers) }
-            .map { it.name }
+            .map { it.name.substringBefore('-') }
             .toSet()
 }
