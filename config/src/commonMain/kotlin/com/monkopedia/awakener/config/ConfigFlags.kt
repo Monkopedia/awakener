@@ -93,6 +93,29 @@ enum class MissingFile {
     DEFAULTS,
 }
 
+/** What a running watch does with an event batch that says events were lost. */
+enum class WatchOverflow {
+    /**
+     * Re-read the file, exactly as a change to it would.
+     *
+     * An overflow is the one event that says *something you were meant to see is gone*, and a
+     * re-read is total — the store reads the whole file, so one read repairs however many
+     * events were dropped. That is why this is the default: the alternative leaves the watch
+     * quietest at the moment it has most reason to speak.
+     */
+    REREAD,
+
+    /**
+     * Keep the values last read, and report the loss through `FileConfigStore.loadError`.
+     *
+     * For a deployment where the snapshot must not move except on a change somebody can point
+     * at — an overflow says events were lost, not that this file was among them, so a re-read
+     * on one is a reload with no edit behind it. The cost is the honest one: if the file *did*
+     * change in the lost batch, nothing picks it up until the next event.
+     */
+    REPORT,
+}
+
 /** Flags governing configuration itself. */
 object ConfigFlags {
     val discovery = Flags.enum(
@@ -176,6 +199,34 @@ object ConfigFlags {
             "process without a restart. This governs the *watch* only: a store built when the " +
             "file does not exist reads defaults under both values, because there are no last " +
             "values to keep.",
+    )
+
+    val watchOverflow = Flags.enum(
+        "config.watch.overflow",
+        WatchOverflow.REREAD,
+        "What a running watch does when the operating system tells it events were lost. An " +
+            "overflow arrives with no path attached — it is a statement about the queue, not " +
+            "about a file — so the name filter that decides every other event cannot decide " +
+            "this one, and dropping it made the watch go quiet at exactly the moment it had " +
+            "most reason to read. REREAD treats it as a change: a read is total, so one " +
+            "re-read repairs any number of dropped events, and the worst it costs is a reload " +
+            "that finds nothing different. REPORT keeps the last values and says so through " +
+            "the same channel an unreadable file uses, for a deployment where the snapshot " +
+            "must only move on a change somebody can point at. An overflow needs no " +
+            "registration to be delivered, so this applies to every watch.",
+    )
+
+    val lockRequired = Flags.boolean(
+        "config.store.lock_required",
+        false,
+        "Whether `set` and `unset` refuse to write when they cannot take the cross-process " +
+            "lock beside the config file. Off writes anyway and reports the degradation, " +
+            "because refusing would make the config unwritable on a filesystem that will not " +
+            "lock (an NFS home without lockd) — at the cost that a concurrent `set` can be " +
+            "lost, which is the whole defect the lock exists to close. On refuses instead, " +
+            "for a deployment that would rather have no write than a silently lost one. " +
+            "Either way the write is atomic by rename over a per-process staging file, so an " +
+            "unlocked write can lose an update but can never tear the file.",
     )
 
     /**

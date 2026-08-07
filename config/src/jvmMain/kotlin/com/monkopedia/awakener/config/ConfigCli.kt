@@ -105,6 +105,11 @@ object ConfigCli {
                 try {
                     runBlocking { store.set(key, raw) }
                     out("$key = $raw")
+                    // After the write, not before: this is the one warning that cannot be known
+                    // until the write has tried. A `set` that could not take the cross-process
+                    // lock still succeeded, and still may have overwritten another one — the
+                    // whole point of #88 is that the loss is silent, so the report is the fix.
+                    store.lockError.value?.let { out("warning: $it") }
                     0
                 } catch (e: Exception) {
                     // `e.toString()` rather than a stand-in like "invalid value": catching
@@ -120,6 +125,7 @@ object ConfigCli {
                 try {
                     runBlocking { store.unset(key) }
                     out("$key reset to default")
+                    store.lockError.value?.let { out("warning: $it") }
                     0
                 } catch (e: Exception) {
                     usage(out, e.message ?: "unknown flag")

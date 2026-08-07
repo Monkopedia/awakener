@@ -114,10 +114,19 @@ class Config internal constructor(
 }
 
 /**
- * A live, reloadable source of configuration.
+ * A reloadable source of configuration.
  *
- * Implementations must publish a new snapshot when the underlying source changes, so callers
- * can react to a flag flip without restarting.
+ * Implementations publish a new snapshot when the underlying source changes — but for
+ * `FileConfigStore` that happens only while something is running its `watch`, and **nothing in
+ * the build does yet** (#43), because every entry point is one-shot. So today a flag flip
+ * applies to the next run rather than to a running process.
+ *
+ * Callers still read from [config] per operation rather than caching a value at construction.
+ * That is what makes the reload work the day the first long-lived entry point wires `watch`,
+ * and it is the discipline this module asks of everyone else — so it is written as a property
+ * of the design, not as an observed property of the binary. Do not read this interface as a
+ * promise that the property is already live: it said exactly that, without the qualifier, and
+ * the reader it misled was the one who would otherwise have gone and wired the watch.
  */
 interface ConfigStore {
     val config: StateFlow<Config>
