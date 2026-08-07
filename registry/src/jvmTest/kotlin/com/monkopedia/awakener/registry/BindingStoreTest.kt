@@ -3,9 +3,11 @@ package com.monkopedia.awakener.registry
 import com.monkopedia.awakener.config.InMemoryConfigStore
 import java.io.IOException
 import java.nio.file.Files
+import kotlin.io.path.Path
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.exists
 import kotlin.io.path.isDirectory
+import kotlin.io.path.name
 import kotlin.io.path.readText
 import kotlin.io.path.writeText
 import kotlin.test.AfterTest
@@ -13,6 +15,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -96,8 +99,8 @@ class BindingStoreTest {
         val store = store()
         store.bind(key)
 
-        assertTrue(store.unbind(key))
-        assertFalse(store.unbind(key), "the second unbind has nothing to do")
+        assertTrue(store.unbind(key).wasBound)
+        assertFalse(store.unbind(key).wasBound, "the second unbind has nothing to do")
         assertNull(store().resolve(key), "and the removal reached the file")
     }
 
@@ -114,7 +117,7 @@ class BindingStoreTest {
         val holder = store()
         val original = holder.bind(key)
 
-        assertTrue(store().unbind(key), "awakener-registry forget, in its own process")
+        assertTrue(store().unbind(key).wasBound, "awakener-registry forget, in its own process")
 
         val rebound = holder.bind(key)
         assertNotEquals(original.agent, rebound.agent, "the forgotten agent must not come back")
@@ -130,7 +133,7 @@ class BindingStoreTest {
         val holder = store()
         holder.bind(forgotten)
 
-        assertTrue(store().unbind(forgotten))
+        assertTrue(store().unbind(forgotten).wasBound)
         holder.bind(other)
 
         assertNull(store().resolve(forgotten), "an unrelated bind must not resurrect it")
@@ -176,7 +179,7 @@ class BindingStoreTest {
         val holder = store()
         holder.bind(key)
 
-        assertTrue(store().unbind(key))
+        assertTrue(store().unbind(key).wasBound)
         assertNull(holder.resolve(key))
     }
 
@@ -192,7 +195,7 @@ class BindingStoreTest {
         val original = holder.bind(key)
         config.put(RegistryFlags.forgetConflict, ForgetConflict.HOLDER_WINS)
 
-        assertTrue(store().unbind(key))
+        assertTrue(store().unbind(key).wasBound)
         val rebound = holder.bind(key)
 
         assertEquals(original.agent, rebound.agent, "the live agent keeps its surface")
@@ -210,7 +213,7 @@ class BindingStoreTest {
         val holder = store()
         val original = holder.bind(key)
 
-        assertTrue(store().unbind(key))
+        assertTrue(store().unbind(key).wasBound)
         assertEquals(original.agent, holder.bind(key).agent, "the stale map wins, as documented")
     }
 
@@ -366,5 +369,196 @@ class BindingStoreTest {
         assertTrue(
             store().residueLocation(SurfaceKey.Window("firefox")).startsWith(elsewhere.toString()),
         )
+    }
+
+    /**
+     * #60, pinned as the default rather than fixed away. Residue is keyed on the surface, so a
+     * forget changes the identity and leaves the written-down model exactly where the fresh
+     * Lifeless will read it. That is the right answer to "this surface is bound to the wrong
+     * agent" and the wrong one to "this agent has the wrong model of me", which is why the
+     * behaviour below is kept as [ForgetResidue.KEEP] and given company rather than replaced.
+     */
+    @Test
+    fun `a forget hands the fresh Lifeless the forgotten agent's residue by default`() = runTest {
+        val key = SurfaceKey.Window("firefox")
+        val store = store()
+        val original = store.bind(key)
+        val residue = store.prepareResidue(key)
+        residue.writeText("prefers dark mode")
+
+        val forget = store.unbind(key)
+        assertTrue(forget.wasBound)
+        assertEquals(ResidueOutcome.Kept(residue.toString()), forget.residue)
+
+        val fresh = store.bind(key)
+        assertNotEquals(original.agent, fresh.agent, "forget mints a fresh Lifeless")
+        assertEquals(
+            residue.toString(),
+            store.residueLocation(key),
+            "onto the residue path the forgotten agent was writing into",
+        )
+        assertEquals("prefers dark mode", residue.readText(), "which still holds its model")
+    }
+
+    /**
+     * The repair the flag exists for: the fresh Lifeless starts empty, and the model the old
+     * one had of Jason is still on disk to read. Both halves are asserted, because an
+     * implementation that deleted would pass the first and one that copied would pass the
+     * second.
+     */
+    @Test
+    fun `archiving empties the residue for the fresh agent and keeps the old model`() = runTest {
+        config.put(RegistryFlags.forgetResidue, ForgetResidue.ARCHIVE)
+        val key = SurfaceKey.Window("firefox")
+        val store = store()
+        store.bind(key)
+        val residue = store.prepareResidue(key)
+        residue.writeText("prefers dark mode")
+
+        val archived = assertIs<ResidueOutcome.Archived>(store.unbind(key).residue)
+
+        assertFalse(residue.exists(), "the live residue path is free for the fresh Lifeless")
+        assertEquals(residue.toString(), archived.path)
+        assertEquals("prefers dark mode", Path(archived.archive).readText())
+        assertTrue(
+            Path(archived.archive).name.startsWith("${key.slug}."),
+            "an archive is findable from the surface it belonged to: ${archived.archive}",
+        )
+        assertTrue(archived.archive.endsWith(".md"), archived.archive)
+        assertEquals(
+            residue.parent,
+            Path(archived.archive).parent,
+            "and it stays beside the residue rather than moving out of the state directory",
+        )
+    }
+
+    /** Two forgets of one surface inside a second must not lose the first archive. */
+    @Test
+    fun `a second archive in the same second gets its own name`() = runTest {
+        config.put(RegistryFlags.forgetResidue, ForgetResidue.ARCHIVE)
+        val key = SurfaceKey.Window("firefox")
+        // A clock that never moves, so the timestamp cannot be what separates the two names.
+        val store = FileBindingStore(
+            config,
+            identities,
+            environment = emptyMap(),
+            clock = { 0L },
+            path = dir.resolve("bindings.json"),
+        )
+        val archives = (1..2).map {
+            store.bind(key)
+            store.prepareResidue(key).writeText("model $it")
+            assertIs<ResidueOutcome.Archived>(store.unbind(key).residue).archive
+        }
+
+        assertNotEquals(archives[0], archives[1], "the first archive must not be overwritten")
+        assertEquals("model 1", Path(archives[0]).readText())
+        assertEquals("model 2", Path(archives[1]).readText())
+    }
+
+    @Test
+    fun `deleting removes the residue outright`() = runTest {
+        config.put(RegistryFlags.forgetResidue, ForgetResidue.DELETE)
+        val key = SurfaceKey.Window("firefox")
+        val store = store()
+        store.bind(key)
+        val residue = store.prepareResidue(key)
+        residue.writeText("prefers dark mode")
+
+        assertEquals(ResidueOutcome.Deleted(residue.toString()), store.unbind(key).residue)
+        assertFalse(residue.exists())
+    }
+
+    /**
+     * The layouts are not interchangeable to a rename or a delete — one is a file, the other a
+     * populated directory — so both are exercised. A `Files.delete` that never learned about
+     * [ResidueLayout.PER_KEY_DIR] passes every test above and throws on a real desktop the
+     * moment distillation writes a second artifact.
+     */
+    @Test
+    fun `a per-directory residue archives and deletes whole`() = runTest {
+        config.put(RegistryFlags.residueLayout, ResidueLayout.PER_KEY_DIR)
+        config.put(RegistryFlags.forgetResidue, ForgetResidue.ARCHIVE)
+        val key = SurfaceKey.Window("firefox")
+        val store = store()
+        store.bind(key)
+        val residue = store.prepareResidue(key)
+        residue.resolve("model.md").writeText("prefers dark mode")
+
+        val archived = assertIs<ResidueOutcome.Archived>(store.unbind(key).residue)
+        assertFalse(residue.exists(), "the directory itself moves, not just its contents")
+        assertEquals("prefers dark mode", Path(archived.archive).resolve("model.md").readText())
+        assertFalse(archived.archive.endsWith(".md"), "a directory archive is not named as a file")
+
+        config.put(RegistryFlags.forgetResidue, ForgetResidue.DELETE)
+        store.bind(key)
+        store.prepareResidue(key).resolve("model.md").writeText("second model")
+        assertEquals(ResidueOutcome.Deleted(residue.toString()), store.unbind(key).residue)
+        assertFalse(residue.exists(), "a populated directory is removed rather than refused")
+    }
+
+    /**
+     * A surface that was never bound has had nothing forgotten, so nothing of its is disposed
+     * of. Under [ForgetResidue.DELETE] this is the difference between a mistyped key costing
+     * an error message and it costing six weeks of accumulated model.
+     */
+    @Test
+    fun `a forget of an unbound surface disposes of nothing`() = runTest {
+        config.put(RegistryFlags.forgetResidue, ForgetResidue.DELETE)
+        val key = SurfaceKey.Window("firefox")
+        val store = store()
+        val residue = store.prepareResidue(key)
+        residue.writeText("prefers dark mode")
+
+        val forget = store.unbind(key)
+
+        assertFalse(forget.wasBound)
+        assertTrue(residue.exists(), "an unbound key must not take its residue down with it")
+        assertEquals("prefers dark mode", residue.readText())
+    }
+
+    @Test
+    fun `a surface that wrote nothing down reports that rather than an archive`() = runTest {
+        config.put(RegistryFlags.forgetResidue, ForgetResidue.ARCHIVE)
+        val key = SurfaceKey.Window("firefox")
+        val store = store()
+        store.bind(key)
+
+        val outcome = store.unbind(key).residue
+        assertIs<ResidueOutcome.Absent>(outcome)
+        assertEquals(store.residueLocation(key), outcome.path)
+    }
+
+    /**
+     * The binding is durably gone by the time the residue is touched, so a disposal that fails
+     * cannot be reported by failing the forget — it would name the half that worked. It comes
+     * back as [ResidueOutcome.Failed] naming the file that is still there.
+     */
+    @Test
+    fun `a disposal that cannot happen is reported rather than thrown or hidden`() = runTest {
+        config.put(RegistryFlags.forgetResidue, ForgetResidue.ARCHIVE)
+        val key = SurfaceKey.Window("firefox")
+        val store = store()
+        store.bind(key)
+        val residue = store.prepareResidue(key)
+        residue.writeText("prefers dark mode")
+        // Read-only residue directory: the one way to make a rename fail on a host whose
+        // filesystem is otherwise healthy. The bindings file lives in the parent, so the
+        // durable half of the forget is unaffected — which is the situation being tested.
+        val residueDir = residue.parent
+        residueDir.toFile().setWritable(false)
+
+        val forget = try {
+            store.unbind(key)
+        } finally {
+            residueDir.toFile().setWritable(true)
+        }
+
+        assertTrue(forget.wasBound, "the binding is gone; only the residue disposal failed")
+        val failed = assertIs<ResidueOutcome.Failed>(forget.residue)
+        assertEquals(residue.toString(), failed.path)
+        assertTrue(failed.reason.isNotBlank(), "the reason must say why, not just that")
+        assertEquals("prefers dark mode", residue.readText(), "and the model is still there")
+        assertNull(store().resolve(key), "while the binding really did go")
     }
 }

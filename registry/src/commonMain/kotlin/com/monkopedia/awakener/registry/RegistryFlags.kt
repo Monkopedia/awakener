@@ -153,6 +153,41 @@ enum class ForgetConflict {
     HOLDER_WINS,
 }
 
+/**
+ * What a forget does with the residue the forgotten agent accumulated.
+ *
+ * Residue is keyed on the [SurfaceKey], not on the agent, so a forget alone changes the
+ * identity and leaves the written-down model exactly where it was — the freshly minted
+ * Lifeless is handed the same residue path the forgotten one was writing into. That is right
+ * for one of the two reasons anyone reaches for `forget` and wrong for the other, which is why
+ * it is a flag: "this surface is bound to the wrong agent" wants the model to follow the
+ * surface, and "this agent has the wrong model of me" wants it out of the way (#60).
+ */
+enum class ForgetResidue {
+    /**
+     * Leave it. The rebinding case, and the only value that cannot lose anything — a wrong
+     * `forget` costs an agent id rather than six weeks of accumulated model.
+     */
+    KEEP,
+
+    /**
+     * Rename it aside, so the fresh Lifeless starts empty and the old model is still readable.
+     *
+     * This is what makes `forget` a real repair for "the agent has the wrong idea about me":
+     * the memory model's claim is that the durable layer is inspectable when the agent gets you
+     * wrong, and inspecting it is not much use if the only lever leaves the wrongness in place.
+     */
+    ARCHIVE,
+
+    /**
+     * Remove it. **Irreversible, and there is no undo above this layer** — nothing else in
+     * awakener copies residue anywhere. For "start this surface over" reach for [ARCHIVE]
+     * first; this value is for residue that should not go on existing, which is a real thing
+     * to want of a file holding a model of its user, and is the one reason it is built.
+     */
+    DELETE,
+}
+
 /** How a surface's durable residue is laid out on disk. */
 enum class ResidueLayout {
     /** One file per surface, `<slug>.md`. Simplest thing that stays readable by hand. */
@@ -202,6 +237,20 @@ object RegistryFlags {
         "What a holder's bind does with a binding forgotten underneath it: honour the forget " +
             "and mint a fresh Lifeless, or re-establish the identity the holder is carrying so " +
             "a live agent keeps its surface.",
+    )
+
+    val forgetResidue = Flags.enum(
+        "registry.binding.forget_residue",
+        ForgetResidue.KEEP,
+        "What a forget does with the residue the forgotten agent accumulated. Residue is keyed " +
+            "on the surface rather than on the agent, so KEEP — today's behaviour, and the " +
+            "default — hands the freshly minted Lifeless the same written-down model the " +
+            "forgotten one had, which is right when the complaint is 'wrong agent' and wrong " +
+            "when it is 'wrong model of me'. ARCHIVE renames it to <slug>.<timestamp> beside " +
+            "itself so the new agent starts empty and the old model stays readable. DELETE " +
+            "removes it, which nothing undoes. Only a forget that actually dropped a binding " +
+            "disposes of anything, and a disposal that fails is reported rather than folded " +
+            "into the forget's own success.",
     )
 
     val windowIdentity = Flags.enum(

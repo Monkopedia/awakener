@@ -25,7 +25,7 @@ class InMemoryBindingStoreTest {
         assertEquals("agent-lifeless-${key.slug}", bound.agentId)
         assertEquals(bound, store.resolve(key))
 
-        assertTrue(store.unbind(key))
+        assertTrue(store.unbind(key).wasBound)
         assertNull(store.resolve(key))
     }
 

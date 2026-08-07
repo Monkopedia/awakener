@@ -9,8 +9,16 @@ import kotlinx.coroutines.runBlocking
  *
  * The memory model's promise is that the durable layer is inspectable when an agent gets you
  * wrong, and "which agent is this window even talking to" is the first question you would ask.
- * `forget` is the repair: it drops a binding so the surface mints a fresh Lifeless, without
- * touching the residue the old one accumulated.
+ * `forget` is the repair: it drops a binding so the surface mints a fresh Lifeless, and says
+ * what became of the residue the old one accumulated — kept, archived aside, or deleted, per
+ * [RegistryFlags.forgetResidue]. It used to promise "residue left in place" unconditionally,
+ * which was true and was also the whole of #60: residue is keyed on the surface rather than on
+ * the agent, so the fresh Lifeless was handed the forgotten one's written-down model.
+ *
+ * Exit codes: 0 forgot it, 1 nothing was bound, 2 the arguments were wrong, **3 the binding is
+ * gone but the residue disposal failed** — a distinct code because under
+ * [ForgetResidue.DELETE] that is a model the user asked to be rid of which is still on disk,
+ * and folding it into 0 would report a repair that half happened as one that did.
  */
 object RegistryCli {
     fun run(args: Array<String>, store: FileBindingStore, out: (String) -> Unit): Int {
@@ -52,9 +60,19 @@ object RegistryCli {
             "forget" -> {
                 val key = args.getOrNull(1)?.let(SurfaceKey::parse)
                     ?: return usage(out, "forget needs a canonical key")
-                val had = runBlocking { store.unbind(key) }
-                out(if (had) "forgot ${key.canonical}; residue left in place" else "not bound")
-                if (had) 0 else 1
+                val forget = runBlocking { store.unbind(key) }
+                if (!forget.wasBound) {
+                    out("not bound")
+                    1
+                } else {
+                    out("forgot ${key.canonical}")
+                    // Named rather than implied. The user reaching for this command has just
+                    // decided an agent has the wrong idea about them, and the next thing they
+                    // need to know is whether the written-down version of that idea is still
+                    // there — which under RegistryFlags.forgetResidue it may or may not be.
+                    out("  residue  ${forget.residue.describe()}")
+                    if (forget.residue is ResidueOutcome.Failed) 3 else 0
+                }
             }
 
             else -> usage(out, "unknown command '${args[0]}'")
@@ -64,6 +82,20 @@ object RegistryCli {
         // exclusion is one another process can undo, and that is the whole of #50.
         store.lockError?.let { out("warning: $it") }
         return code
+    }
+
+    /**
+     * One line saying where the model now is.
+     *
+     * Every case names a path, so none of them can be read as any of the others at a glance —
+     * "left in place" and "archived" differ by the thing the user is about to go and look at.
+     */
+    private fun ResidueOutcome.describe(): String = when (this) {
+        is ResidueOutcome.Kept -> "left in place at $path"
+        is ResidueOutcome.Archived -> "archived to $archive (the fresh agent starts empty)"
+        is ResidueOutcome.Deleted -> "deleted from $path"
+        is ResidueOutcome.Absent -> "nothing had been written to $path"
+        is ResidueOutcome.Failed -> "STILL AT $path — could not be disposed of: $reason"
     }
 
     private fun usage(out: (String) -> Unit, error: String): Int {
