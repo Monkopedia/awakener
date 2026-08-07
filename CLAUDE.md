@@ -47,6 +47,26 @@ check that reads back the artefact you are making a claim about.
   `return`, which JUnit records as PASSED, so a host with no compositor reported `skipped="0"`
   and a full count of passes, indistinguishable from a run against a live sway. Read the count
   *and* set the flags: the count catches the mistake afterwards, the flags stop it happening.
+- **Both of those answer questions about the tests that ran. Neither one can see a module that
+  ran nothing.** `AWAKENER_REQUIRE_SWAY=1` turns *a test that ran and found no sway* into a
+  failure and says nothing about a test that never ran; `skipped="0"` is true and empty when
+  there were no tests to skip. Four mechanisms produce that — a disabled test task, a module
+  never wired to `check`, a cached task replayed as up-to-date, a run filtered to an empty set —
+  and all four render as an honest, smaller table. Measured on `00c6d9e` (#97): one line in
+  `wm/build.gradle.kts` took the total from 279 to 178 with `BUILD SUCCESSFUL`, `skipped="0"`,
+  and the reassurance printed in full over a run in which the entire compositor suite never
+  executed. **`.github/scripts/test-floors` is the other half of the comparison** — a committed
+  per-module floor that `test-summary.sh` reads and *gates* on, and that `./gradlew build` checks
+  through `:root:verifyTestFloors`. Two things follow for you. First, the floor file has to name
+  every module in the build, in both directions, so **a new module cannot land without a line
+  saying what it should run** — `0` is a legitimate answer and a stated one. Second, when a
+  change legitimately removes tests, **lower the floor in the same commit**: the number is
+  committed precisely so a drop in coverage appears in a diff next to its cause. Adding tests
+  never needs an edit. Enumerating the four routes was the losing move, and the invariant is
+  worth carrying to any other instrument you build here: **an aggregate reports on what it ran,
+  never on what it should have run**, and an expectation derived from the same run shares the
+  run's blind spot — a module that produced nothing contributes zero to the counts *and* zero to
+  any expectation drawn from them, and `0` is not below `0`.
 - "BUILD SUCCESSFUL" alone still distinguishes nothing. If you add a tool-gated test, gate it
   with an assumption, never with a bare `return` — and if you add a new gate, declare what it
   reads as a test input. `org.gradle.caching=true`, and Gradle treats neither `PATH` nor the
