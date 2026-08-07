@@ -1,5 +1,6 @@
 package com.monkopedia.awakener.registry
 
+import com.monkopedia.awakener.config.FilePermissions
 import com.monkopedia.awakener.config.Flags
 
 /** What makes two windows "the same surface" for the purpose of a durable binding. */
@@ -188,6 +189,45 @@ enum class ForgetResidue {
     DELETE,
 }
 
+/**
+ * What preparing residue does when the directory it is about to write into can be written by
+ * users other than this one.
+ *
+ * The check is on the nearest directory that already exists, not on the leaf: a residue
+ * directory awakener creates is created `0700` under [RegistryFlags.filePermissions], so the
+ * exposure that survives that is an *ancestor* somebody else can write to. In such a directory
+ * another local user can create the residue path first — as their own directory, or as a symlink
+ * pointing at something of theirs — and awakener would then write the user's model into it. The
+ * sticky bit does not close that: `/tmp` being `1777` stops another user *removing* an entry
+ * that is already there, and does nothing about one that is not there yet.
+ *
+ * Only the write permission is examined. A directory that is merely readable by others leaks the
+ * *names* of surfaces, which are app ids, while the residue files inside it are `0600` — worth
+ * less than the noise it would generate on a machine with a `0755` home.
+ */
+enum class ResidueExposure {
+    /**
+     * Prepare it anyway, and say so. The default, and the same call
+     * [RegistryFlags.lockRequired] makes for the same reason: this runs on the hotkey path, a
+     * refusal there takes the key press down, and awakener does not own the directory the user
+     * pointed it at. Naming it is what the alternative — carrying on in silence, which is
+     * exactly what #102 describes — cannot do.
+     */
+    REPORT,
+
+    /**
+     * Refuse to prepare it, raising rather than writing. For a deployment where residue must
+     * never be written where another user could have got there first, and which would rather
+     * lose the hotkey than find that out later.
+     */
+    REFUSE,
+
+    /**
+     * Say nothing. For a shared machine where this is understood and the warning is noise.
+     */
+    ALLOW,
+}
+
 /** How a surface's durable residue is laid out on disk. */
 enum class ResidueLayout {
     /** One file per surface, `<slug>.md`. Simplest thing that stays readable by hand. */
@@ -331,6 +371,38 @@ object RegistryFlags {
         "",
         "Directory holding each surface's distilled residue. Empty means a `residue` " +
             "directory beside the bindings file.",
+    )
+
+    val filePermissions = Flags.enum(
+        "registry.store.permissions",
+        FilePermissions.OWNER_ONLY,
+        "What permissions this module creates files and directories with: the bindings file, " +
+            "its lock and staging files, the residue directory and each surface's residue. " +
+            "OWNER_ONLY writes 0600 on files and 0700 on directories, applied as a creation " +
+            "attribute rather than a chmod afterwards so there is no window in which the file " +
+            "exists and is not yet private. UMASK is the behaviour before #102 — whatever the " +
+            "process umask leaves, which under the usual 022 is a world-readable 0644 on " +
+            "every residue file — and is kept for a deployment that widens the umask or sets " +
+            "a default ACL on purpose so that a group or a backup agent can read the state " +
+            "directory. Only creation is governed: a directory that already exists is left as " +
+            "it is, which is registry.residue.exposed_dir's question rather than this one. " +
+            "`:config` has the same switch over its own files as config.store.permissions.",
+    )
+
+    val residueExposure = Flags.enum(
+        "registry.residue.exposed_dir",
+        ResidueExposure.REPORT,
+        "What preparing residue does when the nearest existing directory above it is writable " +
+            "by other users — registry.residue.dir pointed at /tmp is the case this exists " +
+            "for. There another local user can create the residue path before awakener does, " +
+            "as their own directory or as a symlink onto something of theirs, and the sticky " +
+            "bit does not prevent it: 1777 stops an entry being removed, not one being " +
+            "created. REPORT prepares it and warns, which is the default because this is the " +
+            "hotkey path and a refusal there costs the key press, and because awakener does " +
+            "not own the directory it was pointed at. REFUSE raises instead, for a deployment " +
+            "that would rather lose the hotkey than write a model somewhere another user " +
+            "reached first. ALLOW says nothing. Only write permission is examined: a merely " +
+            "readable directory leaks surface names, and the residue files in it are 0600.",
     )
 
     val residueLayout = Flags.enum(

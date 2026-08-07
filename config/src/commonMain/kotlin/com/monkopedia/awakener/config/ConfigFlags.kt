@@ -229,6 +229,22 @@ object ConfigFlags {
             "unlocked write can lose an update but can never tear the file.",
     )
 
+    val filePermissions = Flags.enum(
+        "config.store.permissions",
+        FilePermissions.OWNER_ONLY,
+        "What permissions the config file, its lock file and its staging file are created " +
+            "with. OWNER_ONLY writes 0600 (0700 on directories this store creates) as a " +
+            "creation attribute rather than a chmod afterwards, so there is no window in " +
+            "which the file exists and is not yet private. UMASK is the behaviour before " +
+            "#102 — whatever the process umask leaves, which under the usual 022 is a " +
+            "world-readable 0644 — and is kept for a deployment that deliberately widens the " +
+            "umask or sets a default ACL so a group or a backup agent can read the state " +
+            "directory. Existing files are not touched: this governs creation, and a rename " +
+            "over an old 0644 file replaces its mode along with its contents. The registry " +
+            "has the same switch over its own files as registry.store.permissions; a " +
+            "deployment that wants the old behaviour has to set both.",
+    )
+
     /**
      * The one cross-flag rule `:config` has of its own, and the reason [Flags.constraint] is
      * exercised by the module that declares it rather than only by a test. `FlagDiscovery`
