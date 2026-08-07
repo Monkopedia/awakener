@@ -299,9 +299,18 @@ class SwayLifecycleTest {
         assertEquals(1, wm.repairs.value.reconnects, "the manager has to be on the new session")
 
         val refused = assertFailsWith<CompositorSessionEnded> { handle.detach() }
+        val message = refused.message.orEmpty()
         assertTrue(
-            "${handle.dockId.raw}" in refused.message.orEmpty(),
+            "${handle.dockId.raw}" in message,
             "the refusal has to name the id it would have acted on: was $refused",
+        )
+        // Both generations, because "a session that ended" leaves a reader unable to tell one
+        // boundary from three — and because a field that only a message reads is a field that
+        // stops being true the moment nothing checks the message.
+        assertTrue(
+            "from session 1" in message && "on session 2" in message,
+            "the refusal has to say which session the handle is from and which the manager has " +
+                "moved to: was $refused",
         )
 
         store.put(WmFlags.staleHandles, StaleHandle.ACT)

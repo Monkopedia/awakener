@@ -88,9 +88,13 @@ class SwayWindowManager(
      *
      * The connection is the identity, not merely a field of it: the design note's rule is that the
      * dock table's lifetime *is* the IPC connection's lifetime, and a handle or a tree edit that
-     * wants to say "the session I was made against" has nothing else to point at. [generation]
-     * exists so that a message can say which one, since a reader looking at two connections cannot
-     * tell them apart.
+     * wants to say "the session I was made against" has nothing else to point at.
+     *
+     * [generation] is that identity said out loud, and it exists because it has a reader:
+     * [SwayDockHandle.checkSession] names both numbers when it refuses, so a caller holding a stale
+     * handle is told *which* session it is from and which one the manager has moved to. Two
+     * connections are otherwise indistinguishable to anybody reading a message, and "this handle is
+     * from a session that ended" leaves a reader unable to tell one boundary from three.
      */
     private class Session(val connection: SwayConnection, val generation: Long)
 
@@ -1500,11 +1504,15 @@ class SwayWindowManager(
          */
         private fun checkSession(action: String) {
             if (config[WmFlags.staleHandles] == StaleHandle.ACT) return
-            if (liveSession === session) return
+            val current = liveSession
+            if (current === session) return
+            val now = current?.let { "on session ${it.generation}" }
+                ?: "on no session at all, the compositor having gone away"
             throw CompositorSessionEnded(
-                "refusing to $action dock ${dockId.raw}: this handle names con_ids from a " +
-                    "compositor session that has ended, and a fresh session hands those ids to " +
-                    "different windows. Obtain a new handle, or set " +
+                "refusing to $action dock ${dockId.raw}: this handle is from session " +
+                    "${session.generation} and the manager is $now. A compositor allocates " +
+                    "con_ids from a counter that restarts with it, so in a later session this id " +
+                    "names a different window rather than no window. Obtain a new handle, or set " +
                     "wm.session.stale_handles=ACT to issue it anyway.",
             )
         }
