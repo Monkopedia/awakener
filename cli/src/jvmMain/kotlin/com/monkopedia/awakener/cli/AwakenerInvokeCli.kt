@@ -206,6 +206,11 @@ private fun awaken(args: Array<String>, store: FileConfigStore): Int {
                     ::println,
                 )
             } finally {
+                // Where the model was written, when that is somewhere another local user could
+                // have got to first. In the `finally` because a press that then failed for some
+                // other reason has still created the directory, and on stderr for the reason
+                // every warning here is: stdout is what the press reports about its surface.
+                bindings.residueExposure?.let { System.err.println("warning: $it") }
                 // The dock is sway's child, not this process's, so retiring the manager stops its
                 // collector and gives up its connection and leaves every panel standing.
                 //

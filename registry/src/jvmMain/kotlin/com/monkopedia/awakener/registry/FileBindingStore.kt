@@ -2,18 +2,19 @@ package com.monkopedia.awakener.registry
 
 import com.monkopedia.awakener.config.Config
 import com.monkopedia.awakener.config.ConfigStore
+import com.monkopedia.awakener.config.PrivateFiles
 import java.io.IOException
 import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
+import java.nio.file.attribute.PosixFilePermission
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.io.path.ExperimentalPathApi
-import kotlin.io.path.createParentDirectories
 import kotlin.io.path.deleteRecursively
 import kotlin.io.path.exists
 import kotlin.io.path.isDirectory
@@ -57,9 +58,16 @@ class FileBindingStore(
     private val config: Config get() = configStore.config.value
 
     /**
-     * The path is captured once rather than read per call. [RegistryFlags.storePath] reloads
-     * like every flag, but a store that silently began writing somewhere else mid-session would
-     * strand the bindings it had already made; moving the durable set is a restart, not a flip.
+     * The path is captured once rather than read per call, and that is a decision rather than
+     * an omission.
+     *
+     * [RegistryFlags.storePath] *would* reload like every other flag once anything in the build
+     * outlives one operation (#43): the mechanism is `FileConfigStore.watch`, which publishes a
+     * new snapshot for as long as somebody is running it, and nothing runs it yet — so today a
+     * flip of this key applies to the next process whichever way this property were written.
+     * The exception is stated against the property the store will have, not against that gap: a
+     * store that silently began writing somewhere else mid-session would strand the bindings it
+     * had already made, so moving the durable set is a restart and not a flip.
      */
     val path: Path = path ?: RegistryPaths.storePath(config, environment)
 
@@ -123,6 +131,21 @@ class FileBindingStore(
      * Cleared as soon as a write does get the lock.
      */
     val lockError: String? get() = unlocked
+
+    @Volatile
+    private var exposedResidue: String? = null
+
+    /**
+     * Why the residue directory prepared most recently was reachable by other users, if it was.
+     *
+     * The third property of this shape, for the third degradation only the store can see. It is
+     * set by [prepareResidue] alone: that is the one call that creates anything under
+     * `registry.residue.dir`, so it is the one moment the answer is both knowable and about to
+     * matter. [residueLocation] deliberately does not set it — naming a path is not writing to
+     * one, and a `awakener-registry residue` that warned would be reporting a hazard nobody had
+     * yet run into.
+     */
+    val residueExposure: String? get() = exposedResidue
 
     private val state = MutableStateFlow(snapshot.bindings)
 
@@ -273,17 +296,86 @@ class FileBindingStore(
      * Creates the residue location so a distiller has somewhere to write and a curious human has
      * somewhere to look. Kept out of [bind] because binding must stay cheap and must not fail on
      * a read-only state directory.
+     *
+     * Every directory and file it creates gets [RegistryFlags.filePermissions] — `0700` and
+     * `0600` by default. Before #102 they took the process umask, so on any ordinary desktop
+     * the residue, which the design brief calls the accumulated model of the user, was created
+     * world-readable; what stopped that mattering was `/home/<user>` being `0700`, a property
+     * of directories this store neither creates nor checks.
+     *
+     * The permissions are what this store can put on what it makes. Where it was *told* to
+     * make it is a separate question, asked once here and answered by
+     * [RegistryFlags.residueExposure].
      */
     suspend fun prepareResidue(key: SurfaceKey): Path = withContext(Dispatchers.IO) {
-        val location = RegistryPaths.residueLocation(config, path, key)
-        when (config[RegistryFlags.residueLayout]) {
-            ResidueLayout.PER_KEY_DIR -> Files.createDirectories(location)
+        val cfg = config
+        val location = RegistryPaths.residueLocation(cfg, path, key)
+        val permissions = cfg[RegistryFlags.filePermissions]
+        checkExposure(
+            RegistryPaths.residueDir(cfg, path),
+            cfg[RegistryFlags.residueExposure],
+        )
+        when (cfg[RegistryFlags.residueLayout]) {
+            ResidueLayout.PER_KEY_DIR -> PrivateFiles.createDirectories(location, permissions)
             ResidueLayout.PER_KEY_FILE -> {
-                location.createParentDirectories()
-                if (!location.exists()) Files.createFile(location)
+                PrivateFiles.createParentDirectories(location, permissions)
+                if (!location.exists()) PrivateFiles.createFile(location, permissions)
             }
         }
         location
+    }
+
+    /**
+     * Applies [RegistryFlags.residueExposure] to the directory [residueDir] will be created in.
+     *
+     * The directory asked about is the nearest one that **already exists** on the way to
+     * [residueDir], because that is the only one anybody else has had a chance at: everything
+     * below it this call is about to create, at `0700`. `registry.residue.dir=/tmp/awakener` on a
+     * machine with a second user is the case — `/tmp` is `1777`, so they can create
+     * `/tmp/awakener` first, as a symlink onto a directory of theirs, and every model written
+     * afterwards lands there. The sticky bit is not a defence against that; it prevents removing
+     * an entry, not creating one.
+     *
+     * The residue *directory* rather than the per-surface file, so that both layouts ask one
+     * question and so the answer does not change the second time a surface is prepared: under
+     * `PER_KEY_FILE` the file exists by then, is `0600`, and would make an exposed directory
+     * above it read as fine.
+     *
+     * **The deepest existing directory, and not the whole chain above it.** That answers the
+     * question this can act on — whether somebody else can create the next component — and it
+     * is the question `registry.residue.dir` pointed somewhere shared actually raises. Walking
+     * every ancestor would answer a second one, whether an existing directory could be *swapped*
+     * for another, and would do it badly: `/tmp` is `1777` on every Linux system, so a chain walk
+     * warns about every path under it, including ones nobody can reach because the directory
+     * below is `0700` and `/tmp`'s sticky bit stops it being removed. A warning that fires where
+     * nothing is wrong is one nobody reads, and this one exists to be read.
+     *
+     * A path this cannot examine — a filesystem with no POSIX mode bits, a directory that
+     * vanishes between the walk and the read — is treated as unexposed rather than as exposed,
+     * for the same reason.
+     */
+    private fun checkExposure(residueDir: Path, policy: ResidueExposure) {
+        if (policy == ResidueExposure.ALLOW) {
+            exposedResidue = null
+            return
+        }
+        val existing = generateSequence(residueDir.toAbsolutePath().normalize()) { it.parent }
+            .firstOrNull { it.exists() }
+        val open = existing?.let {
+            runCatching { Files.getPosixFilePermissions(it) }.getOrNull()
+        }?.filter { it in WORLD_WRITABLE }.orEmpty()
+        if (open.isEmpty()) {
+            exposedResidue = null
+            return
+        }
+        val why = "$existing is writable by others (${open.joinToString(", ") { it.name }}), so " +
+            "another local user can create $residueDir before awakener does — as a symlink onto " +
+            "something of theirs — and the model written there would be theirs to read"
+        if (policy == ResidueExposure.REFUSE) {
+            throw IOException("$why; set ${RegistryFlags.residueExposure.key}=REPORT to proceed")
+        }
+        exposedResidue = "$why; set ${RegistryFlags.residueExposure.key}=REFUSE to make this " +
+            "refuse instead, or point ${RegistryFlags.residueDir.key} somewhere private"
     }
 
     /**
@@ -325,12 +417,13 @@ class FileBindingStore(
      * filesystem, and it should be loud.
      */
     private suspend fun <T> withFileLock(block: suspend () -> T): T {
+        val permissions = config[RegistryFlags.filePermissions]
         val channel = try {
-            lockPath.createParentDirectories()
-            FileChannel.open(
+            PrivateFiles.createParentDirectories(lockPath, permissions)
+            PrivateFiles.open(
                 lockPath,
-                StandardOpenOption.CREATE,
-                StandardOpenOption.WRITE,
+                permissions,
+                setOf(StandardOpenOption.CREATE, StandardOpenOption.WRITE),
             )
         } catch (e: IOException) {
             return degrade("cannot create the lock file", e) { block() }
@@ -395,13 +488,17 @@ class FileBindingStore(
         val file = BindingsFile(
             bindings = bindings.mapKeys { (key, _) -> key.canonical } + snapshot.unreadable,
         )
-        path.createParentDirectories()
+        val permissions = config[RegistryFlags.filePermissions]
+        PrivateFiles.createParentDirectories(path, permissions)
         val tmp = tmpPath
-        Files.writeString(tmp, json.encodeToString(file))
-        // fsync before the rename, or the rename can land while the contents it points at are
-        // still in page cache: a power loss then leaves an empty file where the bindings were,
-        // which reads as "nothing is bound" and re-mints every agent on the desktop.
-        FileChannel.open(tmp, StandardOpenOption.WRITE).use { it.force(true) }
+        // The permissions go on the *staging* file, and the rename carries them to the bindings
+        // file along with the contents — which is also what upgrades a bindings file an earlier
+        // build left at 0644, with no migration step anywhere. `sync` is the fsync that used to
+        // be a second `FileChannel.open` here: without it the rename can land while the contents
+        // it points at are still in page cache, and a power loss then leaves an empty file where
+        // the bindings were, which reads as "nothing is bound" and re-mints every agent on the
+        // desktop.
+        PrivateFiles.writeString(tmp, json.encodeToString(file), permissions, sync = true)
         // Atomic rename, same discipline as the config file: a concurrent reader sees the old
         // bindings or the new ones, never a truncated file.
         Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
@@ -449,6 +546,15 @@ class FileBindingStore(
 
         /** How many names within one second an archive will try before giving up. */
         private const val ARCHIVE_ATTEMPTS = 100
+
+        /**
+         * The mode bits that let somebody other than the owner create an entry in a directory.
+         * Write only: see [ResidueExposure] for why a merely readable one is not reported.
+         */
+        private val WORLD_WRITABLE = setOf(
+            PosixFilePermission.GROUP_WRITE,
+            PosixFilePermission.OTHERS_WRITE,
+        )
 
         /** Reads the same flag the same way everywhere, so the two call sites cannot drift. */
         private val Config.holderWinsForget: Boolean

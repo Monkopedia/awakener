@@ -5,8 +5,8 @@ plugins {
     alias(libs.plugins.kotlin.multiplatform) apply false
     alias(libs.plugins.kotlin.serialization) apply false
     // Only for the lifecycle tasks. The root project builds no artifact; what it needs is a
-    // `check` to hang the repo-wide suite below off, so that `./gradlew build` — the command
-    // CLAUDE.md names as the full autonomous check — actually runs it.
+    // `check` to hang the repo-wide suite below off, so that the `build` task — the lifecycle
+    // task CLAUDE.md's full autonomous check invokes — actually runs it.
     base
 }
 

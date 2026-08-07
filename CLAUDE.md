@@ -17,14 +17,48 @@ is the ephemeral per-task coordinator.
 
 ## Verification
 
-**The system JDK on kaladin is 8. Every Gradle command must pin 21:**
+**This fence is the whole command, not the JDK-pinning half of it.** Copy it as it stands:
 
 ```sh
-JAVA_HOME=/usr/lib/jvm/java-21-openjdk ./gradlew build
+AWAKENER_REQUIRE_SWAY=1 AWAKENER_REQUIRE_SPANREED=1 \
+  JAVA_HOME=/usr/lib/jvm/java-21-openjdk ./gradlew clean build --no-build-cache
 ```
 
-That is the full autonomous check — it compiles every module and runs all tests, including
-the `:wm` integration suite against a real headless sway.
+*That* is the full autonomous check — it compiles every module and runs all tests, including
+the `:wm` integration suite against a real headless sway. Every piece of it is load-bearing,
+and dropping any piece still prints `BUILD SUCCESSFUL`:
+
+- **`JAVA_HOME`** pins 21, because the system JDK on kaladin is 8.
+- **The two REQUIRE flags** turn a missing `sway`/`foot`/`spanreed` into a failure instead of
+  a skip. The bullet below is the long version, and it calls them mandatory; a fence that
+  omitted them was a way to disobey the rule by following the documentation (#91).
+- **`clean` and `--no-build-cache`** make it a run rather than a replay. Without them
+  `jvmTest` can resolve UP-TO-DATE, or come out of the build cache, and execute nothing.
+  **`--no-daemon` is not a substitute** and buys nothing here: it governs whether a daemon
+  persists between invocations, and has nothing to do with the up-to-date check, which reads
+  task inputs and outputs on disk.
+
+**Then read the executed count, and look at the clock.** `BUILD SUCCESSFUL` is printed
+identically by a run of the whole suite and a run of zero, so the number comes from
+`*/build/test-results/jvmTest/*.xml` and never from the console. Delete the results
+directories first, so that *absent* and *stale* cannot be read as each other:
+
+```sh
+find . -type d -path '*/build/test-results' -prune -exec rm -rf {} +
+```
+
+Not `rm -rf */build/test-results`: in `zsh` an unmatched glob is fatal, so on a tree that has
+never built it kills the chain before Gradle starts — and `2>/dev/null` does not hide it,
+because the shell is refusing to run the command rather than the command writing to stderr.
+
+**Wall-clock is the one tell that needs no flag and no file.** Measured, not guessed: a
+`clean build --no-build-cache` of this repo takes **38–55s on kaladin** (two runs over a
+331-test tree on 2026-08-07, cold and warm daemon) and **1m28s–3m51s on CI** across the eight
+most recent `main` runs up to `3d16851`. Tens of seconds is normal here and eight seconds is
+not — a build an order of magnitude below what the work implies has measured nothing, and that
+is a finding to report rather than good news. Another repo in this fleet printed
+`BUILD SUCCESSFUL in 8s` across five modules with zero tests executed, and what caught it was
+someone noticing the clock.
 
 **Every bullet below is one failure wearing a different coat.** None of these instruments was
 broken; each answered its own question correctly and was read as answering a different one.

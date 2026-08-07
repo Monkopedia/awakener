@@ -13,7 +13,6 @@ import java.nio.file.StandardWatchEventKinds.OVERFLOW
 import java.nio.file.WatchEvent
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
-import kotlin.io.path.createParentDirectories
 import kotlin.io.path.exists
 import kotlin.io.path.name
 import kotlin.io.path.readText
@@ -145,7 +144,7 @@ class FileConfigStore(
      * one. That is the same rule this module asks of everyone else.
      */
     fun watch(scope: CoroutineScope) = scope.launch(Dispatchers.IO) {
-        path.createParentDirectories()
+        PrivateFiles.createParentDirectories(path, config.value[ConfigFlags.filePermissions])
         val dir = path.parent
         val watcher = dir.fileSystem.newWatchService()
         // OVERFLOW is deliberately absent: it is delivered whether or not it was registered
@@ -247,9 +246,14 @@ class FileConfigStore(
             lock.withLock {
                 withFileLock {
                     val next = transform(currentForWrite())
-                    path.createParentDirectories()
+                    val permissions = config.value[ConfigFlags.filePermissions]
+                    PrivateFiles.createParentDirectories(path, permissions)
                     val tmp = tmpPath
-                    Files.writeString(tmp, json.encodeToString(JsonObject(next)))
+                    // The permissions go on the staging file and the rename carries them to the
+                    // config file with the contents, which is also what tightens a file an
+                    // earlier build created 0644 — no migration step, and no window in which a
+                    // file exists at one mode and is about to be another (#102).
+                    PrivateFiles.writeString(tmp, json.encodeToString(JsonObject(next)), permissions)
                     // Atomic rename: a reader either sees the old file or the new one, never a
                     // partial write. This is also why [watch] is registered on the directory —
                     // the target's inode does not survive this, so the store's own writes are
@@ -284,9 +288,14 @@ class FileConfigStore(
      * filesystem, and it should be loud.
      */
     private fun <T> withFileLock(block: () -> T): T {
+        val permissions = config.value[ConfigFlags.filePermissions]
         val channel = try {
-            lockPath.createParentDirectories()
-            FileChannel.open(lockPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE)
+            PrivateFiles.createParentDirectories(lockPath, permissions)
+            PrivateFiles.open(
+                lockPath,
+                permissions,
+                setOf(StandardOpenOption.CREATE, StandardOpenOption.WRITE),
+            )
         } catch (e: IOException) {
             return degrade("cannot create the lock file", e, block)
         }
