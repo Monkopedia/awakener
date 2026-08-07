@@ -40,10 +40,20 @@ class InMemoryBindingStore(
         next
     }
 
-    override suspend fun unbind(key: SurfaceKey): Boolean = lock.withLock {
+    /**
+     * [RegistryFlags.forgetResidue] is not consulted, and the outcome is always
+     * [ResidueOutcome.Kept].
+     *
+     * Not an oversight and not a shortcut: this store has no filesystem, and its
+     * [residueLocation] is a bare leaf name rather than a path — there is nothing on disk for
+     * an archive or a delete to act on. Reporting `Kept` is the honest answer, since nothing
+     * was disposed of; a store that claimed `Archived` here would be describing a file it
+     * never wrote.
+     */
+    override suspend fun unbind(key: SurfaceKey): Forget = lock.withLock {
         val had = key in state.value
         state.value = state.value - key
-        had
+        Forget(had, ResidueOutcome.Kept(residueLocation(key)))
     }
 
     override fun residueLocation(key: SurfaceKey): String =
@@ -82,3 +92,18 @@ internal fun residueLeaf(key: SurfaceKey, layout: ResidueLayout): String = when 
     ResidueLayout.PER_KEY_FILE -> "${key.slug}.md"
     ResidueLayout.PER_KEY_DIR -> key.slug
 }
+
+/**
+ * Where [ForgetResidue.ARCHIVE] moves that residue to.
+ *
+ * Beside [residueLeaf] rather than derived from it by string surgery, so the two cannot drift:
+ * an archive name built by chopping `.md` off the live name would silently become a directory
+ * name the day a third layout arrives. [stamp] carries the timestamp and, where one archive
+ * already holds that second, a counter — the name is what a human reads to tell two archives
+ * of one surface apart, so it stays readable rather than becoming an opaque id.
+ */
+internal fun archiveLeaf(key: SurfaceKey, layout: ResidueLayout, stamp: String): String =
+    when (layout) {
+        ResidueLayout.PER_KEY_FILE -> "${key.slug}.$stamp.md"
+        ResidueLayout.PER_KEY_DIR -> "${key.slug}.$stamp"
+    }
