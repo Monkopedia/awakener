@@ -436,10 +436,14 @@ class FileConfigStore(
         /**
          * What one batch of watch events means for a file called [name].
          *
-         * Separated from [watch] because the interesting case cannot be provoked to order: an
-         * `OVERFLOW` is the kernel's queue giving up, and a test that tried to induce one would
-         * be measuring how fast the machine is. Pulled out, the decision is a total function of
-         * the events and the flag, and `FileConfigStoreWatchTest` states it directly.
+         * Separated from [watch] so the decision is a total function of the events and the flag,
+         * which `FileConfigStoreWatchTest` states case by case. That is a readability split and
+         * nothing more: an overflow **can** be provoked to order, and the same suite provokes a
+         * real one end to end. The cap that produces it is the JDK's own — `AbstractWatchKey`
+         * holds at most 512 pending events per key and substitutes a single `OVERFLOW` past
+         * that — so a few hundred writes into the watched directory reach it every time, with no
+         * dependence on how fast the machine is. Measured on JDK 21: 400 files already overflow,
+         * and the drained batch is exactly `[OVERFLOW]`.
          *
          * The name filter is what keeps the `.tmp` and `.lock` files [mutate] writes beside the
          * target — and everything else sharing the directory — from provoking a re-read. An

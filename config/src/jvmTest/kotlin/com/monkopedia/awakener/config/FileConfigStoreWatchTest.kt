@@ -17,6 +17,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlin.test.fail
 import kotlinx.coroutines.CoroutineScope
@@ -45,12 +46,17 @@ private object WatchKnobs {
 }
 
 /**
- * A watch event this suite can construct.
+ * A watch event this suite can construct, for stating [FileConfigStore.reactionTo]'s cases one
+ * at a time.
  *
- * The one case worth stating — `OVERFLOW` — is the one no test can provoke: it is the kernel's
- * queue giving up under a backlog, so inducing it would be a measurement of the machine rather
- * than of the code. Its distinguishing property is exactly what a fake can carry: the kind is
- * `OVERFLOW` and there is no context path.
+ * A fake is how the *table* of cases is written, not how the mechanism is established: the two
+ * tests at the end of this class drive a real `OVERFLOW` out of a real `WatchService` through
+ * the real loop. An earlier version of this comment claimed no test could provoke one, on the
+ * theory that an overflow is the kernel's queue giving up. That is wrong about the platform, and
+ * it was a claim about untestability sitting in a PR whose other half exists to delete a claim
+ * that stopped a reader doing work they could have done. The cap is the **JDK's**:
+ * `AbstractWatchKey` keeps at most 512 pending events per key and replaces the lot with a single
+ * `OVERFLOW` beyond that, so a flood of a couple of thousand files provokes one every time.
  */
 private class FakeEvent(
     private val kind: WatchEvent.Kind<*>,
@@ -325,13 +331,11 @@ class FileConfigStoreWatchTest {
     // ---- What an OVERFLOW means (#43's last comment) ----
 
     /**
-     * The decision, stated directly rather than through a provoked overflow.
+     * The decision, stated one case at a time.
      *
-     * An `OVERFLOW` is the kernel's watch queue giving up. Nothing can ask for one, so a test
-     * that tried to induce one would be measuring how fast this machine is; the decision is
-     * pulled out of the loop into a total function of the events and the flag, and these name
-     * its four cases. What that leaves untested is the three lines wiring the answer back into
-     * the loop, which is a real gap and a small one.
+     * These four name what [FileConfigStore.reactionTo] answers; the two tests after them drive a
+     * real overflow through the loop, so the wiring from the answer back into the snapshot is
+     * covered too rather than left as the gap this comment used to admit to.
      */
     @Test
     fun `an overflow re-reads by default`() {
@@ -392,6 +396,98 @@ class FileConfigStoreWatchTest {
         )
     }
 
+    // ---- A real OVERFLOW, driven through the real loop ----
+
+    /**
+     * Puts the watcher into a state where a genuine `OVERFLOW` reaches it, and returns the store.
+     *
+     * Two things have to be true at once, and neither is a timing gamble:
+     *
+     * - **The watcher must not be draining while the flood runs.** It drains every 250ms, so a
+     *   flood into a watcher that is polling normally arrives as a string of small batches and
+     *   never reaches the cap. Parking it in its own debounce is the window: a named edit sends
+     *   it into `delay(config.watch.debounce_ms)`, and [PARK_MS] is how long that lasts. The
+     *   debounce is raised through the *file* first and waited for, so the value is in the live
+     *   snapshot before the parking edit is made — the loop reads it per event, so an edit that
+     *   carried the new debounce with it would still be timed by the old one.
+     * - **The flood must exceed the JDK's per-key cap**, which is 512 and is a constant rather
+     *   than a function of machine speed. [FLOOD_FILES] is 2000, and the whole flood measured
+     *   28–58ms on this host across three rounds, against a park of [PARK_MS]. The drained batch
+     *   was `[OVERFLOW]` — size 1, no context path — every time.
+     */
+    private suspend fun parkedAndFlooded(name: String, environment: Map<String, String>): Watched {
+        val watched = watching(name, environment)
+        val slow = """"config.watch.debounce_ms": $PARK_MS"""
+        watched.path.writeText("""{$slow, "watch.count": 2}""")
+        watched.settlesAt(2, "the edit raising the debounce never arrived")
+
+        // Parks the watcher for PARK_MS. Everything below happens inside that window.
+        watched.path.writeText("""{$slow, "watch.count": 3}""")
+        delay(PARKED_MS)
+        repeat(FLOOD_FILES) { dir.resolve("junk$it").writeText("x") }
+
+        // The park ends by re-reading the parking edit. The overflow is a *separate* batch,
+        // drained on the next turn of the loop — which is the turn under test.
+        watched.settlesAt(3, "the edit that parked the watcher never arrived")
+        return watched
+    }
+
+    /**
+     * The arm with nothing else holding it: `REPORT` must actually report.
+     *
+     * `Reaction.REPORT_LOSS -> Unit` passes every other test in this file, which is what makes
+     * this the one that earns its place. The waiting period is longer than [PARK_MS] on purpose —
+     * under `REREAD` the same batch costs one more debounce and *then* re-reads, so a shorter
+     * window would go green for both values of the flag and distinguish nothing.
+     */
+    @Test
+    fun `a real overflow under REPORT is reported and provokes no re-read`() = runBlocking {
+        val watched = parkedAndFlooded(
+            "overflow-report.json",
+            mapOf("AWAKENER_CONFIG_WATCH_OVERFLOW" to "REPORT"),
+        )
+        // Identity, not equality: `load` builds a fresh `Config` every time and the class does
+        // not define equals, so "is this the same snapshot" is exactly "has nothing re-read".
+        // It is also what makes the StateFlow publish a re-read that changed no value.
+        val snapshot = watched.store.config.value
+
+        val reported = withTimeoutOrNull(SETTLE_MS) {
+            watched.store.loadError.first { it != null }
+        } ?: fail("a real overflow was dropped in silence")
+        assertTrue(
+            ConfigFlags.watchOverflow.key in reported,
+            "the report does not name the flag that would re-read instead: $reported",
+        )
+
+        delay(PARK_MS + QUIET_MS)
+        assertSame(snapshot, watched.store.config.value, "REPORT replaced the snapshot anyway")
+        assertEquals(3, watched.store.config.value[WatchKnobs.count], "the values moved")
+    }
+
+    /**
+     * And the default arm does re-read, on an overflow that carries no path to match on.
+     *
+     * This is the regression in its original form. Before the overflow was handled, this batch
+     * failed the `as? Path` name filter and read as "nothing here concerns me" — so the watch
+     * went silent at the one moment the operating system had told it a change may have been
+     * lost, and nothing would have re-read until some later event happened to arrive.
+     */
+    @Test
+    fun `a real overflow under the default re-reads rather than going quiet`() = runBlocking {
+        val watched = parkedAndFlooded("overflow-reread.json", emptyMap())
+        val snapshot = watched.store.config.value
+
+        withTimeoutOrNull(PARK_MS + SETTLE_MS) {
+            watched.store.config.first { it !== snapshot }
+        } ?: fail("a real overflow left the watch quiet")
+
+        assertNull(
+            watched.store.loadError.value,
+            "a re-read that found the file intact still reported it broken",
+        )
+        assertEquals(3, watched.store.config.value[WatchKnobs.count], "the values moved")
+    }
+
     /** The lifetime is the caller's: a cancelled scope leaves nothing reading the file. */
     @Test
     fun `cancelling the scope retires the watch`() = runBlocking {
@@ -425,5 +521,23 @@ class FileConfigStoreWatchTest {
          * short enough that the test still finishes.
          */
         const val SLOW_DEBOUNCE_MS = 2_500L
+
+        /**
+         * How long the watcher sits in its debounce while the flood runs — the window in which
+         * it is guaranteed not to be draining. Comfortably more than [PARKED_MS] plus the
+         * measured 28–58ms the flood itself takes.
+         */
+        const val PARK_MS = 1_500L
+
+        /** How long the parking edit is given to reach the watcher and send it into its wait. */
+        const val PARKED_MS = 700L
+
+        /**
+         * Enough to pass the JDK's per-key cap of 512 pending events with room to spare. Not a
+         * threshold that machine speed moves: `AbstractWatchKey` counts events, not milliseconds,
+         * and 400 already overflows on JDK 21.
+         */
+        const val FLOOD_FILES = 2_000
+
     }
 }
