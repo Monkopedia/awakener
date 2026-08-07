@@ -44,6 +44,14 @@
 # rounds of controls: **what does this suite write, where does it go, and who reads it?** See
 # the canary a few lines down.
 #
+# Since #97 the script also *gates*, on a committed per-module floor, and that half is covered
+# the same way: one floor file per fixture at `$WORK/fx/<name>.floors` (and an optional
+# `<name>.modules` standing in for the build's roster), handed to the script through
+# `AWAKENER_TEST_FLOORS`. Per-fixture floors are what let a row say "this module reported less
+# than it should have" without every other row having to agree about what the real modules are —
+# and the price is that the *default* location, the only one CI uses, is then exercised by no
+# row at all. `check_default_resolution` below pays it back explicitly.
+#
 # Written to run under dash and busybox sh as well as bash, so the harness cannot depend on
 # the shell whose behaviour it is testing around.
 set -eu
@@ -144,6 +152,10 @@ UNMEASURED='**These counts were not measured.**'
 NOTESTS='**No tests were counted**'
 LOWER='could not be read.** The counts above are a lower bound'
 NOFILES='No JUnit XML found under'
+BELOWFLOOR='**Coverage is below the committed floor**'
+NORESULTS='produced no test results at all; the floor says'
+UNDECLARED='is not declared in the floor file'
+BADFLOORS='**The test floor file could not be used**'
 
 # ------------------------------------------------------------------ fixtures
 #
@@ -158,6 +170,24 @@ suitedir() {
 fx() {
     mkdir -p "$WORK/fx/$1"
     printf '%s' "$WORK/fx/$1"
+}
+
+# The floor file for one fixture, and — where a row needs one — the module roster the build would
+# have handed the script. `check` picks both up by fixture name, so a row cannot forget to point
+# the script at its own floors and silently read someone else's. A fixture with *no* floors file
+# is the "the floor file is missing" case, and it is written as an absence on purpose: that is
+# the shape the failure has in the tree.
+floors() {
+    name=$1
+    shift
+    : >"$WORK/fx/$name.floors"
+    for entry in "$@"; do
+        printf '%s\n' "$entry" >>"$WORK/fx/$name.floors"
+    done
+}
+
+modules_of() {
+    printf '%s' "$2" >"$WORK/fx/$1.modules"
 }
 
 # A single well-formed suite, the shape Gradle writes: one `<testsuite>` per class, on one
@@ -178,21 +208,25 @@ suite() {
 d=$(suitedir clean wm)
 suite "$d/TEST-a.xml" AlphaTest 60 0 0 0
 suite "$d/TEST-b.xml" BetaTest 41 0 0 0
+floors clean 'wm 101'
 
 # multi: three modules, so the per-module rows and the sum over them are both asserted.
 d=$(suitedir multi wm);       suite "$d/TEST-a.xml" WmTest 101 0 0 0
 d=$(suitedir multi registry); suite "$d/TEST-a.xml" RegTest 78 0 0 0
 d=$(suitedir multi cli);      suite "$d/TEST-a.xml" CliTest 55 0 0 0
+floors multi '# three modules, all of them at their floor' 'cli 55' 'registry 78' 'wm 101'
 
 # skips: a tool-gated test opted out. The alarm, not the reassurance.
 d=$(suitedir skips wm)
 suite "$d/TEST-a.xml" GatedTest 101 3 0 0
+floors skips 'wm 101'
 
 # failures: a red suite with nothing skipped. `skipped=0` is still true and still worth
 # saying — the reassurance is about opting out, not about passing — so this pins that the
 # script does not conflate the two.
 d=$(suitedir failures wm)
 suite "$d/TEST-a.xml" BrokenTest 101 0 2 1
+floors failures 'wm 101'
 
 # multiline: the `<testsuite …>` tag split across lines. Still one tag; a per-line regex reads
 # it as zero suites, which was the first of #76's three paths.
@@ -203,15 +237,21 @@ d=$(suitedir multiline wm)
     echo '           skipped="0" failures="0" errors="0">'
     echo '</testsuite>'
 } >"$d/TEST-a.xml"
+floors multiline 'wm 101'
 
 # truncated: a hard-killed test worker's output. Nothing readable in the only file there is.
 d=$(suitedir truncated wm)
 printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuite name="KilledTest" tests="91" skipp' \
     >"$d/TEST-a.xml"
+# The floor is deliberately one this fixture cannot meet. A failed parse has no counts to compare,
+# so the floor must *not* fire here — reporting a shortfall from a measurement that did not happen
+# would be the same class of claim the script exists to refuse.
+floors truncated 'wm 91'
 
 # zerotests: a suite element that reports nothing ran. Parsed fine; says nothing.
 d=$(suitedir zerotests wm)
 suite "$d/TEST-a.xml" EmptyTest 0 0 0 0
+floors zerotests 'wm 0'
 
 # partial: #83. One good file and one truncated one — the good file parses, the truncated one
 # contributes zero to every column including `skipped`, and the total renders as a total.
@@ -219,12 +259,17 @@ d=$(suitedir partial wm)
 suite "$d/TEST-a.xml" GoodTest 10 0 0 0
 printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuite name="KilledTest" tests="91" skipp' \
     >"$d/TEST-b.xml"
+# Met by the part that *did* read, so the row is about the shortfall message and not about the
+# floor. A lower bound above the floor establishes nothing about the floor either way, and the
+# script says so by leaving the reassurance withheld for #83's reason rather than this one.
+floors partial 'wm 10'
 
 # partialskips: the two alarms are independent facts and both have to be said.
 d=$(suitedir partialskips wm)
 suite "$d/TEST-a.xml" GoodTest 10 2 0 0
 printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuite name="KilledTest" tests="91" skipp' \
     >"$d/TEST-b.xml"
+floors partialskips 'wm 10'
 
 # twosuites: two `<testsuite>` elements in one file. Both counted.
 d=$(suitedir twosuites wm)
@@ -233,6 +278,7 @@ d=$(suitedir twosuites wm)
     echo '<testsuite name="OneTest" tests="9" skipped="0" failures="0" errors="0"></testsuite>'
     echo '<testsuite name="TwoTest" tests="6" skipped="0" failures="0" errors="0"></testsuite>'
 } >"$d/TEST-a.xml"
+floors twosuites 'wm 15'
 
 # twosuitespartial: the discriminator for *how* the read-file count is kept. Two suites in one
 # file plus one file that yields none. Counted per suite, the tally is 2 against 2 files
@@ -246,6 +292,7 @@ d=$(suitedir twosuitespartial wm)
 } >"$d/TEST-a.xml"
 printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuite name="KilledTest" tests="91" skipp' \
     >"$d/TEST-b.xml"
+floors twosuitespartial 'wm 15'
 
 # wrapper: a `<testsuites>` root element around the real one, which some JUnit writers emit and
 # whose own `tests=` attribute is a total, not another suite. Double-counting it would inflate
@@ -259,9 +306,98 @@ d=$(suitedir wrapper wm)
     echo '</testsuite>'
     echo '</testsuites>'
 } >"$d/TEST-a.xml"
+floors wrapper 'wm 7'
 
-# empty: the glob matches nothing at all.
+# empty: the glob matches nothing at all. The floor is what turns that from a warning nobody has
+# to act on into a red: "no module produced anything" is the strongest form of #97, not a milder
+# one, and before the floor existed it was the only form the script exited 0 on.
 mkdir -p "$(fx empty)"
+floors empty 'wm 101'
+
+# ---------------------------------------------------------------- #97: what should have run
+#
+# Everything above this line asks whether the script read what was in front of it. These ask
+# whether what was in front of it was all of it — the question no control in the build, the
+# workflow or this script was asking when one line in `wm/build.gradle.kts` took the total from
+# 279 to 178 under `BUILD SUCCESSFUL`, `skipped="0"` and the reassurance printed in full.
+
+# missingmodule: the measurement in #97, at fixture scale. `cli` reported; `wm` did not exist at
+# all. Every column that is present is correct, every warning stays quiet, and the only trace is
+# a smaller number than the tree says to expect.
+d=$(suitedir missingmodule cli); suite "$d/TEST-a.xml" CliTest 55 0 0 0
+floors missingmodule 'cli 55' 'wm 101'
+
+# belowfloor: the same failure part-way. A module that ran one test out of a hundred is not
+# distinguishable from a module that ran a hundred by anything except the count.
+d=$(suitedir belowfloor wm); suite "$d/TEST-a.xml" WmTest 100 0 0 0
+floors belowfloor 'wm 101'
+
+# undeclared: results from a module the floor file says nothing about. Its tests are counted into
+# the total, and nothing constrains them — so the total looks bigger while the guarantee gets
+# smaller. This is what a new module looks like before anyone states what it should run.
+d=$(suitedir undeclared wm);  suite "$d/TEST-a.xml" WmTest 101 0 0 0
+d=$(suitedir undeclared cli); suite "$d/TEST-a.xml" CliTest 55 0 0 0
+floors undeclared 'wm 101'
+
+# nofloors: the comparison's own input, missing. Written as an absent file rather than an empty
+# one because deleting it is the cheapest way to make every floor stop applying, and a fallback
+# to "report only what was found" would make that deletion silent.
+d=$(suitedir nofloors wm); suite "$d/TEST-a.xml" WmTest 101 0 0 0
+
+# badfloors: a line that does not parse. Skipping it would drop exactly one module's floor and
+# leave the file looking like a floor file.
+d=$(suitedir badfloors wm); suite "$d/TEST-a.xml" WmTest 101 0 0 0
+floors badfloors 'wm one hundred and one'
+
+# dupfloors: the same module twice. Last-one-wins would let a second line quietly lower the first.
+d=$(suitedir dupfloors wm); suite "$d/TEST-a.xml" WmTest 101 0 0 0
+floors dupfloors 'wm 101' 'wm 3'
+
+# rostergap: the build has a module the floor file has never heard of. That module need not have
+# produced anything for this to fire, which is the point — a module whose tests were never wired
+# to `check` produces nothing and is invisible to every per-module comparison.
+d=$(suitedir rostergap wm); suite "$d/TEST-a.xml" WmTest 101 0 0 0
+floors rostergap 'wm 101'
+modules_of rostergap 'wm,registry'
+
+# rosterextra: the other direction. A floor for a module that is no longer in the build reads as
+# coverage that is being enforced and is not.
+d=$(suitedir rosterextra wm); suite "$d/TEST-a.xml" WmTest 101 0 0 0
+floors rosterextra 'wm 101' 'bus 0'
+modules_of rosterextra 'wm'
+
+# rosterok: the roster agreeing with the floor file has to still print the reassurance, or
+# "always complain about the roster" would pass every row above.
+d=$(suitedir rosterok wm); suite "$d/TEST-a.xml" WmTest 101 0 0 0
+floors rosterok 'wm 101'
+modules_of rosterok 'wm'
+
+# settingsgap / settingsok: the same two directions with no roster handed in — read out of
+# `settings.gradle.kts`, which is what the CI step gets and what makes the property survive the
+# Gradle task that would otherwise be its only source being disabled. Written in the file's real
+# shape, comments and all, because a parse that only handles the tidy form is a parse that stops
+# working on the day someone tidies differently.
+d=$(suitedir settingsgap wm); suite "$d/TEST-a.xml" WmTest 101 0 0 0
+floors settingsgap 'wm 101'
+cat >"$WORK/fx/settingsgap/settings.gradle.kts" <<'EOF'
+rootProject.name = "awakener"
+
+include(":registry")
+include(":wm")
+
+// Owns the command-line entry points.
+EOF
+
+d=$(suitedir settingsok wm); suite "$d/TEST-a.xml" WmTest 101 0 0 0
+floors settingsok 'wm 101'
+printf 'rootProject.name = "awakener"\ninclude(":wm")\n' \
+    >"$WORK/fx/settingsok/settings.gradle.kts"
+
+# driftup: a module that has grown past its floor. Green, and said out loud, because a floor
+# everything has grown past is exactly the state in which it stops describing anything and starts
+# being a number nobody has read since it was written.
+d=$(suitedir driftup wm); suite "$d/TEST-a.xml" WmTest 101 0 0 0
+floors driftup 'wm 90'
 
 # ------------------------------------------------------------------ PATH construction
 #
@@ -424,6 +560,8 @@ IMPL=''
 # mutant, and every mutant is named by at least one row — because a mutant nobody references is
 # equally silent.
 MUTANTS='num measured zerotests partial multiline skipguard pessimist nofiles emit pre76'
+MUTANTS="$MUTANTS floormissing floorbelow floorundeclared floorfile floorroster floorsettings"
+MUTANTS="$MUTANTS floordrift pre97"
 GUARDS_SEEN=''
 
 check() {
@@ -470,14 +608,25 @@ check() {
     summary=$WORK/summary-$$.md
     rm -f "$summary"
 
+    # Both by fixture name, so a row cannot read another row's floors and cannot fall back to the
+    # committed one — which would make every floor assertion depend on numbers that change every
+    # time a module gains a test.
+    fx_floors=$WORK/fx/$fixture.floors
+    fx_modules=''
+    if [ -f "$WORK/fx/$fixture.modules" ]; then
+        fx_modules=$(cat "$WORK/fx/$fixture.modules")
+    fi
+
     run_count=$((run_count + 1))
     set +e
     if [ "$envmode" = summary ]; then
-        got=$(PATH="$runpath" GITHUB_STEP_SUMMARY="$summary" "$RUN_SCRIPT" \
-            "$WORK/fx/$fixture" 2>&1 </dev/null)
+        got=$(PATH="$runpath" GITHUB_STEP_SUMMARY="$summary" \
+            AWAKENER_TEST_FLOORS="$fx_floors" AWAKENER_TEST_MODULES="$fx_modules" \
+            "$RUN_SCRIPT" "$WORK/fx/$fixture" 2>&1 </dev/null)
     else
-        got=$(env -u GITHUB_STEP_SUMMARY PATH="$runpath" "$RUN_SCRIPT" \
-            "$WORK/fx/$fixture" 2>&1 </dev/null)
+        got=$(env -u GITHUB_STEP_SUMMARY PATH="$runpath" \
+            AWAKENER_TEST_FLOORS="$fx_floors" AWAKENER_TEST_MODULES="$fx_modules" \
+            "$RUN_SCRIPT" "$WORK/fx/$fixture" 2>&1 </dev/null)
     fi
     rc=$?
     set -e
@@ -572,34 +721,37 @@ check() {
 # ------------------------------------------------------------------ the cases
 cases() {
     check clean 'pessimist' clean impl plain \
-        '+| `wm` | 2 | 101 | 0 | 0 | 0 |' \
-        '+| **total** | **2** | **101** | **0** | **0** | **0** |' \
+        '+| `wm` | 2 | 101 | 0 | 0 | 0 | 101 |' \
+        '+| **total** | **2** | **101** | **0** | **0** | **0** | **101** |' \
         "+$REASSURE" \
-        "-$UNMEASURED" "-$LOWER" "-$NOTESTS" "-lower bound"
+        "-$UNMEASURED" "-$LOWER" "-$NOTESTS" "-lower bound" "-$BELOWFLOOR"
 
     check multi-module 'pessimist' multi impl plain \
-        '+| `cli` | 1 | 55 | 0 | 0 | 0 |' \
-        '+| `registry` | 1 | 78 | 0 | 0 | 0 |' \
-        '+| `wm` | 1 | 101 | 0 | 0 | 0 |' \
-        '+| **total** | **3** | **234** | **0** | **0** | **0** |' \
+        '+| `cli` | 1 | 55 | 0 | 0 | 0 | 55 |' \
+        '+| `registry` | 1 | 78 | 0 | 0 | 0 | 78 |' \
+        '+| `wm` | 1 | 101 | 0 | 0 | 0 | 101 |' \
+        '+| **total** | **3** | **234** | **0** | **0** | **0** | **234** |' \
         "+$REASSURE" "-$LOWER"
 
     check skipped-nonzero 'pessimist skipguard!' skips impl plain \
-        '+| **total** | **1** | **101** | **3** | **0** | **0** |' \
+        '+| **total** | **1** | **101** | **3** | **0** | **0** | **101** |' \
         "+$SKIPS" "-$REASSURE"
 
     check failures-but-no-skips 'pessimist' failures impl plain \
-        '+| **total** | **1** | **101** | **0** | **2** | **1** |' \
+        '+| **total** | **1** | **101** | **0** | **2** | **1** | **101** |' \
         "+$REASSURE"
 
     check multiline-tag 'multiline pre76!' multiline impl plain \
-        '+| **total** | **1** | **101** | **0** | **0** | **0** |' \
+        '+| **total** | **1** | **101** | **0** | **0** | **0** | **101** |' \
         "+$REASSURE" "-$UNMEASURED"
 
+    # The floor here is above what the fixture could report even if it parsed, and the row asserts
+    # the floor stays quiet: a shortfall inferred from a measurement that failed would be a claim
+    # about coverage drawn from no evidence, which is the shape of everything else in this file.
     check truncated-only 'measured pre76!' truncated impl plain \
         '+::warning title=Test counts unreadable' \
-        '+| **total** | *unread* | *unread* | *unread* | *unread* | *unread* |' \
-        "+$UNMEASURED" "-$REASSURE"
+        '+| **total** | *unread* | *unread* | *unread* | *unread* | *unread* | **91** |' \
+        "+$UNMEASURED" "-$REASSURE" "-$BELOWFLOOR" "-$NORESULTS"
 
     check zero-tests-counted 'zerotests! pre76!' zerotests impl plain \
         "+$NOTESTS" "-$REASSURE" "-$UNMEASURED"
@@ -618,32 +770,86 @@ cases() {
     check partial-parse 'partial! pessimist' partial impl plain \
         '+::warning title=Test counts incomplete' \
         '+1 of 2 JUnit XML file(s) yielded no <testsuite> element' \
-        '+| **total (lower bound)** | **1** | **10** | **0** | **0** | **0** |' \
-        "+$LOWER" "-$REASSURE" "-$UNMEASURED"
+        '+| **total (lower bound)** | **1** | **10** | **0** | **0** | **0** | **10** |' \
+        "+$LOWER" "-$REASSURE" "-$UNMEASURED" "-$BELOWFLOOR"
 
     check partial-parse-with-skips 'partial pessimist' partialskips impl plain \
         "+$LOWER" "+$SKIPS" "-$REASSURE"
 
     check two-suites-one-file 'pessimist' twosuites impl plain \
-        '+| **total** | **2** | **15** | **0** | **0** | **0** |' \
+        '+| **total** | **2** | **15** | **0** | **0** | **0** | **15** |' \
         "+$REASSURE" "-$LOWER"
 
     check two-suites-plus-unread 'partial! pessimist' twosuitespartial impl plain \
         '+1 of 2 JUnit XML file(s) yielded no <testsuite> element' \
-        '+| **total (lower bound)** | **2** | **15** | **0** | **0** | **0** |' \
+        '+| **total (lower bound)** | **2** | **15** | **0** | **0** | **0** | **15** |' \
         "+$LOWER" "-$REASSURE"
 
     check testsuites-wrapper 'pessimist' wrapper impl plain \
-        '+| **total** | **1** | **7** | **0** | **0** | **0** |' \
+        '+| **total** | **1** | **7** | **0** | **0** | **0** | **7** |' \
         "+$REASSURE" "-$LOWER"
 
-    check no-xml-at-all 'nofiles' empty unused plain \
+    # Not a warning any more. Before the floor this exited 0: no module produced anything, and the
+    # strongest form of "the run verified nothing" was the one case the script declined to gate on.
+    check no-xml-at-all 'nofiles floormissing' empty unused plain \
         '+::warning title=No JUnit XML' \
-        "+$NOFILES" "-$REASSURE" "-$UNMEASURED"
+        "+$NOFILES" "+$BELOWFLOOR" "+$NORESULTS" "-$REASSURE" "-$UNMEASURED" '=1'
 
     check step-summary-written 'emit pessimist' clean impl summary \
-        '+| **total** | **2** | **101** | **0** | **0** | **0** |' \
+        '+| **total** | **2** | **101** | **0** | **0** | **0** | **101** |' \
         "+$REASSURE"
+
+    # ------------------------------------------------------------ #97: what should have run
+
+    # The measurement in the issue: `cli` correct in every column, `wm` simply not there, and
+    # before this guard nothing anywhere printed a character about it.
+    check module-produced-nothing 'floormissing! pre97!' missingmodule impl plain \
+        '+::error title=Test floor not met' \
+        '+| `cli` | 1 | 55 | 0 | 0 | 0 | 55 |' \
+        '+| `wm` | — | — | — | — | — | **101, and it reported nothing** |' \
+        "+$BELOWFLOOR" "+$NORESULTS" "-$REASSURE" '=1'
+
+    check module-below-its-floor 'floorbelow! pre97!' belowfloor impl plain \
+        '+`wm` reported 100 tests, below the committed floor of 101' \
+        "+$BELOWFLOOR" "-$REASSURE" '=1'
+
+    check module-not-declared 'floorundeclared! pre97!' undeclared impl plain \
+        "+$UNDECLARED" "-$REASSURE" '=1'
+
+    check floor-file-absent 'floorfile! pre97!' nofloors impl plain \
+        '+::error title=Test floor file unusable' \
+        "+$BADFLOORS" "-$REASSURE" '=1'
+
+    check floor-file-unparseable 'floorfile pre97!' badfloors impl plain \
+        "+is not a test count for wm" \
+        "+$BADFLOORS" "-$REASSURE" '=1'
+
+    check floor-file-declares-twice 'floorfile pre97!' dupfloors impl plain \
+        '+wm is declared twice' \
+        "+$BADFLOORS" "-$REASSURE" '=1'
+
+    check roster-has-module-floors-lack 'floorroster! pre97!' rostergap impl plain \
+        "+the build includes 'registry'" \
+        "+$BADFLOORS" "-$REASSURE" '=1'
+
+    check roster-lacks-module-floors-have 'floorroster pre97!' rosterextra impl plain \
+        "+declares 'bus', which is not a module in this build" \
+        "+$BADFLOORS" "-$REASSURE" '=1'
+
+    # The positive: a roster that agrees is not an occasion for anything to be said.
+    check roster-agrees 'pessimist' rosterok impl plain \
+        "+$REASSURE" "-$BADFLOORS" "-$BELOWFLOOR"
+
+    check roster-read-from-settings 'floorsettings! floorroster pre97!' settingsgap impl plain \
+        "+the build includes 'registry'" \
+        "+$BADFLOORS" "-$REASSURE" '=1'
+
+    check roster-from-settings-agrees 'pessimist' settingsok impl plain \
+        "+$REASSURE" "-$BADFLOORS"
+
+    check floor-behind-what-ran 'floordrift pessimist' driftup impl plain \
+        '+Floors behind what ran: `wm` 90→101.' \
+        "+$REASSURE" "-$BELOWFLOOR"
 }
 
 # ------------------------------------------------------------------ phase 1: the real script
@@ -697,8 +903,8 @@ splice() {
 
 M_NUM_OLD="    '' | *[!0-9]*) printf '0' ;;"
 M_NUM_NEW="    '' | *[!0-9]*) printf '%s' \"\${1:-}\" ;;"
-M_MEASURED_OLD='if [ "$awk_rc" -ne 0 ] || [ -z "$total" ] || [ "$tot_suites" -eq 0 ]; then'
-M_MEASURED_NEW='if [ 1 -eq 2 ]; then'
+M_MEASURED_OLD='elif [ "$awk_rc" -ne 0 ] || [ -z "$total" ] || [ "$tot_suites" -eq 0 ]; then'
+M_MEASURED_NEW='elif [ 1 -eq 2 ]; then'
 M_ZERO_OLD='elif [ "$tot_tests" -eq 0 ]; then'
 M_ZERO_NEW='elif [ 1 -eq 2 ]; then'
 M_PARTIAL_OLD='if [ "$measured" = yes ] && [ "$tot_read" -lt "${#files[@]}" ]; then'
@@ -743,10 +949,41 @@ apply() {
             splice "$WORK/mutant/$1.sh" 'measured=yes' 'measured=no'
             ;;
         nofiles)
-            splice "$WORK/mutant/$1.sh" 'if [ ${#files[@]} -eq 0 ]; then' 'if [ 1 -eq 2 ]; then'
+            splice "$WORK/mutant/$1.sh" 'if [ "$nofiles" = yes ]; then' 'if [ 1 -eq 2 ]; then'
             ;;
         emit)
             splice "$WORK/mutant/$1.sh" 'tee -a "$GITHUB_STEP_SUMMARY"' 'cat'
+            ;;
+        # The four floor guards, one splice each. They are separate mutants rather than one,
+        # because "a module reported nothing" and "a module reported less than it should" are
+        # different comparisons and a single mutant would let either of them carry the other.
+        floormissing)
+            splice "$WORK/mutant/$1.sh" 'if [ "$min" -gt 0 ]; then' 'if [ 1 -eq 2 ]; then'
+            ;;
+        floorbelow)
+            splice "$WORK/mutant/$1.sh" 'if [ "$te" -lt "$min" ]; then' 'if [ 1 -eq 2 ]; then'
+            ;;
+        floorundeclared)
+            splice "$WORK/mutant/$1.sh" \
+                'if ! floor_min_of "$m" >/dev/null; then' 'if [ 1 -eq 2 ]; then'
+            ;;
+        # Reporting and the exit status together, because they are what a reader and a CI check
+        # respectively act on. The evaluation stays suppressed — `floors_error` is still set — so
+        # this mutant is "the file is unusable and nothing says so", not "the file is fine".
+        floorfile)
+            splice "$WORK/mutant/$1.sh" 'if [ -n "$floors_error" ]; then' 'if [ 1 -eq 2 ]; then'
+            ;;
+        floorroster)
+            splice "$WORK/mutant/$1.sh" \
+                'if [ -z "$floors_error" ] && [ -n "$ROSTER" ]; then' 'if [ 1 -eq 2 ]; then'
+            ;;
+        floorsettings)
+            splice "$WORK/mutant/$1.sh" \
+                'if [ -z "$floors_error" ] && [ -z "$ROSTER" ] && [ -f settings.gradle.kts ]; then' \
+                'if [ 1 -eq 2 ]; then'
+            ;;
+        floordrift)
+            splice "$WORK/mutant/$1.sh" 'elif [ "$te" -gt "$min" ]; then' 'elif [ 1 -eq 2 ]; then'
             ;;
         *) die "apply: unknown mutation '$2'" ;;
     esac
@@ -770,6 +1007,7 @@ run_mutant() {
     # script working, so the mutant is required to run the clean fixture to completion first.
     set +e
     env -u GITHUB_STEP_SUMMARY PATH="$WORK/path/awk-$IMPL:$BARE" \
+        AWAKENER_TEST_FLOORS="$WORK/fx/clean.floors" AWAKENER_TEST_MODULES='' \
         "$WORK/mutant/$MUTANT.sh" "$WORK/fx/clean" \
         >"$WORK/mutant/$MUTANT.probe" 2>&1 </dev/null
     probe_rc=$?
@@ -809,7 +1047,80 @@ run_mutant emit      no  emit
 # branch, no zero-tests branch, a per-line match for the suite tag, and — since #83's guard
 # did not exist either — no shortfall check. Every row tagged `pre76!` prints the reassurance
 # against it, which is the defect reproduced rather than described.
-run_mutant pre76 yes num measured zerotests multiline partial
+#
+# The floor guards come off too, and that is not padding: several of these fixtures declare a
+# floor their mutated parse cannot meet, so the floor would catch #76's defect for #97's reason
+# and the row would go red without reproducing anything. An era mutant has to be the whole era.
+run_mutant pre76 yes num measured zerotests multiline partial \
+    floormissing floorbelow floorundeclared floorfile floorroster floorsettings floordrift
+run_mutant floormissing    yes floormissing
+run_mutant floorbelow      yes floorbelow
+run_mutant floorundeclared yes floorundeclared
+run_mutant floorfile       yes floorfile
+run_mutant floorroster     yes floorroster
+run_mutant floorsettings   yes floorsettings
+run_mutant floordrift      no  floordrift
+# The shape the script had when #97 was filed: it read the XML faithfully and compared it to
+# nothing. Every row tagged `pre97!` prints the reassurance against it — including the ones where
+# a whole module is missing, which is the measurement in the issue rather than a description of it.
+run_mutant pre97 yes floormissing floorbelow floorundeclared floorfile floorroster \
+    floorsettings floordrift
+
+# ------------------------------------------------ the floor file's default location
+#
+# Every row above hands the script an explicit `AWAKENER_TEST_FLOORS`, which is what lets fixtures
+# carry their own floors — and leaves the default, the only path the CI step and the Gradle task
+# use, asserted by nothing. A guard whose input is resolved wrongly is a guard that is not there,
+# and it would fail open: no file found, and before this pair, no file found meant nothing to
+# compare against. So: the script beside a floor file, the variable unset, once green and once red.
+MODE=real
+RUN_SCRIPT=$SCRIPT
+note ""
+note "# the floor file resolved from the script's own directory, with the variable unset"
+DEFDIR=$WORK/default
+mkdir -p "$DEFDIR"
+cp "$SCRIPT" "$DEFDIR/test-summary.sh"
+chmod +x "$DEFDIR/test-summary.sh"
+printf 'wm 101\n' >"$DEFDIR/test-floors"
+
+default_row() {
+    label=$1
+    want_exit=$2
+    want_text=$3
+    forbid_text=$4
+    run_count=$((run_count + 1))
+    set +e
+    got=$(env -u GITHUB_STEP_SUMMARY -u AWAKENER_TEST_FLOORS -u AWAKENER_TEST_MODULES \
+        PATH="$WORK/path/awk-$IMPL:$BARE" \
+        "$DEFDIR/test-summary.sh" "$WORK/fx/clean" 2>&1 </dev/null)
+    rc=$?
+    set -e
+    no_leak "the $label row"
+    why=''
+    [ "$rc" = "$want_exit" ] || why="exit $rc, wanted $want_exit"
+    if [ -z "$why" ]; then
+        case $got in
+            *"$want_text"*) ;;
+            *) why="output lacks '$want_text'" ;;
+        esac
+    fi
+    if [ -z "$why" ] && [ -n "$forbid_text" ]; then
+        case $got in
+            *"$forbid_text"*) why="output contains '$forbid_text' and must not" ;;
+        esac
+    fi
+    if [ -n "$why" ]; then
+        note "FAIL $label [$IMPL]: $why"
+        detail "$got"
+        fail_count=$((fail_count + 1))
+    else
+        note "ok   $label [$IMPL]"
+    fi
+}
+
+default_row default-floors-found 0 "$REASSURE" "$BADFLOORS"
+rm -f "$DEFDIR/test-floors"
+default_row default-floors-absent 1 "$BADFLOORS" "$REASSURE"
 
 no_leak "the suite, over the whole run"
 

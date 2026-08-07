@@ -1,0 +1,28 @@
+# What this build is supposed to run, per module.
+#
+# `.github/scripts/test-summary.sh` sums `tests=` out of the JUnit XML. That number describes
+# what *ran*; nothing in the build, the workflow or the summary compared it against what should
+# have run, and that gap is the one this repo has now found under four different mechanisms —
+# a disabled test task, a task that is never wired to `check`, a cached task replayed as
+# up-to-date, and a run filtered to an empty set. All four produce the same observation: an
+# honest aggregate over a smaller set, with `skipped="0"`, `BUILD SUCCESSFUL`, and no annotation
+# anywhere. Enumerating the mechanisms is losing. This file is the other half of the comparison.
+#
+# Format: one `<module> <minimum tests>` per line; `#` starts a comment. The module name is the
+# first path component of `<module>/build/test-results/…`, which is the Gradle project name.
+#
+# **These are floors, not targets.** Adding tests never needs a change here. Removing or
+# consolidating them does, and that is the point: the number is committed, so a drop in coverage
+# has to appear in a diff next to the change that caused it, signed by whoever decided it was
+# fine. Lowering a floor is a legitimate thing to do — silently falling below one is not.
+#
+# A module declared `0` is a positive claim that it has no tests. Every module in the build must
+# appear: `:root:verifyTestFloors` passes the build's own module roster in
+# `AWAKENER_TEST_MODULES` and fails if this file and that roster disagree in either direction,
+# so a new module cannot reach `main` without someone stating what it is expected to run.
+#
+# Counts as of `3d16851` (CI run 31221639237, attempt 1): 29 suites, 321 tests, skipped=0.
+cli 55
+config 58
+registry 94
+wm 114

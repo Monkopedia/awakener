@@ -11,6 +11,21 @@ plugins {
 // discovery quietly goes back to reporting a subset, which is the bug this module fixes.
 val siblingModules = rootProject.subprojects.map { it.path } - project.path
 
+/**
+ * A cache key naming *which* of [tools] this build found on PATH, not merely that it found any.
+ * Path, size and mtime rather than a boolean, so upgrading sway re-runs the suite instead of
+ * replaying a green recorded against the previous one. Same helper and same reason as `:wm`,
+ * where the full note lives (#29).
+ */
+fun toolFingerprint(vararg tools: String): String {
+    val entries = System.getenv("PATH").orEmpty().split(File.pathSeparator)
+    return tools.joinToString(" ") { tool ->
+        val found = entries.map { File(it, tool) }.firstOrNull { it.canExecute() }
+        val id = found?.let { "${it.absolutePath}:${it.length()}:${it.lastModified()}" }
+        "$tool=${id ?: "absent"}"
+    }
+}
+
 kotlin {
     jvmToolchain(21)
 
@@ -186,6 +201,14 @@ val launcherTest by tasks.registering(Exec::class) {
     inputs.file(script)
     // Carries the dependency on installDist as well as the up-to-date check.
     inputs.files(installDist)
+    // The matrix re-runs a slice of its rows under `dash` and `busybox sh`, and skips them when
+    // those are absent — so which of them is installed decides what a green here covers, and
+    // Gradle tracks neither PATH nor the environment. Undeclared, the task reported UP-TO-DATE on
+    // a PATH farm without them and, forced, ran 45 rows against 53 (#98). Same declaration as
+    // `swayTooling` below and `awkTooling` on `summaryMatrixTest`, for the same measured reason.
+    inputs.property("shellTooling", toolFingerprint("dash", "busybox"))
+    inputs.property("requireShells", System.getenv("AWAKENER_REQUIRE_SHELLS").orEmpty())
+    System.getenv("AWAKENER_REQUIRE_SHELLS")?.let { environment("AWAKENER_REQUIRE_SHELLS", it) }
     outputs.file(report)
     commandLine(
         "sh",
@@ -198,21 +221,6 @@ val launcherTest by tasks.registering(Exec::class) {
 }
 
 tasks.named("check") { dependsOn(launcherTest) }
-
-/**
- * A cache key naming *which* of [tools] this build found on PATH, not merely that it found any.
- * Path, size and mtime rather than a boolean, so upgrading sway re-runs the suite instead of
- * replaying a green recorded against the previous one. Same helper and same reason as `:wm`,
- * where the full note lives (#29).
- */
-fun toolFingerprint(vararg tools: String): String {
-    val entries = System.getenv("PATH").orEmpty().split(File.pathSeparator)
-    return tools.joinToString(" ") { tool ->
-        val found = entries.map { File(it, tool) }.firstOrNull { it.canExecute() }
-        val id = found?.let { "${it.absolutePath}:${it.length()}:${it.lastModified()}" }
-        "$tool=${id ?: "absent"}"
-    }
-}
 
 tasks.withType<Test>().configureEach {
     // So the suite can assert the wiring above actually happened, for whatever the current set
