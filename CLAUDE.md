@@ -147,11 +147,18 @@ check that reads back the artefact you are making a claim about.
   understands one should recognise the other on sight.
 - **Do not read the shared checkout for anything load-bearing.** `/home/jmonk/git/awakener` is
   the tree the `agent-*` worktrees hang off, and **nothing pulls it on a schedule** — checked
-  2026-08-05: kaladin has no cron at all (no `crontab` binary, no `/etc/cron.*`), and nothing
-  in `systemctl list-timers`, system or user, names this repo or runs a `git fetch`. #71 is the
-  corroboration, since a scheduled pull would have prevented what it describes. So the checkout
-  sits on whatever commit it was last left on, and `git status` reports **clean** the entire
-  time, because it *is* clean — relative to its own stale `HEAD`. That
+  2026-08-05: kaladin has no cron at all (no `crontab` binary, no `/etc/cron.*`), and no unit
+  reachable from `systemctl list-timers`, system or user, runs `git fetch` or `git pull`
+  against this checkout. #71 is the corroboration, since a scheduled pull would have prevented
+  what it describes. **Two timer-activated scripts do *name* the repo** —
+  `~/git/urithiru/workflows/triage-fanout.sh:70` and `health-rotation.sh:58`, both carrying
+  `Monkopedia/awakener` in a `ROSTER` array — so a grep for `awakener` across scheduled units
+  returns hits. Those are GitHub slugs for `gh api` and agent dispatch: grepping both scripts
+  for `git fetch`, `git pull` and a `cd` into the checkout matched nothing (checked 2026-08-07,
+  with the `awakener` grep above as the positive control that the files were being read), so
+  neither script enters the checkout and the hits do not falsify this bullet. The checkout
+  therefore sits on whatever commit it was last left on, and `git status` reports **clean**
+  the entire time, because it *is* clean — relative to its own stale `HEAD`. That
   command answers "are there uncommitted changes"; it never answers "is this current", and the
   second is what it keeps getting read as. #71: the checkout sat six commits back overnight
   with `cli/build.gradle.kts` at 34 lines against 244 on `origin/main`, and an agent checking a
@@ -221,9 +228,19 @@ conversation, not a local workaround.
 
 ## Environment (verified 2026-07-30 — re-check before relying on it)
 
-- **kaladin** — this repo's host. Headless: no `/dev/dri`, no seat, no compositor. Cannot run
-  anything needing a display. **`sudo` here is passwordless**, so installing a tool you need
-  is your call to make, not something to ask Jason for. `sway`, `foot`, `chromium`, `jq`,
+- **kaladin** — this repo's host. Headless: no `/dev/dri`, no seated session, no compositor.
+  Cannot run anything needing a display. **It does have a `seat0`, and that does not
+  contradict the sentence before it** — this said "no seat at all" until 2026-08-07 and the
+  correction is the only reason the bullet still reads as trustworthy. Re-measured that day,
+  every command below run on kaladin: `loginctl list-seats` → `seat0`, `1 seats listed`;
+  `loginctl seat-status seat0` lists input devices, USB hubs, a sound card and NIC LEDs but
+  **no DRM node**; `ls -la /dev/dri` → `No such file or directory`, with `ls -la /dev/kvm` in
+  the same invocation succeeding, so the probe was working and the absence is real;
+  `loginctl list-sessions` shows both sessions with `SEAT` empty; `pgrep -a
+  'sway|gnome-shell|weston|Xorg|kwin'` exits 1. A seat is a udev grouping of input devices and
+  exists on any machine with a keyboard port; what kaladin lacks is a graphics device and
+  anything logged in on that seat. **`sudo` here is passwordless**, so installing a tool you
+  need is your call to make, not something to ask Jason for. `sway`, `foot`, `chromium`, `jq`,
   `qemu` and `waydroid` are already present. **KVM works** (Jason enabled SVM in firmware on
   2026-07-31): `kvm_amd` loads at boot, `/dev/kvm` is mode 0666, nested virtualisation is on.
   Binder needs nothing — the LTS kernel ships `CONFIG_ANDROID_BINDER_IPC_RUST=y`, so Waydroid
@@ -254,21 +271,32 @@ conversation, not a local workaround.
   wrong one is discharged by silence. This bullet claimed three tools absent that were
   installed — the third while correcting the first two.
 - **Neither host runs a tabbed WM as its session** — adolin's is GNOME Shell on seat0,
-  kaladin has no seat at all. The dock design depends on i3/sway tree semantics, so it has
-  nowhere to run *for real* yet. Installed is a different question, and the answer is **both
-  hosts, not one**: `sway 1.12` and `foot 1.27.0` are on kaladin *and* on adolin, explicitly
-  installed there on 2026-07-30 — the same day this section was first written and marked
-  verified. CI installs them too, and the `:wm` and `:cli` suites drive sway on every build.
+  kaladin has no session on its seat at all. The dock design depends on i3/sway tree
+  semantics, so it has nowhere to run *for real* yet. Installed is a different question, and
+  the answer is **both hosts, not one**: `sway 1.12` and `foot 1.27.0` are on kaladin *and* on
+  adolin, explicitly installed there on 2026-07-30 — the same day this section was first
+  written and marked verified. CI installs them too, and the `:wm` and `:cli` suites drive
+  sway on every build.
   `WLR_BACKENDS=headless sway` gives a genuine sway tree drivable entirely over ssh via
   `swaymsg` — that is how structural probes should run, and it needs no display and no change
   to Jason's GNOME session.
 - **Waydroid runs on kaladin, and Test 1 (occlusion lifecycle) is answered** — under qemu on
   2026-07-30 and natively on 07-31; see `docs/findings/`. **Nothing was gated on a DKMS
   module**: the LTS kernel's `CONFIG_ANDROID_BINDER_IPC_RUST=y` driver serves Waydroid
-  unmodified, `/dev/binderfs` is mounted, and `/usr/bin/waydroid` is installed. What remains
-  open is narrower — both runs were software-rendered, so buffer back-pressure from a
-  gbm/DRM-backed Waydroid is untested and needs adolin's real GPU. **That is no longer an
-  install.** Waydroid 1.6.3 has been on adolin since 2026-07-31, `/var/lib/waydroid` is
+  unmodified, the `binder` filesystem type is registered at all times (`grep binder
+  /proc/filesystems` → `nodev binder`), and `/usr/bin/waydroid` is installed. **`/dev/binderfs`
+  is mounted on demand when `waydroid-container` starts, not at boot** — this said flatly that
+  it "is mounted", which is false at rest and is the sentence an agent checks before deciding
+  whether Waydroid work needs a kernel module. Measured 2026-08-07 on both hosts, which is what
+  makes it a mechanism rather than a guess: on kaladin `systemctl is-active waydroid-container`
+  → `inactive`, `mount | grep -i binder` → nothing (exit 1, against 31 mount lines, so the pipe
+  was working) and `/dev/binderfs` does not exist; on adolin, where the unit is `active`, the
+  same `mount` line reads `binder on /dev/binderfs type binder (rw,relatime,max=1048576)`. An
+  absent `/dev/binderfs` therefore means the container is stopped and says nothing about the
+  driver. What remains open is narrower — both runs were software-rendered, so buffer
+  back-pressure from a gbm/DRM-backed Waydroid is untested and needs adolin's real GPU.
+  **That is no longer an install.** Waydroid 1.6.3 has been on adolin since 2026-07-31,
+  `/var/lib/waydroid` is
   initialised, and `waydroid-container` is active with the session stopped. What is left is a
   session started against Jason's live seat — his call to make, not a package for him to
   fetch.

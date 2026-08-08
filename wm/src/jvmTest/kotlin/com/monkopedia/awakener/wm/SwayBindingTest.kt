@@ -46,13 +46,14 @@ class SwayBindingTest {
      *
      * A child of [scope], so `tearDown` still takes everything down in one call — but cancellable
      * on its own, which is what lets [restartAwakener] retire the manager it replaces. That is #56:
-     * `SwayWindowManager` starts its repair collector in its constructor and offers no `close()`,
-     * so rebinding [wm] over a manager built on the shared scope leaves the old collector
-     * subscribed to the same sway. Two collectors do not agree: a sweep answers partly from the
-     * asking manager's table, so a manager that stood a dock up reaps it while a manager that
-     * merely adopted it — or that cannot recognise it at all — refuses (#72). That holds at stock
-     * flags and is only *widest* under [ReapEvidence.STOOD_UP]. Which answer the tree ends up with
-     * was decided by timing.
+     * `SwayWindowManager` starts its repair collector in its constructor, so rebinding [wm] over a
+     * manager built on the shared scope leaves the old collector subscribed to the same sway.
+     * (This used to add "and offers no `close()`", which stopped being true at #116 —
+     * [SwayWindowManager.close] exists and is what the product retires by.) Two collectors do not
+     * agree: a sweep answers partly from the asking manager's table, so a manager that stood a dock
+     * up reaps it while a manager that merely adopted it — or that cannot recognise it at all —
+     * refuses (#72). That holds at stock flags and is only *widest* under
+     * [ReapEvidence.STOOD_UP]. Which answer the tree ends up with was decided by timing.
      */
     private lateinit var wmScope: CoroutineScope
     private lateinit var wm: SwayWindowManager
@@ -108,8 +109,10 @@ class SwayBindingTest {
      * manager's collector subscribed is not a restart; it is two awakeners, and #56 is what that
      * costs — the predecessor's sweep and the assertion race for the same dock, and under
      * [ReapEvidence.STOOD_UP] they want opposite things. Cancelling the outgoing manager's scope is
-     * the only lever `SwayWindowManager` offers for stopping a collector, which is why each manager
-     * gets its own.
+     * the lever this harness uses, which is why each manager gets its own — it is no longer the
+     * *only* one, since #116 added [SwayWindowManager.close], and `SwayLifecycleTest` is where that
+     * is exercised. This keeps the scope join because it covers the manager's other children too,
+     * for the reason the body gives.
      *
      * Returns the retired manager, because what it does *after* being retired — nothing — is worth
      * asserting on.
@@ -762,9 +765,12 @@ class SwayBindingTest {
      * leak by rebinding `wm` without retiring, and this fails every run instead of occasionally,
      * which is the whole difference between a guard and a second lottery ticket.
      *
-     * It says nothing about whether the *product* should stop two managers overlapping. That is
-     * #72's second half and it is open: this asserts only that a caller which retires one gets what
-     * retirement is for.
+     * It says nothing about whether the *product* should stop two managers overlapping. That was
+     * #72's second half; #72 closed with the half it did settle, and the open half moved to
+     * **#85**, which #116 settled by adding [SwayWindowManager.close]. Follow #85, not #72 — a
+     * pointer at a closed issue reads as "already answered", which was true of #72's first half
+     * and not of this. What this test asserts is only that a caller which retires one manager
+     * gets what retirement is for.
      */
     @Test
     fun `a retired manager sweeps nothing, so a restart cannot race it`() = swayTest {

@@ -221,4 +221,22 @@ everything can't tell gist from noise.
 - No new spanreed primitives without exhausting the existing ones — the mirror/bridge
   pattern already covers multiplexed surfaces.
 - Test 1 is Waydroid occlusion lifecycle. Test 2 is a single hotkey-invoked agent on one
-  static window, dock as tree sibling. Neither needs the bus.
+  static window, dock as tree sibling. Test 1 does not need the bus. **Test 2 does, on the
+  shipped defaults** — this said "neither needs the bus", and an owner reading that would try
+  Test 2 on a host without spanreed and get a hard failure rather than a degraded one. Two
+  reaches on the hotkey path, both at stock flags:
+  - `invoke.when_animated=REUSE` (the default) makes `Awakening.invoke` ask
+    `AgentBus.isAnimated` whether this surface's Lifeless is already up, which runs
+    `spanreed list`.
+  - `registry.agent.id_source=SPANREED` (the default) mints the identity with
+    `spanreed agent-id`, on the first invocation for a surface.
+
+  Neither degrades: `SpanreedCli` raises on a failed run and the CLI exits 1. Setting
+  `invoke.when_animated=SECOND_DOCK` short-circuits the first and
+  `registry.agent.id_source=DERIVED` replaces the second with spanreed's documented rule
+  applied locally — with both set, the hotkey path never reaches the bus and the original
+  sentence is true. So "no bus" is a configuration to choose before running Test 2, not a
+  property to assume. (`registry.agent.id_source_unreachable=DERIVE` covers only a spanreed
+  that cannot be run at all, and only for minting.) The separate `list` verb calls
+  `AgentBus.liveAgents` unconditionally with no flag to turn it off, but it is not on the
+  Test 2 path.
