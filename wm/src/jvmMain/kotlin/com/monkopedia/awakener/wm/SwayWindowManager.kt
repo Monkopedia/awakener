@@ -6,6 +6,8 @@ import com.monkopedia.awakener.registry.AgentId
 import com.monkopedia.awakener.registry.BindingStore
 import com.monkopedia.awakener.registry.SurfaceKey
 import com.monkopedia.awakener.registry.asIdentity
+import java.io.File
+import java.security.SecureRandom
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.TimeSource
 import kotlinx.coroutines.CancellationException
@@ -411,12 +413,17 @@ class SwayWindowManager(
      *
      * Costs a second mark scan of the node, on the sweep's candidates only.
      *
-     * [ReapEvidence.STOOD_UP] is the value that does not ask the tree anything. Every mark sway
-     * holds is writable from `swaymsg` — the same `RUN_COMMAND` and the same parser awakener uses,
-     * measured on 1.12 — so a mark is evidence that is only ever *unlikely* to be somebody else's,
-     * never impossible; awakener's own record of standing the dock up is the one thing here that a
-     * desktop cannot write. What it costs is stated at the flag, and it is the mark's own purpose:
-     * a dock adopted after a restart is then never reaped.
+     * [ReapEvidence.STOOD_UP] is the value that does not ask the tree anything *here*. Every mark
+     * sway holds is writable from `swaymsg` — the same `RUN_COMMAND` and the same parser awakener
+     * uses, measured on 1.12 — so a mark is evidence that is only ever *unlikely* to be somebody
+     * else's, never impossible.
+     *
+     * **Not asking the tree here is not the same as the entry being unproducible by a desktop**,
+     * and reading it as such is #96: `attach` writes the entry, and the window it writes it for is
+     * the one that answered a wait on an `app_id` that window's own client declared. So this
+     * predicate is exactly as strong as [WmFlags.stoodUpProof] makes the entry, and the two flags
+     * have to be read together. What `STOOD_UP` costs is stated at the flag and is the mark's own
+     * purpose: a dock adopted after a restart is never reaped.
      */
     private fun currentlyADock(node: Node, table: DockTableSnapshot, cfg: Config): Boolean {
         val stoodUp = table.entries[node.id]?.origin == DockOrigin.STOOD_UP
@@ -438,6 +445,74 @@ class SwayWindowManager(
      */
     private fun reserved(node: Node, table: DockTableSnapshot, cfg: Config): Boolean =
         cfg.consultsTable && table.reserves(node)
+
+    /**
+     * A fresh spawn token for one attach — see [WmFlags.stoodUpProof].
+     *
+     * From [SecureRandom] and not from the source [dockMarkFor]'s nonce uses, and the difference is
+     * the reader rather than the length. A mark's nonce is in `swaymsg -t get_tree` the moment it
+     * is written, so guessing one buys nothing that reading one does not; this string is never put
+     * in the tree at all, which makes predicting it the *only* route that does not require reading
+     * `/proc`. That is a small door and it is worth shutting; it is not a claim that the token
+     * cannot be obtained, which [WmFlags.stoodUpProof] states plainly it can.
+     */
+    private fun newSpawnToken(): String {
+        val bytes = ByteArray(SPAWN_TOKEN_BYTES)
+        spawnTokens.nextBytes(bytes)
+        return bytes.joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
+    }
+
+    /**
+     * Whether the process behind [node] carries this attach's [token] in its environment.
+     *
+     * Two reads, answered by two different things, and the difference is the whole value:
+     *
+     * - an `app_id` is a string the client sets about itself — `xdg_toplevel.set_app_id` is a
+     *   request in `xdg-shell.xml`, three mentions of `app_id` in that file;
+     * - a `pid` is not something a client can state. There is no request carrying one anywhere in
+     *   `wayland.xml` or `xdg-shell.xml` — zero matches for `pid` in either, against 463 for
+     *   `surface` and 3 for `app_id` as the controls that the files were read (checked on kaladin,
+     *   wayland-protocols as shipped). What it *is* is the pid of "the application that owns the
+     *   window", `sway-ipc(7)`'s wording.
+     *
+     * A node matched on `app_id` is necessarily an xdg-shell window, which is what makes the two
+     * safe to read together: `sway-ipc(7)` documents `app_id` as "for an xdg-shell window, the
+     * name of the application, if set. Otherwise, null", and its own worked example shows
+     * `"shell": "xwayland"` beside `"app_id": null`. An xwayland view, where the pid comes from a
+     * client-set X property, can therefore never be the window this reads.
+     *
+     * `/proc/<pid>/environ` is readable because the dock runs as the same user awakener does —
+     * which is the same fact that stops any of this being a privilege boundary.
+     *
+     * **The token is delivered across a wider surface than the one it is read from, and the
+     * margin that makes that harmless is worth stating rather than re-deriving.** It goes out as
+     * `env AWAKENER_DOCK_TOKEN=<t> <command>`, so between the `exec` and `env`'s own exec it sits
+     * in that process's argv. Measured 2026-08-08 with `stat -c '%a'`, on kaladin *and* on adolin:
+     * `/proc/self/environ` is `400` and `/proc/self/cmdline` is `444`, and `/proc/mounts` carries
+     * no `hidepid`. So the read this function does is owner-only, while the delivery is briefly
+     * legible to *any* local user. It does not widen anything, because reading a token is not
+     * spending one: spending it means mapping a window into the sway session, which needs the
+     * socket under `/run/user/<uid>` — `700` on both hosts by the same measurement. A different
+     * local user can therefore obtain the token and provably cannot use it, and the same-user case
+     * was never a boundary to begin with (above, and [WmFlags.stoodUpProof]).
+     *
+     * **Unreadable is not proven.** A process that has already exited, a `/proc` that is not
+     * mounted, an environment the dock program scrubbed: all of them answer false, and the default
+     * [StoodUpProof.TOKEN_OR_ADOPTED] turns that into an [DockOrigin.ADOPTED] entry rather than
+     * into a failed attach. Degrading toward "we did not stand this up" is the safe direction —
+     * it costs a panel that outlives its surface, never a window destroyed.
+     *
+     * The token is matched as a whole entry rather than by `contains`, so a *different* variable
+     * whose value ends in the token is not a match.
+     */
+    private fun carriesSpawnToken(node: Node, token: String): Boolean {
+        val pid = node.pid ?: return false
+        val environ = runCatching { File("/proc/$pid/environ").readBytes() }.getOrNull()
+            ?: return false
+        val entry = "$SPAWN_TOKEN_VAR=$token"
+        // NUL-separated, because that is how the kernel lays `environ` out.
+        return environ.decodeToString().split(NUL).any { it == entry }
+    }
 
     /**
      * Runs [edit] with exclusive use of the window tree.
@@ -490,7 +565,19 @@ class SwayWindowManager(
      * reservation it is never consulted by a read path: [TreeEdit.strayDock] is its only reader,
      * and only where the attach has already failed.
      */
-    private class PendingDock(val appId: String, val standing: Set<Long>)
+    private class PendingDock(
+        val appId: String,
+        val standing: Set<Long>,
+        /**
+         * The same predicate the wait used, so the unwind cannot kill a window the wait refused.
+         *
+         * Under [StoodUpProof.TOKEN_REQUIRED] that is the whole point: an attach that passes over
+         * an interloper and then fails must not take it down on the way out, which is the second
+         * route into the same window that [WmFlags.dockIdentity] already names. Under the other
+         * two values this is `{ true }` and the unwind behaves exactly as it did.
+         */
+        val accept: (Node) -> Boolean,
+    )
 
     /**
      * The only way to change the tree. See [treeEdit] for why it is a receiver.
@@ -715,8 +802,13 @@ class SwayWindowManager(
          * shared name, which this is a second route to: a window a user launches *into this
          * surface's tab* while the attach is waiting reports the same `app_id`, is not in
          * [PendingDock.standing], and is killed here. Named on [WmFlags.dockIdentity] alongside
-         * the adoption route `attach` and `detach` already had, and removed by construction under
+         * the adoption route `attach` and `detach` already had, and narrowed to the accident by
          * [DockIdentity.PER_SURFACE_APP_ID].
+         *
+         * [PendingDock.accept] is the other half of that, and it is why the predicate is carried
+         * here rather than recomputed: under [StoodUpProof.TOKEN_REQUIRED] the wait passed this
+         * window over, and an unwind that killed it anyway would have shut the front door and left
+         * this one open.
          *
          * Reports a failed read onto [cause] rather than raising it, for [compensate]'s reason:
          * losing the original diagnosis to a compensation's own failure is what that rule exists
@@ -731,7 +823,8 @@ class SwayWindowManager(
                 ?.firstOrNull {
                     it.id != surface.raw &&
                         it.appId == pending.appId &&
-                        it.id !in pending.standing
+                        it.id !in pending.standing &&
+                        pending.accept(it)
                 }
                 ?.let { SurfaceId(it.id) }
         } catch (cancelled: CancellationException) {
@@ -788,8 +881,17 @@ class SwayWindowManager(
             appId: String,
             standing: Set<Long>,
             timeoutMs: Long = config[WmFlags.mapWaitMs],
+            /**
+             * A second predicate the window has to satisfy, defaulting to none.
+             *
+             * This is the hook [StoodUpProof.TOKEN_REQUIRED] uses, and it is here rather than in
+             * `attach` because the difference between the two token values is precisely *where*
+             * the check runs: applied to the answer it decides what the entry says, applied to
+             * the wait it decides whether there is an answer at all.
+             */
+            accept: (Node) -> Boolean = { true },
         ): Node? = pollTree(timeoutMs) {
-            tree().windows.firstOrNull { it.appId == appId && it.id !in standing }
+            tree().windows.firstOrNull { it.appId == appId && it.id !in standing && accept(it) }
         }
 
         suspend fun awaitGone(id: SurfaceId, timeoutMs: Long = config[WmFlags.unmapWaitMs]): Boolean =
@@ -999,6 +1101,38 @@ class SwayWindowManager(
         }
         val command = dock.command.replace(DockSpec.APP_ID_PLACEHOLDER, appId)
 
+        // Drawn per attach, and drawn at all only where something will read it. See
+        // WmFlags.stoodUpProof: what it proves is that the window which answered the wait is the
+        // program this attach exec'd, which the app_id — a string that window's own client
+        // declares about itself — never did.
+        val proof = cfg[WmFlags.stoodUpProof]
+        val token = if (proof == StoodUpProof.NONE) null else newSpawnToken()
+        // `env` rather than a shell assignment prefix because sway hands the whole string to
+        // `sh -c` and an assignment binds to the first simple command only; `env` is equally
+        // defeated by a command that is a pipeline or a list, which is why the flag says the
+        // token has to reach the process that owns the surface for TOKEN_REQUIRED to work at all.
+        // The dock command in `:cli` is already of this shape — `foot -a {app_id} -- env … claude`
+        // — so the environment reaching foot is the case that matters and it is the one that does.
+        val spawnCommand = if (token == null) command else "env $SPAWN_TOKEN_VAR=$token $command"
+        // One predicate, used by the wait and by the unwind's look for a window it never
+        // identified. They have to be the same one: an attach that refuses to *adopt* an
+        // interloper and then kills it on the way out has closed one route into that window and
+        // left the other open, which is the shape `strayDock` already documents.
+        //
+        // A named local rather than a lambda so that `token`'s nullability is discharged by a
+        // branch the compiler smart-casts, instead of by a `!!` resting on a fact stated one line
+        // up. The third branch cannot be reached — `token` is null under exactly one value of the
+        // flag and TOKEN_REQUIRED is not it — and is written out anyway so that the case which
+        // cannot happen still falls the safe way: refusing to adopt costs a failed attach, while
+        // adopting on no proof costs the window this flag exists to protect.
+        fun acceptsAsDock(node: Node): Boolean = when {
+            proof != StoodUpProof.TOKEN_REQUIRED -> true
+            token != null -> carriesSpawnToken(node, token)
+            else -> false
+        }
+
+        val acceptDock: (Node) -> Boolean = ::acceptsAsDock
+
         // Bookkeeping, not compensation, which is why it is a `finally` around the whole method
         // and is gated by no flag: a reservation left behind is invisible in `swaymsg -t get_tree`
         // and hides every window under the dock's app_id until its deadline
@@ -1082,17 +1216,61 @@ class SwayWindowManager(
                     // goes out this attach may have a window in the tree, and the map deadline
                     // can expire before anything has identified it. Ungated, because it is not a
                     // suppression — nothing reads it but the unwind.
-                    pending = PendingDock(appId, standing)
-                    run("exec $command")
-                    val dockNode = awaitWindow(appId, standing)
-                        ?: error("dock '$appId' never appeared; command was: $command")
+                    pending = PendingDock(appId, standing, acceptDock)
+                    // The other route by which the token would outlive the attach, and it is the
+                    // same argument as the `command` below: `run` quotes back what it was given,
+                    // so a sway rejection of this exec would put `spawnCommand` — token and all —
+                    // into an exception message. Harmless in itself, since a rejected exec starts
+                    // no process and so no window can ever carry that token, but the two paths out
+                    // of this one call should not disagree about what they are willing to print.
+                    // The cause is dropped rather than chained for the same reason: its message is
+                    // the string being kept out of the log.
+                    try {
+                        run("exec $spawnCommand")
+                    } catch (rejected: IllegalStateException) {
+                        throw IllegalStateException(
+                            "sway rejected the dock exec; command was: $command",
+                        )
+                    }
+                    // Under TOKEN_REQUIRED the proof is part of the wait, so a window that cannot
+                    // show the token is passed over and this attach keeps waiting for its own
+                    // dock. Under the other two values the wait is unchanged and the proof — if
+                    // there is one — decides only what the table records below. `command` and not
+                    // `spawnCommand` in the message: the token is a secret for the length of one
+                    // attach, and an exception message is the one place it would outlive it.
+                    val dockNode = awaitWindow(appId, standing, accept = acceptDock) ?: error(
+                        if (proof == StoodUpProof.TOKEN_REQUIRED) {
+                            "no window under '$appId' proved it was the program this attach " +
+                                "spawned, which wm.dock.stood_up_proof=TOKEN_REQUIRED demands; " +
+                                "a dock command that does not pass its environment through to " +
+                                "the process owning the surface can never satisfy it. Command " +
+                                "was: $command"
+                        } else {
+                            "dock '$appId' never appeared; command was: $command"
+                        },
+                    )
                     val dockId = SurfaceId(dockNode.id)
                     spawned = dockId
 
                     // Before the mark, and this order is the fix: the mark is a round trip away
                     // and enumeration does not take this lock, so a reader landing in between
                     // would be handed the agent panel as a bindable surface.
-                    docks.record(dockId, surface, DockOrigin.STOOD_UP)
+                    // What the entry *says* is the whole of #96. This attach has a dock either
+                    // way — it is marked, moved and torn down by the handle below regardless —
+                    // and the only reader of the origin is the orphan sweep under
+                    // WmFlags.reapEvidence, which is about to be given permission to destroy this
+                    // window when the surface closes. A window that answered on a name it
+                    // declared about itself has not earned that; it is ADOPTED, which is what
+                    // every other claim resting on something outside this process is.
+                    val origin = when {
+                        // TOKEN_REQUIRED proved it in the wait, so re-reading /proc here would
+                        // only introduce a race with a dock that has since exited.
+                        token == null || proof == StoodUpProof.TOKEN_REQUIRED ->
+                            DockOrigin.STOOD_UP
+                        carriesSpawnToken(dockNode, token) -> DockOrigin.STOOD_UP
+                        else -> DockOrigin.ADOPTED
+                    }
+                    docks.record(dockId, surface, origin)
                     recorded = dockId
 
                     // Names the dock as well as the surface, and under the default scheme carries
@@ -1597,5 +1775,30 @@ class SwayWindowManager(
          * and by the second pass that window is either down or was never going to arrive in time.
          */
         const val FLATTEN_PASSES = 2
+
+        /**
+         * The environment variable [WmFlags.stoodUpProof]'s token travels in.
+         *
+         * Prefixed and specific so that a dock program passing its environment on to a child does
+         * not collide with anything, and so that a reader of `/proc` sees what it is looking at.
+         */
+        const val SPAWN_TOKEN_VAR = "AWAKENER_DOCK_TOKEN"
+
+        /**
+         * How many random bytes a spawn token is. Sixteen — 128 bits — because unlike the mark's
+         * nonce this one is never published, so guessing is a route rather than a formality.
+         */
+        const val SPAWN_TOKEN_BYTES = 16
+
+        /** How the kernel separates the entries in `/proc/<pid>/environ`. */
+        const val NUL = '\u0000'
+
+        /**
+         * The source spawn tokens are drawn from.
+         *
+         * One instance for the process: [SecureRandom] is thread-safe, and constructing one per
+         * attach would put a seeding cost on the hotkey path for nothing.
+         */
+        val spawnTokens = SecureRandom()
     }
 }

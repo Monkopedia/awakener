@@ -339,6 +339,32 @@ The only question it could answer — "did *this* awakener stand that dock up" �
 `origin = STOOD_UP` already answers, from memory, without depending on a string the desktop can
 write. This is the note's own rule about fields nothing reads, applied before the field existed.
 
+> **Amended 2026-08-08 by #132: the clause "without depending on a string the desktop can write"
+> was false, and the decision above survives it.** What `origin = STOOD_UP` answered from was
+> memory of an identification made on `app_id` and nothing else. At `e19af5f`,
+> `SwayWindowManager.kt:792` is `tree().windows.firstOrNull { it.appId == appId && it.id !in
+> standing }` and `:1095` is an unconditional `docks.record(dockId, surface,
+> DockOrigin.STOOD_UP)` over whatever that returned; `app_id` is a string the client sets about
+> itself, `xdg_toplevel.set_app_id` being a request in `xdg-shell.xml`. Measured on sway 1.12
+> (#96): a `foot -a awakener-dock` started by hand during an attach is adopted as the dock,
+> marked, and recorded stood up, with no mark forged and nothing guessed. The narrower clause —
+> that no *mark* produces that entry — is true, and it is the only one this section needs, since
+> what it is comparing against is a nonce in the tree.
+>
+> **`wm.dock.stood_up_proof` (`WmFlags.stoodUpProof`) is what the sentence now depends on, and it
+> has three answers.** Under `NONE` the clause is false exactly as written above. Under the
+> default `TOKEN_OR_ADOPTED` and under `TOKEN_REQUIRED` an entry additionally requires a
+> per-attach token that `attach` put in the environment of the process sway `exec`'d, read back
+> from `/proc/<pid>/environ` of the window that answered — a string that never enters sway's tree,
+> so still not one a mark can carry. That is **accident, not forgery**, the same standard this
+> section states for the nonce: `/proc` and `SWAYSOCK` are readable by the same user, and a token
+> read out of `/proc` can be spent by anything that can reach the sway socket.
+>
+> **None of that changes the decision.** A per-process nonce would still be a field with no
+> reader: the question it could answer is answered from memory and, under the two token values,
+> from a string that is not in the tree either — so putting it in the *mark* buys nothing in
+> any of the three configurations.
+
 **And why the value is never checked.** The issue's first constraint, and it decides the design: a
 mark exists to be read by a process that did not write it. A nonce the successor does not know
 would turn every standing dock into a stranded one on every awakener restart — the exact failure
