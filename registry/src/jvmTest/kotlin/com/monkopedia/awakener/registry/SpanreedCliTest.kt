@@ -2,11 +2,9 @@ package com.monkopedia.awakener.registry
 
 import com.monkopedia.awakener.config.Config
 import com.monkopedia.awakener.config.InMemoryConfigStore
-import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.io.path.absolutePathString
-import kotlin.io.path.isExecutable
 import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -15,7 +13,6 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.JsonPrimitive
-import org.junit.AssumptionViolatedException
 
 /**
  * Asserts on the exact argv and environment awakener hands to spanreed.
@@ -498,31 +495,9 @@ class SpanreedCliTest {
     }
 
     /**
-     * The installed spanreed, or a skip the test report actually shows.
-     *
-     * The skip has to throw. A test method that returns normally is recorded as PASSED, so the
-     * early `return` this replaced made a machine without spanreed report `skipped="0"` and a
-     * full green suite — indistinguishable from a run that really did shell out. An assumption
-     * failure is what Gradle writes into the XML as `<skipped/>`, which is what `CLAUDE.md`
-     * claims the count means.
-     *
-     * `AWAKENER_REQUIRE_SPANREED=1` still comes first and still makes absence a failure; that
-     * half of the guard was never the broken one.
+     * The installed spanreed, or a skip the test report actually shows — [SpanreedHarness] holds
+     * the gate and the note on why the skip has to throw. It moved out of this class when `:cli`
+     * gained a test that mints through the real spanreed and needed the same ordering.
      */
-    private fun spanreedOrSkip(): Path {
-        val spanreed = onPath("spanreed")
-        if (spanreed == null) {
-            check(System.getenv("AWAKENER_REQUIRE_SPANREED") != "1") {
-                "AWAKENER_REQUIRE_SPANREED=1 but spanreed is not installed"
-            }
-            throw AssumptionViolatedException("spanreed is not installed")
-        }
-        return spanreed
-    }
-
-    /** Same predicate as `toolFingerprint` in the build scripts — see the note in `:wm` (#29). */
-    private fun onPath(tool: String): Path? =
-        System.getenv("PATH").orEmpty().split(File.pathSeparator)
-            .map { Path.of(it, tool) }
-            .firstOrNull { it.isExecutable() }
+    private fun spanreedOrSkip(): Path = SpanreedHarness.assumeAvailable()
 }

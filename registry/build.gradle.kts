@@ -22,6 +22,24 @@ kotlin {
     }
 }
 
+// `:cli`'s invoke suite mints through the real spanreed, so it needs the same gate this module's
+// tests go through — `SpanreedHarness`, which consults AWAKENER_REQUIRE_SPANREED before it skips.
+// Published rather than copied for the reason `:wm` publishes `SwayHarness`: a second copy is a
+// second place for that ordering to drift, and a drifted gate is invisible until the day the tool
+// is missing. `jvmMain` is the wrong home for it — `org.junit.Assume` has no business in the
+// production artifact.
+val jvmTestClasses: Configuration by configurations.creating {
+    isCanBeResolved = false
+    isCanBeConsumed = true
+}
+
+val jvmTestJar by tasks.registering(Jar::class) {
+    archiveClassifier.set("jvm-test")
+    from(kotlin.jvm().compilations.getByName("test").output.allOutputs)
+}
+
+artifacts.add(jvmTestClasses.name, jvmTestJar)
+
 /**
  * A cache key naming *which* of [tools] this build found on PATH, not merely that it found any.
  * Path, size and mtime rather than a boolean, so upgrading spanreed re-runs the suite instead of
