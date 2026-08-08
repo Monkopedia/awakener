@@ -3,10 +3,15 @@ package com.monkopedia.awakener.cli
 import com.monkopedia.awakener.config.Flags
 import com.monkopedia.awakener.config.InMemoryConfigStore
 import com.monkopedia.awakener.registry.AgentBus
+import com.monkopedia.awakener.registry.AgentIdSource
+import com.monkopedia.awakener.registry.AgentIdentities
 import com.monkopedia.awakener.registry.DerivedAgentIdentities
 import com.monkopedia.awakener.registry.FileBindingStore
 import com.monkopedia.awakener.registry.LiveAgent
 import com.monkopedia.awakener.registry.RegistryFlags
+import com.monkopedia.awakener.registry.SpanreedCli
+import com.monkopedia.awakener.registry.SpanreedHarness
+import com.monkopedia.awakener.registry.UnreachableIdSource
 import com.monkopedia.awakener.wm.CommandResult
 import com.monkopedia.awakener.wm.I3Ipc
 import com.monkopedia.awakener.wm.Node
@@ -52,6 +57,11 @@ import kotlinx.serialization.json.Json
  * The bus is faked here for one reason only: `spanreed list` reads Jason's real registry, and a
  * test suite must not stand throwaway agents up on it. What awakener does with the *answer* is
  * what this asserts; that the answer decodes is `SpanreedCliTest`'s, against the real thing.
+ *
+ * The **mint** is a separate question from the bus, and one test below does not fake it:
+ * `the panel comes up under an identity the real spanreed issued`. That one is what
+ * `AWAKENER_REQUIRE_SPANREED` protects in this module, and before it existed the flag was
+ * forwarded here with nothing on the test path consulting spanreed at all (#100).
  */
 class AwakeningSwayTest {
     private lateinit var sway: SwayHarness
@@ -64,6 +74,13 @@ class AwakeningSwayTest {
     private lateinit var awakening: Awakening
     private val bus = FakeBus()
     private var minted = 0
+
+    /**
+     * Who mints, indirected through a `var` so one test can swap the real [SpanreedCli] in without
+     * every other test paying for a subprocess. The store reads this on every bind, so the swap
+     * has to happen before the invocation and not before the store is built.
+     */
+    private lateinit var identities: AgentIdentities
 
     private val enabled get() = SwayHarness.available()
 
@@ -104,15 +121,16 @@ class AwakeningSwayTest {
         // ask for it — and a test whose subject has already happened proves nothing.
         store.put(WmFlags.sweepOnClose, false)
 
+        // Counted, so "did this invocation mint" is observable rather than inferred; and derived
+        // rather than real, because a mint through the spanreed CLI is a subprocess and this suite
+        // already spends a compositor. The one test that wants the subprocess replaces this.
+        identities = AgentIdentities { key, residuePath ->
+            minted++
+            DerivedAgentIdentities(store).mint(key, residuePath)
+        }
         registry = FileBindingStore(
             configStore = store,
-            // Counted, so "did this invocation mint" is observable rather than inferred; and
-            // derived rather than real, because a mint through the spanreed CLI is a subprocess
-            // and this suite already spends a compositor.
-            identities = { key, residuePath ->
-                minted++
-                DerivedAgentIdentities(store).mint(key, residuePath)
-            },
+            identities = { key, residuePath -> identities.mint(key, residuePath) },
             path = stateDir.resolve("bindings.json"),
         )
         wm = SwayWindowManager({ sway.connection() }, store, registry, scope)
@@ -199,6 +217,70 @@ class AwakeningSwayTest {
             awakened.binding.agentId,
             "and it is the name that address is derived from, so the bus can route to it",
         )
+    }
+
+    /**
+     * The same fact as the test above, with the mint no longer faked: the panel comes up under an
+     * identity **spanreed itself issued**, reached through the flag defaults a machine with no
+     * config file has.
+     *
+     * ### Why it needs the real spanreed, stated so it cannot quietly stop needing it
+     *
+     * `registry.agent.id_source` defaults to `SPANREED` and `registry.agent.id_source_unreachable`
+     * to `FAIL`, so a mint that returns at all has run `spanreed agent-id` as a subprocess:
+     * refusing rather than deriving past an unreachable bus is what those two defaults mean
+     * together. The assertions on the snapshot below are not decoration — flip either default and
+     * this test would keep passing while touching no spanreed at all, which is exactly how the
+     * gate it belongs to came to protect nothing (#100).
+     *
+     * ### And why it is the only test of `registry.agent.spanreed_command`'s default
+     *
+     * Every other spanreed test in the build injects an absolute path or a scratch script, so the
+     * shipped default — the bare name `spanreed`, left for `ProcessBuilder` to resolve on PATH —
+     * is exercised nowhere else. That default is what an unconfigured `awakener-invoke` runs with,
+     * so a typo in it would reach a user's first hotkey press before it reached a build.
+     *
+     * The **bus** is still faked, and the split is deliberate: liveness is `spanreed list`, a read
+     * of Jason's live registry that this suite's own note keeps out, while the mint is `agent-id`,
+     * which prints a derivation and writes nothing.
+     */
+    @Test
+    fun `the panel comes up under an identity the real spanreed issued`() = swayTest {
+        val spanreed = SpanreedHarness.assumeAvailable()
+        val cfg = store.config.value
+        assertEquals(
+            AgentIdSource.SPANREED,
+            cfg[RegistryFlags.agentIdSource],
+            "only under this default does the mint shell out; under DERIVED it needs no spanreed",
+        )
+        assertEquals(
+            UnreachableIdSource.FAIL,
+            cfg[RegistryFlags.idSourceUnreachable],
+            "and only under this one does an unreachable spanreed refuse instead of deriving past",
+        )
+        assertEquals(
+            SpanreedHarness.COMMAND,
+            cfg[RegistryFlags.spanreedCommand],
+            "the shipped default, resolved on PATH — the gate found it at $spanreed",
+        )
+
+        identities = SpanreedCli(store)
+        openSurface("aw-app1")
+        val awakened = assertIs<Awakened.Animated>(awakening.invoke())
+
+        assertEquals(
+            listOf(awakened.binding.spanreedName),
+            awaitReportedNames(1),
+            "the panel's own SPANREED_AGENT_NAME, and the id behind this one came back from a " +
+                "spanreed subprocess rather than from a rule applied locally",
+        )
+        assertEquals(
+            "agent-${awakened.binding.spanreedName}",
+            awakened.binding.agentId,
+            "spanreed still answers agent-id with agent-<name>; a Lifeless bound under anything " +
+                "else is addressed by nobody",
+        )
+        assertEquals(0, minted, "and the counted derived minter is not what ran")
     }
 
     /**

@@ -44,6 +44,10 @@ kotlin {
             // one whose drift shows up as leaked compositors on a shared machine rather than as
             // a failing test.
             implementation(project(path = ":wm", configuration = "jvmTestClasses"))
+            // SpanreedHarness, from `:registry`'s test classes, and the same argument: the gate
+            // consults AWAKENER_REQUIRE_SPANREED before it skips, and that ordering is the
+            // protection this repo names. One copy of it, in the module that owns the bus.
+            implementation(project(path = ":registry", configuration = "jvmTestClasses"))
         }
     }
 }
@@ -227,10 +231,23 @@ tasks.withType<Test>().configureEach {
     // of modules is rather than for a set frozen into a test.
     systemProperty("awakener.modules", siblingModules.joinToString(",") { it.removePrefix(":") })
 
-    // This module now has an integration suite of its own, so it inherits both tool gates whole.
-    // The invoke path needs sway and foot to stand a dock up, and spanreed to answer whether a
-    // Lifeless is animated; `AWAKENER_REQUIRE_*=1` turns a missing tool from a skip into a
-    // failure, which is what stops a green run that verified nothing.
+    // This module has an integration suite of its own, so it inherits both tool gates whole.
+    // `AWAKENER_REQUIRE_*=1` turns a missing tool from a skip into a failure, which is what stops
+    // a green run that verified nothing. What each one covers here, named rather than implied:
+    //
+    //  - sway and foot: every test in `AwakeningSwayTest`, which stands a real dock up.
+    //  - spanreed: `the panel comes up under an identity the real spanreed issued`, and that one
+    //    test alone. It is the only place in the build where the mint runs under the shipped
+    //    default `registry.agent.spanreed_command` — every other spanreed test injects a path or
+    //    a script — so it is also what says an unconfigured `awakener-invoke` can reach the bus.
+    //
+    // The second bullet is what this forwarding was worth *nothing* without, and the wording it
+    // replaces claimed the opposite: it said the invoke path needs spanreed "to answer whether a
+    // Lifeless is animated", which no `:cli` test asked it — the bus is faked in both suites for
+    // the reason `AwakeningSwayTest` gives, and still is. Measured on `e19af5f`, before that test
+    // existed: `:cli:jvmTest` with `AWAKENER_REQUIRE_SPANREED=1` and spanreed off PATH ran
+    // 55 tests, skipped=0, failures=0, BUILD SUCCESSFUL — the same result as with the flag unset,
+    // which is a comment and not a gate (#100).
     System.getenv("AWAKENER_REQUIRE_SWAY")?.let { environment("AWAKENER_REQUIRE_SWAY", it) }
     System.getenv("AWAKENER_REQUIRE_SPANREED")?.let {
         environment("AWAKENER_REQUIRE_SPANREED", it)
