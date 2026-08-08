@@ -161,10 +161,11 @@ check that reads back the artefact you are making a claim about.
   control that the files were read), so the hits are in the scripts, not in anything
   `systemctl` shows you. Those are GitHub slugs for `gh api` and agent dispatch: grepping both
   scripts for `git fetch`, `git pull` and a `cd` into the checkout matched nothing (2026-08-07,
-  with the `awakener` grep above as the positive control that the files were being read), so
-  neither script enters the checkout and the hits do not falsify this bullet. The checkout
-  therefore sits on whatever commit it was last left on, and `git status` reports **clean**
-  the entire time, because it *is* clean — relative to its own stale `HEAD`. That
+  with `/usr/bin/grep -rac awakener` on those same two scripts returning 2 and 1 as the
+  positive control that they were being read), so neither script enters the checkout and the
+  hits do not falsify this bullet. The checkout therefore sits on whatever commit it was last
+  left on, and `git status` reports **clean** the entire time, because it *is* clean —
+  relative to its own stale `HEAD`. That
   command answers "are there uncommitted changes"; it never answers "is this current", and the
   second is what it keeps getting read as. #71: the checkout sat six commits back overnight
   with `cli/build.gradle.kts` at 34 lines against 244 on `origin/main`, and an agent checking a
@@ -257,8 +258,11 @@ someone believes it — it is that an agent who measures, catches the loose clau
   'sway|gnome-shell|weston|Xorg|kwin'` exits 1. A seat is a udev grouping of input devices and
   exists on any machine with a keyboard port; that `fb0` is real too — `ls -la /dev/fb*` →
   `crw-rw---- 1 root video 29, 0 /dev/fb0` and `cat /proc/fb` → `0 EFI VGA` (2026-08-07). So
-  kaladin **has** a graphics device. What it lacks is the **DRM node** a compositor needs, and
-  anything logged in on that seat. **`sudo` here is passwordless**, so installing a tool you
+  kaladin **has** a graphics device. What it lacks is the **DRM node**, and anything logged in
+  on that seat — which does not stop a compositor starting: `WLR_BACKENDS=headless
+  WLR_LIBINPUT_NO_DEVICES=1 sway` logs `drmGetDevices2 failed: No such file or directory` and
+  comes up anyway, with `swaymsg -t get_version` → `sway 1.12` (2026-08-07, on kaladin; that
+  is the probe described below). **`sudo` here is passwordless**, so installing a tool you
   need is your call to make, not something to ask Jason for. `sway`, `foot`, `chromium`, `jq`,
   `qemu` and `waydroid` are already present. **KVM works** (Jason enabled SVM in firmware on
   2026-07-31): `kvm_amd` loads at boot, `/dev/kvm` is mode 0666, nested virtualisation is on.
