@@ -55,6 +55,11 @@ val summaryMatrixTest by tasks.registering(Exec::class) {
     // ones — and installing or upgrading one changes what a green here means. Undeclared, the
     // cache would hand a run that covered gawk and busybox to a later run whose point was mawk.
     inputs.property("awkTooling", toolFingerprint("awk", "gawk", "mawk", "original-awk", "busybox"))
+    // New with #89: the suite now says how many of its declared mutants had to run for its green
+    // to mean anything, and this switch moves that bar. It changes what a pass asserts, so it is a
+    // task input — undeclared, the cache would replay a run that checked a subset into a build
+    // whose point was the full roster. Unset, the suite requires every declared mutant.
+    inputs.property("minMutants", providers.environmentVariable("AWAKENER_MATRIX_MIN_MUTANTS").orElse("all"))
     outputs.file(report)
     commandLine(
         "sh",
@@ -94,6 +99,45 @@ val uploadOutcomeMatrixTest by tasks.registering(Exec::class) {
 }
 
 tasks.named("check") { dependsOn(uploadOutcomeMatrixTest) }
+
+// The staleness check's suite (#123).
+//
+// Wired to `check` for the third time and for the same reason: `check-staleness.sh` is the command
+// CLAUDE.md tells an implementer and a reviewer to run before believing any count, it is edited
+// here, and a red that only arrives after a push arrives after the change has been reported as
+// verified.
+//
+// The tool fingerprint is `git`, and it is not decoration. Every row builds a real repository and
+// every verdict is a git exit status, so which git answered is exactly what a green here is about
+// — `merge-base --is-ancestor` and `rev-parse --verify` are the two calls the whole instrument
+// rests on. Gradle treats neither PATH nor the environment as an input (#28, #29), so without this
+// the build cache would replay a run recorded against one git into a run whose point was another,
+// and an upgraded git would never re-run the suite that exists to characterise it.
+val stalenessMatrixTest by tasks.registering(Exec::class) {
+    group = LifecycleBasePlugin.VERIFICATION_GROUP
+    description = "Runs .github/scripts/check-staleness.sh against its fixture and mutant matrix."
+    val matrix = layout.projectDirectory.file(".github/scripts/staleness-matrix.sh")
+    val script = layout.projectDirectory.file(".github/scripts/check-staleness.sh")
+    val report = layout.buildDirectory.file("reports/staleness-matrix.txt")
+    inputs.file(matrix)
+    inputs.file(script)
+    inputs.property("gitTooling", toolFingerprint("git"))
+    // How much of the counterfactual phase has to have executed for the suite's green to mean
+    // anything. Declared as an input because it changes what a pass asserts, and an undeclared
+    // switch is how a cached run that checked a subset gets replayed into one that demanded all of
+    // it. Unset — the state every build here is in — the suite requires every declared mutant.
+    inputs.property("minMutants", providers.environmentVariable("AWAKENER_MATRIX_MIN_MUTANTS").orElse("all"))
+    outputs.file(report)
+    commandLine(
+        "sh",
+        matrix.asFile.absolutePath,
+        script.asFile.absolutePath,
+        layout.buildDirectory.dir("staleness-matrix").get().asFile.absolutePath,
+        report.get().asFile.absolutePath,
+    )
+}
+
+tasks.named("check") { dependsOn(stalenessMatrixTest) }
 
 // What this build should have run, checked against what it did run.
 //

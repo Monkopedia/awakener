@@ -117,8 +117,28 @@ check that reads back the artefact you are making a claim about.
   implementer before opening and by the reviewer before believing any number in the body:
 
   ```sh
+  .github/scripts/check-staleness.sh
+  ```
+
+  Three outcomes, each with its own word and its own exit status: `current` / 0, `STALE` / 1, and
+  **`UNKNOWN: <reason>` / 2**. The third is why this is a script and not the one-liner it replaces
+  (#123):
+
+  ```sh
   git fetch origin && git merge-base --is-ancestor origin/main HEAD && echo current || echo STALE
   ```
+
+  `||` binds to the whole `&&` list, so *every* way of failing to reach an answer printed `STALE` —
+  a failed fetch, no such remote, running outside a repository, and (twice observed, once on #122)
+  a `cd` in front of it that failed, with ancestry never evaluated. Measured on 2026-08-08 against
+  four forced states, the old idiom printed `STALE` **and exited 0** for all three non-answers, so
+  the word on stdout was its only signal and that word was wrong. It errs safe — it cannot print a
+  false `current` — but "I checked, you are behind" says rebase while "I could not check" says fix
+  the environment, and an agent that rebases on a false STALE spends a build *and* comes away
+  believing it verified currency. Pass `-C <dir>` rather than chaining behind a `cd`; a directory
+  that cannot be entered is `UNKNOWN`, not `STALE`. A detached HEAD is answered, not refused — it
+  resolves to a commit, so the question has an answer. `AWAKENER_STALENESS_UNKNOWN=warn` downgrades
+  `UNKNOWN` from a gate to a report (exit 0); it still never prints `current`.
 
   On `STALE`, rebase or merge and **re-run**, then report the new counts. `mergeStateStatus:
   CLEAN` does **not** imply this — that field answers whether the merge would conflict, which
