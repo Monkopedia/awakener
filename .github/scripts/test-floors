@@ -21,9 +21,41 @@
 # `AWAKENER_TEST_MODULES` and fails if this file and that roster disagree in either direction,
 # so a new module cannot reach `main` without someone stating what it is expected to run.
 #
-# Counts as of `4b2eed0` (CI run 31226978882, job 93023157970): 31 suites, 331 tests, skipped=0
-# — per module, `cli` 5/55, `config` 5/60, `registry` 10/102, `wm` 11/114, read off that run's
-# summary table rather than a local tree. The floors below are those counts.
+# Counts as of the #43 branch rebased onto `1ca031d`: 32 suites, 347 tests, skipped=0 — per
+# module, `cli` 6/60, `config` 5/64, `registry` 10/109, `wm` 11/114, read out of
+# `*/build/test-results/jvmTest/*.xml` after a `clean build --no-build-cache` with both REQUIRE
+# flags set. The floors below are those counts.
+#
+# Three of the four were behind before that change, and only one of the three is its doing: it
+# adds 4 to `cli` and 4 to `config`, while `registry` had been at 109 against a floor of 102
+# since **#127**. The drift note `test-summary.sh` prints named all three on the same line, which
+# is the mechanism working — a floor nobody refreshes decays into a number too small to catch
+# anything short of a module reporting nothing at all.
+#
+# **That attribution said #113 until review caught it, and it was wrong in both halves** — which
+# is worth the space, because a wrong provenance claim in the file whose whole job is provenance
+# is the one kind of error here that propagates: the next person refreshing a floor reads this
+# line rather than re-deriving it. So, derived rather than recalled, every figure from
+# `git grep -c '@Test' <ref> -- registry/src/jvmTest` summed over the files it prints:
+#
+#   - The `102` was not stale since #113. **#122 (`2b92504`) set it**, off CI run 31226978882 on
+#     `4b2eed0` — a tree that already contained #113 (`610154a`, merged five commits earlier).
+#     It was current the day it was written.
+#   - `registry` was at **94** at #113, not 109 — and 94 is exactly the floor #119 (`4b2eed0`)
+#     created and #122 replaced. `4b2eed0` itself sums to 102 (`StorePermissionsTest`, +8).
+#   - The 102 → 109 drift is **#127 (`e19af5f`)**: `ProcessCommandRunnerTest` 7 → 13 `@Test`s and
+#     `SpanreedCliTest` 22 → 23. Two commits touch `registry/src/jvmTest` between `4b2eed0` and
+#     `main`, and only that one moves the count; `9f6521c` extracted `SpanreedHarness` out of
+#     `SpanreedCliTest` and left the sum at 109.
+#
+# `cli`'s sixtieth is #100's (`9f6521c`), not this branch's: the first run of this change measured
+# 59 against `e19af5f`, the rebase onto `9f6521c` brought `AwakeningSwayTest`'s new case with it,
+# and the figure above is from a re-run *after* the rebase. Which is the whole reason the ancestry
+# check exists — the pre-rebase 59 described a tree that was never going to be merged, and so did
+# the 346 this line read before the second rebase, onto `1ca031d` (#129).
+#
+# The line it replaced named `4b2eed0` (CI run 31226978882, job 93023157970): 31 suites, 331
+# tests, `cli` 5/55, `config` 5/60, `registry` 10/102, `wm` 11/114.
 #
 # The previous line named `3d16851` (321 tests), and was behind `main` before it landed. Nothing
 # miscounted, and the ordering is the whole point: those floors came from run 31221639237 on
@@ -34,7 +66,7 @@
 # ran 331 the moment #119 landed, and `test-summary.sh` printed its drift note on every run from
 # the first. A note that has never been silent is a note nobody reads, so when it names a
 # module, refresh this file and this line together.
-cli 55
-config 60
-registry 102
+cli 60
+config 64
+registry 109
 wm 114

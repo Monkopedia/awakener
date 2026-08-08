@@ -71,10 +71,16 @@ private class FakeEvent(
 }
 
 /**
- * What `FileConfigStore.watch` does, which until now nothing said — the mechanism the repo's
+ * What `FileConfigStore.watch` does, which until #87 nothing said — the mechanism the repo's
  * whole "flip a flag against a running system" working model rests on had no test and no
- * caller (#43). It still has no caller: every entry point in the build is one-shot. These are
- * the properties the first long-lived one will be relying on.
+ * caller (#43).
+ *
+ * **These are properties of the mechanism, and every one of them calls `watch` itself.** That
+ * is the right shape here and it is also exactly why this file could be green while the working
+ * model was false of every binary in the build: a suite that calls the thing cannot tell you
+ * whether anything else does. `AwakenerConfigWatchMainTest` in `:cli` is the other half — it
+ * runs `awakener-config watch` as a process and edits the file underneath it — and the two are
+ * complementary rather than duplicates: delete the wiring and only that one goes red.
  *
  * Real time, real files, real inotify — so `runBlocking` rather than `runTest`, whose virtual
  * clock would skip the waits that are the thing under test.
@@ -488,7 +494,20 @@ class FileConfigStoreWatchTest {
         assertEquals(3, watched.store.config.value[WatchKnobs.count], "the values moved")
     }
 
-    /** The lifetime is the caller's: a cancelled scope leaves nothing reading the file. */
+    // ---- How the watch waits between events ----
+
+    /**
+     * The lifetime is the caller's: a cancelled scope leaves nothing reading the file.
+     *
+     * **This one does not exercise the close-to-wake arrangement, and saying so is the point.**
+     * [watching] establishes liveness by writing the file in a loop, so at the moment of
+     * cancellation the `WatchService` still holds events that loop queued: `take` returns a
+     * pending key immediately instead of parking, the loop reaches its `delay`, and *that* is
+     * what observes the cancellation. Delete the sibling and this test stays green. It was
+     * claimed here as the test that held the arrangement; it is not, and the next test is —
+     * which is why that one drains the queue first. What this covers is the ordinary case, and
+     * the ordinary case is worth covering.
+     */
     @Test
     fun `cancelling the scope retires the watch`() = runBlocking {
         val watched = watching("cancelled.json")
@@ -496,6 +515,101 @@ class FileConfigStoreWatchTest {
 
         watched.path.writeText("""{"watch.count": 6}""")
         watched.staysAt(LIVE, QUIET_MS, "the watcher outlived the scope that owned it")
+    }
+
+    /**
+     * The same retirement from the state the arrangement exists for: a watcher genuinely parked
+     * in `WatchService.take`, with nothing queued to return early on.
+     *
+     * `take` parks a thread in a native wait that cancellation cannot reach — cancelling sets a
+     * flag on a coroutine that is not going to look at it — so `watch` runs a sibling coroutine
+     * whose only job is to close the service, and closing it is what returns from the wait.
+     * Nothing else in this class puts the loop there, which is why deleting that sibling left
+     * the whole suite green: measured, `:config` was 63 tests and 0 failures with the sibling
+     * replaced by nothing at all. This test is what makes it 63 passes and one failure, and it
+     * fails on the **join** — the watcher never stops — rather than on an assertion about
+     * values.
+     *
+     * [quiesces] is the part that does the work. A fixed sleep would be a guess about how long
+     * the queue takes to drain; waiting until the snapshot stops being replaced is the
+     * observation that it *has* drained, on the same principle as [watching] establishing
+     * registration by observation rather than by delay.
+     */
+    @Test
+    fun `cancelling a quiescent watch retires it`() = runBlocking {
+        val watched = watching("quiescent.json")
+        watched.quiesces()
+        watched.job.cancelAndJoinWithin()
+
+        watched.path.writeText("""{"watch.count": 6}""")
+        watched.staysAt(LIVE, QUIET_MS, "the watcher outlived the scope that owned it")
+    }
+
+    /**
+     * Waits until nothing has replaced the snapshot for [QUIET_MS], which is what "the watch has
+     * drained its queue and is parked in its wait" looks like from outside.
+     *
+     * Identity rather than value: a re-read that changes no flag still publishes a fresh [Config]
+     * — `load` builds a new one every time and the class defines no `equals` — so `!==` sees the
+     * re-reads that a value comparison cannot. That is the same distinction
+     * `a real overflow under REPORT is reported and provokes no re-read` turns on.
+     */
+    private suspend fun Watched.quiesces() {
+        val drained = withTimeoutOrNull(LIVENESS_MS) {
+            while (true) {
+                val snapshot = store.config.value
+                withTimeoutOrNull(QUIET_MS) { store.config.first { it !== snapshot } } ?: break
+            }
+            true
+        }
+        if (drained == null) {
+            fail("the watch never went quiet within ${LIVENESS_MS}ms, so it was never parked")
+        }
+    }
+
+    /**
+     * The other wakeup, which reaches the snapshot by the same route and gets there by waking
+     * on a timer instead of waiting on the file.
+     *
+     * It exists as a fallback, so what has to be true of it is that it is a *fallback* — a
+     * position of the switch that works — rather than a position that compiles.
+     */
+    @Test
+    fun `the POLL wakeup reaches the live snapshot too`() = runBlocking {
+        val watched = watching("poll.json", mapOf("AWAKENER_CONFIG_WATCH_WAKEUP" to "POLL"))
+        assertEquals(WatchWakeup.POLL, watched.store.config.value[ConfigFlags.watchWakeup])
+
+        watched.path.writeText("""{"watch.count": 2}""")
+        watched.settlesAt(2, "a watch under POLL never saw the edit")
+    }
+
+    /**
+     * And it stops when its scope does, by the mechanism it has instead of the sibling — a
+     * poll returns on its own and the loop then sees an inactive scope.
+     */
+    @Test
+    fun `cancelling the scope retires a POLL watch`() = runBlocking {
+        val watched =
+            watching("poll-cancelled.json", mapOf("AWAKENER_CONFIG_WATCH_WAKEUP" to "POLL"))
+        watched.job.cancelAndJoinWithin()
+
+        watched.path.writeText("""{"watch.count": 6}""")
+        watched.staysAt(LIVE, QUIET_MS, "the watcher outlived the scope that owned it")
+    }
+
+    /**
+     * The interval is a flag rather than the constant it was, and like every other value out of
+     * range it degrades and reports instead of being coerced quietly or taking the watch down.
+     *
+     * Zero is the value worth pinning: a poll of 0ms is a legal argument to `WatchService.poll`
+     * and turns the loop into a spin over a whole core, which is the failure a range exists to
+     * stop and the one that would otherwise be discovered by a fan.
+     */
+    @Test
+    fun `a poll interval out of range degrades to the default and is reported`() {
+        val config = Config.of(mapOf(ConfigFlags.watchPollMs.key to JsonPrimitive(0)))
+        assertEquals(250L, config[ConfigFlags.watchPollMs])
+        assertEquals(listOf(ConfigFlags.watchPollMs.key), config.problems.map { it.key })
     }
 
     private suspend fun Job.cancelAndJoinWithin() {

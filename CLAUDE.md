@@ -370,16 +370,34 @@ behaviours, *build both and add the switch* rather than asking which he wants.
 - Defaults must be the behaviour you would have hard-coded, so an unconfigured system is
   correct.
 - **Never cache a flag value across an operation that could span a reload — read it from the
-  snapshot.** Write to that rule; it is not yet enforced by anything running. `:config` *has*
-  the reload mechanism — `FileConfigStore.watch(scope)` replaces the snapshot when the file
-  changes, and `FileConfigStoreWatchTest` holds it — but **nothing calls it**, because every
-  entry point in the build is one-shot: it reads the file, acts and exits (#43). So a flag flip
-  applies to the next run, not to a running process, and `awakener-config list` says so. The
-  per-operation re-reads in `:wm` and `:cli` are forward-looking rather than cargo, and the
-  first entry point that outlives one operation is expected to call `watch` at the composition
-  root. Until then this bullet describes a discipline, not an observed property — which is
-  exactly why it is worth keeping: re-deriving it after the first daemon exists costs more than
-  writing it this way now.
+  snapshot.** `:config` has the reload mechanism — `FileConfigStore.watch(scope)` replaces the
+  snapshot when the file changes — and it now has a caller: **`awakener-config watch`**, which
+  follows the file and reports every change for as long as it runs (#43). So the rule is
+  observable in one process rather than argued in none. **It is still not observable in the
+  others**: `awakener-invoke` and `awakener-registry` read the file once, act and exit, so a
+  flip reaches them on their next run and `awakener-config list` says exactly that. Keep writing
+  the per-operation re-reads anyway — they are what makes the reload work in whatever becomes
+  long-lived next, and the argument for them no longer rests on a promise nothing kept.
+  `config.watch.enabled` switches following off for a process that has it.
+
+  **Two things a long-lived process owes this rule beyond re-reading.** A watch waits on the
+  file and does not wake on a timer — `config.watch.wakeup` defaults to `BLOCK` for exactly the
+  "no unattended autonomous action" reason, and `POLL` with its `config.watch.poll_ms` interval
+  is the fallback rather than the default. And a suite that calls `watch` cannot tell you
+  whether anything else does: `FileConfigStoreWatchTest` was fully green for the whole period
+  in which the mechanism had no caller at all. Wiring is proved by running the entry point,
+  which is what `AwakenerConfigWatchMainTest` does.
+
+  **The same shape reappears one layer down, in a test's *setup* rather than in a caller**, and
+  it is worth recognising because it is invisible from the assertion: `BLOCK` parks in
+  `WatchService.take`, which cancellation cannot reach, so `watch` closes the service from a
+  sibling coroutine to wake it — and every test that established liveness by writing the file
+  in a loop left events queued, so `take` returned a pending key instead of parking and the
+  arrangement was never exercised. Deleting the sibling outright left `:config` at 63 tests and
+  0 failures, under a KDoc claiming that test held it. **A test reaches a mechanism only from
+  the state that mechanism exists for**, so say which state that is and put the test in it —
+  `cancelling a quiescent watch retires it` drains the queue first, and is the one case that
+  goes red.
 - A snapshot is total: a bad value degrades to that flag's default and is reported through
   `Config.problems`. The config file gets hand-edited against a running desktop, so a typo
   must not take the process down.

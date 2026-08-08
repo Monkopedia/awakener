@@ -117,16 +117,17 @@ class Config internal constructor(
  * A reloadable source of configuration.
  *
  * Implementations publish a new snapshot when the underlying source changes — but for
- * `FileConfigStore` that happens only while something is running its `watch`, and **nothing in
- * the build does yet** (#43), because every entry point is one-shot. So today a flag flip
- * applies to the next run rather than to a running process.
+ * `FileConfigStore` that happens only while something is running its `watch`, and **which
+ * processes do is a fact about those processes, not about this interface** (#43).
+ * `awakener-config watch` runs one; every other entry point in the build is one-shot, reads the
+ * file once and exits, so a flag flip reaches those on their next run.
  *
- * Callers still read from [config] per operation rather than caching a value at construction.
- * That is what makes the reload work the day the first long-lived entry point wires `watch`,
- * and it is the discipline this module asks of everyone else — so it is written as a property
- * of the design, not as an observed property of the binary. Do not read this interface as a
- * promise that the property is already live: it said exactly that, without the qualifier, and
- * the reader it misled was the one who would otherwise have gone and wired the watch.
+ * Callers therefore read from [config] per operation rather than caching a value at
+ * construction. In a one-shot process that is a shape rather than a defence, and it costs
+ * nothing; in a process that outlives one operation it is the whole of how a reload arrives.
+ * Do not read this interface as a promise that every caller is in the second kind — it said
+ * exactly that, without the qualifier, and the reader it misled was the one who would otherwise
+ * have gone and wired the watch.
  */
 interface ConfigStore {
     val config: StateFlow<Config>
