@@ -150,11 +150,17 @@ check that reads back the artefact you are making a claim about.
   2026-08-05: kaladin has no cron at all (no `crontab` binary, no `/etc/cron.*`), and no unit
   reachable from `systemctl list-timers`, system or user, runs `git fetch` or `git pull`
   against this checkout. #71 is the corroboration, since a scheduled pull would have prevented
-  what it describes. **Two timer-activated scripts do *name* the repo** —
+  what it describes. **Two scripts within a timer's blast radius do *name* the repo** —
   `~/git/urithiru/workflows/triage-fanout.sh:70` and `health-rotation.sh:58`, both carrying
-  `Monkopedia/awakener` in a `ROSTER` array — so a grep for `awakener` across scheduled units
-  returns hits. Those are GitHub slugs for `gh api` and agent dispatch: grepping both scripts
-  for `git fetch`, `git pull` and a `cd` into the checkout matched nothing (checked 2026-08-07,
+  `Monkopedia/awakener` in a `ROSTER` array — but only one of them is timer-*activated*:
+  `code-health.timer` → `code-health.service` → `health-fanout.sh:24` execs
+  `health-rotation.sh`, whereas `nightly-triage.timer` → `nightly-triage.service` →
+  `nightly-triage.sh` only `spanreed send`s a `nightly_triage` message to main-coordinator,
+  which runs `triage-fanout.sh` as an agent. And the units hold no `awakener` at all
+  (`/usr/bin/grep -ra awakener ~/.config/systemd/user/` exits 1, with `triage` as the positive
+  control that the files were read), so the hits are in the scripts, not in anything
+  `systemctl` shows you. Those are GitHub slugs for `gh api` and agent dispatch: grepping both
+  scripts for `git fetch`, `git pull` and a `cd` into the checkout matched nothing (2026-08-07,
   with the `awakener` grep above as the positive control that the files were being read), so
   neither script enters the checkout and the hits do not falsify this bullet. The checkout
   therefore sits on whatever commit it was last left on, and `git status` reports **clean**
@@ -228,17 +234,30 @@ conversation, not a local workaround.
 
 ## Environment (verified 2026-07-30 — re-check before relying on it)
 
+**Correcting a claim in this section: the replacement must be at least as precise as the
+evidence that falsified it.** Five entries here have been wrong and three of those were
+introduced *while correcting an earlier one* — each time by measuring something sharp and
+writing it down blunt. `ls /dev/dri` failing while `seat-status` showed `fb0` distinguishes a
+DRM node from a graphics device; the sentence that replaced "no seat at all" said "no graphics
+device" and lost the distinction the measurement had just drawn. Quote the command, and let
+the clause claim no more than its output does. The cost of a blunt replacement is not that
+someone believes it — it is that an agent who measures, catches the loose clause, and
+**discards the whole bullet**, operative claims included.
+
 - **kaladin** — this repo's host. Headless: no `/dev/dri`, no seated session, no compositor.
   Cannot run anything needing a display. **It does have a `seat0`, and that does not
   contradict the sentence before it** — this said "no seat at all" until 2026-08-07 and the
   correction is the only reason the bullet still reads as trustworthy. Re-measured that day,
   every command below run on kaladin: `loginctl list-seats` → `seat0`, `1 seats listed`;
-  `loginctl seat-status seat0` lists input devices, USB hubs, a sound card and NIC LEDs but
-  **no DRM node**; `ls -la /dev/dri` → `No such file or directory`, with `ls -la /dev/kvm` in
+  `loginctl seat-status seat0` lists input devices, USB hubs, a sound card, NIC LEDs and one
+  graphics device (`graphics:fb0 "EFI VGA"`), but **no DRM node**; `ls -la /dev/dri` → `No
+  such file or directory`, with `ls -la /dev/kvm` in
   the same invocation succeeding, so the probe was working and the absence is real;
   `loginctl list-sessions` shows both sessions with `SEAT` empty; `pgrep -a
   'sway|gnome-shell|weston|Xorg|kwin'` exits 1. A seat is a udev grouping of input devices and
-  exists on any machine with a keyboard port; what kaladin lacks is a graphics device and
+  exists on any machine with a keyboard port; that `fb0` is real too — `ls -la /dev/fb*` →
+  `crw-rw---- 1 root video 29, 0 /dev/fb0` and `cat /proc/fb` → `0 EFI VGA` (2026-08-07). So
+  kaladin **has** a graphics device. What it lacks is the **DRM node** a compositor needs, and
   anything logged in on that seat. **`sudo` here is passwordless**, so installing a tool you
   need is your call to make, not something to ask Jason for. `sway`, `foot`, `chromium`, `jq`,
   `qemu` and `waydroid` are already present. **KVM works** (Jason enabled SVM in firmware on
