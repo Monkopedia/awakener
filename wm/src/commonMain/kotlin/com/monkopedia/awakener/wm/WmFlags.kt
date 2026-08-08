@@ -538,7 +538,8 @@ object WmFlags {
             "which is the property the registry exists for, and the design note's tripwire — " +
             "'if the table ever appears in resolve's path, the durability story has rotted' — " +
             "becomes a check somebody can run rather than a promise. ENUMERATION is the previous " +
-            "behaviour: the key comes from surfaces(), which filters out docks and the windows " +
+            "behaviour: the key comes from the enumerating form, which filters out docks and the " +
+            "windows " +
             "an in-flight attach has reserved, so anything the table is hiding resolves as a " +
             "Drab however durably it is bound — a surface hidden by a latched recognition (see " +
             "wm.dock.reap_evidence) or by a reservation under a shared dock app_id then reads as " +
@@ -546,8 +547,8 @@ object WmFlags {
             "already has one. Its one property TREE does not have is that resolve answers " +
             "nothing for a dock: under TREE a dock is an ordinary node and resolves to whatever " +
             "the registry holds under the key its app_id gives, which is nothing unless " +
-            "something bound that key. Callers get their surface ids from surfaces(), which " +
-            "excludes docks under both values.",
+            "something bound that key. Callers get their surface ids from resolve's null-argument " +
+            "form, which excludes docks under both values.",
     )
 
     val mapWaitMs = Flags.long(
@@ -720,7 +721,7 @@ object WmFlags {
             "sway allocates con_ids from a counter that restarts with the compositor — measured " +
             "across two sequential sessions under one client, session A's dock id was session " +
             "B's browser — so a handle that outlives its session does not name a dead window, it " +
-            "names somebody else's live one. REFUSE fails focus, settleFocus and detach on such " +
+            "names somebody else's live one. REFUSE fails focus and detach on such " +
             "a handle with the same compositor-agnostic CompositorSessionEnded the change stream " +
             "reports, which tells a caller holding it exactly what it is holding. ACT is the " +
             "previous behaviour and was harmless only because it was unreachable: before " +

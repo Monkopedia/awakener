@@ -12,6 +12,8 @@ import com.monkopedia.awakener.registry.WindowIdentity
 import com.monkopedia.awakener.registry.asIdentity
 import com.monkopedia.awakener.wm.DockHandle
 import com.monkopedia.awakener.wm.DockSpec
+import com.monkopedia.awakener.wm.FocusTarget
+import com.monkopedia.awakener.wm.Resolution
 import com.monkopedia.awakener.wm.Surface
 import com.monkopedia.awakener.wm.SurfaceChange
 import com.monkopedia.awakener.wm.SurfaceId
@@ -330,11 +332,16 @@ class AwakeningTest {
         val attaches = mutableListOf<Attach>()
         var attachFailure: Throwable? = null
 
-        override suspend fun surfaces(): List<Surface> = surfaces
-
-        override suspend fun resolve(surface: SurfaceId): AgentId? =
-            surfaces.firstOrNull { it.id == surface }
-                ?.let { registry.resolve(SurfaceKey.of(it.descriptor, config.config.value))?.agent }
+        override suspend fun resolve(surface: SurfaceId?): List<Resolution> =
+            surfaces.filter { surface == null || it.id == surface }
+                .map {
+                    Resolution(
+                        it,
+                        registry.resolve(
+                            SurfaceKey.of(it.descriptor, config.config.value),
+                        )?.agent,
+                    )
+                }
 
         override suspend fun attach(
             surface: SurfaceId,
@@ -359,8 +366,7 @@ class AwakeningTest {
         override val agent: AgentId,
         override val dockId: SurfaceId,
     ) : DockHandle {
-        override suspend fun focus() = Unit
-        override suspend fun settleFocus() = Unit
+        override suspend fun focus(target: FocusTarget) = Unit
         override suspend fun detach() = Unit
     }
 }
