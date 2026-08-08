@@ -230,9 +230,9 @@ class SpanreedCliTest {
 
     /**
      * And it is refused for *being* short rather than for happening to be unparseable — which
-     * is what stops the guard depending on the decoder's luck. There is no prefix of a JSON
-     * array that parses, so today the two coincide; a `list` that ever grew a line-oriented
-     * form would separate them, and this is the assertion that survives it.
+     * is what stops the guard depending on the decoder's luck. For every document that can
+     * arrive here the two coincide; a `list` that ever grew a line-oriented form would separate
+     * them, and this is the assertion that survives it.
      */
     @Test
     fun `a list the runner says it read short is refused even when it parses`() = runTest {
@@ -241,6 +241,65 @@ class SpanreedCliTest {
             assertFailsWith<IllegalStateException> { cli.liveAgents() }
                 .message!!.contains("cut off"),
         )
+    }
+
+    /**
+     * The decoder's half of that pair, and it is a claim about *value identity* rather than
+     * about which documents parse.
+     *
+     * In a document that is one JSON array plus whitespace the top-level `]` is the last
+     * non-whitespace character, so a proper prefix that parses at all has to contain it, and
+     * then differs from the whole only by trailing whitespace — every parseable proper prefix
+     * decodes to the same array. A truncated `list` is therefore a parse failure or the
+     * identical answer, never a different plausible one.
+     *
+     * **Two earlier statements of this were false, and the second is why this fixture carries a
+     * trailing newline.** "A JSON array has no proper prefix that parses" is falsified by `[]`
+     * against `[]\n`. Narrowing it to "no proper prefix of a **non-empty** array parses" is
+     * falsified by the same construction one step along: `spanreed list` emits a trailing
+     * newline, so the canonical one-element text below is a proper prefix of the document that
+     * actually arrives, and it parses. A version of this test over a fixture with no trailing
+     * whitespace could not reach that prefix and so could not fail on the false claim — which is
+     * the whole of what was wrong with it, and the reason the document, not the value text, is
+     * what gets truncated here (#110).
+     */
+    @Test
+    fun `every parseable proper prefix of a list decodes to the same list`() = runTest {
+        // The document `spanreed list` actually emits, trailing newline and all: measured
+        // against a scratch SPANREED_STATE_ROOT, `spanreed list | od -c` is `[  ]  \n` on an
+        // empty bus and ends `]  \n` on one with an agent registered.
+        val whole = """[{"agent_id": "agent-lifeless-a", "name": "lifeless-a"}]"""
+        val document = "$whole\n"
+
+        response = ProcessResult(0, document, "")
+        val answer = cli.liveAgents()
+        assertEquals(1, answer.size, "the document as sent decodes")
+
+        for (cut in document.indices) {
+            val prefix = document.substring(0, cut)
+            response = ProcessResult(0, prefix, "")
+            if (prefix.trimEnd() == whole) {
+                // Holds the top-level `]`, so it is the whole answer minus whitespace. This
+                // is the prefix the false claim denies exists; it is reached once, at
+                // cut == whole.length, and only because `document` is longer than `whole`.
+                assertEquals(
+                    answer,
+                    cli.liveAgents(),
+                    "a prefix of length $cut decoded into a different answer",
+                )
+            } else {
+                assertFailsWith<Exception>("a prefix of length $cut decoded into an answer") {
+                    cli.liveAgents()
+                }
+            }
+        }
+
+        // The empty bus is not a special case under identity, which is the point: `[]` is the
+        // parseable proper prefix of `[]\n` and decodes to what the whole of it decodes to.
+        response = ProcessResult(0, "[]\n", "")
+        assertEquals(emptyList(), cli.liveAgents())
+        response = ProcessResult(0, "[]", "")
+        assertEquals(emptyList(), cli.liveAgents())
     }
 
     // ------------------------------------------------------------ minting against a real child

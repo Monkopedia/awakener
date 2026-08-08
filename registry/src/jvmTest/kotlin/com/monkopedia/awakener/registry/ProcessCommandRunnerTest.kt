@@ -1,14 +1,20 @@
 package com.monkopedia.awakener.registry
 
+import com.monkopedia.awakener.config.Config
+import com.monkopedia.awakener.config.InMemoryConfigStore
+import java.io.IOException
+import java.io.InputStream
 import java.nio.file.Files
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
 import kotlin.io.path.readText
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.test.fail
+import kotlinx.serialization.json.JsonPrimitive
 
 /**
  * The one place awakener leaves its own process, exercised as a real subprocess.
@@ -46,7 +52,8 @@ class ProcessCommandRunnerTest {
     fun `a hung child is killed when the timeout expires`() {
         val startedAt = System.nanoTime()
         val result = bounded(seconds = 15) {
-            ProcessCommandRunner(timeoutMs = 300).run(listOf("sh", "-c", "sleep 60"), emptyMap())
+            ProcessCommandRunner(timeoutMs = { 300L })
+                .run(listOf("sh", "-c", "sleep 60"), emptyMap())
         }
         val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000
 
@@ -92,8 +99,9 @@ class ProcessCommandRunnerTest {
     fun `a stdout that was only half read is not reported as success`() {
         val result = bounded(seconds = 15) {
             ProcessCommandRunner().run(
-                // The second half arrives after DRAIN_GRACE_MS, from a background job the child
-                // leaves holding its stdout — so the child exits 0 with its output in flight.
+                // The second half arrives after registry.agent.drain_grace_ms (1s by default),
+                // from a background job the child leaves holding its stdout — so the child exits
+                // 0 with its output in flight.
                 listOf("sh", "-c", "{ printf part; sleep 5; printf rest; } &\nsleep 1\nexit 0"),
                 emptyMap(),
             )
@@ -120,6 +128,203 @@ class ProcessCommandRunnerTest {
         assertTrue(result.succeeded)
     }
 
+    // -------------------------------------------------------- #110: one observation, not two
+    //
+    // `Drain.collect` snapshotted the buffer and *then* read the flag saying whether the read
+    // had finished, and the flag was written outside the buffer's monitor. A drain that appended
+    // its last chunk in the gap between those two therefore published a prefix with `shortRead`
+    // null — the one outcome the whole signal exists to prevent.
+    //
+    // **The real window is tens of nanoseconds and nothing can hit it on purpose**: it is the
+    // stretch between a `monitorexit` and the volatile read on the next line, and reaching it
+    // needs the collector descheduled there while the drain runs append, EOF and a write. So
+    // these two do not try. They pin the invariant — *a body reported whole is the whole body* —
+    // over an interleave that is scheduled rather than raced, and they are calibrated to catch
+    // the defect when its window is widened enough to be reachable. Measured, on this tree:
+    // reinstating the pre-fix ordering with a 500ms delay wedged into the gap reds the first of
+    // these and leaves every pre-existing `:registry` test green, including the one directly
+    // above — its own margin is 3s, so it does not notice until the widening is 6× larger.
+
+    /**
+     * The drain's grace expires with the answer still in flight, and what comes back has to say
+     * so — with the body and the verdict on it taken as one observation, not two.
+     *
+     * `registry.agent.drain_grace_ms` is 200 here and the rest of the output lands ~300ms after
+     * that expires, which is what makes the interleave scheduled rather than raced: the snapshot
+     * happens first, and the only way to report this body as complete is to read the completion
+     * flag *later* than the body. 300ms is the sensitivity — it is how far the gap has to be
+     * stretched before the defect is visible at all — and it is deliberately much tighter than
+     * the 3s margin the test above happens to have.
+     *
+     * The invariant is asserted rather than the exact string, because the assertion has to stay
+     * true in both directions: on a stalled machine the drain may legitimately have finished
+     * before the snapshot, and `partrest` with no short read is then the correct answer. What is
+     * never correct is `part` with no short read — so a stall makes this test weaker, never
+     * flaky, which is the trade to want in a timing test that gates a build.
+     */
+    @Test
+    fun `a body reported whole is the whole body, even across the grace expiring`() {
+        val result = bounded(seconds = 15) {
+            ProcessCommandRunner(drainGraceMs = { 200L }).run(
+                listOf("sh", "-c", "{ printf part; sleep 1.5; printf rest; } &\nsleep 1\nexit 0"),
+                emptyMap(),
+            )
+        }
+
+        assertEquals(0, result.exitCode, "the child exits cleanly; that is what makes this hard")
+        assertTrue(
+            result.stdout == "part" || result.stdout == "partrest",
+            "the child writes 'partrest' in two pieces, so anything else is a third failure: " +
+                "'${result.stdout}'",
+        )
+        assertTrue(
+            result.shortRead != null || result.stdout == "partrest",
+            "a prefix reported as whole is the defect (#110): stdout='${result.stdout}' " +
+                "shortRead=${result.shortRead}",
+        )
+    }
+
+    /**
+     * The control, and it is not optional: an implementation that reported every read as short
+     * would satisfy the invariant above completely, and it is the implementation a too-eager
+     * guard produces.
+     *
+     * Same shape — a background job holding the pipe past the child's exit — with the grace set
+     * wide enough that the drain finishes inside it. Both halves must come back, and the read
+     * must not be accused of truncation.
+     */
+    @Test
+    fun `a read that finished inside the grace is whole and is not accused of being short`() {
+        val result = bounded(seconds = 15) {
+            ProcessCommandRunner(drainGraceMs = { 3_000L }).run(
+                listOf("sh", "-c", "{ printf part; sleep 0.2; printf rest; } &\nsleep 1\nexit 0"),
+                emptyMap(),
+            )
+        }
+
+        assertEquals("partrest", result.stdout)
+        assertNull(result.shortRead)
+        assertTrue(result.succeeded)
+    }
+
+    /**
+     * The third arm of the same observation, and the one no public path can reach on demand.
+     *
+     * `Drain` resolves a read three ways — EOF, the grace expiring, and the read *failing* —
+     * and all three now happen under one monitor. The first two are driven above through a real
+     * child; the third needs a pipe that breaks mid-read, which is not something to fake against
+     * a live one, so it landed with #110 disclosed as untested.
+     *
+     * It is reachable without widening anything production sees: `Drain` is `internal`, it reads
+     * whatever [InputStream] it is handed, and a stream that throws after *n* bytes is a few
+     * lines here. The property is the one the whole change is about — a read that ended early
+     * yields the prefix **and** a reason, never the prefix alone — and the clean stream at the
+     * end is the control, because "always report a failure" would satisfy the first half by
+     * itself.
+     */
+    @Test
+    fun `a stream that fails mid-read yields the prefix and a reason`() {
+        val head = "agent-lifeless-".toByteArray()
+        val breaks = object : InputStream() {
+            private var at = 0
+
+            override fun read(): Int {
+                if (at >= head.size) throw IOException("the pipe went away")
+                return head[at++].toInt() and 0xff
+            }
+
+            override fun read(b: ByteArray, off: Int, len: Int): Int {
+                if (at >= head.size) throw IOException("the pipe went away")
+                val n = minOf(len, head.size - at)
+                head.copyInto(b, off, at, at + n)
+                at += n
+                return n
+            }
+        }
+
+        val cut = ProcessCommandRunner.Drain(breaks, 5_000L).collect()
+
+        assertEquals("agent-lifeless-", cut.text, "what did arrive is kept, not discarded")
+        val reason = assertNotNull(cut.shortBy, "a prefix with no reason is the defect (#51/#110)")
+        assertTrue(reason.contains("failed mid-read"), "the reason must name the cause: $reason")
+
+        val intact = "agent-lifeless-firefox\n".byteInputStream()
+        val whole = ProcessCommandRunner.Drain(intact, 5_000L).collect()
+
+        assertEquals("agent-lifeless-firefox\n", whole.text)
+        assertNull(whole.shortBy, "a stream that reached EOF must not be accused of failing")
+    }
+
+    // ------------------------------------------------------------------ the budgets are flags
+    //
+    // Both numbers govern how long a key press can stall, which is Jason's time rather than a
+    // fact about the system, so both are flags and neither is captured when the runner is built.
+    // These drive the config-store constructor — the one production uses — so a flag that stops
+    // reaching the runner fails here rather than in a hotkey.
+
+    @Test
+    fun `the kill deadline comes from registry_agent_command_timeout_ms`() {
+        val config = InMemoryConfigStore().put(RegistryFlags.commandTimeoutMs, 300L)
+        val startedAt = System.nanoTime()
+        val result = bounded(seconds = 15) {
+            ProcessCommandRunner(config).run(listOf("sh", "-c", "sleep 60"), emptyMap())
+        }
+        val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000
+
+        assertEquals(ProcessResult.TIMED_OUT, result.exitCode)
+        assertTrue(
+            result.stderr.contains("timed out after 300ms"),
+            "the note has to quote the budget that was actually applied: ${result.stderr}",
+        )
+        assertTrue(elapsedMs < 10_000, "took ${elapsedMs}ms against a 300ms flag")
+    }
+
+    @Test
+    fun `the drain grace comes from registry_agent_drain_grace_ms`() {
+        val config = InMemoryConfigStore().put(RegistryFlags.drainGraceMs, 200L)
+        val startedAt = System.nanoTime()
+        val result = bounded(seconds = 15) {
+            ProcessCommandRunner(config).run(
+                listOf("sh", "-c", "{ printf part; sleep 5; printf rest; } &\nsleep 1\nexit 0"),
+                emptyMap(),
+            )
+        }
+        val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000
+
+        assertEquals(0, result.exitCode)
+        assertTrue(
+            result.shortRead?.contains("200ms") == true,
+            "the reason has to quote the grace that was actually spent: ${result.shortRead}",
+        )
+        assertTrue(
+            elapsedMs < 3_000,
+            "took ${elapsedMs}ms: a 200ms grace must not wait out a 5s grandchild",
+        )
+    }
+
+    /**
+     * A negative grace is a value that decodes and is nonsense, which is the half of "bad value"
+     * that used to change behaviour in silence. Declared on the flag, so the file can be
+     * hand-edited against a running desktop and a typo degrades and says so.
+     */
+    @Test
+    fun `an out-of-range budget degrades to its default and is reported`() {
+        val snapshot = Config.of(
+            mapOf(
+                RegistryFlags.drainGraceMs.key to JsonPrimitive(-1),
+                RegistryFlags.commandTimeoutMs.key to JsonPrimitive(0),
+            ),
+        )
+
+        assertEquals(1_000L, snapshot[RegistryFlags.drainGraceMs])
+        assertEquals(10_000L, snapshot[RegistryFlags.commandTimeoutMs])
+        assertEquals(
+            setOf(RegistryFlags.drainGraceMs.key, RegistryFlags.commandTimeoutMs.key),
+            snapshot.problems.map { it.key }.toSet(),
+            "a budget that degraded silently is a hotkey whose stall nobody can explain",
+        )
+    }
+
     /**
      * A slow spanreed's own stderr is the one thing that says why it was slow, and the timeout
      * branch used to replace it with the timeout note. The two failures compound: an operator
@@ -128,7 +333,7 @@ class ProcessCommandRunnerTest {
     @Test
     fun `a killed child keeps the stderr it managed to write`() {
         val result = bounded(seconds = 15) {
-            ProcessCommandRunner(timeoutMs = 500).run(
+            ProcessCommandRunner(timeoutMs = { 500L }).run(
                 listOf("sh", "-c", "echo 'registry is locked, retrying' >&2; sleep 60"),
                 emptyMap(),
             )
@@ -168,7 +373,7 @@ class ProcessCommandRunnerTest {
 
         val caller = Thread {
             try {
-                ProcessCommandRunner(timeoutMs = 60_000).run(
+                ProcessCommandRunner(timeoutMs = { 60_000L }).run(
                     listOf("sh", "-c", "echo $$ > '$pidFile'; exec sleep 30"),
                     emptyMap(),
                 )

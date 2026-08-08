@@ -72,7 +72,7 @@ class RegistryPathsTest {
     @Test
     fun `not runnable is not reported as a timeout`() {
         val absent = ProcessCommandRunner().run(listOf("awakener-no-such-spanreed"), emptyMap())
-        val timedOut = ProcessCommandRunner(timeoutMs = 50).run(listOf("sleep", "5"), emptyMap())
+        val timedOut = ProcessCommandRunner(timeoutMs = { 50L }).run(listOf("sleep", "5"), emptyMap())
         assertFalse(absent.succeeded)
         assertFalse(timedOut.succeeded)
         assertTrue(

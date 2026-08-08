@@ -47,6 +47,13 @@ data class ProcessResult(
      * job holding its stdout; the other twenty-four are caught. Anything whose correctness turns
      * on completeness therefore needs its own framing check as well, which is why
      * [SpanreedCli] requires an `agent-id` answer to carry the line terminator a whole line has.
+     *
+     * That quantification covers **one** path to the residual and there used to be a second: the
+     * drain read its completion flag *after* it had snapshotted the buffer, so a drain that
+     * appended its last chunk in the gap between the two reported a prefix with nothing saying
+     * so. That one is closed — the buffer and the flags are now one observation under one
+     * monitor (#110) — so the JVM's pipe substitution is again the whole of what this field
+     * cannot see.
      */
     val shortRead: String? = null,
 ) {
@@ -93,8 +100,16 @@ data class ProcessResult(
  * variable** rather than setting it empty. Removal is not a convenience: awakener's own process
  * routinely runs with `SPANREED_AGENT_NAME` set — the hotkey path is reached from a session that
  * has one, and `awakener-invoke` is a child of whatever launched it — so a read of the whole bus
- * issued without clearing it would be issued *as* some other agent. Setting it empty is not the
- * same thing either, since spanreed's override is on presence.
+ * issued without clearing it would be issued *as* some other agent.
+ *
+ * Setting it empty would reach spanreed the same way — `identity.py` tests the override with
+ * `if override:`, so an empty value and an absent variable take the same branch and spanreed
+ * cannot tell them apart. (Measured, because this doc claimed the opposite until #109: with
+ * `SPANREED_AGENT_NAME=""` and with it unset, `spanreed agent-id` printed the same cwd-derived
+ * `agent-0474e11f`.) The reason to remove rather than blank it is about everything *else* in the
+ * child's environment: an empty name is a lie any other reader of that variable would believe,
+ * and removal is what "as nobody in particular" actually means. Weaker than the claim it
+ * replaces, and enough to keep the `String?`.
  */
 fun interface CommandRunner {
     fun run(command: List<String>, environment: Map<String, String?>): ProcessResult
@@ -105,12 +120,34 @@ fun interface CommandRunner {
  *
  * Every call here is on the hotkey path — the default [AgentIdSource] shells out to mint an
  * identity, and `attach` awaits it — so the contract is that [run] returns within [timeoutMs]
- * whatever the child does, and returns at all whether or not there is a child to run.
+ * (plus at most one [drainGraceMs] per pipe) whatever the child does, and returns at all whether
+ * or not there is a child to run.
  *
- * @param timeoutMs how long the child gets before it is killed. A parameter rather than a
- * constant so a test can prove the timeout fires without spending the production budget waiting.
+ * Both budgets are suppliers rather than numbers, and both are read once per [run]. That is what
+ * lets the flags behind them be read from the live snapshot instead of captured when the runner
+ * was built: an operation gets one consistent pair, and the next operation gets whatever the
+ * config file says by then.
+ *
+ * @param timeoutMs how long the child gets before it is killed.
+ * @param drainGraceMs how long a finished child's pipes are still read before the runner keeps
+ * what arrived and calls the read short.
  */
-class ProcessCommandRunner(private val timeoutMs: Long = DEFAULT_TIMEOUT_MS) : CommandRunner {
+class ProcessCommandRunner(
+    private val timeoutMs: () -> Long = { RegistryFlags.commandTimeoutMs.default },
+    private val drainGraceMs: () -> Long = { RegistryFlags.drainGraceMs.default },
+) : CommandRunner {
+    /**
+     * The production wiring: both budgets come off the config snapshot at the moment of the call.
+     *
+     * Not read at construction, because a value captured then is a value a live edit cannot
+     * reach — and these two are exactly the numbers somebody tunes against a running desktop
+     * when a hotkey feels slow.
+     */
+    constructor(configStore: ConfigStore) : this(
+        timeoutMs = { configStore.config.value[RegistryFlags.commandTimeoutMs] },
+        drainGraceMs = { configStore.config.value[RegistryFlags.drainGraceMs] },
+    )
+
     override fun run(command: List<String>, environment: Map<String, String?>): ProcessResult {
         val builder = ProcessBuilder(command)
             .apply {
@@ -162,6 +199,11 @@ class ProcessCommandRunner(private val timeoutMs: Long = DEFAULT_TIMEOUT_MS) : C
     }
 
     private fun drainAndWait(process: Process): ProcessResult {
+        // Both budgets read once, here, so the whole of one run is measured against one pair.
+        // Re-reading per drain would let a config reload land between the two pipes of a single
+        // command and give stdout and stderr different grace periods.
+        val timeout = timeoutMs()
+        val grace = drainGraceMs()
         // Nothing awakener runs is fed on stdin, and a child that reads it would otherwise wait
         // forever for input that is never coming.
         process.outputStream.close()
@@ -170,9 +212,9 @@ class ProcessCommandRunner(private val timeoutMs: Long = DEFAULT_TIMEOUT_MS) : C
         // (~64 KiB) to stderr: it blocks on that write, so it never closes stdout, so the read
         // never returns — and a timeout applied *after* the reads can then never fire. A
         // spanreed that logs a stack trace is enough to hit it.
-        val stdout = Drain(process.inputStream)
-        val stderr = Drain(process.errorStream)
-        if (!process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) {
+        val stdout = Drain(process.inputStream, grace)
+        val stderr = Drain(process.errorStream, grace)
+        if (!process.waitFor(timeout, TimeUnit.MILLISECONDS)) {
             process.destroyForcibly()
             // Killing the child closes its pipes, which is what lets the drains finish.
             process.waitFor()
@@ -183,7 +225,7 @@ class ProcessCommandRunner(private val timeoutMs: Long = DEFAULT_TIMEOUT_MS) : C
             return ProcessResult(
                 ProcessResult.TIMED_OUT,
                 out.text,
-                listOf(stderr.collect().noted(), "timed out after ${timeoutMs}ms")
+                listOf(stderr.collect().noted(), "timed out after ${timeout}ms")
                     .filter { it.isNotEmpty() }
                     .joinToString("\n"),
                 shortRead = out.shortBy,
@@ -198,8 +240,12 @@ class ProcessCommandRunner(private val timeoutMs: Long = DEFAULT_TIMEOUT_MS) : C
         )
     }
 
-    /** What one pipe yielded, and — [shortBy] — why that may not be the whole of it. */
-    private class Read(val text: String, val shortBy: String?) {
+    /**
+     * What one pipe yielded, and — [shortBy] — why that may not be the whole of it.
+     *
+     * `internal` for the same reason as [Drain]: it is that class's answer.
+     */
+    internal class Read(val text: String, val shortBy: String?) {
         /**
          * The text with the reason folded in, for a pipe whose completeness is not modelled.
          * Only stderr is read this way; see [ProcessResult.shortRead].
@@ -222,20 +268,45 @@ class ProcessCommandRunner(private val timeoutMs: Long = DEFAULT_TIMEOUT_MS) : C
      * #51: the join returned whatever had arrived, and a `runCatching {}` around the read loop
      * made a mid-read `IOException` look identical to a clean EOF. Both now come back as a
      * reason on [Read.shortBy], and it is the caller's to decide about.
+     *
+     * **How much arrived and whether that was all of it are one fact, so they are read as one**
+     * (#110). They were two: the buffer was snapshotted under [text]'s monitor and [atEnd] was
+     * read afterwards, having been written outside it — so a drain that appended its final chunk
+     * in the gap between the two published a *prefix* alongside a flag saying the read was
+     * whole, which is precisely the outcome the signal exists to prevent. The window was tens of
+     * nanoseconds wide and no test could hit it; widening it artificially is how it was
+     * demonstrated, and the fix is structural rather than a re-ordering: every write of a flag
+     * happens under the same monitor as the appends, and [collect] takes all three in one block.
+     *
+     * **`internal` rather than `private`, as a test seam and nothing else.** The [failure] arm
+     * cannot be reached on demand through [run]: making a real pipe fail mid-read is not
+     * something to fake, so that branch landed with #110 untested and disclosed as such. This
+     * class reads whatever [InputStream] it is handed, so a stream that throws after *n* bytes
+     * reaches it in one line of test code — `a stream that fails mid-read yields the prefix and
+     * a reason`. `internal` does not cross a module boundary, so no caller of this package gains
+     * anything; only `:registry`'s own tests do.
      */
-    private class Drain(stream: InputStream) {
+    internal class Drain(stream: InputStream, private val graceMs: Long) {
         private val text = StringBuilder()
 
         /**
-         * Set only after the read loop saw EOF. Volatile because the collector reads it from
-         * another thread, and checked *first* in [collect] so that a thread finishing during
-         * the join is read as complete rather than as short.
+         * Set once the read loop has seen EOF, **under [text]'s monitor**, in the same
+         * critical section discipline as the appends.
+         *
+         * Deliberately not `@Volatile` any more. Volatile would make an unsynchronised read
+         * *visible* and still leave it a different observation from the buffer's, which is the
+         * bug — a sound read of a second, later fact is still not the fact that was read first.
+         *
+         * **Nothing enforces the monitor.** This is an ordinary `private var`: an `if (atEnd)`
+         * outside a `synchronized(text)` block compiles, and without `@Volatile` such a read is
+         * now a data race rather than a merely stale one, so dropping volatile makes an
+         * accidental unsynchronised read *worse* rather than impossible. Holding the two under
+         * one monitor is a convention this class keeps and the compiler does not check — which
+         * is why the reason is written here rather than left to be inferred from the code.
          */
-        @Volatile
         private var atEnd = false
 
-        /** Why the read stopped before EOF on its own, when it did. */
-        @Volatile
+        /** Why the read stopped before EOF on its own, when it did. Guarded by [text] too. */
         private var failure: String? = null
 
         private val thread = Thread {
@@ -244,14 +315,16 @@ class ProcessCommandRunner(private val timeoutMs: Long = DEFAULT_TIMEOUT_MS) : C
             try {
                 while (true) {
                     val read = reader.read(chunk)
-                    if (read < 0) break
+                    if (read < 0) {
+                        synchronized(text) { atEnd = true }
+                        break
+                    }
                     synchronized(text) { text.appendRange(chunk, 0, read) }
                 }
-                atEnd = true
             } catch (e: Throwable) {
                 // Throwable rather than IOException: whatever ends this loop early, the buffer
                 // below is a prefix, and a prefix reported as whole is the defect.
-                failure = "the pipe failed mid-read ($e)"
+                synchronized(text) { failure = "the pipe failed mid-read ($e)" }
             }
         }.apply {
             name = "awakener-subprocess-drain"
@@ -260,38 +333,45 @@ class ProcessCommandRunner(private val timeoutMs: Long = DEFAULT_TIMEOUT_MS) : C
         }
 
         fun collect(): Read {
-            thread.join(DRAIN_GRACE_MS)
-            val body = synchronized(text) { text.toString() }
-            return Read(
-                body,
-                when {
-                    atEnd -> null
-                    failure != null -> failure
-                    else -> "the output was cut off: still unread ${DRAIN_GRACE_MS}ms after " +
-                        "the child was done, so something it left behind still holds the pipe"
-                },
-            )
+            thread.join(graceMs)
+            // One observation. The drain thread cannot append between the buffer and the verdict
+            // on it, because it needs this monitor to do either — which is the whole of #110.
+            return synchronized(text) {
+                Read(
+                    text.toString(),
+                    when {
+                        atEnd -> null
+                        failure != null -> failure
+                        else -> "the output was cut off: still unread ${graceMs}ms after " +
+                            "the child was done, so something it left behind still holds the pipe"
+                    },
+                )
+            }
         }
-    }
-
-    private companion object {
-        const val DEFAULT_TIMEOUT_MS = 10_000L
-        const val DRAIN_GRACE_MS = 1_000L
     }
 }
 
 /**
  * awakener's only route to spanreed.
  *
- * spanreed publishes `register` / `send` / `recv` / `list` / `name` / `focus` / `status` as a
- * versioned contract; `~/.claude/spanreed/registry.json` and its lockfile are internal. Driving
- * the files directly would mean reimplementing spanreed's locking discipline in a second
- * language — duplicating invariants that are not ours to hold — so this shells out even where a
- * file read would be shorter.
+ * spanreed's CLI is its versioned contract and `~/.claude/spanreed/registry.json` and its
+ * lockfile are internal. Driving the files directly would mean reimplementing spanreed's locking
+ * discipline in a second language — duplicating invariants that are not ours to hold — so this
+ * shells out even where a file read would be shorter.
+ *
+ * The published set is whatever `spanreed --help` prints; as of 2026-08-07 that is `agent-id`,
+ * `inbox-path`, `register`, `deregister`, `list`, `send`, `recv`, `inbox-watch`,
+ * `session-start`, `name`, `focus`, `status`, `status-tracking`, `activity-log`, `log`,
+ * `conjoin`. **awakener calls two of them**: `agent-id`, from [spanreedId], which is the primary
+ * mint path, and `list`, from [liveAgents]; [register] adds a third under
+ * [RegistryFlags.registerOnMint], which is off by default. Naming what awakener uses rather than
+ * an abridged copy of the contract is the point — the abridged copy this replaces omitted
+ * `agent-id`, so an audit of "does awakener stay inside the published contract?" read the list
+ * beside the code and found this class's main call unaccounted for (#109).
  */
 class SpanreedCli(
     private val configStore: ConfigStore,
-    private val runner: CommandRunner = ProcessCommandRunner(),
+    private val runner: CommandRunner = ProcessCommandRunner(configStore),
     private val ownPid: () -> Long = { ProcessHandle.current().pid() },
     /**
      * Where a substitution this class made on its own is reported.
@@ -321,18 +401,41 @@ class SpanreedCli(
      * why silence is refused too. A zero exit is not enough on its own — [ProcessCommandRunner]
      * stops waiting on the drain after a grace period and returns what arrived, so a child that
      * exits 0 while its output is still in flight yields a short read. A short read of a JSON
-     * array is either blank or unparseable, and both now raise; what must never happen is the
-     * one shape that would parse into a plausible answer, and an empty string papered into `[]`
-     * was exactly that shape.
+     * array is blank, or unparseable, or short by nothing but trailing whitespace — the first
+     * two raise and the third decodes to the same answer the whole document carries, per the
+     * identity property below. What must never happen is the remaining shape, one that parses
+     * into a *plausible* answer that is not the one spanreed sent, and an empty string papered
+     * into `[]` was exactly that shape.
      *
      * Since #51 the runner says so itself: [ProcessResult.succeeded] is false for a run whose
      * stdout was cut off, whatever it exited with, so the check below now covers the shape it
      * previously only happened to catch through the decoder. The decoder is still the second
      * line and still worth keeping — the two guards fail on different things, and only the
-     * decoder covers the residual [ProcessResult.shortRead] documents. It covers it completely:
-     * a JSON array has no proper prefix that parses, so any truncation is a parse failure
-     * whether or not the plumbing noticed. That is why no framing check is needed here and one
-     * is needed for `agent-id`, whose answer's every prefix is a valid answer.
+     * decoder covers the residual [ProcessResult.shortRead] documents.
+     *
+     * **What the decoder rests on is value identity, not parseability.** In a document that is
+     * one JSON array plus whitespace, the top-level `]` is the last non-whitespace character, so
+     * a proper prefix that parses at all must contain it, and therefore differs from the whole
+     * document only by trailing whitespace: **every parseable proper prefix of a JSON array
+     * decodes to the same array.** A `list` cut off mid-answer is accordingly either a parse
+     * failure or the identical answer. What it cannot be is a *different, plausible* answer —
+     * which is the only outcome this second line exists to prevent.
+     *
+     * Two narrower claims stood here before, and both were false the same way, which is why the
+     * property is stated as identity rather than as a rule about which documents parse:
+     *  - "a JSON array has no proper prefix that parses" — `[]` is a proper prefix of `[]\n`.
+     *  - "no proper prefix of a **non-empty** array parses" — the same construction one step
+     *    along. `spanreed list` really does emit a trailing newline (measured against a scratch
+     *    `SPANREED_STATE_ROOT` on 2026-08-07: `spanreed list | od -c` is `[ ] \n` on an empty
+     *    bus and ends `] \n` on a bus with an agent on it), so the canonical text of a
+     *    one-element answer is a proper prefix of the document that arrives, and it parses.
+     *
+     * Emptiness was never the distinction between the prefixes that are safe and the ones that
+     * are not; trailing whitespace was, and identity is the property that survives it. Both
+     * halves are pinned by `every parseable proper prefix of a list decodes to the same list`.
+     *
+     * That is why no framing check is needed here and one is needed for `agent-id`, whose
+     * answer's every prefix is a valid — and a *different* — answer (#110).
      */
     override suspend fun liveAgents(): List<LiveAgent> {
         val result = withContext(Dispatchers.IO) {

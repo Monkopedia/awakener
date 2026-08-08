@@ -420,7 +420,8 @@ object WmFlags {
             "covers the tree and only the tree — awakener's own record of the dock and of the " +
             "attach's reservation is cleared on both paths whatever this says, since a leaked " +
             "reservation is invisible in `swaymsg -t get_tree` while hiding every window under " +
-            "the dock's app_id for the life of the process. Two things it does not reach " +
+            "the dock's app_id until its deadline — wm.wait.reservation_grace_ms, 5s by " +
+            "default. Two things it does not reach " +
             "either: a no_focus rule, which sway cannot revoke, and the dock program itself, " +
             "which is already exec'd by the time anything can fail — a dock that maps after " +
             "the unwind has finished stands as an unowned panel. A repair collector exists now " +
@@ -584,8 +585,10 @@ object WmFlags {
         "How long an attach's app_id reservation keeps suppressing windows if nothing evicts " +
             "it. attach evicts its own in a finally, which is what normally ends one, so this " +
             "only bounds a reservation whose attach died without running that — a process " +
-            "killed mid-attach leaves no other way to clear it, and a stale one hides every " +
-            "window under the dock's app_id for the life of the process. It has to be at or " +
+            "killed mid-attach leaves no other way to clear it, and until this expires a stale " +
+            "one hides every window under the dock's app_id. This value is that bound and " +
+            "nothing else is, which is why the eviction in attach's finally is unconditional " +
+            "rather than left to it. It has to be at or " +
             "above wm.wait.map_ms, and that is a declared constraint rather than advice: a " +
             "grace shorter than the map deadline expires while the attach it belongs to is " +
             "still waiting, which reopens the gap wm.dock.pending_suppression closes — " +

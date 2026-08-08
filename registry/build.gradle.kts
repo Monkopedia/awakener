@@ -38,9 +38,16 @@ fun toolFingerprint(vararg tools: String): String {
 }
 
 tasks.withType<Test>().configureEach {
-    // One test drives the real `spanreed agent-id`, which is read-only. It skips when spanreed
-    // is not installed; set AWAKENER_REQUIRE_SPANREED=1 to make absence a failure instead, the
-    // same discipline :wm uses for sway.
+    // Two tests drive the real spanreed, and both are read-only: `the real spanreed derives
+    // agent-name from SPANREED_AGENT_NAME` runs `agent-id`, which only prints a derivation, and
+    // `the real spanreed list decodes into live agents` runs `list`, which reads the registry
+    // under spanreed's own lock and writes nothing. The second is worth naming for a second
+    // reason: `list` reads **the developer's live bus**, so on kaladin this build opens
+    // ~/.claude/spanreed/registry.json on every run. It asserts on the shape of what it finds
+    // and never on a count, so Jason's bus being busy or empty cannot fail it — but a build that
+    // reads live state should say so rather than leave an auditor to find it (#109). Both skip
+    // when spanreed is not installed; set AWAKENER_REQUIRE_SPANREED=1 to make absence a failure
+    // instead, the same discipline :wm uses for sway.
     System.getenv("AWAKENER_REQUIRE_SPANREED")?.let { environment("AWAKENER_REQUIRE_SPANREED", it) }
 
     // Neither PATH nor the environment is a test input as far as Gradle is concerned, so

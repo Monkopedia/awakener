@@ -1001,9 +1001,20 @@ class SwayWindowManager(
 
         // Bookkeeping, not compensation, which is why it is a `finally` around the whole method
         // and is gated by no flag: a reservation left behind is invisible in `swaymsg -t get_tree`
-        // and hides every window under the dock's app_id for the life of the process, and a
-        // failed attach's table entry names a node nothing owns. Tree repair is a different job,
-        // done under the lock, and is not here (#6).
+        // and hides every window under the dock's app_id until its deadline
+        // (wm.wait.reservation_grace_ms, 5s by default), and a failed attach's table entry names
+        // a node nothing owns. Tree repair is a different job, done under the lock, and is not
+        // here (#6).
+        //
+        // The bound is real and this eviction is still unconditional, which is the part worth
+        // stating because the comment used to say "for the life of the process" and that was
+        // never true — `DockReservation.covers` has consulted the deadline since the reservation
+        // was introduced in #23, and `DockTableTest` pins it (#108). The argument survives the
+        // correction and does not need the overstatement: the grace is a backstop for an attach
+        // that *died* mid-flight, not a substitute for eviction by one that merely failed, and a
+        // reservation whose attach has already returned is suppressing on evidence known to be
+        // stale. Five seconds of blinding one app_id is a cost to avoid, not one to accept
+        // because it is finite.
         var reservation: DockReservation? = null
         var recorded: SurfaceId? = null
         var attached = false
