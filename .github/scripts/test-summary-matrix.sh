@@ -54,13 +54,23 @@
 #
 # Written to run under dash and busybox sh as well as bash, so the harness cannot depend on
 # the shell whose behaviour it is testing around.
+#
+# **Three exit statuses, because a suite that did not run is not a suite that passed** (#89):
+#
+#   0  every declared mutant ran and every row behaved
+#   1  a row failed, or the suite caught itself writing to the caller's run summary
+#   2  the suite could not vouch — it never reached the state where a row verdict means anything
+#
+# `AWAKENER_MATRIX_MIN_MUTANTS` (default `all`) is how much of the counterfactual phase has to
+# have executed for a 0; see the mutant table.
 set -eu
 
 SCRIPT=$1
 WORK=$2
 REPORT=$3
 
-[ -f "$SCRIPT" ] || { echo "test-summary-matrix: no script at $SCRIPT" >&2; exit 1; }
+# Exit 2: the suite could not run, which is not the same fact as a row failing. See `die`.
+[ -f "$SCRIPT" ] || { echo "test-summary-matrix: CANNOT VOUCH: no script at $SCRIPT" >&2; exit 2; }
 SCRIPT=$(CDPATH= cd -P -- "$(dirname "$SCRIPT")" && pwd)/$(basename "$SCRIPT")
 
 rm -rf "$WORK"
@@ -82,9 +92,18 @@ detail() {
     printf '%s\n' "$1" | head -20 | sed 's/^/      | /'
 }
 
+# Exit 2, not 1, and that is the whole of #89 in one line. `die` is reached when the suite could
+# not get as far as testing what it claims to test — a mutant that will not build, an anchor that
+# no longer exists, a guard naming nothing, a declared mutant that never ran. That is a different
+# fact from "a row failed", which is exit 1, and until now both printed a red the caller could not
+# tell apart. Three outcomes, and the caller can act on them without reading prose:
+#
+#   0  every declared mutant ran and every row behaved
+#   1  a row failed, or the suite caught itself writing where it must not (`no_leak`)
+#   2  the suite could not vouch — it never reached the state where a row verdict means anything
 die() {
-    note "test-summary-matrix: $1"
-    exit 1
+    note "test-summary-matrix: CANNOT VOUCH: $1"
+    exit 2
 }
 
 MARKERS=$WORK/markers
@@ -552,17 +571,104 @@ MUTANT=''
 MUTANT_REASSURE=no
 IMPL=''
 
-# Every mutant this file knows how to build. A guard naming anything else is a typo, and a typo
-# is not a harmless one: `partial!` written `partail!` matches no mutant, so the row is silently
-# dropped from the counterfactual phase and the row that reproduces #83 stops having one. The
-# suite stayed green through exactly that, at `78 rows, 0 failed`, with the row count as the
-# only trace and nothing asserting it. Both directions are checked — every guard names a real
-# mutant, and every mutant is named by at least one row — because a mutant nobody references is
-# equally silent.
-MUTANTS='num measured zerotests partial multiline skipguard pessimist nofiles emit pre76'
-MUTANTS="$MUTANTS floormissing floorbelow floorundeclared floorfile floorroster floorsettings"
-MUTANTS="$MUTANTS floordrift pre97"
+# ------------------------------------------------------------------ the mutant table
+#
+# Every mutant this file knows how to build, what it is spliced from, and whether it is expected
+# to print the reassurance for the rows tagged `!`. **Declaring a mutant and running it are the
+# same act**: the roster below is the only list, `MUTANTS` is derived from it, and the mutant
+# phase is a loop over it. That is deliberate and it is #89 — the roster used to be a bare list
+# of names with a separate `run_mutant <name> …` line per mutant, and a name that was in the list,
+# was named by rows, and had lost its `run_mutant` line satisfied every check in the file. The
+# guard-name check found it in the list, the reverse check found it in `GUARDS_SEEN`, and the
+# "ran no rows" check lives *inside* `run_mutant`, so nothing reached it. Deleting one line took
+# the suite from `112 rows, 0 failed` to `109 rows, 0 failed`, exit 0, with three counterfactuals
+# — including the one that reproduces #83 — silently gone. The row count was the only trace.
+#
+# A guard naming something not in this table is a typo, and a typo is not a harmless one:
+# `partial!` written `partail!` matches no mutant, so the row is silently dropped from the
+# counterfactual phase. The suite stayed green through exactly that too, at `78 rows, 0 failed`.
+# Both directions are still checked — every guard names a real mutant, and every mutant is named
+# by at least one row — because a mutant nobody references is equally silent.
+#
+# Format, one record per line: `name|reassure|mutation [mutation …]`. Blank lines and lines whose
+# first non-blank character is `#` are commentary, so an era mutant's justification lives beside
+# it rather than in a comment block that can drift away from the entry it explains.
+MUTANT_TABLE='
+num|yes|num
+measured|no|measured
+zerotests|yes|zerotests
+partial|yes|partial
+multiline|no|multiline
+skipguard|yes|skipguard
+pessimist|no|pessimist
+nofiles|no|nofiles
+emit|no|emit
+
+# The shape the script had when #76 was filed: no integer normalisation, no no-measurement
+# branch, no zero-tests branch, a per-line match for the suite tag, and — since #83s guard did
+# not exist either — no shortfall check. Every row tagged `pre76!` prints the reassurance against
+# it, which is the defect reproduced rather than described.
+#
+# The floor guards come off too, and that is not padding: several of these fixtures declare a
+# floor their mutated parse cannot meet, so the floor would catch #76s defect for #97s reason and
+# the row would go red without reproducing anything. An era mutant has to be the whole era.
+pre76|yes|num measured zerotests multiline partial floormissing floorbelow floorundeclared floorfile floorroster floorsettings floordrift
+
+floormissing|yes|floormissing
+floorbelow|yes|floorbelow
+floorundeclared|yes|floorundeclared
+floorfile|yes|floorfile
+floorroster|yes|floorroster
+floorsettings|yes|floorsettings
+floordrift|no|floordrift
+
+# The shape the script had when #97 was filed: it read the XML faithfully and compared it to
+# nothing. Every row tagged `pre97!` prints the reassurance against it — including the ones where
+# a whole module is missing, which is the measurement in the issue rather than a description of it.
+pre97|yes|floormissing floorbelow floorundeclared floorfile floorroster floorsettings floordrift
+'
+
+# The one place that knows the record format. Everything else asks this.
+mutant_rows() {
+    printf '%s\n' "$MUTANT_TABLE" | grep -v '^[[:space:]]*#' | grep -v '^[[:space:]]*$' || true
+}
+
+mutant_row_for() {
+    mutant_rows | while IFS= read -r r; do
+        case $r in
+            "$1|"*) printf '%s\n' "$r"; return 0 ;;
+        esac
+    done
+}
+
+MUTANTS=''
+for _n in $(mutant_rows | sed 's/|.*//'); do
+    # A duplicate would run its mutant twice and read in the log as extra coverage.
+    case " $MUTANTS " in
+        *" $_n "*) die "mutant '$_n' appears twice in MUTANT_TABLE" ;;
+    esac
+    MUTANTS="$MUTANTS $_n"
+done
+[ -n "$MUTANTS" ] || die "MUTANT_TABLE parsed to no mutants at all"
+MUTANTS=${MUTANTS# }
+MUTANTS_DECLARED=0
+for _n in $MUTANTS; do MUTANTS_DECLARED=$((MUTANTS_DECLARED + 1)); done
+MUTANTS_RUN=''
 GUARDS_SEEN=''
+
+# How many of the declared mutants must actually have run before this suite's green is worth
+# anything. `all` — the default, and the behaviour that would otherwise be hard-coded — means
+# every one: a green then says the whole counterfactual phase executed, which is the only thing
+# that makes the row verdicts evidence. An integer instead lets a deliberately partial run (a
+# bisect, a single mutant under a debugger) still report, and it is the *number* that keeps that
+# honest rather than a boolean, because "I meant to run a subset" and "the loop silently skipped
+# one" are otherwise the same output. Anything short of the bar exits 2, never 0 and never 1.
+MIN_MUTANTS=${AWAKENER_MATRIX_MIN_MUTANTS:-all}
+case $MIN_MUTANTS in
+    all) ;;
+    ''|*[!0-9]*)
+        die "AWAKENER_MATRIX_MIN_MUTANTS must be 'all' or a non-negative integer, got '$MIN_MUTANTS'" ;;
+esac
 
 check() {
     label=$1; guards=$2; fixture=$3; pathmode=$4; envmode=$5
@@ -989,8 +1095,7 @@ apply() {
     esac
 }
 
-# name -> mutations, and whether the mutant is expected to print the reassurance for the rows
-# tagged with a `!`.
+# Runs one record of MUTANT_TABLE. Never called by hand — see the loop below.
 run_mutant() {
     MUTANT=$1
     MUTANT_REASSURE=$2
@@ -1026,6 +1131,7 @@ run_mutant() {
     # Belt to the roster check's braces: that one catches a guard naming no mutant, this one
     # catches a mutant whose rows all sat out for any other reason.
     [ "$run_count" -gt "$before" ] || die "mutant $MUTANT ran no rows at all"
+    MUTANTS_RUN="$MUTANTS_RUN $MUTANT"
 }
 
 # Mutants test the script's logic rather than the parser's portability, so one implementation
@@ -1034,37 +1140,43 @@ MODE=mutant
 IMPL=${IMPLS# }
 IMPL=${IMPL%% *}
 
-run_mutant num       yes num
-run_mutant measured  no  measured
-run_mutant zerotests yes zerotests
-run_mutant partial   yes partial
-run_mutant multiline no  multiline
-run_mutant skipguard yes skipguard
-run_mutant pessimist no  pessimist
-run_mutant nofiles   no  nofiles
-run_mutant emit      no  emit
-# The shape the script had when #76 was filed: no integer normalisation, no no-measurement
-# branch, no zero-tests branch, a per-line match for the suite tag, and — since #83's guard
-# did not exist either — no shortfall check. Every row tagged `pre76!` prints the reassurance
-# against it, which is the defect reproduced rather than described.
-#
-# The floor guards come off too, and that is not padding: several of these fixtures declare a
-# floor their mutated parse cannot meet, so the floor would catch #76's defect for #97's reason
-# and the row would go red without reproducing anything. An era mutant has to be the whole era.
-run_mutant pre76 yes num measured zerotests multiline partial \
-    floormissing floorbelow floorundeclared floorfile floorroster floorsettings floordrift
-run_mutant floormissing    yes floormissing
-run_mutant floorbelow      yes floorbelow
-run_mutant floorundeclared yes floorundeclared
-run_mutant floorfile       yes floorfile
-run_mutant floorroster     yes floorroster
-run_mutant floorsettings   yes floorsettings
-run_mutant floordrift      no  floordrift
-# The shape the script had when #97 was filed: it read the XML faithfully and compared it to
-# nothing. Every row tagged `pre97!` prints the reassurance against it — including the ones where
-# a whole module is missing, which is the measurement in the issue rather than a description of it.
-run_mutant pre97 yes floormissing floorbelow floorundeclared floorfile floorroster \
-    floorsettings floordrift
+# The mutant phase is a loop over the table, and there is no other way to reach `run_mutant`. A
+# mutant that is declared and not run is therefore unrepresentable rather than merely detected —
+# deleting a record removes the mutant from `MUTANTS` too, and the rows still naming it then trip
+# the guard-name check with a message that says so.
+for mutant_name in $MUTANTS; do
+    mutant_record=$(mutant_row_for "$mutant_name")
+    [ -n "$mutant_record" ] || die "no MUTANT_TABLE record for '$mutant_name'"
+    mutant_rest=${mutant_record#*|}
+    mutant_reassure=${mutant_rest%%|*}
+    mutant_muts=${mutant_rest#*|}
+    case $mutant_reassure in
+        yes|no) ;;
+        *) die "mutant '$mutant_name' declares reassure '$mutant_reassure', wanted yes or no" ;;
+    esac
+    [ -n "$mutant_muts" ] || die "mutant '$mutant_name' names no mutation to apply"
+    run_mutant "$mutant_name" "$mutant_reassure" $mutant_muts
+done
+
+# And the belt to that: what was declared, confronted with what actually ran. The loop above makes
+# the #89 hole unwritable; this makes it unreachable by any other route — an edit to the loop, an
+# early `continue`, a filter someone adds later. It reports the pair of numbers rather than a
+# boolean, because "I ran a subset on purpose" and "one silently sat out" are the same green
+# otherwise. Exit 2: a suite that did not run its counterfactuals has not failed, it has abstained.
+mutants_ran=0
+mutants_missing=''
+for m in $MUTANTS; do
+    case " $MUTANTS_RUN " in
+        *" $m "*) mutants_ran=$((mutants_ran + 1)) ;;
+        *) mutants_missing="$mutants_missing $m" ;;
+    esac
+done
+if [ "$MIN_MUTANTS" = all ]; then
+    [ -z "$mutants_missing" ] ||
+        die "declared but never run:$mutants_missing — $mutants_ran of $MUTANTS_DECLARED mutants ran, so the rows naming the rest passed with and without the guard they exist to test"
+elif [ "$mutants_ran" -lt "$MIN_MUTANTS" ]; then
+    die "$mutants_ran of $MUTANTS_DECLARED mutants ran, below the $MIN_MUTANTS required by AWAKENER_MATRIX_MIN_MUTANTS"
+fi
 
 # ------------------------------------------------ the floor file's default location
 #
@@ -1126,6 +1238,10 @@ no_leak "the suite, over the whole run"
 
 note ""
 note "test-summary-matrix: $run_count rows, $fail_count failed"
+# Printed on the green path too, and that is the point: the row count was the only trace #89 left
+# behind, and nobody compares row counts between runs. This states the fact the reader needs —
+# how much of the counterfactual phase actually happened — instead of leaving it to be inferred.
+note "  mutants: $mutants_ran of $MUTANTS_DECLARED declared ran (required: $MIN_MUTANTS)"
 note "  awk coverage: $IMPL_COUNT distinct implementations —$IMPLS"
 if [ -n "$AMBIENT_SUMMARY" ]; then
     # Recorded rather than inferred. This line is what lets a later reader confirm from the log
