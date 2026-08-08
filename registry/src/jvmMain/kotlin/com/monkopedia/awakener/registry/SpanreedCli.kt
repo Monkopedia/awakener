@@ -240,8 +240,12 @@ class ProcessCommandRunner(
         )
     }
 
-    /** What one pipe yielded, and — [shortBy] — why that may not be the whole of it. */
-    private class Read(val text: String, val shortBy: String?) {
+    /**
+     * What one pipe yielded, and — [shortBy] — why that may not be the whole of it.
+     *
+     * `internal` for the same reason as [Drain]: it is that class's answer.
+     */
+    internal class Read(val text: String, val shortBy: String?) {
         /**
          * The text with the reason folded in, for a pipe whose completeness is not modelled.
          * Only stderr is read this way; see [ProcessResult.shortRead].
@@ -273,8 +277,16 @@ class ProcessCommandRunner(
      * nanoseconds wide and no test could hit it; widening it artificially is how it was
      * demonstrated, and the fix is structural rather than a re-ordering: every write of a flag
      * happens under the same monitor as the appends, and [collect] takes all three in one block.
+     *
+     * **`internal` rather than `private`, as a test seam and nothing else.** The [failure] arm
+     * cannot be reached on demand through [run]: making a real pipe fail mid-read is not
+     * something to fake, so that branch landed with #110 untested and disclosed as such. This
+     * class reads whatever [InputStream] it is handed, so a stream that throws after *n* bytes
+     * reaches it in one line of test code — `a stream that fails mid-read yields the prefix and
+     * a reason`. `internal` does not cross a module boundary, so no caller of this package gains
+     * anything; only `:registry`'s own tests do.
      */
-    private class Drain(stream: InputStream, private val graceMs: Long) {
+    internal class Drain(stream: InputStream, private val graceMs: Long) {
         private val text = StringBuilder()
 
         /**
@@ -283,8 +295,14 @@ class ProcessCommandRunner(
          *
          * Deliberately not `@Volatile` any more. Volatile would make an unsynchronised read
          * *visible* and still leave it a different observation from the buffer's, which is the
-         * bug; requiring the monitor makes reading it apart from the buffer impossible to write
-         * by accident.
+         * bug — a sound read of a second, later fact is still not the fact that was read first.
+         *
+         * **Nothing enforces the monitor.** This is an ordinary `private var`: an `if (atEnd)`
+         * outside a `synchronized(text)` block compiles, and without `@Volatile` such a read is
+         * now a data race rather than a merely stale one, so dropping volatile makes an
+         * accidental unsynchronised read *worse* rather than impossible. Holding the two under
+         * one monitor is a convention this class keeps and the compiler does not check — which
+         * is why the reason is written here rather than left to be inferred from the code.
          */
         private var atEnd = false
 
@@ -383,27 +401,41 @@ class SpanreedCli(
      * why silence is refused too. A zero exit is not enough on its own — [ProcessCommandRunner]
      * stops waiting on the drain after a grace period and returns what arrived, so a child that
      * exits 0 while its output is still in flight yields a short read. A short read of a JSON
-     * array is either blank or unparseable, and both now raise; what must never happen is the
-     * one shape that would parse into a plausible answer, and an empty string papered into `[]`
-     * was exactly that shape.
+     * array is blank, or unparseable, or short by nothing but trailing whitespace — the first
+     * two raise and the third decodes to the same answer the whole document carries, per the
+     * identity property below. What must never happen is the remaining shape, one that parses
+     * into a *plausible* answer that is not the one spanreed sent, and an empty string papered
+     * into `[]` was exactly that shape.
      *
      * Since #51 the runner says so itself: [ProcessResult.succeeded] is false for a run whose
      * stdout was cut off, whatever it exited with, so the check below now covers the shape it
      * previously only happened to catch through the decoder. The decoder is still the second
      * line and still worth keeping — the two guards fail on different things, and only the
-     * decoder covers the residual [ProcessResult.shortRead] documents. It covers it for the
-     * documents that can actually arrive here: **no proper prefix of a non-empty JSON array
-     * parses as an array**, so a `list` that was cut off mid-answer is a parse failure whether
-     * or not the plumbing noticed. Stated narrowly on purpose. The wider sentence this replaces
-     * — "a JSON array has no proper prefix that parses" — is false, and `[]` is the
-     * counterexample, being a proper prefix of `[]\n`; truncating trailing whitespace off an
-     * empty array yields something that parses into the same empty list. Harmless, because that
-     * document says the bus is empty and so does the whole of it, and the blank case is refused
-     * above regardless — but a reader extending the wide claim to a `list` that ever grew a
-     * line-oriented form would be extending something that was never true (#110).
+     * decoder covers the residual [ProcessResult.shortRead] documents.
+     *
+     * **What the decoder rests on is value identity, not parseability.** In a document that is
+     * one JSON array plus whitespace, the top-level `]` is the last non-whitespace character, so
+     * a proper prefix that parses at all must contain it, and therefore differs from the whole
+     * document only by trailing whitespace: **every parseable proper prefix of a JSON array
+     * decodes to the same array.** A `list` cut off mid-answer is accordingly either a parse
+     * failure or the identical answer. What it cannot be is a *different, plausible* answer —
+     * which is the only outcome this second line exists to prevent.
+     *
+     * Two narrower claims stood here before, and both were false the same way, which is why the
+     * property is stated as identity rather than as a rule about which documents parse:
+     *  - "a JSON array has no proper prefix that parses" — `[]` is a proper prefix of `[]\n`.
+     *  - "no proper prefix of a **non-empty** array parses" — the same construction one step
+     *    along. `spanreed list` really does emit a trailing newline (measured against a scratch
+     *    `SPANREED_STATE_ROOT` on 2026-08-07: `spanreed list | od -c` is `[ ] \n` on an empty
+     *    bus and ends `] \n` on a bus with an agent on it), so the canonical text of a
+     *    one-element answer is a proper prefix of the document that arrives, and it parses.
+     *
+     * Emptiness was never the distinction between the prefixes that are safe and the ones that
+     * are not; trailing whitespace was, and identity is the property that survives it. Both
+     * halves are pinned by `every parseable proper prefix of a list decodes to the same list`.
      *
      * That is why no framing check is needed here and one is needed for `agent-id`, whose
-     * answer's every prefix is a valid answer.
+     * answer's every prefix is a valid — and a *different* — answer (#110).
      */
     override suspend fun liveAgents(): List<LiveAgent> {
         val result = withContext(Dispatchers.IO) {

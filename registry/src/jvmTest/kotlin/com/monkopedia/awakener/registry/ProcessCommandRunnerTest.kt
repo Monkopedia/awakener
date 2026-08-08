@@ -2,12 +2,15 @@ package com.monkopedia.awakener.registry
 
 import com.monkopedia.awakener.config.Config
 import com.monkopedia.awakener.config.InMemoryConfigStore
+import java.io.IOException
+import java.io.InputStream
 import java.nio.file.Files
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
 import kotlin.io.path.readText
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.test.fail
@@ -49,7 +52,8 @@ class ProcessCommandRunnerTest {
     fun `a hung child is killed when the timeout expires`() {
         val startedAt = System.nanoTime()
         val result = bounded(seconds = 15) {
-            ProcessCommandRunner(timeoutMs = { 300L }).run(listOf("sh", "-c", "sleep 60"), emptyMap())
+            ProcessCommandRunner(timeoutMs = { 300L })
+                .run(listOf("sh", "-c", "sleep 60"), emptyMap())
         }
         val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000
 
@@ -201,6 +205,54 @@ class ProcessCommandRunnerTest {
         assertEquals("partrest", result.stdout)
         assertNull(result.shortRead)
         assertTrue(result.succeeded)
+    }
+
+    /**
+     * The third arm of the same observation, and the one no public path can reach on demand.
+     *
+     * `Drain` resolves a read three ways — EOF, the grace expiring, and the read *failing* —
+     * and all three now happen under one monitor. The first two are driven above through a real
+     * child; the third needs a pipe that breaks mid-read, which is not something to fake against
+     * a live one, so it landed with #110 disclosed as untested.
+     *
+     * It is reachable without widening anything production sees: `Drain` is `internal`, it reads
+     * whatever [InputStream] it is handed, and a stream that throws after *n* bytes is a few
+     * lines here. The property is the one the whole change is about — a read that ended early
+     * yields the prefix **and** a reason, never the prefix alone — and the clean stream at the
+     * end is the control, because "always report a failure" would satisfy the first half by
+     * itself.
+     */
+    @Test
+    fun `a stream that fails mid-read yields the prefix and a reason`() {
+        val head = "agent-lifeless-".toByteArray()
+        val breaks = object : InputStream() {
+            private var at = 0
+
+            override fun read(): Int {
+                if (at >= head.size) throw IOException("the pipe went away")
+                return head[at++].toInt() and 0xff
+            }
+
+            override fun read(b: ByteArray, off: Int, len: Int): Int {
+                if (at >= head.size) throw IOException("the pipe went away")
+                val n = minOf(len, head.size - at)
+                head.copyInto(b, off, at, at + n)
+                at += n
+                return n
+            }
+        }
+
+        val cut = ProcessCommandRunner.Drain(breaks, 5_000L).collect()
+
+        assertEquals("agent-lifeless-", cut.text, "what did arrive is kept, not discarded")
+        val reason = assertNotNull(cut.shortBy, "a prefix with no reason is the defect (#51/#110)")
+        assertTrue(reason.contains("failed mid-read"), "the reason must name the cause: $reason")
+
+        val intact = "agent-lifeless-firefox\n".byteInputStream()
+        val whole = ProcessCommandRunner.Drain(intact, 5_000L).collect()
+
+        assertEquals("agent-lifeless-firefox\n", whole.text)
+        assertNull(whole.shortBy, "a stream that reached EOF must not be accused of failing")
     }
 
     // ------------------------------------------------------------------ the budgets are flags
