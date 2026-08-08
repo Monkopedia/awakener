@@ -26,9 +26,25 @@ enum class DockIdentity {
     NEW_NODE,
 
     /**
-     * A dock `app_id` minted per surface, so the criteria that match it can never be ambiguous.
-     * Immune by construction to another window answering the wait, since nothing else carries
-     * the name. Requires the dock command to accept it — see [DockSpec.APP_ID_PLACEHOLDER].
+     * A dock `app_id` minted per surface — `<dock app_id>-<surface con_id>` — so the criteria that
+     * match it name one surface's dock rather than every dock at once.
+     *
+     * **It removes the accident, not the forgery**, which is the standard
+     * [DockMarkScheme.DOCK_SURFACE_AND_NONCE] already states for marks and is reached here for the
+     * same reason. What it buys is real: a second panel started by hand under the shared name no
+     * longer answers another surface's wait, and awakener's own attaches stop being able to do it
+     * to each other by name. What it is not is unguessable. The surface's `con_id` is in
+     * `swaymsg -t get_tree` for any process holding `SWAYSOCK`, and an `app_id` is a string a
+     * client declares about itself, so a window presenting the minted name is matched exactly as
+     * one presenting the shared name is — measured on sway 1.12 (#96), where `foot -a
+     * awakener-dock-5` satisfied `[app_id="^awakener-dock-5$"]` against a negative control on a
+     * name nothing carried, which sway refused with `No matching node`.
+     *
+     * This said "immune by construction … nothing else carries the name" until #96. Neither half
+     * is enforced by anything: correct it here rather than reasoning from it, because an operator
+     * choosing between the two values is choosing on what this paragraph says.
+     *
+     * Requires the dock command to accept it — see [DockSpec.APP_ID_PLACEHOLDER].
      */
     PER_SURFACE_APP_ID,
 }
@@ -63,14 +79,30 @@ enum class DockRecognition {
 /**
  * What the orphan sweep accepts as proof that a node is a dock, before it kills it.
  *
- * Declared narrowest first, and the narrowest is the only one that does not rest on something the
- * desktop can write: every mark in sway's namespace is reachable from `swaymsg`, measured on 1.12.
+ * Declared narrowest first, and the narrowest is the only one that does not read the *tree* at
+ * all: every mark in sway's namespace is reachable from `swaymsg`, measured on 1.12.
+ *
+ * **"Does not read the tree" is not "cannot be produced by the desktop", and this said the second
+ * until #96.** What `attach` records is whichever window answered its wait, and that wait is on an
+ * `app_id` the window's own client declares — so a window awakener never spawned could earn the
+ * entry [STOOD_UP] reads, carrying no mark and needing to forge nothing. [WmFlags.stoodUpProof] is
+ * what decides whether an entry means more than "something answered the wait", and it is the flag
+ * to read next: this enum's narrowest value is exactly as strong as that one makes it.
  */
 enum class ReapEvidence {
     /**
-     * An entry this process wrote when it stood the dock up itself, and nothing else. The only
-     * evidence for a kill that no mark can produce — at the price of never reaping a dock this
-     * process merely adopted, which is every dock that outlived an awakener restart.
+     * An entry this process wrote when it stood the dock up itself, and nothing else.
+     *
+     * The only evidence for a kill that no *mark* can produce, which is the claim that survives
+     * #96 — it used to say "that no desktop can write", and `attach` writing this entry for a
+     * window it identified by `app_id` alone is why that was false. At the default
+     * [StoodUpProof.TOKEN_OR_ADOPTED] a window that cannot show the token `attach` put into the
+     * dock program's environment is recorded [DockOrigin.ADOPTED] instead, and this value reaps it
+     * no more than it reaps a dock that outlived a restart. Under [StoodUpProof.NONE] the older
+     * behaviour is back and this sentence is a promise this enum cannot keep.
+     *
+     * Its price is unchanged and is the mark's own purpose: a dock this process merely adopted is
+     * never reaped, which is every dock that outlived an awakener restart.
      */
     STOOD_UP,
 
@@ -79,6 +111,79 @@ enum class ReapEvidence {
 
     /** Whatever enumeration recognises, an adopted node whose mark has since gone included. */
     RECOGNITION,
+}
+
+/**
+ * What `attach` requires of the window that answered its wait before recording it as one this
+ * process stood up.
+ *
+ * Its own flag because the question is narrow and the answer is destructive: nothing reads
+ * [DockOrigin.STOOD_UP] except [WmFlags.reapEvidence], and what it reads it for is a kill.
+ *
+ * `attach` finds the dock it spawned by `app_id` — [DockIdentity] is the whole of that choice, and
+ * *both* its values rest on a name the window's own client declares. So the entry `attach` wrote
+ * was only ever evidence that something answered the wait. Measured on sway 1.12 (#96): a `foot -a
+ * awakener-dock` started by hand while an attach is waiting is adopted as the dock, marked, moved,
+ * resized, and recorded as stood up — with no mark forged and nothing guessed.
+ *
+ * What the token values add is a per-attach secret put into the *environment* of the process sway
+ * `exec`s, checked against `/proc/<pid>/environ` of the window that answered. Three fields, and
+ * who can write each is the whole of why this is worth doing:
+ *
+ * - **`app_id`** is a string the client sets about itself — `xdg_toplevel.set_app_id` — so
+ *   presenting one costs nothing and requires knowing nothing;
+ * - **`pid`** is not a thing a client can state at all: there is no request carrying one in
+ *   `wayland.xml` or `xdg-shell.xml` (zero matches in either, against 463 for `surface` and 3 for
+ *   `app_id` as the controls that the files were read). `sway-ipc(7)` calls it the pid of "the
+ *   application that owns the window". A node matched on `app_id` is necessarily an xdg-shell
+ *   window — the same page documents `app_id` as null for anything else, and shows
+ *   `"shell": "xwayland"` beside `"app_id": null` — so the xwayland case, where the pid *is* a
+ *   client-set property, is never the window this reads;
+ * - **the token** lives in that process's environment, so a forgery has to read it out of `/proc`
+ *   and map a window under the dock's name before the real dock does.
+ *
+ * **It removes the accident, not the forgery**, the same standard
+ * [DockMarkScheme.DOCK_SURFACE_AND_NONCE] states for marks. `/proc/<pid>/environ` and `SWAYSOCK`
+ * are readable by the same user, and a process already running as that user can drive `swaymsg`
+ * and so can already do everything awakener can. This is not a privilege boundary and no value
+ * here makes it one.
+ */
+enum class StoodUpProof {
+    /**
+     * Whatever answers the wait is recorded as stood up, which is what awakener did before #96.
+     *
+     * Here so that the older behaviour is reachable without a rebuild — and named for what it is,
+     * so that an operator combining it with [ReapEvidence.STOOD_UP] can see that the pair reopens
+     * the gap that flag exists to close.
+     */
+    NONE,
+
+    /**
+     * The token decides the *origin*, never the identification.
+     *
+     * A window that answers the wait and proves the token is [DockOrigin.STOOD_UP]; one that
+     * answers and cannot is [DockOrigin.ADOPTED] — docked, marked and torn down by its handle
+     * exactly as before, and reaped on its mark under the default [ReapEvidence.CURRENT], but not
+     * on awakener's word that it spawned it.
+     *
+     * The default, because it cannot fail an attach that would otherwise have succeeded: a dock
+     * program that scrubs its environment still gets docked, and the only thing it loses is being
+     * reaped under [ReapEvidence.STOOD_UP] — a leaked panel, which is the direction this whole
+     * flag family already errs in.
+     */
+    TOKEN_OR_ADOPTED,
+
+    /**
+     * The wait itself passes over a window that cannot prove the token, so an interloper is not
+     * adopted at all and the attach goes on waiting for the dock it `exec`'d.
+     *
+     * The strongest value and the one that can fail: a dock program that does not pass its
+     * environment through to the process that owns the surface never satisfies this, and every
+     * attach then expires on [WmFlags.mapWaitMs] and unwinds. It is the value to reach for on a
+     * desktop where the dock command is known to preserve its environment and an adopted stranger
+     * would be worse than no dock.
+     */
+    TOKEN_REQUIRED,
 }
 
 /**
@@ -240,9 +345,16 @@ object WmFlags {
             "unmanaged. A failed attach reaches the same window by a second route: its unwind " +
             "reads the surface's container back against this name to find a dock it never " +
             "identified, so a window under it that maps in there during the attach is killed " +
-            "by the unwind instead. PER_SURFACE_APP_ID makes the name itself unique, so " +
-            "nothing else can answer the wait, and where " +
-            "wm.dock.focus_suppression=NO_FOCUS_RULE is chosen it " +
+            "by the unwind instead. PER_SURFACE_APP_ID mints the name per surface — the dock " +
+            "app_id and the surface's con_id — which removes the accident rather than the " +
+            "forgery: a panel started by hand under the shared name stops answering another " +
+            "surface's wait, but the con_id half is in swaymsg -t get_tree for anything holding " +
+            "SWAYSOCK and the app_id half is still a string a client declares about itself, so a " +
+            "window presenting the minted name is adopted exactly as one presenting the shared " +
+            "name is (measured on sway 1.12, #96 — this said 'nothing else can answer the wait', " +
+            "which nothing enforces). wm.dock.stood_up_proof is what narrows the consequence of " +
+            "either name being answered by a stranger. Where " +
+            "wm.dock.focus_suppression=NO_FOCUS_RULE is chosen PER_SURFACE_APP_ID " +
             "additionally scopes that rule to one dock instead of to every dock ever spawned — " +
             "at the cost of requiring the dock command to accept the name, and, in that " +
             "combination only, of one permanent no_focus rule per attach, since sway cannot " +
@@ -385,12 +497,50 @@ object WmFlags {
             "when it stood that dock up, which is evidence held in awakener's own memory rather " +
             "than in a namespace the desktop writes into. Every mark sway holds is writable from " +
             "swaymsg, measured on 1.12, so this is the only thing that makes a forged mark " +
-            "harmless rather than merely unlikely. Its price is what the mark is for: a dock " +
+            "harmless rather than merely unlikely. How much that is worth is " +
+            "wm.dock.stood_up_proof's to decide and not this flag's: attach identifies the dock " +
+            "it spawned by an app_id the window's own client declares, so under " +
+            "wm.dock.stood_up_proof=NONE a window awakener never spawned earns the entry this " +
+            "value reaps on, with no mark forged at all (#96). The default there is what makes " +
+            "the sentence above true. Its price is what the mark is for: a dock " +
             "that outlived an awakener restart is adopted from its mark and was never stood up " +
             "by this process, so it is never reaped — its panel stands when its surface closes " +
             "and has to be closed by hand. That is a leaked panel against a destroyed window, " +
             "and CURRENT stays the default because the default wm.dock.mark_scheme already makes " +
             "the destroyed window need a mark nobody writes by accident.",
+    )
+
+    val stoodUpProof = Flags.enum(
+        "wm.dock.stood_up_proof",
+        StoodUpProof.TOKEN_OR_ADOPTED,
+        "What attach requires of the window that answered its wait before recording it as one " +
+            "this process stood up. That record is read by exactly one thing — " +
+            "wm.dock.reap_evidence — and what it is read for is a kill. attach finds its dock by " +
+            "app_id, which a window's own client declares about itself, so under NONE a window " +
+            "awakener never spawned is adopted as the dock, marked, moved into the surface's tab " +
+            "and recorded as stood up, with no mark forged and nothing guessed; that is the " +
+            "behaviour before #96 and it is what made wm.dock.reap_evidence=STOOD_UP weaker than " +
+            "it reads. The other two values put a per-attach token into the environment of the " +
+            "process sway execs and check it against /proc/<pid>/environ of the window that " +
+            "answered. Three fields and three different writers: app_id is the client's own " +
+            "claim about itself; pid is what the kernel told sway about the peer on the Wayland " +
+            "socket, so a client cannot present another process's; the token is in that " +
+            "process's environment, so a forgery has to read it out of /proc and map a window " +
+            "before the real dock does. What that buys is the accident, not the forgery — the " +
+            "same standard wm.dock.mark_scheme states for marks, and for the same reason: " +
+            "/proc and SWAYSOCK are readable by the same user, and a process running as that " +
+            "user can already drive swaymsg. TOKEN_OR_ADOPTED is the default and lets the token " +
+            "decide the origin rather than the identification: a window that cannot prove it is " +
+            "still docked, marked and torn down by its handle exactly as before, and still " +
+            "reaped on its mark under wm.dock.reap_evidence=CURRENT, but it is recorded ADOPTED " +
+            "rather than STOOD_UP. It therefore cannot fail an attach that would otherwise have " +
+            "succeeded — a dock program that scrubs its environment loses only being reaped " +
+            "under STOOD_UP, which is a leaked panel and the direction this flag family already " +
+            "errs in. TOKEN_REQUIRED makes the wait itself pass over a window that cannot prove " +
+            "the token, so an interloper is never adopted and the attach goes on waiting for the " +
+            "dock it exec'd — the strongest value and the one that can fail, since a dock " +
+            "command that does not pass its environment through to the process owning the " +
+            "surface then expires on wm.wait.map_ms and unwinds every time.",
     )
 
     val orphanPolicy = Flags.enum(

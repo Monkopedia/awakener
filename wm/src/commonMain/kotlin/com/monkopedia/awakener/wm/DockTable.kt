@@ -37,10 +37,22 @@ internal data class DockReservation(
 
 /** Where an entry's claim that a node is a dock came from. */
 internal enum class DockOrigin {
-    /** This process spawned the window and marked it, inside the tree-edit lock. */
+    /**
+     * This process spawned the window and marked it, inside the tree-edit lock.
+     *
+     * How much "spawned" is worth is [WmFlags.stoodUpProof]'s to say. `attach` identifies the
+     * window it spawned by an `app_id` the window's own client declares, so under
+     * [StoodUpProof.NONE] this means "answered the wait" and nothing more (#96). The default asks
+     * the window for a token `attach` put in the dock program's environment and records
+     * [ADOPTED] instead when it cannot show one.
+     */
     STOOD_UP,
 
-    /** A read found the mark on a node the table did not know, and recorded what it read. */
+    /**
+     * The claim rests on something outside this process: a read found the mark on a node the table
+     * did not know, or an `attach` adopted a window that could not prove it was the dock it
+     * `exec`'d. Recorded either way, so the node is a dock for every purpose except a kill.
+     */
     ADOPTED,
 }
 
@@ -105,7 +117,10 @@ internal data class DockTableSnapshot(
  * names closes. Recording is what makes the *hiding* outlast the mark; it is not what makes the
  * kill possible. What bounds the kill is the shape the mark has to have — see
  * [DockMarkScheme.DOCK_SURFACE_AND_NONCE], which is why one cannot be written by accident — and,
- * for a desktop that wants no tree evidence to be destructive at all, [ReapEvidence.STOOD_UP].
+ * for a desktop that wants no tree evidence to be destructive at all, [ReapEvidence.STOOD_UP]
+ * together with [WmFlags.stoodUpProof], which are one lever in two halves: the second decides what
+ * an entry the first reaps on had to prove, and at [StoodUpProof.NONE] the answer is a dock
+ * `app_id` presented by the window itself.
  *
  * Authoritative for exactly that one predicate. It never says a window exists — the tree keeps
  * that, and a node the tree has dropped is simply never asked about — and **nothing here is
@@ -243,7 +258,9 @@ enum class DockMarkScheme {
      * `success:true` and the mark reads back verbatim. Nor is there a structural substitute — the
      * tree's layout is `swaymsg`'s to write as well. So what this buys is the *accident*: a nonce
      * copied out of `swaymsg -t get_tree` and re-marked onto another window still reaches the
-     * sweep, and [ReapEvidence.STOOD_UP] is the flag that closes that, at its own price.
+     * sweep, and [ReapEvidence.STOOD_UP] is the flag that closes that, at its own price — and only
+     * as far as [WmFlags.stoodUpProof] lets it, since an entry earned by presenting the dock's
+     * `app_id` is the one thing `STOOD_UP` reads and is not a mark at all (#96).
      */
     DOCK_SURFACE_AND_NONCE,
 
@@ -287,13 +304,18 @@ private const val NONCE_LENGTH = 16
  * A fresh nonce for one dock's mark.
  *
  * Per dock rather than per process, because a per-process nonce would be a field with no reader:
- * the only question it could answer — "did *this* awakener stand that dock up" — is the one
- * [DockOrigin.STOOD_UP] already answers, from memory, without depending on a string the desktop
- * can write.
+ * the only question it could answer — "did *this* awakener stand that dock up" — is
+ * [DockOrigin.STOOD_UP]'s, answered from memory rather than from anything in the tree. That is
+ * still the right division of labour, but it is not by itself a guarantee about who *earned* the
+ * entry: see [WmFlags.stoodUpProof], which is where that question now lives.
  *
  * Sixty-four bits, from the ordinary random source rather than a cryptographic one, because what
  * it has to survive is a coincidence and not an adversary — see [DockMarkScheme] for why an
  * adversary is not on the table at all.
+ *
+ * That paragraph is about the *mark's* nonce and stays true. [WmFlags.stoodUpProof]'s token is a
+ * different string with a different reader, drawn per attach from a cryptographic source, and it
+ * never appears in the tree at all — see there for who can write what.
  */
 private fun newDockMarkNonce(): String =
     Random.nextLong().toULong().toString(16).padStart(NONCE_LENGTH, '0')

@@ -15,6 +15,7 @@ import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -738,6 +739,138 @@ class SwayBindingTest {
             assertNotNull(
                 wm.tree().find(dock.raw),
                 "and it is left standing, which is the price of refusing to kill on a mark",
+            )
+        }
+
+    /**
+     * The positive control for the three tests below, and the one that fails if the token
+     * mechanism is quietly proving nothing.
+     *
+     * Every one of those asserts that some window is *not* reaped, which a build recording every
+     * dock as adopted would satisfy for free. This is the other direction: a dock this attach
+     * genuinely `exec`'d has to keep earning [DockOrigin.STOOD_UP], or [ReapEvidence.STOOD_UP]
+     * stops reaping anything at all and the flag becomes `OrphanPolicy.LEAVE` under another name.
+     */
+    @Test
+    fun `a dock this attach spawned proves it, so a stood-up requirement still reaps it`() =
+        swayTest {
+            store.put(WmFlags.reapEvidence, ReapEvidence.STOOD_UP)
+            val app = openSurface("aw-app1")
+            val dock = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1")).dockId
+
+            command("[con_id=${app.raw}] kill")
+            awaitGone(app)
+            awaitSweep()
+            wm.reapOrphans()
+
+            assertNull(
+                wm.tree().find(dock.raw),
+                "the dock carried this attach's spawn token, so the entry the sweep reaps on is " +
+                    "one this process is entitled to have written",
+            )
+        }
+
+    /**
+     * #96: what `attach` records is whichever window answered its wait, and that wait is on an
+     * `app_id` the window's own client declares.
+     *
+     * So a window awakener never spawned could earn [DockOrigin.STOOD_UP] — the entry
+     * [ReapEvidence.STOOD_UP] is documented as the only evidence a desktop cannot produce — with
+     * no mark forged and nothing guessed. The interloper here is `foot -a aw-dock`, `exec`'d
+     * straight at sway by this test, carrying no mark and never touched by awakener until the
+     * attach adopts it.
+     *
+     * **The adoption itself is not what this closes.** That is [DockIdentity]'s disclosed cost and
+     * it still happens: the interloper is marked, moved into the surface's tab and torn down by
+     * this attach's own `detach`. What changes is that it is recorded [DockOrigin.ADOPTED], so the
+     * flag whose whole purpose is "no evidence the desktop can produce is destructive" stops
+     * destroying it. `wm.dock.stood_up_proof=NONE` in the test below is the same run against the
+     * behaviour before this change, and there the window is gone.
+     */
+    @Test
+    fun `a window that only claims the dock's app_id is not one this process stood up`() =
+        swayTest {
+            store.put(WmFlags.reapEvidence, ReapEvidence.STOOD_UP)
+            val app = openSurface("aw-app1")
+
+            val (interloper, dock) = attachRacedByAnInterloper(app)
+            assertEquals(
+                interloper,
+                dock.dockId,
+                "the interloper is still adopted as the dock — that is wm.dock.identity's " +
+                    "disclosed cost and this flag does not touch it",
+            )
+
+            command("[con_id=${app.raw}] kill")
+            awaitGone(app)
+            awaitSweep()
+            wm.reapOrphans()
+
+            assertNotNull(
+                wm.tree().find(interloper.raw),
+                "a window that proved nothing but its own claim about its app_id must not be " +
+                    "reaped by the value documented as resting on evidence the desktop cannot " +
+                    "produce",
+            )
+        }
+
+    /**
+     * The same run with the proof switched off, which is what awakener did before #96 — and it is
+     * the mutation this change is measured by. A stranger's window is destroyed under the flag
+     * that exists to make no forgery costly, and the pre-existing suite is green while it happens.
+     */
+    @Test
+    fun `wm dock stood_up_proof=NONE puts a claimed app_id back in reach of the sweep`() =
+        swayTest {
+            store.put(WmFlags.reapEvidence, ReapEvidence.STOOD_UP)
+            store.put(WmFlags.stoodUpProof, StoodUpProof.NONE)
+            val app = openSurface("aw-app1")
+
+            val (interloper, dock) = attachRacedByAnInterloper(app)
+            assertEquals(interloper, dock.dockId, "the interloper is adopted as the dock")
+
+            command("[con_id=${app.raw}] kill")
+            awaitGone(app)
+            awaitSweep()
+            wm.reapOrphans()
+
+            assertNull(
+                wm.tree().find(interloper.raw),
+                "and under NONE it is destroyed, which is the defect #96 filed: the app_id it " +
+                    "declared about itself was the whole of the evidence",
+            )
+        }
+
+    /**
+     * The strict value, where the proof moves into the wait rather than into the record.
+     *
+     * This is the only thing here that closes the *adoption* as well as the kill: the interloper
+     * maps first and is passed over, and the attach goes on waiting for the program it `exec`'d.
+     * Its price is at the flag — a dock command that does not carry its environment through to the
+     * process owning the surface fails every attach — which is why it is not the default.
+     */
+    @Test
+    fun `wm dock stood_up_proof=TOKEN_REQUIRED makes the wait pass over a claimed app_id`() =
+        swayTest {
+            store.put(WmFlags.stoodUpProof, StoodUpProof.TOKEN_REQUIRED)
+            val app = openSurface("aw-app1")
+
+            val (interloper, dock) = attachRacedByAnInterloper(app)
+
+            assertNotEquals(
+                interloper,
+                dock.dockId,
+                "the window that mapped first could not show the token this attach put in its " +
+                    "dock's environment, so the wait had to keep waiting",
+            )
+            assertNotNull(
+                wm.tree().find(interloper.raw),
+                "and it is left alone rather than adopted, marked and killed",
+            )
+            assertTrue(
+                interloper.raw in wm.surfaces().map { it.id.raw },
+                "a window awakener passed over is an ordinary bindable surface, not something " +
+                    "it owns silently",
             )
         }
 
@@ -1882,6 +2015,35 @@ class SwayBindingTest {
         DockSpec(appId, "sh -c 'sleep $SLOW_DOCK_SLEEP_S; exec ${sway.windowCommand(appId)}'")
 
     /**
+     * An attach on [surface] whose dock's `app_id` is answered by somebody else's window first.
+     *
+     * Returns the window that mapped first and the handle the attach produced, which is the pair
+     * every #96 test asks a question about — whether they are the same node, and what the table
+     * says about the one that was adopted.
+     *
+     * **The two sleeps are what make this deterministic rather than a race.** The interloper is
+     * `exec`'d before the attach starts but maps a second in, so it is certainly absent from the
+     * snapshot of standing docks the attach takes — the snapshot is a handful of round trips
+     * away — and certainly present a second before the real dock. Ordering the `exec` against the
+     * snapshot directly is what is not observable from out here; ordering two maps is.
+     *
+     * The interloper goes through this test's own connection, so it is not queued behind the tree
+     * lock the attach is holding — which is also true of the hand that would do this on a real
+     * desktop, since `swaymsg` knows nothing about awakener's lock.
+     */
+    private suspend fun attachRacedByAnInterloper(
+        surface: SurfaceId,
+        appId: String = "aw-dock",
+    ): Pair<SurfaceId, DockHandle> = coroutineScope {
+        command("exec sh -c 'sleep $INTERLOPER_SLEEP_S; exec ${sway.windowCommand(appId)}'")
+        val attaching = async { wm.attach(surface, slowDock(appId), AgentId("agent-1")) }
+        val first = SurfaceId(
+            assertNotNull(awaitWindow(appId), "the interloping window '$appId' never appeared"),
+        )
+        first to attaching.await()
+    }
+
+    /**
      * A manager whose commands reach sway through [valve], so that a test can hold one of them.
      * Its own manager rather than the shared one: the valve is a one-shot and the field manager
      * is what the assertions read the tree with.
@@ -2092,6 +2254,14 @@ class SwayBindingTest {
          * dock is certainly still absent when the deadline expires.
          */
         const val SLOW_DOCK_SLEEP_S = 2
+
+        /**
+         * How long the #96 interloper waits before mapping: after the attach has certainly taken
+         * its snapshot of standing docks, and a whole second before [SLOW_DOCK_SLEEP_S] brings the
+         * real dock up. Both margins are wide because what is being ordered is two window maps
+         * against a handful of IPC round trips, not two things of comparable cost.
+         */
+        const val INTERLOPER_SLEEP_S = 1
 
         /**
          * The map deadline for a test whose dock program never maps anything.
