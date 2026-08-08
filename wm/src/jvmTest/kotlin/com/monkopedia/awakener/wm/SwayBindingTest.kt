@@ -867,8 +867,10 @@ class SwayBindingTest {
     /**
      * The reservation covers the dock from before it exists, so it has to be given back whether
      * the attach worked or not — and a leaked one is invisible in the tree while hiding every
-     * window under the dock's `app_id` for the life of the process. Cancelled rather than left to
-     * time out, because a reservation that has merely expired would prove nothing about eviction.
+     * window under the dock's `app_id` until its deadline (`wm.wait.reservation_grace_ms`, 5s by
+     * default). Cancelled rather than left to time out, because a reservation that has merely
+     * expired would prove nothing about eviction — which is also why the deadline is a backstop
+     * for an attach that died rather than a reason not to evict (#108).
      */
     @Test
     fun `a cancelled attach gives its reservation back`() = swayTest {

@@ -36,10 +36,14 @@ import kotlinx.serialization.json.Json
  * configuration — awakener writes it, nobody hand-authors it — but "awakener" is not one
  * process: a long-lived holder and an `awakener-registry forget` beside it is the shape this
  * runs in, and `forget` is the module's advertised repair path. So a store owns the *entry* it
- * is changing, never the whole file: each write re-reads under a lock and puts back what it
- * found plus its own change, and each resolve can be told to re-read too
- * ([RegistryFlags.storeReload]). A store that assumed sole ownership would write its snapshot
- * back over a forget and silently resurrect the binding the user had just removed.
+ * is changing, never the whole file: under every value of [RegistryFlags.storeReload] except
+ * `NEVER`, each write re-reads under the lock and puts back what it found plus its own change,
+ * and under `BEFORE_READ` each resolve re-reads too. A store that assumed sole ownership would
+ * write its snapshot back over a forget and silently resurrect the binding the user had just
+ * removed — which is exactly what `NEVER` does, deliberately and documented on the value
+ * itself. The qualification is here rather than only there because this paragraph is what a
+ * caller reads first, and stated flat it made a property of one flag value read as a property
+ * of the class (#109).
  *
  * The file stays plain, readable JSON on purpose: the memory model's claim is that the durable
  * layer is *inspectable when the agent gets you wrong*, and that has to start with which agent a

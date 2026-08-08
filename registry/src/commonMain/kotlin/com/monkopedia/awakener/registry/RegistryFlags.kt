@@ -351,6 +351,35 @@ object RegistryFlags {
         Flags.nonBlank(),
     )
 
+    val commandTimeoutMs = Flags.long(
+        "registry.agent.command_timeout_ms",
+        10_000,
+        "How long a spanreed subprocess gets before it is killed and the run reported as timed " +
+            "out. This is the hotkey's budget: id_source=SPANREED shells out on every first " +
+            "bind and `attach` awaits it, so a bus that has wedged stalls the key press for " +
+            "this long. Lower it on a desktop where a slow answer should fail fast, raise it " +
+            "for a bus that is genuinely slow under load. The child's own stderr survives the " +
+            "kill either way, because it is the only account of why it was slow. Read once per " +
+            "run, so a flip applies to the next command rather than to one already in flight.",
+        Flags.atLeast(1L),
+    )
+
+    val drainGraceMs = Flags.long(
+        "registry.agent.drain_grace_ms",
+        1_000,
+        "How long a finished child's pipes are still read before the runner keeps what arrived " +
+            "and reports the read as short. A child's exit does not close a pipe a grandchild " +
+            "inherited — `spanreed` leaving anything in the background is enough — so without a " +
+            "bound the hotkey waits on a process it never started; with one, an answer still in " +
+            "flight is refused rather than believed. Spent per pipe and only when the drain has " +
+            "not already finished, so a well-behaved child costs none of it. Raising it makes " +
+            "awakener wait longer for a slow answer instead of refusing it; lowering it refuses " +
+            "sooner. 0 keeps only what is already buffered when the child exits. Either way a " +
+            "truncated answer is reported as truncated: what this number moves is the line " +
+            "between waiting and refusing, never between refusing and silently accepting.",
+        Flags.atLeast(0L),
+    )
+
     val registerOnMint = Flags.boolean(
         "registry.agent.register_on_mint",
         false,

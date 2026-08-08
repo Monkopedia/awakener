@@ -1039,7 +1039,12 @@ The flag's stated reason is that *tree damage you can see beats tree damage that
 away*. A leaked reservation is invisible in `swaymsg -t get_tree`, so leaving it standing
 serves that reason not at all — and it costs a great deal: under the default `NEW_NODE` the
 reservation is on the shared dock `app_id`, so `surfaces()` would hide **every** window under
-that name for the life of the process. A flag whose off-state silently blinds surface
+that name until the reservation's deadline (`wm.wait.reservation_grace_ms`, 5s by default).
+That bound has existed since the reservation did — `DockReservation.covers` consults it and
+`DockTableTest` pins it — and the argument does not need the overstatement it replaces: the
+deadline is a backstop for an attach that *died*, not a substitute for eviction by one that
+merely failed, and five seconds of blinding one `app_id` is a cost to avoid rather than one to
+accept because it is finite. A flag whose off-state silently blinds surface
 enumeration is precisely the failure this note indicts in #4, arriving inside this note's own
 design.
 
@@ -1345,8 +1350,15 @@ reconsidered once **#32** lands, not now.)*
    path, and an entry that does not exist until the dock maps is not it.
 3. **#9 must land the reservation's whole lifetime, not just its creation.** Otherwise the
    order does not compose: `wm.dock.pending_suppression` defaults `true`, so between #9 merging
-   and #6 merging, every failed attach on `main` leaks a permanent reservation and blinds
-   `surfaces()` for the dock's `app_id`.
+   and #6 merging, every failed attach on `main` leaks a reservation that blinds `surfaces()`
+   for the dock's `app_id` until its deadline — `wm.wait.reservation_grace_ms`, 5s by default.
+   (This paragraph said "permanent", and that was false of the tree it described:
+   `git show 997073f:wm/src/commonMain/kotlin/com/monkopedia/awakener/wm/DockTable.kt` — #23,
+   the commit that introduced the reservation — already has the deadline field, `hasPassedNow()`
+   in `covers`, and `reserve(…, grace: Duration)`. There was never an interval on `main` in
+   which a leaked reservation was unbounded in time. The ordering argument does not depend on
+   it: a 5s blind spot per failed attach is still a gap worth not shipping, which is why the
+   resolution below stands unchanged.)
 
    The resolution is not a reordering — #6 before #9 would land an unwind with nothing to
    unwind, and the gap would reappear the moment #9 arrived. It is the division already

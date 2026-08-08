@@ -230,9 +230,9 @@ class SpanreedCliTest {
 
     /**
      * And it is refused for *being* short rather than for happening to be unparseable — which
-     * is what stops the guard depending on the decoder's luck. There is no prefix of a JSON
-     * array that parses, so today the two coincide; a `list` that ever grew a line-oriented
-     * form would separate them, and this is the assertion that survives it.
+     * is what stops the guard depending on the decoder's luck. For every document that can
+     * arrive here the two coincide; a `list` that ever grew a line-oriented form would separate
+     * them, and this is the assertion that survives it.
      */
     @Test
     fun `a list the runner says it read short is refused even when it parses`() = runTest {
@@ -242,6 +242,39 @@ class SpanreedCliTest {
                 .message!!.contains("cut off"),
         )
     }
+
+    /**
+     * The decoder's half of that pair, stated as narrowly as it is true.
+     *
+     * The comment above this method used to read "there is no prefix of a JSON array that
+     * parses", and that is false: `[]` is a proper prefix of `[]\n` and both decode to the empty
+     * list, as this pins. What holds — and what the guard actually rests on — is the narrow
+     * form: no proper prefix of a **non-empty** array parses as an array, so a `list` cut off
+     * mid-answer cannot come back as a shorter, plausible one. The wide claim was never needed,
+     * and a reader extending it to a format where it fails would be extending something that
+     * was never true (#110).
+     */
+    @Test
+    fun `a truncated non-empty list cannot parse, which is the property the guard rests on`() =
+        runTest {
+            // The counterexample to the wide claim, and harmless: this document says the bus is
+            // empty, and so does every longer one it is a prefix of.
+            response = ProcessResult(0, "[]\n", "")
+            assertEquals(emptyList(), cli.liveAgents())
+            response = ProcessResult(0, "[]", "")
+            assertEquals(emptyList(), cli.liveAgents())
+
+            // The property the guard needs: every proper prefix of a non-empty answer is refused.
+            val whole = """[{"agent_id": "agent-lifeless-a", "name": "lifeless-a"}]"""
+            for (cut in whole.indices) {
+                response = ProcessResult(0, whole.substring(0, cut), "")
+                assertFailsWith<Exception>("a prefix of length $cut decoded into an answer") {
+                    cli.liveAgents()
+                }
+            }
+            response = ProcessResult(0, whole, "")
+            assertEquals(1, cli.liveAgents().size, "and the whole answer still decodes")
+        }
 
     // ------------------------------------------------------------ minting against a real child
     //

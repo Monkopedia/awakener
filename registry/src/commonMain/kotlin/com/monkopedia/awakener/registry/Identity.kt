@@ -27,6 +27,13 @@ data class AgentIdentity(val id: AgentId, val spanreedName: String)
  * session must run under to come out as this agent — even for an id that was originally derived
  * from a working directory. Used when a caller hands in an agent it already holds and only the
  * id is known.
+ *
+ * Exact for every id awakener can mint, and there is one input it does not invert: the literal
+ * `"agent-"`, which strips to `""`. spanreed's override test is `if override:` rather than a
+ * presence check, so a session launched with `SPANREED_AGENT_NAME=""` derives its id from the
+ * cwd and does not come out as `agent-`. Unreachable here — [spanreedNameFor] is a prefix plus a
+ * non-empty slug — and named because the same misreading of that `if` was stated as fact one
+ * file over (#109).
  */
 fun AgentId.asIdentity(): AgentIdentity = AgentIdentity(this, raw.removePrefix("agent-"))
 
