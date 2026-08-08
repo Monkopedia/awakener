@@ -116,6 +116,65 @@ enum class WatchOverflow {
     REPORT,
 }
 
+/**
+ * How a running watch waits for the next batch of change events.
+ *
+ * This is the one place in awakener where the design brief's "no unattended autonomous action"
+ * rule has to be argued rather than assumed, because a watcher is a thing that runs while
+ * nobody is asking it anything. The distinction the brief draws is between *waiting* and
+ * *polling*: an agent that waits on an event costs nothing and acts only when the world moves,
+ * whereas one that wakes on a timer is acting on a schedule. [BLOCK] is the first; [POLL] is
+ * the second, and it exists because the second is sometimes the only thing a platform offers.
+ */
+enum class WatchWakeup {
+    /**
+     * Park on the `WatchService` until it has something, with no timer at all.
+     *
+     * `WatchService.take` is not interruptible by coroutine cancellation — cancelling the scope
+     * sets a flag on a coroutine whose thread is blocked in a native wait and does not return
+     * from it. What *does* return from it is closing the service, so the watch runs a sibling
+     * coroutine whose only job is to close it when the watch is cancelled. That is what makes
+     * a timer unnecessary, and it is why this is the default: a process holding this open for
+     * a week wakes exactly as many times as the file changes.
+     */
+    BLOCK,
+
+    /**
+     * Wake every [ConfigFlags.watchPollMs] and ask.
+     *
+     * The behaviour before the wakeup was a choice, and the fallback if the close-to-wake
+     * arrangement above ever misbehaves on some filesystem or JDK — a poll notices a cancelled
+     * scope on its own without anything having to wake it. Its cost is exactly what the design
+     * brief objects to: a process that is doing nothing still wakes several times a second
+     * forever, which nothing observed while [watch][FileConfigStore] had no caller and which
+     * becomes real the moment something long-lived runs one.
+     *
+     * The mode is read per iteration, so flipping it applies to a watcher already running —
+     * but a watcher parked in [BLOCK] is parked until the next event, so the flip lands on the
+     * event after the one that wakes it.
+     */
+    POLL,
+}
+
+/** What `awakener-config watch` prints when the snapshot it is following is replaced. */
+enum class WatchReport {
+    /**
+     * Only the flags whose values moved, one per line, with what they were.
+     *
+     * A reload is total — the whole file is re-read — so most of what it publishes is
+     * unchanged, and a full listing per edit buries the one line the operator is looking for.
+     */
+    CHANGES,
+
+    /**
+     * The whole listing again, exactly as `list` prints it.
+     *
+     * For watching a file somebody else is rewriting wholesale, where "what does this process
+     * now believe" is the question rather than "what did that edit do".
+     */
+    ALL,
+}
+
 /** Flags governing configuration itself. */
 object ConfigFlags {
     val discovery = Flags.enum(
@@ -214,6 +273,61 @@ object ConfigFlags {
             "the same channel an unreadable file uses, for a deployment where the snapshot " +
             "must only move on a change somebody can point at. An overflow needs no " +
             "registration to be delivered, so this applies to every watch.",
+    )
+
+    val watchEnabled = Flags.boolean(
+        "config.watch.enabled",
+        true,
+        "Whether an entry point that outlives one operation follows the config file while it " +
+            "runs. On is the behaviour the flags-first working model rests on: edit the file " +
+            "against a running process and the values it reads change, with no restart. Off " +
+            "makes such a process read the file once at startup and keep those values for its " +
+            "whole life, which is what every one-shot command does anyway and is the way back " +
+            "if a watch ever misbehaves against a particular editor or filesystem — the cost " +
+            "is that a flag flip then needs the process restarted. It governs whether the " +
+            "watch is *started*, so it is read once when the process begins and flipping it " +
+            "later does nothing until the next start; every other config.watch.* flag is read " +
+            "live by the running watch.",
+    )
+
+    val watchWakeup = Flags.enum(
+        "config.watch.wakeup",
+        WatchWakeup.BLOCK,
+        "How a running watch waits for the next change. BLOCK parks on the watch service with " +
+            "no timer, so a process that nothing is editing wakes exactly as often as the file " +
+            "changes — which is what the design brief's rule against acting on a schedule asks " +
+            "for. Because that park is not interruptible by cancellation, the watch runs a " +
+            "sibling coroutine that closes the service to wake it, which is the one piece of " +
+            "machinery this mode costs. POLL asks every config.watch.poll_ms instead and " +
+            "notices a cancelled scope by itself; it is the behaviour before this was a choice, " +
+            "and the fallback if closing to wake ever misbehaves. Read per iteration, so a flip " +
+            "reaches a running watch — but a watcher already parked under BLOCK stays parked " +
+            "until the next event, so it takes effect one event later.",
+    )
+
+    val watchPollMs = Flags.long(
+        "config.watch.poll_ms",
+        250,
+        "How long a watch under config.watch.wakeup=POLL waits for events before looking at " +
+            "whether it has been cancelled. It delays no reload — an event ends the wait " +
+            "immediately — so all it bounds is how long after a cancellation the watcher " +
+            "notices, at the price of that many wake-ups per second for as long as the process " +
+            "lives. It was a constant while nothing called the watch, which made the cost " +
+            "invisible: the first long-lived process to run one is where a 250ms timer starts " +
+            "being a timer. Ignored entirely under BLOCK.",
+        requires = Flags.atLeast(1L),
+    )
+
+    val watchReport = Flags.enum(
+        "config.watch.report",
+        WatchReport.CHANGES,
+        "What `awakener-config watch` prints each time the file it is following is re-read. " +
+            "CHANGES prints one line per flag whose value moved, naming what it was, because a " +
+            "reload re-reads the whole file and a full listing per edit buries the line being " +
+            "looked for. ALL reprints the whole listing, for watching a file something else " +
+            "rewrites wholesale. Either way a value that could not be read, or one that broke " +
+            "its flag's requirement, is reported as it arrives — that is not this flag's to " +
+            "silence.",
     )
 
     val lockRequired = Flags.boolean(

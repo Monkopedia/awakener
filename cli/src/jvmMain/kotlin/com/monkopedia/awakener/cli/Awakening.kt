@@ -136,9 +136,12 @@ class Awakening(
      *
      * The flag snapshot is read once, so one invocation cannot act on two of them: a command
      * built under one dock name and attached under another would leave a panel nothing can
-     * find. That is the right shape rather than a live defence — nothing calls
-     * `FileConfigStore.watch`, so no snapshot is replaced under a running process today, which
-     * is #43.
+     * find. **That reason is about this method and not about the binary it happens to be in.**
+     * It used to be stated the other way round — that reading once was merely the right shape,
+     * because nothing anywhere called `FileConfigStore.watch` and no snapshot was ever replaced
+     * (#43). Something does now, so the qualifier has gone; what has not changed is that the
+     * one read is deliberate. A hotkey press is one operation and must act on one set of
+     * values, and it would still have to whether or not this process were following the file.
      */
     suspend fun invoke(target: SurfaceId? = null): Awakened {
         val cfg = config

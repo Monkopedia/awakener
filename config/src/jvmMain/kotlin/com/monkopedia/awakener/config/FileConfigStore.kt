@@ -2,6 +2,7 @@ package com.monkopedia.awakener.config
 
 import java.io.IOException
 import java.nio.channels.FileChannel
+import java.nio.file.ClosedWatchServiceException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
@@ -11,6 +12,7 @@ import java.nio.file.StandardWatchEventKinds.ENTRY_DELETE
 import java.nio.file.StandardWatchEventKinds.ENTRY_MODIFY
 import java.nio.file.StandardWatchEventKinds.OVERFLOW
 import java.nio.file.WatchEvent
+import java.nio.file.WatchService
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import kotlin.io.path.exists
@@ -18,6 +20,7 @@ import kotlin.io.path.name
 import kotlin.io.path.readText
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -42,12 +45,13 @@ import kotlinx.serialization.json.jsonObject
  * default on a stray keystroke, would be a far worse failure against a live desktop. A file
  * that disappears gets the same treatment by default; see [ConfigFlags.watchMissingFile].
  *
- * **Nothing in the build calls [watch] yet** (#43). Every entry point today is one-shot: it
- * builds a store, reads the file once and exits, so no snapshot is replaced under a running
- * process. The mechanism is here, and tested, for the first entry point that outlives a
- * single operation — which is why code above this module reads flags out of the snapshot per
- * operation rather than caching them at construction. That is written against the property
- * this class provides, not against the process that exists.
+ * **[watch] has one caller: `awakener-config watch`** (#43), which is the first thing in the
+ * build to outlive a single operation. Every other entry point is still one-shot — it builds a
+ * store, reads the file once and exits — so a flag flip still reaches those on their next run
+ * rather than mid-operation. That is why code above this module reads flags out of the snapshot
+ * per operation rather than caching them at construction: the discipline is written against the
+ * property this class provides, and there is now a process in which it is observable rather
+ * than only argued.
  *
  * **Writing is not single-writer and never was** (#88). Two `awakener-config set` runs are two
  * processes over one file, and so is a `set` beside an editor saving it. Every write is
@@ -57,7 +61,14 @@ import kotlinx.serialization.json.jsonObject
  * guidance on the other.
  */
 class FileConfigStore(
-    private val path: Path,
+    /**
+     * The file this store reads and rewrites.
+     *
+     * Readable because a caller that reports on the store has to name it, and the alternative
+     * — deriving it from `ConfigCli.defaultPath()` at the report site — is right only for a
+     * store built at the default path and silently wrong for every other one.
+     */
+    val path: Path,
     private val environment: Map<String, String> = System.getenv(),
 ) : ConfigStore {
     private val json = Json { prettyPrint = true; ignoreUnknownKeys = true }
@@ -128,7 +139,7 @@ class FileConfigStore(
 
     /**
      * Watches [path] for changes until [scope] is cancelled, replacing the snapshot each time
-     * it changes. Nothing calls this yet; see the class documentation.
+     * it changes. `awakener-config watch` is what runs it; see the class documentation.
      *
      * Watches the *parent directory*, and has to: a `WatchService` registers directories only,
      * and `Path.register` on a regular file raises `NotDirectoryException` rather than
@@ -142,6 +153,11 @@ class FileConfigStore(
      * read — [ConfigFlags.watchDebounceMs], read from the live snapshot every time round, so
      * that changing it applies to the watcher that is already running rather than to the next
      * one. That is the same rule this module asks of everyone else.
+     *
+     * **How it waits between events is [ConfigFlags.watchWakeup]'s**, and under the default it
+     * does not wake at all until one arrives. That mattered to nobody while this had no caller
+     * and matters now that it has one: a timed poll in a process that lives for a week is a
+     * thing acting on a schedule, which is the one shape the design brief rules out.
      */
     fun watch(scope: CoroutineScope) = scope.launch(Dispatchers.IO) {
         PrivateFiles.createParentDirectories(path, config.value[ConfigFlags.filePermissions])
@@ -152,28 +168,69 @@ class FileConfigStore(
         // handled.
         dir.register(watcher, ENTRY_CREATE, ENTRY_MODIFY, ENTRY_DELETE)
         watcher.use {
-            while (isActive) {
-                // A timed poll rather than a blocking take: cancelling [scope] does not
-                // interrupt the thread a WatchService is parked on, and the close that would
-                // wake it is the one this `use` performs on the way out.
-                val key = watcher.poll(POLL_INTERVAL_MS, TimeUnit.MILLISECONDS) ?: continue
-                val events = key.pollEvents()
-                key.reset()
-                when (reactionTo(events, path.name, config.value[ConfigFlags.watchOverflow])) {
-                    Reaction.IGNORE -> Unit
+            // What makes a blocking wait cancellable. Cancelling [scope] cancels this child
+            // immediately — it does not wait for the parent's body to return, which is the
+            // whole point, since that body is the thing parked in `take`. Closing the service
+            // is what wakes it, and the `use` above would only do that on the way out.
+            //
+            // `FileConfigStoreWatchTest.cancelling a quiescent watch retires it` is what holds
+            // this, and it is the only test that does: every other one cancels a watcher with
+            // events still queued, which returns from `take` without ever parking. Deleting
+            // this block leaves those green.
+            val waker = launch {
+                try {
+                    awaitCancellation()
+                } finally {
+                    watcher.close()
+                }
+            }
+            try {
+                watchLoop(watcher, dir)
+            } finally {
+                waker.cancel()
+            }
+        }
+    }
 
-                    // Reported through the same channel an unreadable file uses, because it is
-                    // the same situation for the reader: the values in effect are no longer
-                    // guaranteed to be the ones they can look at.
-                    Reaction.REPORT_LOSS -> loadError.value =
-                        "$dir: the change queue overflowed and events were lost, so $path may " +
-                        "no longer hold the values in effect; set " +
-                        "${ConfigFlags.watchOverflow.key}=REREAD to re-read on an overflow"
+    /**
+     * The watch's loop, split out only so that the arrangement that makes it cancellable reads
+     * as one thing and the reaction to events as another.
+     *
+     * Both ways out are ordinary: the service being closed under a blocking wait, which is how
+     * cancellation reaches [WatchWakeup.BLOCK], and the scope going inactive, which is how it
+     * reaches [WatchWakeup.POLL]. Neither is reported, because neither is a failure — the
+     * caller asked for it.
+     */
+    private suspend fun CoroutineScope.watchLoop(watcher: WatchService, dir: Path) {
+        while (isActive) {
+            val key = try {
+                when (config.value[ConfigFlags.watchWakeup]) {
+                    WatchWakeup.BLOCK -> watcher.take()
+                    WatchWakeup.POLL ->
+                        watcher.poll(config.value[ConfigFlags.watchPollMs], TimeUnit.MILLISECONDS)
+                            ?: continue
+                }
+            } catch (e: ClosedWatchServiceException) {
+                return
+            } catch (e: InterruptedException) {
+                return
+            }
+            val events = key.pollEvents()
+            key.reset()
+            when (reactionTo(events, path.name, config.value[ConfigFlags.watchOverflow])) {
+                Reaction.IGNORE -> Unit
 
-                    Reaction.REREAD -> {
-                        delay(config.value[ConfigFlags.watchDebounceMs])
-                        reloadFromWatch()
-                    }
+                // Reported through the same channel an unreadable file uses, because it is the
+                // same situation for the reader: the values in effect are no longer guaranteed
+                // to be the ones they can look at.
+                Reaction.REPORT_LOSS -> loadError.value =
+                    "$dir: the change queue overflowed and events were lost, so $path may " +
+                    "no longer hold the values in effect; set " +
+                    "${ConfigFlags.watchOverflow.key}=REREAD to re-read on an overflow"
+
+                Reaction.REREAD -> {
+                    delay(config.value[ConfigFlags.watchDebounceMs])
+                    reloadFromWatch()
                 }
             }
         }
@@ -434,14 +491,6 @@ class FileConfigStore(
     )
 
     internal companion object {
-        /**
-         * How long [watch] blocks before checking whether it has been cancelled. Left a
-         * constant rather than made a flag: an event wakes the poll immediately, so this
-         * delays no reload — all it bounds is how long after `scope.cancel()` the watcher
-         * notices, which nothing yet depends on because nothing yet calls [watch].
-         */
-        const val POLL_INTERVAL_MS = 250L
-
         /**
          * What one batch of watch events means for a file called [name].
          *
