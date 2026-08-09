@@ -169,18 +169,20 @@ check that reads back the artefact you are making a claim about.
   shell is not GNU grep: `type grep` names a function in
   `~/.claude/shell-snapshots/snapshot-zsh-*.sh`, whose body (line 2271, read 2026-08-09 on
   kaladin) is `ARGV0=ugrep "$_cc_bin" -G --ignore-files --hidden -I --exclude-dir=.git …`, and
-  `grep --version` prints `ugrep 7.5.0`. Three separate things make an empty result, each
-  measured here, and only the third is about ugrep at all:
-  - **`--ignore-files` skips gitignored subtrees.** In a scratch tree with `build/` gitignored,
-    one JUnit XML inside it and one tracked file carrying the same pattern as a positive
-    control, `grep -rn 'tests=' <root>` returned **only the control** and exit 0, while
-    `/usr/bin/grep -ran 'tests='` on the same path returned both. So the recursive form cannot
-    corroborate the count the bullet above asks you to read — read that XML by glob or by path,
-    and use **`/usr/bin/grep -ra`** for any absence claim. `-I` is the same shadowing one step
-    on: on a file containing a NUL byte, `grep -c MARKER` printed nothing and exited 1 where
-    `/usr/bin/grep MARKER` printed `binary file matches` and exited 0. And a zsh function does
-    not survive into another shell, so **the shadowing vanishes inside a wrapper** — that same
-    recursive search matched one file run directly and two under each of `bash -c`,
+  `grep --version` prints `ugrep 7.5.0`. Three separate things are at work below, each measured
+  here — the first two make an empty result and only the first is about ugrep at all, while the
+  third governs what an empty one entitles you to conclude:
+  - **`--ignore-files` skips whatever a `.gitignore` excludes, repository or not.** In a scratch
+    tree with `build/` gitignored — and **no `.git` on it or any ancestor**, so this is not
+    confined to checkouts — one JUnit XML inside it and one file outside carrying the same pattern
+    as a positive control, `grep -rn 'tests=' <root>` returned **only the control** and exit 0,
+    while `/usr/bin/grep -ran 'tests='` on the same path returned both. So the recursive form
+    cannot corroborate the count the skipped-count bullet above asks you to read — read that XML
+    by glob or by path, and use **`/usr/bin/grep -ra`** for any absence claim. `-I` is the same
+    shadowing one step on: on a file containing a NUL byte, `grep -c MARKER` printed nothing and
+    exited 1 where `/usr/bin/grep MARKER` printed `binary file matches` and exited 0. And a zsh
+    function does not survive into another shell, so **the shadowing vanishes inside a wrapper** —
+    that same recursive search matched one file run directly and two under each of `bash -c`,
     `find -exec grep` and `xargs grep`. Same search, different answer, nothing in the output
     saying which one you ran.
   - **grep is line-oriented, so a phrase that wraps across a newline cannot match** — and prose
