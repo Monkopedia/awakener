@@ -27,6 +27,31 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Every third-party `uses:` below is pinned to a full commit SHA with the tag it resolved to in a
+# trailing comment. A tag is not a pin — `@v4` is a mutable ref the publishing repository can move
+# at any time, so it names a policy ("whatever they call v4 today"), not an artefact. The SHA names
+# the artefact. The comment is what lets the next reader see which version it is without an API
+# call, and it is a comment precisely because nothing enforces it: if the two ever disagree, the SHA
+# is what runs.
+#
+# The cost, stated rather than discovered later: a SHA also freezes the deprecation warnings these
+# actions emit ("Node.js 20 is deprecated", "setup-java v4 is deprecated"). Those used to clear
+# themselves when the publisher moved the tag; now they clear when somebody bumps the SHA on
+# purpose. That is the trade being made — drift you did not choose, for warnings you have to
+# choose to clear — and it is the same trade the `spanreed-bus` pin makes with its version.
+#
+# The bound on all of this is that the token here is read-only. Every downloaded thing in this
+# workflow — the actions, the Gradle distribution, the apt packages, the spanreed wheel — executes
+# on the runner, so a compromised one runs arbitrary code with whatever credentials the job holds.
+# `default_workflow_permissions: read` at the repository level is the reason that is "code execution
+# on an ephemeral runner" rather than "code execution holding a write token", but a repository
+# setting is invisible from the tree and one click from being widened. Declaring it here puts the
+# bound in the diff, where a change to it has to be reviewed like anything else. The trigger is
+# plain `pull_request`, never `pull_request_target`, so a fork's code never runs with repo
+# credentials in the first place.
+permissions:
+  contents: read
+
 jobs:
   # A red on this check means the code is red. Every step in it is compile, test, or a
   # prerequisite without which the tests cannot run at all; nothing in it can fail for a
@@ -39,14 +64,104 @@ jobs:
       xml-upload: ${{ steps.upload-xml.outcome }}
       html-upload: ${{ steps.upload-html.outcome }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-java@v4
+      # ⚠️ The pin rejects a wrong value and accepts a MISSING one. Measured on an isolated copy
+      # of this wrapper, fresh GRADLE_USER_HOME each time — four states of the one line, and the
+      # two gates in this job catch disjoint halves of them:
+      #
+      #   value            wrapper                                   this guard
+      #   real             exit 0, unpacked                          pinned    (0)
+      #   deleted          exit 0, DOWNLOADED AND RAN, unverified    UNPINNED  (1)  <- only here
+      #   empty            exit 1, nothing unpacked                  UNPINNED  (1)
+      #   64 zeroes        exit 1, nothing unpacked                  pinned    (0)  <- only there
+      #
+      # So `distributionSha256Sum` on its own does not fail closed: deleting the line restores the
+      # pre-#101 behaviour and every build stays green with nothing verified. That is the same
+      # failure this PR caught one level down, and deletion is the realistic accident — a merge
+      # resolution across gradle-wrapper.properties, or the 9.5.1 -> 9.7.0 bump that has to
+      # rewrite exactly this line. (`./gradlew wrapper --gradle-version` was expected to strip it
+      # and does not; it preserves the value and drops only the comments. Checked, not assumed.)
+      #
+      # Nothing else here holds the property. wrapper-validation below reads the **jar** and never
+      # opens gradle-wrapper.properties, and a Gradle task could not hold it either: by the time
+      # any Gradle code runs, the unverified distribution has already been unpacked and executed.
+      # Hence a shell check, first, before ./gradlew exists as an option.
+      #
+      # The matrix runs first and is not ceremony — it is the control that this guard can still
+      # fail. It asserts a deleted line is rejected *and* that 64 zeroes are accepted, so a later
+      # "improvement" that makes the guard judge correctness instead of presence collapses the two
+      # gates into one and reddens here.
+      - name: Check the distribution is pinned at all
+        run: |
+          set -eu
+          .github/scripts/check-wrapper-pin-matrix.sh
+          .github/scripts/check-wrapper-pin.sh
+
+      # gradle-wrapper.jar is committed to this repository, and it is the code that downloads and
+      # unpacks the distribution — so `distributionSha256Sum` in gradle-wrapper.properties is only
+      # as good as the jar that reads it. This step compares the committed jar against Gradle's
+      # published list of known-good wrapper jars. It has to run before anything invokes ./gradlew,
+      # which is why it sits above setup-gradle rather than next to the build.
+      - uses: gradle/actions/wrapper-validation@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
         with:
           distribution: temurin
           java-version: '21'
 
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
+
+      # ⚠️ Without this step `distributionSha256Sum` is a checksum CI never evaluates, and a
+      # checksum nobody checks is indistinguishable from no checksum at all.
+      #
+      # Measured, not reasoned about. setup-gradle restores ~/.gradle/wrapper/dists from its own
+      # cache entry, and that entry holds the **unpacked** distribution together with the wrapper's
+      # `.ok` marker — so `Install` short-circuits and returns before it ever reaches
+      # `verifyDownloadChecksum`. The key is derived from the distributionUrl and nothing else:
+      # `gradle-wrapper-zips-v1-32a3a100d181ec75e824fde1164fcedd` was byte-identical across a run
+      # with the real checksum and a run with it replaced by 64 zeroes, because the checksum is not
+      # an input to it. Run 31297782597 on this branch is that second run, and it came back
+      # **green** — a workflow carrying a deliberately wrong pin, verifying nothing, reporting
+      # success. That is the exact shape of #100 and #89.
+      #
+      # Deleting the restored copy costs one download of a 130MB zip per build and buys the only
+      # thing the checksum was added for: the wrapper takes the download path, hashes what it was
+      # served, and aborts before unpacking if it disagrees. Run 31297924375 is the same zeroed
+      # checksum with this step present, and it is **red**, at `Build and test`, on
+      # "Verification of Gradle distribution failed!".
+      #
+      # It has to run *after* setup-gradle, because setup-gradle is what puts the directory there.
+      #
+      # And the `rm` cannot fail loudly on its own: if setup-gradle ever stops putting the
+      # distribution at this path, the `rm` deletes nothing, exits 0, and the checksum goes back to
+      # being inert with nothing saying so — a third way to be green and verify nothing, after
+      # "no pin" and "wrong pin". So the download is forced here rather than left to `Build and
+      # test`, and the step asserts positively that it happened: `Downloading
+      # https://services.gradle.org/…` is printed by the wrapper only on the path that also calls
+      # verifyDownloadChecksum. Confirmed both ways locally — a fresh GRADLE_USER_HOME prints that
+      # line once, a warm one prints it zero times. It costs nothing extra: this is the same single
+      # download `Build and test` would otherwise do, moved one step earlier so its absence is
+      # visible.
+      - name: Make the distribution checksum load-bearing
+        run: |
+          set -eu
+          dists="${GRADLE_USER_HOME:-$HOME/.gradle}/wrapper/dists"
+          rm -rf "$dists"
+          log="$RUNNER_TEMP/wrapper-fetch.log"
+          if ! ./gradlew --version > "$log" 2>&1; then
+            cat "$log"
+            echo "::error::The wrapper failed before the build started; see the log above."
+            exit 1
+          fi
+          if ! grep -q '^Downloading https://services\.gradle\.org/' "$log"; then
+            cat "$log"
+            echo "::error::The wrapper did not download the distribution, so" \
+                 "distributionSha256Sum was not evaluated on this run. Deleting $dists no longer" \
+                 "forces the download path — find where setup-gradle now puts the distribution."
+            exit 1
+          fi
+          grep -e '^Fetching distribution' -e '^Downloading ' "$log"
 
       # :wm asserts on real compositor behaviour — tree shape, focus memory, what sway does
       # and does not collapse. Headless wlroots needs no GPU, seat, or display, so the runner
@@ -85,10 +200,36 @@ jobs:
 
       # :registry shells out to the spanreed CLI, and its suite skips silently without it —
       # the same false-green trap as :wm without sway, in a second module.
+      #
+      # This used to be `pipx install spanreed-bus`, which resolved to whatever PyPI served that
+      # morning and checked nothing about it. The wheel is now named by version *and* verified
+      # against a sha256 taken from PyPI's own metadata for that file
+      # (`https://pypi.org/pypi/spanreed-bus/json`, `urls[].digests.sha256`) — published by the
+      # index, not computed here from the file we were handed, which would certify whatever we
+      # were served. `sha256sum -c` exits non-zero on a mismatch and the step dies before the
+      # wheel is installed, let alone executed.
+      #
+      # Two things this deliberately does not do, so nobody reads more into it than is there.
+      # The wheel's dependencies (anyio, mcp, pydantic and their closure) are resolved by pip from
+      # PyPI with no pin and no hash: hash-pinning them means committing the whole transitive
+      # closure and re-deriving it on every bump, which is not proportionate for a package that
+      # is the repository owner's own. And a pin freezes the CLI contract :registry tests against
+      # — CI no longer picks up a new spanreed the day it ships, so bumping SPANREED_VERSION and
+      # SPANREED_SHA256 together is now part of releasing one.
       - name: Install spanreed
         id: install-spanreed
+        env:
+          SPANREED_VERSION: '0.0.8'
+          SPANREED_SHA256: '7ab7c0128235751da1ff466916047df3e94716e11a2e27c5403227de5bae87d1'
         run: |
-          pipx install spanreed-bus || pip install --user spanreed-bus
+          set -euo pipefail
+          wheel_dir="$RUNNER_TEMP/spanreed-wheel"
+          mkdir -p "$wheel_dir"
+          python3 -m pip download --no-deps --only-binary :all: \
+            "spanreed-bus==${SPANREED_VERSION}" -d "$wheel_dir"
+          wheel="$wheel_dir/spanreed_bus-${SPANREED_VERSION}-py3-none-any.whl"
+          echo "${SPANREED_SHA256}  ${wheel}" | sha256sum -c -
+          pipx install "$wheel" || pip install --user "$wheel"
           spanreed --help > /dev/null
 
       - name: Build and test
@@ -164,7 +305,7 @@ jobs:
         id: upload-xml
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: test-results-xml
           path: '*/build/test-results/*/*.xml'
@@ -183,7 +324,7 @@ jobs:
         id: upload-html
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: test-report-html
           path: '*/build/reports/tests/**'
@@ -223,7 +364,7 @@ jobs:
       # `skipped` and a typo'd step id all exited 0 — and a check that can only be exercised by
       # pushing to a branch is one nobody exercises. `uploadOutcomeMatrixTest` now runs those
       # inputs on every build, against mutants that put the defect back.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Report whether the test evidence was captured
         env:
