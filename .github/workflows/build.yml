@@ -27,6 +27,25 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Every third-party `uses:` below is pinned to a full commit SHA with the tag it resolved to in a
+# trailing comment. A tag is not a pin — `@v4` is a mutable ref the publishing repository can move
+# at any time, so it names a policy ("whatever they call v4 today"), not an artefact. The SHA names
+# the artefact. The comment is what lets the next reader see which version it is without an API
+# call, and it is a comment precisely because nothing enforces it: if the two ever disagree, the SHA
+# is what runs.
+#
+# The bound on all of this is that the token here is read-only. Every downloaded thing in this
+# workflow — the actions, the Gradle distribution, the apt packages, the spanreed wheel — executes
+# on the runner, so a compromised one runs arbitrary code with whatever credentials the job holds.
+# `default_workflow_permissions: read` at the repository level is the reason that is "code execution
+# on an ephemeral runner" rather than "code execution holding a write token", but a repository
+# setting is invisible from the tree and one click from being widened. Declaring it here puts the
+# bound in the diff, where a change to it has to be reviewed like anything else. The trigger is
+# plain `pull_request`, never `pull_request_target`, so a fork's code never runs with repo
+# credentials in the first place.
+permissions:
+  contents: read
+
 jobs:
   # A red on this check means the code is red. Every step in it is compile, test, or a
   # prerequisite without which the tests cannot run at all; nothing in it can fail for a
@@ -39,14 +58,21 @@ jobs:
       xml-upload: ${{ steps.upload-xml.outcome }}
       html-upload: ${{ steps.upload-html.outcome }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-java@v4
+      # gradle-wrapper.jar is committed to this repository, and it is the code that downloads and
+      # unpacks the distribution — so `distributionSha256Sum` in gradle-wrapper.properties is only
+      # as good as the jar that reads it. This step compares the committed jar against Gradle's
+      # published list of known-good wrapper jars. It has to run before anything invokes ./gradlew,
+      # which is why it sits above setup-gradle rather than next to the build.
+      - uses: gradle/actions/wrapper-validation@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
         with:
           distribution: temurin
           java-version: '21'
 
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
 
       # :wm asserts on real compositor behaviour — tree shape, focus memory, what sway does
       # and does not collapse. Headless wlroots needs no GPU, seat, or display, so the runner
@@ -85,10 +111,36 @@ jobs:
 
       # :registry shells out to the spanreed CLI, and its suite skips silently without it —
       # the same false-green trap as :wm without sway, in a second module.
+      #
+      # This used to be `pipx install spanreed-bus`, which resolved to whatever PyPI served that
+      # morning and checked nothing about it. The wheel is now named by version *and* verified
+      # against a sha256 taken from PyPI's own metadata for that file
+      # (`https://pypi.org/pypi/spanreed-bus/json`, `urls[].digests.sha256`) — published by the
+      # index, not computed here from the file we were handed, which would certify whatever we
+      # were served. `sha256sum -c` exits non-zero on a mismatch and the step dies before the
+      # wheel is installed, let alone executed.
+      #
+      # Two things this deliberately does not do, so nobody reads more into it than is there.
+      # The wheel's dependencies (anyio, mcp, pydantic and their closure) are resolved by pip from
+      # PyPI with no pin and no hash: hash-pinning them means committing the whole transitive
+      # closure and re-deriving it on every bump, which is not proportionate for a package that
+      # is the repository owner's own. And a pin freezes the CLI contract :registry tests against
+      # — CI no longer picks up a new spanreed the day it ships, so bumping SPANREED_VERSION and
+      # SPANREED_SHA256 together is now part of releasing one.
       - name: Install spanreed
         id: install-spanreed
+        env:
+          SPANREED_VERSION: '0.0.8'
+          SPANREED_SHA256: '7ab7c0128235751da1ff466916047df3e94716e11a2e27c5403227de5bae87d1'
         run: |
-          pipx install spanreed-bus || pip install --user spanreed-bus
+          set -euo pipefail
+          wheel_dir="$RUNNER_TEMP/spanreed-wheel"
+          mkdir -p "$wheel_dir"
+          python3 -m pip download --no-deps --only-binary :all: \
+            "spanreed-bus==${SPANREED_VERSION}" -d "$wheel_dir"
+          wheel="$wheel_dir/spanreed_bus-${SPANREED_VERSION}-py3-none-any.whl"
+          echo "${SPANREED_SHA256}  ${wheel}" | sha256sum -c -
+          pipx install "$wheel" || pip install --user "$wheel"
           spanreed --help > /dev/null
 
       - name: Build and test
@@ -164,7 +216,7 @@ jobs:
         id: upload-xml
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: test-results-xml
           path: '*/build/test-results/*/*.xml'
@@ -183,7 +235,7 @@ jobs:
         id: upload-html
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: test-report-html
           path: '*/build/reports/tests/**'
@@ -223,7 +275,7 @@ jobs:
       # `skipped` and a typo'd step id all exited 0 — and a check that can only be exercised by
       # pushing to a branch is one nobody exercises. `uploadOutcomeMatrixTest` now runs those
       # inputs on every build, against mutants that put the defect back.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Report whether the test evidence was captured
         env:
