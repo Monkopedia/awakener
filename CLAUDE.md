@@ -165,6 +165,49 @@ check that reads back the artefact you are making a claim about.
   both are argued per case from what the diff actually touches, and neither is ever discharged
   by looking the case up on a list of things previously agreed to be harmless. An agent who
   understands one should recognise the other on sight.
+- **A grep that returned nothing is the weakest signal in this file.** The `grep` in an agent
+  shell is not GNU grep: `type grep` names a function in
+  `~/.claude/shell-snapshots/snapshot-zsh-*.sh`, whose body (line 2271, read 2026-08-09 on
+  kaladin) is `ARGV0=ugrep "$_cc_bin" -G --ignore-files --hidden -I --exclude-dir=.git …`, and
+  `grep --version` prints `ugrep 7.5.0`. Three separate things make an empty result, each
+  measured here, and only the third is about ugrep at all:
+  - **`--ignore-files` skips gitignored subtrees.** In a scratch tree with `build/` gitignored,
+    one JUnit XML inside it and one tracked file carrying the same pattern as a positive
+    control, `grep -rn 'tests=' <root>` returned **only the control** and exit 0, while
+    `/usr/bin/grep -ran 'tests='` on the same path returned both. So the recursive form cannot
+    corroborate the count the bullet above asks you to read — read that XML by glob or by path,
+    and use **`/usr/bin/grep -ra`** for any absence claim. `-I` is the same shadowing one step
+    on: on a file containing a NUL byte, `grep -c MARKER` printed nothing and exited 1 where
+    `/usr/bin/grep MARKER` printed `binary file matches` and exited 0. And a zsh function does
+    not survive into another shell, so **the shadowing vanishes inside a wrapper** — that same
+    recursive search matched one file run directly and two under each of `bash -c`,
+    `find -exec grep` and `xargs grep`. Same search, different answer, nothing in the output
+    saying which one you ran.
+  - **grep is line-oriented, so a phrase that wraps across a newline cannot match** — and prose
+    wraps. `docs/design-notes/wm-dock-ownership.md` at `c3aff53` contains
+    `a string the desktop can write` **twice**; `/usr/bin/grep -oa` on that exact phrase finds
+    **one**, because the other breaks after `can` at the end of line 339. Two occurrences, one
+    visible, same file and same pattern — the discrepancy is the defect in one line. It bit
+    **an author and a reviewer of #132 on the same day, in opposite roles**: a body asserting
+    six corrected sites where there were seven, and a review that had found the sentence *by
+    reading* and credited a grep that could never have contradicted it. What works is a
+    **whitespace-normalised whole-file scan** — collapse every run of whitespace, newlines
+    included, to a single space per file, then match. That is what returns 2.
+  - **A control only protects a claim if the control could fail the same way the claim could.**
+    This is the transferable half. A positive control on a different, unwrapped string passes
+    above and proves the file was read, not that a wrapped target could ever match. Away from
+    grep entirely: a fleet `429` scan reported hits that were microsecond timestamps —
+    `/usr/bin/grep -oa '429'` on a line reading `2026-08-09T05:04:40.2429114Z … 200 ok` returns
+    1 — and a positive control on a log containing a real 429 would also have passed. The
+    control needed there was a **negative** one sharing the failure mode: a log known to
+    contain no rate-limiting, run through the same detector. Same shape as the reach and
+    known-flake exemptions above; argue it from what your control can actually distinguish.
+
+  This bullet is new with #106/#134, and #134's own ask said to add it "beside the existing
+  ugrep warnings" here. There were none — those live in the fleet's `CLAUDE.md`, and an
+  injected context does not label which file a rule came from. That is #79 arriving inside the
+  report about instruments that answer a different question from the one they were read as
+  answering.
 - **Do not read the shared checkout for anything load-bearing.** `/home/jmonk/git/awakener` is
   the tree the `agent-*` worktrees hang off, and **nothing pulls it on a schedule** — checked
   2026-08-05: kaladin has no cron at all (no `crontab` binary, no `/etc/cron.*`), and no unit
