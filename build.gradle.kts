@@ -78,8 +78,11 @@ tasks.named("check") { dependsOn(summaryMatrixTest) }
 // red that only arrives after a push arrives after the change has been reported as verified. It
 // declares no tool fingerprint, and that is a decision rather than an omission — no row in it is
 // gated on a tool being present, so there is no reduced-coverage run for the cache to replay. It
-// dies outright if `awk` is missing (the splice needs one), which is the loud failure the
-// fingerprints elsewhere exist to convert a silent one into.
+// dies outright if `awk` is missing (the splice needs one) or `grep`/`sed` (the mutant table is
+// parsed with them), which is the loud failure the fingerprints elsewhere exist to convert a
+// silent one into. That distinction is the test: a fingerprint earns its place when a *missing*
+// tool would leave the suite running with less coverage and still green, and nothing here has
+// that shape.
 val uploadOutcomeMatrixTest by tasks.registering(Exec::class) {
     group = LifecycleBasePlugin.VERIFICATION_GROUP
     description = "Runs .github/scripts/upload-outcome.sh against its input and mutant matrix."
@@ -88,6 +91,13 @@ val uploadOutcomeMatrixTest by tasks.registering(Exec::class) {
     val report = layout.buildDirectory.file("reports/upload-outcome-matrix.txt")
     inputs.file(matrix)
     inputs.file(script)
+    // New with #133, matching the two sibling matrices: the suite now says how many of its
+    // declared mutants had to run for its green to mean anything, and this switch moves that bar.
+    // It changes what a pass asserts, so it is a task input — `org.gradle.caching=true` and Gradle
+    // treats neither PATH nor the environment as an input, so undeclared, the cache would replay a
+    // run that checked a subset into a build whose point was the full roster. Unset — the state
+    // every build here is in — the suite requires every declared mutant.
+    inputs.property("minMutants", providers.environmentVariable("AWAKENER_MATRIX_MIN_MUTANTS").orElse("all"))
     outputs.file(report)
     commandLine(
         "sh",
