@@ -34,6 +34,12 @@ concurrency:
 # call, and it is a comment precisely because nothing enforces it: if the two ever disagree, the SHA
 # is what runs.
 #
+# The cost, stated rather than discovered later: a SHA also freezes the deprecation warnings these
+# actions emit ("Node.js 20 is deprecated", "setup-java v4 is deprecated"). Those used to clear
+# themselves when the publisher moved the tag; now they clear when somebody bumps the SHA on
+# purpose. That is the trade being made — drift you did not choose, for warnings you have to
+# choose to clear — and it is the same trade the `spanreed-bus` pin makes with its version.
+#
 # The bound on all of this is that the token here is read-only. Every downloaded thing in this
 # workflow — the actions, the Gradle distribution, the apt packages, the spanreed wheel — executes
 # on the runner, so a compromised one runs arbitrary code with whatever credentials the job holds.
@@ -59,6 +65,38 @@ jobs:
       html-upload: ${{ steps.upload-html.outcome }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # ⚠️ The pin rejects a wrong value and accepts a MISSING one. Measured on an isolated copy
+      # of this wrapper, fresh GRADLE_USER_HOME each time — four states of the one line, and the
+      # two gates in this job catch disjoint halves of them:
+      #
+      #   value            wrapper                                   this guard
+      #   real             exit 0, unpacked                          pinned    (0)
+      #   deleted          exit 0, DOWNLOADED AND RAN, unverified    UNPINNED  (1)  <- only here
+      #   empty            exit 1, nothing unpacked                  UNPINNED  (1)
+      #   64 zeroes        exit 1, nothing unpacked                  pinned    (0)  <- only there
+      #
+      # So `distributionSha256Sum` on its own does not fail closed: deleting the line restores the
+      # pre-#101 behaviour and every build stays green with nothing verified. That is the same
+      # failure this PR caught one level down, and deletion is the realistic accident — a merge
+      # resolution across gradle-wrapper.properties, or the 9.5.1 -> 9.7.0 bump that has to
+      # rewrite exactly this line. (`./gradlew wrapper --gradle-version` was expected to strip it
+      # and does not; it preserves the value and drops only the comments. Checked, not assumed.)
+      #
+      # Nothing else here holds the property. wrapper-validation below reads the **jar** and never
+      # opens gradle-wrapper.properties, and a Gradle task could not hold it either: by the time
+      # any Gradle code runs, the unverified distribution has already been unpacked and executed.
+      # Hence a shell check, first, before ./gradlew exists as an option.
+      #
+      # The matrix runs first and is not ceremony — it is the control that this guard can still
+      # fail. It asserts a deleted line is rejected *and* that 64 zeroes are accepted, so a later
+      # "improvement" that makes the guard judge correctness instead of presence collapses the two
+      # gates into one and reddens here.
+      - name: Check the distribution is pinned at all
+        run: |
+          set -eu
+          .github/scripts/check-wrapper-pin-matrix.sh
+          .github/scripts/check-wrapper-pin.sh
 
       # gradle-wrapper.jar is committed to this repository, and it is the code that downloads and
       # unpacks the distribution — so `distributionSha256Sum` in gradle-wrapper.properties is only
@@ -94,8 +132,36 @@ jobs:
       # "Verification of Gradle distribution failed!".
       #
       # It has to run *after* setup-gradle, because setup-gradle is what puts the directory there.
+      #
+      # And the `rm` cannot fail loudly on its own: if setup-gradle ever stops putting the
+      # distribution at this path, the `rm` deletes nothing, exits 0, and the checksum goes back to
+      # being inert with nothing saying so — a third way to be green and verify nothing, after
+      # "no pin" and "wrong pin". So the download is forced here rather than left to `Build and
+      # test`, and the step asserts positively that it happened: `Downloading
+      # https://services.gradle.org/…` is printed by the wrapper only on the path that also calls
+      # verifyDownloadChecksum. Confirmed both ways locally — a fresh GRADLE_USER_HOME prints that
+      # line once, a warm one prints it zero times. It costs nothing extra: this is the same single
+      # download `Build and test` would otherwise do, moved one step earlier so its absence is
+      # visible.
       - name: Make the distribution checksum load-bearing
-        run: rm -rf "${GRADLE_USER_HOME:-$HOME/.gradle}/wrapper/dists"
+        run: |
+          set -eu
+          dists="${GRADLE_USER_HOME:-$HOME/.gradle}/wrapper/dists"
+          rm -rf "$dists"
+          log="$RUNNER_TEMP/wrapper-fetch.log"
+          if ! ./gradlew --version > "$log" 2>&1; then
+            cat "$log"
+            echo "::error::The wrapper failed before the build started; see the log above."
+            exit 1
+          fi
+          if ! grep -q '^Downloading https://services\.gradle\.org/' "$log"; then
+            cat "$log"
+            echo "::error::The wrapper did not download the distribution, so" \
+                 "distributionSha256Sum was not evaluated on this run. Deleting $dists no longer" \
+                 "forces the download path — find where setup-gradle now puts the distribution."
+            exit 1
+          fi
+          grep -e '^Fetching distribution' -e '^Downloading ' "$log"
 
       # :wm asserts on real compositor behaviour — tree shape, focus memory, what sway does
       # and does not collapse. Headless wlroots needs no GPU, seat, or display, so the runner
