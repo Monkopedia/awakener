@@ -17,13 +17,24 @@
 # assert it goes *green*, which is the defect reproduced rather than described.
 #
 # Written to run under dash and busybox sh as well as bash.
+#
+# **Three exit statuses, because a suite that did not run is not a suite that passed** (#89,
+# fixed in `test-summary-matrix.sh` by #129 and propagated here by #133):
+#
+#   0  every declared mutant ran and every row behaved
+#   1  a row failed
+#   2  the suite could not vouch — it never reached the state where a row verdict means anything
+#
+# `AWAKENER_MATRIX_MIN_MUTANTS` (default `all`) is how much of the counterfactual phase has to
+# have executed for a 0; see the mutant table.
 set -eu
 
 SCRIPT=$1
 WORK=$2
 REPORT=$3
 
-[ -f "$SCRIPT" ] || { echo "upload-outcome-matrix: no script at $SCRIPT" >&2; exit 1; }
+# Exit 2: the suite could not run, which is not the same fact as a row failing. See `die`.
+[ -f "$SCRIPT" ] || { echo "upload-outcome-matrix: CANNOT VOUCH: no script at $SCRIPT" >&2; exit 2; }
 SCRIPT=$(CDPATH= cd -P -- "$(dirname "$SCRIPT")" && pwd)/$(basename "$SCRIPT")
 
 rm -rf "$WORK"
@@ -44,12 +55,95 @@ detail() {
     printf '%s\n' "$1" | head -12 | sed 's/^/      | /' | tee -a "$REPORT" >/dev/null
 }
 
+# Exit 2, not 1, and that is the whole of #89 in one line. `die` is reached when the suite could
+# not get as far as testing what it claims to test — a mutant that will not build, an anchor that
+# no longer exists, a guard naming nothing, a declared mutant that never ran. That is a different
+# fact from "a row failed", which is exit 1, and until #133 both printed a red the caller could
+# not tell apart. Three outcomes, and the caller can act on them without reading prose:
+#
+#   0  every declared mutant ran and every row behaved
+#   1  a row failed
+#   2  the suite could not vouch — it never reached the state where a row verdict means anything
 die() {
-    note "upload-outcome-matrix: $1"
-    exit 1
+    note "upload-outcome-matrix: CANNOT VOUCH: $1"
+    exit 2
 }
 
-MUTANTS='unexpected emptypair emptybranch successarm failarm cancelarm readboth pre99'
+# ------------------------------------------------------------------ the mutant roster
+#
+# One record per mutant, and this table is also the invocation list — the loop at the bottom is
+# the only route to `run_mutant`. That is #89's fix rather than a fourth check for it: before
+# #133 this file held a bare `MUTANTS='…'` declaration and eight hand-maintained `run_mutant`
+# lines beside it, so a name that was declared, named by rows, and missing its `run_mutant` line
+# satisfied every check here — the guard-name check found it in `MUTANTS`, the roster check found
+# it in `GUARDS_SEEN`, and the `run_count > before` check lives *inside* `run_mutant`, so it was
+# never reached. The rows naming it then passed with and without the guard they exist to test,
+# and the row count was the only trace.
+#
+# Deleting a record now deletes the declaration too, so the rows still naming that guard trip the
+# guard-name check at the first row instead of going quietly green.
+#
+# Format, one record per line: `name|mutation [mutation …]`. Blank lines and lines whose first
+# non-blank character is `#` are commentary, so an era mutant's justification lives beside it
+# rather than in a comment block that can drift away from the entry it explains.
+MUTANT_TABLE='
+unexpected|unexpected
+emptypair|emptypair
+emptybranch|emptybranch
+successarm|successarm
+failarm|failarm
+cancelarm|cancelarm
+readboth|readboth
+
+# The shape the step had when #99 was filed: only the literal string `failure` reddens, and the
+# both-empty case notices whatever the build did. Every row tagged `pre99!` asserts it exits 0
+# against this, which is the defect reproduced rather than described.
+pre99|unexpected emptypair
+'
+
+# The one place that knows the record format. Everything else asks this.
+mutant_rows() {
+    printf '%s\n' "$MUTANT_TABLE" | grep -v '^[[:space:]]*#' | grep -v '^[[:space:]]*$' || true
+}
+
+mutant_row_for() {
+    mutant_rows | while IFS= read -r r; do
+        case $r in
+            "$1|"*) printf '%s\n' "$r"; return 0 ;;
+        esac
+    done
+}
+
+MUTANTS=''
+for _n in $(mutant_rows | sed 's/|.*//'); do
+    # A duplicate would run its mutant twice and read in the log as extra coverage.
+    case " $MUTANTS " in
+        *" $_n "*) die "mutant '$_n' appears twice in MUTANT_TABLE" ;;
+    esac
+    MUTANTS="$MUTANTS $_n"
+done
+[ -n "$MUTANTS" ] || die "MUTANT_TABLE parsed to no mutants at all"
+MUTANTS=${MUTANTS# }
+MUTANTS_DECLARED=0
+for _n in $MUTANTS; do MUTANTS_DECLARED=$((MUTANTS_DECLARED + 1)); done
+MUTANTS_RUN=''
+
+# How many of the declared mutants must actually have run before this suite's green is worth
+# anything. `all` — the default, and the behaviour that would otherwise be hard-coded — means
+# every one: a green then says the whole counterfactual phase executed, which is the only thing
+# that makes the row verdicts evidence. An integer instead lets a deliberately partial run (a
+# bisect, a single mutant under a debugger) still report, and it is the *number* that keeps that
+# honest rather than a boolean, because "I meant to run a subset" and "the loop silently skipped
+# one" are otherwise the same output. Anything short of the bar exits 2, never 0 and never 1.
+# Same switch, same name and same default as the two sibling matrices, so one setting governs the
+# whole family rather than three spellings of the same idea.
+MIN_MUTANTS=${AWAKENER_MATRIX_MIN_MUTANTS:-all}
+case $MIN_MUTANTS in
+    all) ;;
+    ''|*[!0-9]*)
+        die "AWAKENER_MATRIX_MIN_MUTANTS must be 'all' or a non-negative integer, got '$MIN_MUTANTS'" ;;
+esac
+
 GUARDS_SEEN=''
 MODE=real
 MUTANT=''
@@ -273,6 +367,7 @@ apply() {
     esac
 }
 
+# Runs one record of MUTANT_TABLE. Never called by hand — see the loop below.
 run_mutant() {
     MUTANT=$1
     shift
@@ -302,22 +397,50 @@ run_mutant() {
     note "# counterfactual: the rows that name '$MUTANT' must go red without it"
     before=$run_count
     cases
+    # Belt to the roster check's braces: that one catches a guard naming no mutant, this one
+    # catches a mutant whose rows all sat out for any other reason.
     [ "$run_count" -gt "$before" ] || die "mutant $MUTANT ran no rows at all"
     RUN_SCRIPT=$SCRIPT
+    MUTANTS_RUN="$MUTANTS_RUN $MUTANT"
 }
 
+# The mutant phase is a loop over the table, and there is no other way to reach `run_mutant`. A
+# mutant that is declared and not run is therefore unrepresentable rather than merely detected —
+# deleting a record removes the mutant from `MUTANTS` too, and the rows still naming it then trip
+# the guard-name check with a message that says so.
 MODE=mutant
-run_mutant unexpected  unexpected
-run_mutant emptypair   emptypair
-run_mutant emptybranch emptybranch
-run_mutant successarm  successarm
-run_mutant failarm     failarm
-run_mutant cancelarm   cancelarm
-run_mutant readboth    readboth
-# The shape the step had when #99 was filed: only the literal string `failure` reddens, and the
-# both-empty case notices whatever the build did.
-run_mutant pre99 unexpected emptypair
+for mutant_name in $MUTANTS; do
+    mutant_record=$(mutant_row_for "$mutant_name")
+    [ -n "$mutant_record" ] || die "no MUTANT_TABLE record for '$mutant_name'"
+    mutant_muts=${mutant_record#*|}
+    [ -n "$mutant_muts" ] || die "mutant '$mutant_name' names no mutation to apply"
+    run_mutant "$mutant_name" $mutant_muts
+done
+
+# And the belt to that: what was declared, confronted with what actually ran. The loop above makes
+# the #89 hole unwritable; this makes it unreachable by any other route — an edit to the loop, an
+# early `continue`, a filter someone adds later. It reports the pair of numbers rather than a
+# boolean, because "I ran a subset on purpose" and "one silently sat out" are the same green
+# otherwise. Exit 2: a suite that did not run its counterfactuals has not failed, it has abstained.
+mutants_ran=0
+mutants_missing=''
+for m in $MUTANTS; do
+    case " $MUTANTS_RUN " in
+        *" $m "*) mutants_ran=$((mutants_ran + 1)) ;;
+        *) mutants_missing="$mutants_missing $m" ;;
+    esac
+done
+if [ "$MIN_MUTANTS" = all ]; then
+    [ -z "$mutants_missing" ] ||
+        die "declared but never run:$mutants_missing — $mutants_ran of $MUTANTS_DECLARED mutants ran, so the rows naming the rest passed with and without the guard they exist to test"
+elif [ "$mutants_ran" -lt "$MIN_MUTANTS" ]; then
+    die "$mutants_ran of $MUTANTS_DECLARED mutants ran, below the $MIN_MUTANTS required by AWAKENER_MATRIX_MIN_MUTANTS"
+fi
 
 note ""
 note "upload-outcome-matrix: $run_count rows, $fail_count failed"
+# Printed on the green path too, and that is the point: the row count was the only trace #89 left
+# behind, and nobody compares row counts between runs. This states the fact the reader needs —
+# how much of the counterfactual phase actually happened — instead of leaving it to be inferred.
+note "  mutants: $mutants_ran of $MUTANTS_DECLARED declared ran (required: $MIN_MUTANTS)"
 [ "$fail_count" -eq 0 ] || exit 1
