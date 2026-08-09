@@ -89,7 +89,7 @@ jobs:
       #
       # Deleting the restored copy costs one download of a 130MB zip per build and buys the only
       # thing the checksum was added for: the wrapper takes the download path, hashes what it was
-      # served, and aborts before unpacking if it disagrees. RUN_ID_PENDING is the same zeroed
+      # served, and aborts before unpacking if it disagrees. Run 31297924375 is the same zeroed
       # checksum with this step present, and it is **red**, at `Build and test`, on
       # "Verification of Gradle distribution failed!".
       #
