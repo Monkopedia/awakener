@@ -11,6 +11,14 @@ plugins {
 // discovery quietly goes back to reporting a subset, which is the bug this module fixes.
 val siblingModules = rootProject.subprojects.map { it.path } - project.path
 
+// What the suite checks that list *against*, and deliberately not the list itself. Both the
+// dependencies above and the `awakener.modules` property below are derived from
+// `siblingModules`, so a module it fails to enumerate used to drop out of the expectation and
+// out of the classpath together — `FlagVisibilityTest` compared a set against itself and could
+// not fail (#142). The test parses this file instead, which is the source `settings.gradle.kts`
+// is the authority for and which nothing in this script can quietly narrow.
+val settingsFile = rootProject.layout.projectDirectory.file("settings.gradle.kts")
+
 /**
  * A cache key naming *which* of [tools] this build found on PATH, not merely that it found any.
  * Path, size and mtime rather than a boolean, so upgrading sway re-runs the suite instead of
@@ -229,7 +237,20 @@ tasks.named("check") { dependsOn(launcherTest) }
 tasks.withType<Test>().configureEach {
     // So the suite can assert the wiring above actually happened, for whatever the current set
     // of modules is rather than for a set frozen into a test.
-    systemProperty("awakener.modules", siblingModules.joinToString(",") { it.removePrefix(":") })
+    systemProperty("awakener.modules", siblingModules.joinToString(","))
+
+    // And what it compares that claim against. The *path* is passed rather than the parsed
+    // result, so the deriving happens in the test where it is reviewable next to the assertion
+    // it feeds — and so that nothing in this script sits between `settings.gradle.kts` and the
+    // expectation.
+    systemProperty("awakener.settings", settingsFile.asFile.absolutePath)
+    // The content, as a separate declaration, because the path string does not change when a
+    // module is added to that file. Gradle would then see identical inputs, replay the previous
+    // green, and the one change this check exists to catch would be the one change invisible to
+    // it — the #29 failure with a different file in the middle.
+    inputs.file(settingsFile)
+        .withPathSensitivity(PathSensitivity.NONE)
+        .withPropertyName("settingsFile")
 
     // This module has an integration suite of its own, so it inherits both tool gates whole.
     // `AWAKENER_REQUIRE_*=1` turns a missing tool from a skip into a failure, which is what stops

@@ -1,10 +1,13 @@
 package com.monkopedia.awakener.cli
 
+import kotlin.io.path.Path
 import kotlin.io.path.createTempDirectory
+import kotlin.io.path.readText
 import kotlin.io.path.writeText
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 /**
@@ -75,21 +78,70 @@ class FlagVisibilityTest {
 
     /**
      * Discovery can only find what is on the classpath, so the other half of the guarantee is
-     * the build: `:cli` depends on every module in the build, computed from the build itself.
-     * If a new module is included in `settings.gradle.kts` this starts covering it too.
+     * the build: `:cli` depends on every module in the build. If a new module is included in
+     * `settings.gradle.kts` this starts covering it too.
+     *
+     * **The expectation comes from `settings.gradle.kts`, not from the build script under
+     * test**, and that is the whole content of this test rather than a detail of it.
+     * `cli/build.gradle.kts` derives `:cli`'s dependencies *and* the `awakener.modules`
+     * property it publishes from one expression, so while this read only that property a
+     * module the expression failed to enumerate was absent from both sides at once: the loop
+     * iterated a set that was correct by construction and the docstring above promised
+     * something it could not keep (#142). Measured on this branch — with that expression
+     * replaced by a hand-written three-module list and a genuine fourth module included, this
+     * test fails, and before the rewrite it passed while `awakener-config list` could not see
+     * that module's flags.
      */
     @Test
     fun `every module in the build reaches the CLI classpath`() {
-        val modules = System.getProperty("awakener.modules").orEmpty()
-            .split(",").filter { it.isNotEmpty() }
-        assertTrue(modules.isNotEmpty(), "the build did not say which modules exist")
+        val included = includedProjects()
+        // A control on the parse, not on the build. An expectation derived by reading a file
+        // fails *open*: a moved file or a regex that stops matching yields an empty set and
+        // every assertion below passes for the reason this test was rewritten to stop passing
+        // for. `:cli` is the one project that must be in there — this class is compiled into
+        // it — so its absence indicts the parse rather than the wiring.
+        assertTrue(
+            ":cli" in included,
+            "settings.gradle.kts parsed to $included, which does not include the module this " +
+                "test is compiled into, so the parse is what is wrong and not the build",
+        )
+
+        val expected = included - ":cli"
+        val declared = System.getProperty("awakener.modules").orEmpty()
+            .split(",").filter { it.isNotEmpty() }.toSet()
+        assertEquals(
+            expected,
+            declared,
+            "cli/build.gradle.kts builds :cli's dependencies from the same list it publishes " +
+                "as awakener.modules, so a module missing from it is a module whose flags " +
+                "`awakener-config list` cannot report",
+        )
+
         val classPath = System.getProperty("java.class.path").orEmpty()
-        modules.forEach { module ->
+        expected.forEach { module ->
+            val dir = module.removePrefix(":").replace(':', '/')
             assertTrue(
-                classPath.contains("/$module/build/"),
-                "module :$module is not on the CLI classpath, so its flags cannot be found",
+                classPath.contains("/$dir/build/"),
+                "module $module is not on the CLI classpath, so its flags cannot be found",
             )
         }
+    }
+
+    /**
+     * Every `include(...)` in the root settings file, as Gradle project paths. Text rather than
+     * anything Gradle computed, on purpose: the point is a source of truth that
+     * `cli/build.gradle.kts` has no way to narrow.
+     */
+    private fun includedProjects(): Set<String> {
+        val settings = assertNotNull(
+            System.getProperty("awakener.settings"),
+            "the build did not say where settings.gradle.kts is",
+        )
+        val text = Path(settings).readText()
+        return Regex("""\binclude\s*\(([^)]*)\)""").findAll(text)
+            .flatMap { call -> Regex(""""([^"]+)"""").findAll(call.groupValues[1]) }
+            .map { it.groupValues[1] }
+            .toSet()
     }
 
     /**

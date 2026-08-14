@@ -27,14 +27,22 @@ class WmFlagsTest {
     private fun snapshot(vararg values: Pair<String, Long>): Config =
         Config.of(values.associate { (key, value) -> key to JsonPrimitive(value) })
 
+    /**
+     * Through [Config.of], because that is the only place a cross-flag [Flags.constraint] is
+     * ever evaluated (`Config.of`, where `Flags.allConstraints()` runs). This read
+     * `Config.EMPTY.problems`, which reaches the primary constructor instead — and there
+     * `problems` is a stored parameter defaulting to `emptyList()`, so the assertion was
+     * `assertEquals(emptyList(), emptyList())` and stayed green for *any* violated constraint,
+     * including this file's own. Measured: with `reservationGraceMs`'s default dropped below
+     * `mapWaitMs`'s, the old line passed and the new one fails (#142).
+     */
     @Test
     fun `the shipped defaults trip nothing`() {
         assertEquals(
             emptyList(),
-            Config.EMPTY.problems,
+            snapshot().problems,
             "an unconfigured system has to be correct, which is the whole rule about defaults",
         )
-        assertEquals(emptyList(), snapshot().problems)
     }
 
     /**
