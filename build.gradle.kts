@@ -149,6 +149,51 @@ val stalenessMatrixTest by tasks.registering(Exec::class) {
 
 tasks.named("check") { dependsOn(stalenessMatrixTest) }
 
+// The wrapper-pin check's suite (#141).
+//
+// Wired to `check` for the fourth time and for the same reason as the three above: the script is
+// edited here, and a red that only arrives after a push arrives after the change has already been
+// reported as verified. This one was the outlier — `.github/workflows/build.yml` was the only
+// thing in the tree that named `check-wrapper-pin-matrix.sh`, so it *did* run on every CI build
+// (that job is a required check) but `./gradlew build` on a developer machine did not touch it.
+// Confirmed two ways before this task existed: an exhaustive `git grep` at `99877a6` returned the
+// workflow line and nothing else, with `staleness-matrix.sh` as the control that turns up in this
+// file; and `./gradlew check --dry-run` at the same commit listed the three sibling matrix tasks
+// and no fourth.
+//
+// No tool fingerprint, and that is a decision rather than an omission — the same one
+// `uploadOutcomeMatrixTest` records. No row in the suite is gated on a tool being present: it dies
+// outright with `CANNOT VOUCH` if `grep` or `awk` is missing, so there is no reduced-coverage run
+// for the cache to replay. A fingerprint earns its place when a *missing* tool would leave the
+// suite running with less coverage and still green, and nothing here has that shape.
+val wrapperPinMatrixTest by tasks.registering(Exec::class) {
+    group = LifecycleBasePlugin.VERIFICATION_GROUP
+    description = "Runs .github/scripts/check-wrapper-pin.sh against its case and mutant matrix."
+    val matrix = layout.projectDirectory.file(".github/scripts/check-wrapper-pin-matrix.sh")
+    val script = layout.projectDirectory.file(".github/scripts/check-wrapper-pin.sh")
+    val report = layout.buildDirectory.file("reports/check-wrapper-pin-matrix.txt")
+    inputs.file(matrix)
+    inputs.file(script)
+    // How much of the counterfactual phase has to have executed for the suite's green to mean
+    // anything. Declared as an input because it changes what a pass asserts, and an undeclared
+    // switch is how a cached run that checked a subset gets replayed into one that demanded all of
+    // it. Unset — the state every build here is in — the suite requires every declared mutant.
+    inputs.property("minMutants", providers.environmentVariable("AWAKENER_MATRIX_MIN_MUTANTS").orElse("all"))
+    outputs.file(report)
+    commandLine(
+        "sh",
+        matrix.asFile.absolutePath,
+        "--script",
+        script.asFile.absolutePath,
+        "--work",
+        layout.buildDirectory.dir("check-wrapper-pin-matrix").get().asFile.absolutePath,
+        "--report",
+        report.get().asFile.absolutePath,
+    )
+}
+
+tasks.named("check") { dependsOn(wrapperPinMatrixTest) }
+
 // What this build should have run, checked against what it did run.
 //
 // `.github/scripts/test-summary.sh` holds the comparison and CI runs it as a step after the
