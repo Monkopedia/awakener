@@ -9,6 +9,7 @@ import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
@@ -129,6 +130,51 @@ class FileConfigStoreLockTest {
             "the store wrote with no cross-process exclusion and said nothing: " +
                 "${store.lockError.value}",
         )
+    }
+
+    /**
+     * Reported, and then *stopped* being reported once a `set` does get the lock.
+     *
+     * The same property `StorePermissionsTest` holds for the residue exposure report, and the
+     * same reason: a warning that latches is a warning that stops meaning anything the moment
+     * somebody acts on it. `ConfigCli` prints [FileConfigStore.lockError] after every `set`, so
+     * a store that never cleared it would print `warning: … writing without cross-process
+     * exclusion` on every subsequent **successful** write, for the life of the process.
+     *
+     * The transition is the whole test, because it is the half nothing observed (#140). Every
+     * assertion this suite had was either *set* — block the lock, write once, assert non-null,
+     * stop — or *never-set*, an `assertNull` on a store that was never degraded and would pass
+     * against a store that cannot clear at all. Measured: with `lockError.value = null` deleted
+     * from `withFileLock`, the whole build stayed green at 351 tests.
+     */
+    @Test
+    fun `the unlocked-write warning clears once a set does get the lock`() = runBlocking {
+        val path = dir.resolve("relockable.json")
+        path.writeText("{}")
+        val lock = dir.resolve("relockable.json.lock")
+        // A directory where the lock file goes, for the reason the test above gives: it is the
+        // arrangeable version of a filesystem that will not lock, and it is *removable*, which
+        // is what makes the recovery half of this arrangeable too.
+        Files.createDirectory(lock)
+
+        val store = FileConfigStore(path, environment = emptyMap())
+        store.set("lock.a.3", "7")
+        assertTrue(
+            store.lockError.value?.contains("relockable.json.lock") == true,
+            "the degraded write has to be reported before its clearing can mean anything: " +
+                "${store.lockError.value}",
+        )
+
+        Files.delete(lock)
+        store.set("lock.a.4", "8")
+
+        assertNull(
+            store.lockError.value,
+            "this `set` took the lock, so the warning describes nothing that is still true — " +
+                "left standing it makes every later successful write print it too",
+        )
+        assertEquals(8, store.config.value[LockKnobs.slots[4]], "and the write itself happened")
+        assertEquals(7, store.config.value[LockKnobs.slots[3]], "beside the degraded one")
     }
 
     /** The other arm: refuse rather than write without exclusion. */

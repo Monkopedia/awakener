@@ -236,6 +236,47 @@ class BindingStoreTest {
         assertTrue(store.path.readText().contains("window:firefox"), "and the bind still happened")
     }
 
+    /**
+     * Reported, and then *stopped* being reported once a bind does get the lock.
+     *
+     * The same property `StorePermissionsTest` holds for the residue exposure report, and the
+     * same reason: a warning that latches is a warning that stops meaning anything the moment
+     * somebody acts on it. `RegistryCli` prints [FileBindingStore.lockError] beside its other
+     * warnings, so a store that never cleared it would print `warning: … binding without
+     * cross-process exclusion` on every subsequent **successful** write, for the life of the
+     * process — and the operator who fixed the state directory would have no way to tell that
+     * from a store still writing unlocked.
+     *
+     * The transition is the whole test, because it is the half nothing observed (#140). The
+     * assertion above is *set* — block the lock, write once, assert non-null, stop — and
+     * `StorePermissionsTest`'s is *never-set*, an `assertNull` on a store that was never
+     * degraded and would pass against a store that cannot clear at all. Measured: with
+     * `unlocked = null` deleted from `withFileLock`, the whole build stayed green at 351 tests.
+     */
+    @Test
+    fun `the unlocked-write warning clears once a bind does get the lock`() = runTest {
+        val store = store()
+        val lock = dir.resolve("bindings.json.lock")
+        // Removable, unlike the acquisition arm: a filesystem that will not lock cannot be
+        // talked into locking mid-test, so the creation arm is the one that can state recovery.
+        Files.createDirectories(lock)
+        store.bind(SurfaceKey.Window("firefox"))
+        assertNotNull(store.lockError, "the degraded write has to be reported first")
+
+        Files.delete(lock)
+        store.bind(SurfaceKey.Window("chromium"))
+
+        assertNull(
+            store.lockError,
+            "this bind took the lock, so the warning describes nothing that is still true — " +
+                "left standing it makes every later successful bind print it too",
+        )
+        assertTrue(
+            store.path.readText().contains("window:chromium"),
+            "and the locked bind still happened",
+        )
+    }
+
     /** The other half of the trade: refuse the write rather than make it without exclusion. */
     @Test
     fun `an operator can require the lock instead of degrading`() = runTest {
