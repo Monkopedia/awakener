@@ -262,6 +262,15 @@ tasks.withType<Test>().configureEach {
     //    default `registry.agent.spanreed_command` — every other spanreed test injects a path or
     //    a script — so it is also what says an unconfigured `awakener-invoke` can reach the bus.
     //
+    // That second claim was made here before anything held it, and the distance between the two is
+    // narrow enough to be worth naming: the test did require spanreed to be *installed*
+    // (`SpanreedHarness.assumeAvailable`, which this forwarding is what makes fatal), and it did
+    // run under the default, but every assertion it then made about the result was one the local
+    // fallback satisfied too. `AgentIdSource.SPANREED -> derivedId(name)` left it green with no
+    // child forked (#139). It now records the subprocess through the production runner and asserts
+    // on the argv, the environment and the child's own bytes, so a mint that stops shelling out
+    // reds here — which is what makes this bullet a gate rather than a description.
+    //
     // The second bullet is what this forwarding was worth *nothing* without, and the wording it
     // replaces claimed the opposite: it said the invoke path needs spanreed "to answer whether a
     // Lifeless is animated", which no `:cli` test asked it — the bus is faked in both suites for

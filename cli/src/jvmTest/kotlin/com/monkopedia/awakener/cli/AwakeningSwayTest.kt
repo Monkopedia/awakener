@@ -5,9 +5,12 @@ import com.monkopedia.awakener.config.InMemoryConfigStore
 import com.monkopedia.awakener.registry.AgentBus
 import com.monkopedia.awakener.registry.AgentIdSource
 import com.monkopedia.awakener.registry.AgentIdentities
+import com.monkopedia.awakener.registry.CommandRunner
 import com.monkopedia.awakener.registry.DerivedAgentIdentities
 import com.monkopedia.awakener.registry.FileBindingStore
 import com.monkopedia.awakener.registry.LiveAgent
+import com.monkopedia.awakener.registry.ProcessCommandRunner
+import com.monkopedia.awakener.registry.ProcessResult
 import com.monkopedia.awakener.registry.RegistryFlags
 import com.monkopedia.awakener.registry.SpanreedCli
 import com.monkopedia.awakener.registry.SpanreedHarness
@@ -61,7 +64,10 @@ import kotlinx.serialization.json.Json
  * The **mint** is a separate question from the bus, and one test below does not fake it:
  * `the panel comes up under an identity the real spanreed issued`. That one is what
  * `AWAKENER_REQUIRE_SPANREED` protects in this module, and before it existed the flag was
- * forwarded here with nothing on the test path consulting spanreed at all (#100).
+ * forwarded here with nothing on the test path consulting spanreed at all (#100). It asserts on
+ * the subprocess itself rather than on the id that came back, because the id is by design one a
+ * local rule reproduces — which is how that test spent its first life gating a spanreed
+ * *installation* while a mint that never forked one would have passed it (#139).
  */
 class AwakeningSwayTest {
     private lateinit var sway: SwayHarness
@@ -243,6 +249,35 @@ class AwakeningSwayTest {
      * The **bus** is still faked, and the split is deliberate: liveness is `spanreed list`, a read
      * of Jason's live registry that this suite's own note keeps out, while the mint is `agent-id`,
      * which prints a derivation and writes nothing.
+     *
+     * ### Why none of that can be asserted through the id (#139)
+     *
+     * The obvious proof — assert the id — cannot work here, and the reason is a property worth
+     * keeping rather than a defect: `SpanreedCli.derivedId` and [DerivedAgentIdentities] apply
+     * spanreed's `SPANREED_AGENT_NAME` override rule from one shared definition **so the two
+     * cannot drift apart**, and spanreed applies the same rule literally — measured on kaladin,
+     * `SPANREED_AGENT_NAME=Aw_Test-UPPER.dot spanreed agent-id` prints exactly
+     * `agent-Aw_Test-UPPER.dot`, with no normalisation to distinguish it by. So **every id a real
+     * spanreed can return is reconstructible locally**, and an assertion on the value is satisfied
+     * by the fallback it exists to rule out. This test's three "spanreed ran" assertions were each
+     * that shape: `"agent-" + binding.spanreedName` is `derivedId`'s rule verbatim,
+     * `binding.spanreedName` is `spanreedNameFor` computed in-process, and `minted == 0` was true
+     * by construction — [identities] is reassigned below, so the counting lambda installed in
+     * `setUp` is no longer on the mint path at all. Rewriting `AgentIdSource.SPANREED ->
+     * spanreedId(cfg, name)` to `-> derivedId(name)` left the whole test green with no subprocess
+     * forked, which is #100's gate holding *installation* and still not *consultation*.
+     *
+     * What replaces them is an assertion on the **act**, since the answer cannot carry it: the
+     * production [ProcessCommandRunner] is wrapped in a [RecordingRunner], so the argv, the
+     * environment override and the child's own bytes are all readable afterwards. A record of a
+     * run is the one artefact the local rule produces none of, and the id is then pinned to
+     * `stdout` **including its terminator** — the byte `derivedId` has no way to invent.
+     *
+     * Wrapping rather than pointing [RegistryFlags.spanreedCommand] at a recording script is the
+     * whole point: a script would move that flag off its shipped default, and being the only test
+     * that runs the mint *under* the default is the reason this test is worth gating. The
+     * delegate is `ProcessCommandRunner(store)`, which is exactly what [SpanreedCli]'s own default
+     * argument builds — so what runs is unchanged and only the record of it is new.
      */
     @Test
     fun `the panel comes up under an identity the real spanreed issued`() = swayTest {
@@ -264,23 +299,49 @@ class AwakeningSwayTest {
             "the shipped default, resolved on PATH — the gate found it at $spanreed",
         )
 
-        identities = SpanreedCli(store)
+        val runs = RecordingRunner(ProcessCommandRunner(store))
+        identities = SpanreedCli(store, runner = runs)
         openSurface("aw-app1")
         val awakened = assertIs<Awakened.Animated>(awakening.invoke())
 
         assertEquals(
             listOf(awakened.binding.spanreedName),
             awaitReportedNames(1),
-            "the panel's own SPANREED_AGENT_NAME, and the id behind this one came back from a " +
-                "spanreed subprocess rather than from a rule applied locally",
+            "the panel's own SPANREED_AGENT_NAME, read out of the process sway started",
+        )
+
+        // Everything above here is satisfied by a mint that never left the JVM. Everything below
+        // is about a subprocess that ran.
+        val call = assertNotNull(
+            runs.calls.singleOrNull(),
+            "the mint has to have forked exactly one child; it ran ${runs.calls.size} — " +
+                "${runs.calls.map { it.command }}",
         )
         assertEquals(
-            "agent-${awakened.binding.spanreedName}",
-            awakened.binding.agentId,
-            "spanreed still answers agent-id with agent-<name>; a Lifeless bound under anything " +
-                "else is addressed by nobody",
+            listOf(SpanreedHarness.COMMAND, "agent-id"),
+            call.command,
+            "the bare name the shipped default holds, handed to ProcessBuilder unresolved — " +
+                "this test injected no path, which is what makes it the one that says an " +
+                "unconfigured awakener-invoke can reach the bus",
         )
-        assertEquals(0, minted, "and the counted derived minter is not what ran")
+        assertEquals(
+            awakened.binding.spanreedName,
+            call.environment["SPANREED_AGENT_NAME"],
+            "asked as this surface's agent; a surface has no cwd, so without the override " +
+                "spanreed answers about wherever awakener was started from",
+        )
+        assertEquals(0, call.result.exitCode, "a zero exit from the spanreed at $spanreed")
+        assertNull(
+            call.result.shortRead,
+            "and the whole of what it wrote — a prefix of an agent id is itself a valid agent id",
+        )
+        assertEquals(
+            "${awakened.binding.agentId}\n",
+            call.result.stdout,
+            "the Lifeless is bound under exactly the bytes that child printed. The terminator is " +
+                "the part that cannot be reconstructed: derivedId returns 'agent-<name>' and " +
+                "nothing else in the process ever appends a newline to it",
+        )
     }
 
     /**
@@ -468,6 +529,38 @@ class AwakeningSwayTest {
     private class FakeBus : AgentBus {
         var live: List<LiveAgent> = emptyList()
         override suspend fun liveAgents(): List<LiveAgent> = live
+    }
+
+    /**
+     * Every subprocess a mint ran, recorded **around** the production runner rather than in place
+     * of it.
+     *
+     * Not a fake: [delegate] is the real [ProcessCommandRunner], so the child is forked, the pipes
+     * are drained and the short-read discipline applies exactly as they do on the hotkey path.
+     * All that is added is a record — which is the only evidence available here, because the id a
+     * real spanreed returns is by design reconstructible without one (#139; see
+     * `the panel comes up under an identity the real spanreed issued`).
+     *
+     * [calls] is a plain list on purpose. It is written on `Dispatchers.IO` inside
+     * `SpanreedCli.exec`'s `withContext` and read after `invoke()` has returned, and that
+     * resumption is the happens-before — a concurrent collection here would suggest a
+     * concurrency this test does not have.
+     */
+    private class RecordingRunner(private val delegate: CommandRunner) : CommandRunner {
+        val calls = mutableListOf<Call>()
+
+        override fun run(
+            command: List<String>,
+            environment: Map<String, String?>,
+        ): ProcessResult = delegate.run(command, environment).also {
+            calls += Call(command, environment, it)
+        }
+
+        class Call(
+            val command: List<String>,
+            val environment: Map<String, String?>,
+            val result: ProcessResult,
+        )
     }
 
     private companion object {
