@@ -46,6 +46,17 @@
 # an unusable floor file, or a floor file that disagrees with the build's own module roster all
 # exit non-zero. Nothing else here does.
 #
+# **What it declines to report is deliberate too** (#143). A floor *below* what ran is the state
+# the tree is supposed to be in — `CLAUDE.md` and the head of the floor file both say adding tests
+# needs no edit there — so a line naming every module that has grown past its floor says only that
+# the repository grew, and says it on every run for ever. It did: it named `wm` on every build from
+# 2026-08-08, byte-identical, and not one reader acted on it. A warning that fires on sanctioned
+# behaviour does not get acted on; it teaches its readers to skip the part of the page it prints
+# in, which is the same page the shortfall error prints on. So the ordinary case is carried by the
+# per-module `floor` column, which already sits beside the count, and the prose line fires only
+# where a floor has decayed past the point of constraining anything finer than "this module
+# reported nothing at all".
+#
 # `.github/scripts/test-summary-matrix.sh` holds this script's suite, and it is not optional
 # reading if you edit here: it asserts the behaviour above *and* asserts that each guard,
 # removed, brings a case back red. `./gradlew check` runs it.
@@ -307,7 +318,7 @@ counts_for() {
 }
 
 evaluate_floors() {
-  local i=0 name min row te m rest
+  local i=0 name min row su te span m rest
   while [ "$i" -lt "${#floor_names[@]}" ]; do
     name=${floor_names[$i]}
     min=${floor_mins[$i]}
@@ -318,15 +329,27 @@ evaluate_floors() {
       fi
       continue
     fi
-    read -r _ te _ _ _ <<< "$row"
+    read -r su te _ _ _ <<< "$row"
     te=$(num "$te")
+    su=$(num "$su")
+    # A floor that everything has grown past still catches a module reporting nothing, and stops
+    # catching anything smaller — which is how a floor quietly becomes a rubber stamp. That decay
+    # is worth a line of prose, and it is prose rather than a gate because raising a floor is
+    # never *required*. But the gap at which it is worth saying is not "any gap at all": one test
+    # added is the sanctioned state, and a note that fires on it fires always.
+    #
+    # `span` is the threshold, and it is measured from this same run rather than fixed here: the
+    # module's own mean tests-per-suite, which is what one of its test classes is worth. A gap at
+    # or above it means a whole average-sized class could stop running with this gate still green,
+    # and that is precisely the floor having stopped constraining anything short of silence. Below
+    # it the `floor` column in the table carries the number and nothing is being asked of anyone.
+    # A module with more suites than tests has no meaningful class size, so the threshold floors
+    # at 1 and any drift there is reported.
+    span=1
+    if [ "$su" -gt 0 ] && [ $((te / su)) -gt 1 ]; then span=$((te / su)); fi
     if [ "$te" -lt "$min" ]; then
       floor_failures+=("\`$name\` reported $te tests, below the committed floor of $min")
-    elif [ "$te" -gt "$min" ]; then
-      # A floor that everything has grown past still catches a module reporting nothing, and
-      # stops catching anything smaller — which is how a floor quietly becomes a rubber stamp.
-      # Saying it every run is the cheapest way to keep the number describing the module, and
-      # raising one is never *required*, so this is a line of prose and not a gate.
+    elif [ $((te - min)) -ge "$span" ]; then
       floor_drift="$floor_drift \`$name\` $min→$te,"
     fi
   done
@@ -473,7 +496,7 @@ row_names() {
       echo '> `skipped` is zero, so every tool-gated test executed rather than opting out.'
     fi
     if [ -n "$floor_drift" ]; then
-      echo "> Floors behind what ran:${floor_drift%,}. Each is still enough to catch a module that reported nothing, and no longer enough to catch a module that reported most of itself. Raising them in \`$FLOORS\` is never required and is how the number goes on meaning something."
+      echo "> Floors that have stopped constraining:${floor_drift%,}. Each gap is at least that module's own mean tests-per-suite, so a whole test class could stop running with this gate still green: what is left catches a module that reported nothing, and nothing smaller. Growth on its own is not on this line — adding tests needs no edit, and the \`floor\` column above already carries it. Raise these in \`$FLOORS\` off a CI run on a merged tree, which is the only tree whose counts will still be true after the merge."
     fi
   fi
 } | emit

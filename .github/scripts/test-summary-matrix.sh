@@ -175,6 +175,7 @@ BELOWFLOOR='**Coverage is below the committed floor**'
 NORESULTS='produced no test results at all; the floor says'
 UNDECLARED='is not declared in the floor file'
 BADFLOORS='**The test floor file could not be used**'
+DRIFT='Floors that have stopped constraining:'
 
 # ------------------------------------------------------------------ fixtures
 #
@@ -412,11 +413,25 @@ floors settingsok 'wm 101'
 printf 'rootProject.name = "awakener"\ninclude(":wm")\n' \
     >"$WORK/fx/settingsok/settings.gradle.kts"
 
-# driftup: a module that has grown past its floor. Green, and said out loud, because a floor
-# everything has grown past is exactly the state in which it stops describing anything and starts
-# being a number nobody has read since it was written.
-d=$(suitedir driftup wm); suite "$d/TEST-a.xml" WmTest 101 0 0 0
-floors driftup 'wm 90'
+# driftup / driftsmall: the same four suites — 101 tests over four classes, so a mean class is 25
+# — against two floors, one either side of the threshold. Both are green; only one is said out
+# loud. `driftup`'s floor is 30 behind, which is more than a class, so a whole class could stop
+# running under it and the note fires. `driftsmall`'s is 11 behind, which is the ordinary state of
+# a repository that keeps adding tests, and the note must be silent or it is silent about nothing.
+#
+# The pair is the shape of #143: with the note firing on any excess at all, the second of these
+# printed the same line as the first, so the line said "the repository grew" on every build and
+# nobody read it. Neither row can be satisfied by deleting the note and neither by printing it
+# unconditionally, which is the only reason the two together assert anything.
+driftsuites() {
+    d=$(suitedir "$1" wm)
+    suite "$d/TEST-a.xml" WmOneTest 25 0 0 0
+    suite "$d/TEST-b.xml" WmTwoTest 25 0 0 0
+    suite "$d/TEST-c.xml" WmThreeTest 25 0 0 0
+    suite "$d/TEST-d.xml" WmFourTest 26 0 0 0
+}
+driftsuites driftup;    floors driftup 'wm 71'
+driftsuites driftsmall; floors driftsmall 'wm 90'
 
 # ------------------------------------------------------------------ PATH construction
 #
@@ -621,6 +636,12 @@ floorfile|yes|floorfile
 floorroster|yes|floorroster
 floorsettings|yes|floorsettings
 floordrift|no|floordrift
+
+# The shape the script had when #143 was filed: the drift note firing on any excess at all. Not a
+# guard that was missing, but a threshold that was — which is why it needs an inverse mutant
+# rather than a `1 -eq 2`. It is an era mutant of one line, and the era it reproduces is the week
+# in which `wm 114→118` printed on every build and trained everyone to skip that paragraph.
+pre143|no|floordriftalways
 
 # The shape the script had when #97 was filed: it read the XML faithfully and compared it to
 # nothing. Every row tagged `pre97!` prints the reassurance against it — including the ones where
@@ -954,7 +975,15 @@ cases() {
         "+$REASSURE" "-$BADFLOORS"
 
     check floor-behind-what-ran 'floordrift pessimist' driftup impl plain \
-        '+Floors behind what ran: `wm` 90→101.' \
+        "+$DRIFT \`wm\` 71→101." \
+        "+$REASSURE" "-$BELOWFLOOR"
+
+    # The other side of the threshold, and the row #143 is about: a floor behind by less than a
+    # test class is the state every green build is in, so saying so is saying nothing on a page
+    # whose other lines have to be read. Guarded by `pre143`, which is this script's own previous
+    # behaviour — under it this row prints the note and goes red.
+    check floor-behind-but-still-constraining 'pre143 pessimist' driftsmall impl plain \
+        "-$DRIFT" \
         "+$REASSURE" "-$BELOWFLOOR"
 }
 
@@ -1089,7 +1118,15 @@ apply() {
                 'if [ 1 -eq 2 ]; then'
             ;;
         floordrift)
-            splice "$WORK/mutant/$1.sh" 'elif [ "$te" -gt "$min" ]; then' 'elif [ 1 -eq 2 ]; then'
+            splice "$WORK/mutant/$1.sh" \
+                'elif [ $((te - min)) -ge "$span" ]; then' 'elif [ 1 -eq 2 ]; then'
+            ;;
+        # The inverse of a guard removal: the threshold put back to where #143 found it, so the
+        # note fires on any excess. `1 -eq 2` cannot express this — the behaviour under test is a
+        # narrowing, and the counterfactual for a narrowing is the wider thing it replaced.
+        floordriftalways)
+            splice "$WORK/mutant/$1.sh" \
+                'elif [ $((te - min)) -ge "$span" ]; then' 'elif [ "$te" -gt "$min" ]; then'
             ;;
         *) die "apply: unknown mutation '$2'" ;;
     esac
