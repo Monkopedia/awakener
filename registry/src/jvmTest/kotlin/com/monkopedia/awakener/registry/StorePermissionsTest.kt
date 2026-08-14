@@ -213,7 +213,10 @@ class StorePermissionsTest {
     /**
      * Reported, and then *stopped* being reported once the residue is somewhere private. A
      * warning that latches is a warning that stops meaning anything the moment somebody acts on
-     * it — the same property [FileBindingStore.lockError] holds.
+     * it — the same property [FileBindingStore.lockError] holds, and `BindingStoreTest`'s
+     * `the unlocked-write warning clears once a bind does get the lock` is where it is held.
+     * That sentence named a property nothing tested until #140; a comment pointing at a test is
+     * checkable, and pointing at a contract is not.
      */
     @Test
     fun `the exposure report clears once the residue moves somewhere private`() = runTest {
