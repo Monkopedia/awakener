@@ -16,6 +16,36 @@
 # has to appear in a diff next to the change that caused it, signed by whoever decided it was
 # fine. Lowering a floor is a legitimate thing to do — silently falling below one is not.
 #
+# **That rule governs, and until #143 it had a rival in this same file.** The tail below used to
+# end "when it names a module, refresh this file and this line together" — a standing obligation
+# triggered by a note that fires whenever the repository grows, which is to say always. Two rules,
+# opposite answers, no tie-break: so the note named `wm` on every build from 2026-08-08 and nobody
+# refreshed anything. `CLAUDE.md` breaks the tie, and it breaks it for the minimums: *"when a
+# change legitimately removes tests, lower the floor in the same commit… Adding tests never needs
+# an edit."* Two reasons beyond the doctrine saying so:
+#
+#   - **A diff here is rare, and that is what makes it a signal.** The value of a committed floor
+#     is that lowering one appears next to the change that caused it, signed by someone. If every
+#     PR that adds a test also bumps a line here, a lowering is one line among many.
+#   - **The refresh cannot honestly be measured from the tree that would carry it.** A count read
+#     off a feature branch describes a tree `main` has since left, which is the failure the rest
+#     of this file spends thirty lines on. An honest number comes off a CI run on a merged tree,
+#     and that is not something the PR adding the tests can produce.
+#
+# So nothing refreshes these on a schedule and nothing asks anyone to. They are raised when
+# someone is editing this file anyway — lowering a floor, adding a module — or when the drift note
+# says a floor has stopped constraining, and then from a CI run on a merged tree, quoting the run.
+# **The floors below sitting behind what `main` runs is the intended state, not a chore in
+# arrears.**
+#
+# **The note was narrowed to match** (#143). `test-summary.sh` no longer says anything about a
+# floor a module has merely grown past: the `floor` column of its per-module table carries that,
+# beside the count, at the cost of nobody's attention. It prints prose only where the gap has
+# reached that module's own mean tests-per-suite — the point at which a whole test class could
+# stop running with the gate still green. The floor is not dead at that moment: it still catches
+# any loss larger than the gap. What it has lost is the unit these numbers were committed in, and
+# that is what is worth a line on the page.
+#
 # A module declared `0` is a positive claim that it has no tests. Every module in the build must
 # appear: `:root:verifyTestFloors` passes the build's own module roster in
 # `AWAKENER_TEST_MODULES` and fails if this file and that roster disagree in either direction,
@@ -24,13 +54,19 @@
 # Counts as of the #43 branch rebased onto `1ca031d`: 32 suites, 347 tests, skipped=0 — per
 # module, `cli` 6/60, `config` 5/64, `registry` 10/109, `wm` 11/114, read out of
 # `*/build/test-results/jvmTest/*.xml` after a `clean build --no-build-cache` with both REQUIRE
-# flags set. The floors below are those counts.
+# flags set. The floors below are those counts. **That is provenance for the four numbers below,
+# not a claim about what `main` runs now** — the two stopped being equal the next time anyone added
+# a test, which is the intended behaviour and not a line waiting to be rewritten.
 #
 # Three of the four were behind before that change, and only one of the three is its doing: it
 # adds 4 to `cli` and 4 to `config`, while `registry` had been at 109 against a floor of 102
-# since **#127**. The drift note `test-summary.sh` prints named all three on the same line, which
-# is the mechanism working — a floor nobody refreshes decays into a number too small to catch
-# anything short of a module reporting nothing at all.
+# since **#127**. The drift note as it then read named all three on the same line — the mechanism
+# half working. It was exactly as loud about `registry`, seven behind, as about the two that had
+# grown by four that morning, and exactly as loud again about a floor behind by one, which is what
+# `config` and `registry` are today. A line that reads the same at every gap leaves the reader to
+# work out which gap this is, and the reader stops. A floor nobody refreshes does decay into a
+# number too small to catch anything short of a module reporting nothing at all; what the note
+# lacked was any way to say when that had happened.
 #
 # **That attribution said #113 until review caught it, and it was wrong in both halves** — which
 # is worth the space, because a wrong provenance claim in the file whose whole job is provenance
@@ -64,8 +100,11 @@
 # #119 itself merged. #118's two test classes were therefore never in the counts these floors
 # were written from; the counter was right and the tree was simply a different one. So `main`
 # ran 331 the moment #119 landed, and `test-summary.sh` printed its drift note on every run from
-# the first. A note that has never been silent is a note nobody reads, so when it names a
-# module, refresh this file and this line together.
+# the first. **A note that has never been silent is a note nobody reads** — the diagnosis was
+# right, and the remedy this line used to carry was not: it made the note's usefulness depend on
+# someone acting on a line that fires on every healthy build, and across every run since, no
+# reader ever did — #143 is the code-health pass filing that fact rather than a person. The
+# note was narrowed instead, and the rule that replaced the remedy is at the top of this file.
 cli 60
 config 64
 registry 109
