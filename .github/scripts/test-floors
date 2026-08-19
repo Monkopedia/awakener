@@ -42,9 +42,9 @@
 # floor a module has merely grown past: the `floor` column of its per-module table carries that,
 # beside the count, at the cost of nobody's attention. It prints prose only where the gap has
 # reached that module's own mean tests-per-suite — the point at which a whole test class could
-# stop running with the gate still green, so that the floor has stopped catching anything short of
-# a module reporting nothing at all. That is the state these numbers exist to prevent, and it is
-# the state worth a line on the page.
+# stop running with the gate still green. The floor is not dead at that moment: it still catches
+# any loss larger than the gap. What it has lost is the unit these numbers were committed in, and
+# that is what is worth a line on the page.
 #
 # A module declared `0` is a positive claim that it has no tests. Every module in the build must
 # appear: `:root:verifyTestFloors` passes the build's own module roster in

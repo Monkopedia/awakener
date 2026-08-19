@@ -54,8 +54,10 @@
 # behaviour does not get acted on; it teaches its readers to skip the part of the page it prints
 # in, which is the same page the shortfall error prints on. So the ordinary case is carried by the
 # per-module `floor` column, which already sits beside the count, and the prose line fires only
-# where a floor has decayed past the point of constraining anything finer than "this module
-# reported nothing at all".
+# where a floor has decayed past the point of catching the loss of one average test class. It does
+# not claim the floor has stopped catching everything: at the moment the note fires the floor
+# still reds any loss larger than the gap. What it has lost is the unit — a class could go with
+# the gate still green — and the gap only widens from there.
 #
 # `.github/scripts/test-summary-matrix.sh` holds this script's suite, and it is not optional
 # reading if you edit here: it asserts the behaviour above *and* asserts that each guard,
@@ -341,10 +343,17 @@ evaluate_floors() {
     # `span` is the threshold, and it is measured from this same run rather than fixed here: the
     # module's own mean tests-per-suite, which is what one of its test classes is worth. A gap at
     # or above it means a whole average-sized class could stop running with this gate still green,
-    # and that is precisely the floor having stopped constraining anything short of silence. Below
+    # which is the floor having stopped constraining at the granularity it was committed for — not
+    # having stopped constraining altogether, since a loss larger than the gap still reds. Below
     # it the `floor` column in the table carries the number and nothing is being asked of anyone.
     # A module with more suites than tests has no meaningful class size, so the threshold floors
     # at 1 and any drift there is reported.
+    #
+    # "Derived from the run" is the claim, and the matrix holds it: `driftup` and `driftwide` are
+    # the same gap of 30 with opposite verdicts, differing only in module shape, so no constant
+    # written here can satisfy both. Without that row a hard-coded 25 passed the whole suite —
+    # and a constant is not a harmless simplification, it silences the note permanently for any
+    # module smaller than it.
     span=1
     if [ "$su" -gt 0 ] && [ $((te / su)) -gt 1 ]; then span=$((te / su)); fi
     if [ "$te" -lt "$min" ]; then
@@ -496,7 +505,7 @@ row_names() {
       echo '> `skipped` is zero, so every tool-gated test executed rather than opting out.'
     fi
     if [ -n "$floor_drift" ]; then
-      echo "> Floors that have stopped constraining:${floor_drift%,}. Each gap is at least that module's own mean tests-per-suite, so a whole test class could stop running with this gate still green: what is left catches a module that reported nothing, and nothing smaller. Growth on its own is not on this line — adding tests needs no edit, and the \`floor\` column above already carries it. Raise these in \`$FLOORS\` off a CI run on a merged tree, which is the only tree whose counts will still be true after the merge."
+      echo "> Floors that have stopped constraining:${floor_drift%,}. Each gap is at least that module's own mean tests-per-suite, so a whole average test class could stop running with this gate still green. What is left is not nothing — the floor still catches any loss larger than the gap — but a test class is the unit a floor is worth committing in, and this one no longer catches that. Growth on its own is not on this line — adding tests needs no edit, and the \`floor\` column above already carries it. Raise these in \`$FLOORS\` off a CI run on a merged tree, which is the only tree whose counts will still be true after the merge."
     fi
   fi
 } | emit

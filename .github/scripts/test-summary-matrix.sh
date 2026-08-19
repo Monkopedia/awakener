@@ -433,6 +433,28 @@ driftsuites() {
 driftsuites driftup;    floors driftup 'wm 71'
 driftsuites driftsmall; floors driftsmall 'wm 90'
 
+# driftwide: two suites of 60, so 120 tests and a mean class of 60 — the *same* gap of 30 as
+# `driftup`, and the opposite verdict, because the only thing that differs is the module's shape.
+#
+# `driftup` and `driftsmall` between them pin the narrowing but not the thing the narrowing is
+# sold on. They are the same four-suite shape, so any threshold constant in `(11, 30]` satisfies
+# both: replacing the derivation with `span=25` leaves the matrix report byte-identical. The
+# property that actually matters is that the threshold is derived **per module from this run**,
+# and only a third row of a different shape at an already-covered gap can assert it. With this
+# row present no constant exists — `driftup` needs one at or below 30, `driftwide` needs one above
+# 30, and `driftsmall` needs one above 11.
+#
+# What it costs to get this wrong is not coverage but the note's reach: a hard-coded 25 switches
+# it off for every small module for ever. A future `:bus` at 3 suites / 12 tests would need its
+# floor to be 25 behind — twice its whole test count — before anything printed, and the modules
+# most likely to be forgotten are exactly the ones a constant silences.
+#
+# No new mutant: `pre143` reds it (any excess prints), and a constant reds it too.
+d=$(suitedir driftwide wm)
+suite "$d/TEST-a.xml" WmWideOneTest 60 0 0 0
+suite "$d/TEST-b.xml" WmWideTwoTest 60 0 0 0
+floors driftwide 'wm 90'
+
 # ------------------------------------------------------------------ PATH construction
 #
 # Built rather than inherited, so "no awk anywhere" means it and so the suite is a standing
@@ -983,6 +1005,15 @@ cases() {
     # whose other lines have to be read. Guarded by `pre143`, which is this script's own previous
     # behaviour — under it this row prints the note and goes red.
     check floor-behind-but-still-constraining 'pre143 pessimist' driftsmall impl plain \
+        "-$DRIFT" \
+        "+$REASSURE" "-$BELOWFLOOR"
+
+    # The same gap as `floor-behind-what-ran` — 30 — and the opposite verdict, because this
+    # module's classes are 60 tests rather than 25. It is the row that distinguishes a threshold
+    # derived from the run from one written down: no constant satisfies this row and `driftup`
+    # together, and `driftsmall` closes the bottom. Reds under `pre143` for the same reason
+    # `floor-behind-but-still-constraining` does.
+    check floor-behind-but-the-classes-are-larger 'pre143 pessimist' driftwide impl plain \
         "-$DRIFT" \
         "+$REASSURE" "-$BELOWFLOOR"
 }
