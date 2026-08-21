@@ -19,6 +19,19 @@ class FlagDiscoveryTest {
     private companion object {
         /** The package discovery scans, spelt the way a classpath entry holds it. */
         const val PACKAGE = "com/monkopedia/awakener"
+
+        /**
+         * The two declaring classes [stagedPackageDirectory] copies in, in the two subpackages
+         * that make a refusal *inside* an entry distinguishable from a refusal *of* it. They are
+         * different classes on purpose: a fixture holding one class twice would be satisfied by
+         * "loaded everything" and by "loaded nothing" alike, depending only on where the lock
+         * went, and the pair of assertions below would then have a value that satisfies both.
+         */
+        const val INSIDE = "$PACKAGE/wm/WmFlags.class"
+        const val OUTSIDE = "$PACKAGE/registry/RegistryFlags.class"
+
+        /** [INSIDE] and [OUTSIDE] as `Class.forName` spells them, which is what `loaded` holds. */
+        fun loadedName(path: String) = path.removeSuffix(".class").replace('/', '.')
     }
 
     private val dir = createTempDirectory("awakener-discovery")
@@ -261,6 +274,15 @@ class FlagDiscoveryTest {
      * [unreadableEntries] rides along because the requirement is the same one and it is not
      * really about archives: whatever an entry claims, a refused look leaves nothing true to
      * say except which permission refused it.
+     *
+     * The empty `loaded` is the other half of that sentence and it was missing (#37): reporting
+     * the refusal is what discovery *says*, and contributing nothing is what it *does*. An
+     * implementation that named the fault and then handed back whatever the walk managed to
+     * reach passed every assertion this test used to make, because every fixture's only
+     * declaring class sat inside the refused subtree — so "no flags at all" and "the flags that
+     * were readable" were the same empty list. [stagedPackageDirectory] now stages [OUTSIDE] as
+     * well, outside the subtree [unreadableEntries] locks, which is what gives this line
+     * something to be wrong about.
      */
     @Test
     fun `an entry that cannot be read is reported as unreadable, not as something else`() {
@@ -275,8 +297,64 @@ class FlagDiscoveryTest {
                     report.problems.singleOrNull()?.contains("could not be read") == true,
                     "$path: $shape was not reported as unreadable: ${report.problems}",
                 )
+                assertEquals(
+                    emptyList(),
+                    report.loaded,
+                    "$path: $shape reported the refusal and loaded flags anyway",
+                )
             }
         }
+    }
+
+    /**
+     * The guarantee stated as a pair, because either half alone has a value that satisfies it.
+     *
+     * One entry, one lock, two runs. Unlocked, the entry contributes both declaring classes —
+     * so an implementation that returns nothing whenever anything looks difficult fails here.
+     * With one subpackage locked, it contributes neither — so an implementation that reports the
+     * refusal and keeps [OUTSIDE], which is everything the walk could still reach, fails there.
+     * No single answer passes both, which is the property that stops this test going the way the
+     * one above went: it cannot be satisfied by a fixture that happens to hold nothing.
+     *
+     * The first run is also the control the second one needs. An assertion that a refused entry
+     * loaded nothing is trivially true of an entry that never held anything, and a fixture can
+     * lose its class file to a rename in `:registry` or a change in how [stagedPackageDirectory]
+     * copies one, silently, at which point the whole test passes for the reason it exists to
+     * reject. Asserting what the *unlocked* entry loads fails in exactly that case, naming the
+     * fixture rather than the implementation.
+     */
+    @Test
+    fun `a subtree that cannot be listed costs the entry, not only what it hid`() {
+        val entry = stagedPackageDirectory("partial-load")
+        val both = listOf(INSIDE, OUTSIDE).map(::loadedName).sorted()
+        val unlocked = FlagDiscovery.discover(classPath = entry.path)
+        assertEquals(
+            both,
+            unlocked.loaded.sorted(),
+            "the fixture does not hold both declaring classes, so locking one proves nothing",
+        )
+        assertEquals(emptyList(), unlocked.problems, "the unlocked fixture is already faulty")
+
+        val subtree = entry.resolve(INSIDE).parentFile
+        subtree.setReadable(false, false)
+        subtree.setExecutable(false, false)
+        assertTrue(
+            subtree.list() == null && entry.resolve(PACKAGE).list() != null,
+            "$subtree still lists, or its parent stopped listing, so this proves nothing — " +
+                "run as root?",
+        )
+
+        val refused = FlagDiscovery.discover(classPath = entry.path)
+        assertEquals(
+            emptyList(),
+            refused.loaded,
+            "a refused subtree cost only what it hid: ${loadedName(OUTSIDE)} survived, and a " +
+                "short flag list reads exactly like a complete one",
+        )
+        assertTrue(
+            refused.problems.singleOrNull()?.contains("could not be read") == true,
+            "the refusal was not reported: ${refused.problems}",
+        )
     }
 
     /**
@@ -547,6 +625,12 @@ class FlagDiscoveryTest {
      * then the listing is refused — one call further down than the stat, with the module's flags
      * sitting intact inside. Both are locked after they are staged, so what a refusal costs here
      * is a real declaring class rather than an empty tree.
+     *
+     * The locks differ in reach, and the second one is the discriminating row: `unlistable`
+     * refuses the scanned package itself, so nothing under it is reachable by any implementation
+     * and its empty `loaded` says only that there was nothing to load. `locked-subtree` refuses
+     * one subpackage of two, leaving [OUTSIDE] readable — so its empty `loaded` is a claim about
+     * what discovery does with a fault rather than about what the filesystem left it.
      */
     private fun unreadableEntries(): Map<String, File> {
         val locked = dir.resolve("locked-package").toFile().apply {
@@ -598,6 +682,13 @@ class FlagDiscoveryTest {
             "$subtree still lists, or its parent no longer does, so it proves nothing — " +
                 "run as root?",
         )
+        // And the half the lock does not cover: a declaring class the walk can still reach, so
+        // that "no flags at all" is a different observation from "the flags that were readable".
+        assertTrue(
+            lockedSubtree.resolve(OUTSIDE).canRead(),
+            "${lockedSubtree.resolve(OUTSIDE)} is unreadable too, so the row cannot tell a " +
+                "partial load from a refused one",
+        )
         return mapOf(
             "a directory holding the package that cannot be read" to locked,
             "a symlink loop" to there,
@@ -607,10 +698,15 @@ class FlagDiscoveryTest {
     }
 
     /**
-     * A directory classpath entry holding a real declaring class, in the layout a compiled
-     * module directory has it in. Copied out of the running classpath rather than written by
-     * hand, so the entry is one discovery would genuinely load flags from and a fixture that
-     * loses them has lost something real.
+     * A directory classpath entry holding two real declaring classes in two subpackages, in the
+     * layout a compiled module directory has them in. Copied out of the running classpath rather
+     * than written by hand, so the entry is one discovery would genuinely load flags from and a
+     * fixture that loses them has lost something real.
+     *
+     * Two, in different subpackages, because one is not enough to see the guarantee (#37). A
+     * refusal aimed at [INSIDE]'s subpackage leaves [OUTSIDE] readable, so an entry that
+     * contributes nothing and an entry that contributes what survived are now distinguishable
+     * reports rather than the same empty list.
      *
      * Reopened before it is staged into, so that a second call builds the fixture rather than
      * tripping over the lock the first call left on it.
@@ -621,11 +717,12 @@ class FlagDiscoveryTest {
             it.setReadable(true, false)
             it.setExecutable(true, false)
         }
-        val declaring = "$PACKAGE/wm/WmFlags.class"
-        val bytes = checkNotNull(javaClass.classLoader.getResourceAsStream(declaring)) {
-            "$declaring is not on the classpath, so this proves nothing"
-        }.use { it.readBytes() }
-        File(entry, declaring).apply { parentFile.mkdirs() }.writeBytes(bytes)
+        for (declaring in listOf(INSIDE, OUTSIDE)) {
+            val bytes = checkNotNull(javaClass.classLoader.getResourceAsStream(declaring)) {
+                "$declaring is not on the classpath, so this proves nothing"
+            }.use { it.readBytes() }
+            File(entry, declaring).apply { parentFile.mkdirs() }.writeBytes(bytes)
+        }
         return entry
     }
 

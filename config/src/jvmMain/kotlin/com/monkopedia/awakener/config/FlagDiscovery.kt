@@ -179,7 +179,22 @@ object FlagDiscovery {
      * permission — the same sentence the refused stat already produces, and the exception names
      * the directory within. The entry then contributes nothing at all rather than whatever
      * happened to be readable: what a partial listing is missing is precisely what nothing
-     * established, and a short list of flags reads as a complete one.
+     * established, and a short list of flags reads as a complete one. *Nothing at all* is the
+     * load-bearing half and it is pinned as such: `a subtree that cannot be listed costs the
+     * entry, not only what it hid` locks one subpackage of a two-subpackage entry and asserts
+     * both that the unlocked entry yields both declaring classes and that the locked one yields
+     * neither, because either assertion alone is satisfied by a fixture that holds nothing.
+     *
+     * **Read the exception's type as "the listing failed", never as "a permission refused it".**
+     * `FileTreeWalk` reaches this handler from exactly two call sites in kotlin-stdlib 2.3.20,
+     * both guarded by `listFiles() == null`, and both raise [kotlin.io.AccessDeniedException] —
+     * the only class the walk has for the case. A directory *removed while the walk is in
+     * progress* arrives here under that name too, having been access-denied by nothing: it
+     * simply stopped existing between the parent's listing and its own. The name reaches the
+     * report, so an operator sent after a permissions fault by it will find the mode of every
+     * surviving directory perfectly correct. The trade is still the right one — losing a whole
+     * entry beats loading part of one — and a build directory deleted underneath a running scan
+     * is the ordinary way to meet it.
      */
     private fun File.classesUnderPackage(): List<String> {
         val root = resolve(PACKAGE)
