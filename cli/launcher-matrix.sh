@@ -140,16 +140,81 @@ mkdir -p "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$XDG_DATA_HOME"
 BARE_PATH=$WORK/bin
 mkdir -p "$BARE_PATH"
 # `command -v` answers with a bare name for a shell builtin — `printf` is one in dash, bash and
-# busybox — and linking that to itself makes a cycle, which is fatal to anything that later walks
-# the build directory. A builtin needs no entry here: every shell that could run the launcher
-# already has it.
+# busybox — and for a busybox applet when this script is run under busybox ash. That is a correct
+# answer to the question `command -v` asks, "what would running this name do here". It is not an
+# answer to the question either caller below is asking, and the two of them are not asking the
+# same one:
+#
+#   - the tool loop asks *will a shell whose PATH is `$BARE_PATH` be able to run this*. For a
+#     builtin the answer is yes, with nothing to link — and linking a bare name to itself makes a
+#     symlink cycle, which is fatal to anything that later walks the build directory.
+#   - the shell roster asks *is there a file here I can put in `$BARE_PATH` and exec*. For a bare
+#     answer the answer is no.
+#
+# One return value cannot mean both, and until #155 one function returned it to both: a roster
+# shell answering bare was counted present with nothing in `$BARE_PATH`. That is precisely the
+# reading `AWAKENER_REQUIRE_SHELLS=1` exists to make impossible — the gate would pass, the summary
+# would claim `2 of 2`, and the rows below would skip anyway on `[ ! -e "$BARE_PATH/…" ]`, which
+# is #98 with the count now actively lying instead of merely being ambiguous.
+#
+# So the resolver reports three outcomes and each caller decides what the middle one means:
+#
+#   exit 0, prints an absolute path — a file exists; link it.
+#   exit 2, prints nothing          — the name runs here, but out of a namespace that is not the
+#                                     filesystem, and no file on PATH backs it. Nothing to link.
+#   exit 1, prints nothing          — the name does not run here at all.
+#
+# The PATH walk is what earns the middle outcome its meaning: without it, `bare` would conflate
+# "there is no file" with "this shell preferred its own answer to one", and the roster would call
+# `busybox` missing on a host that has `/bin/busybox`. It is #154's `resolve_tool` from
+# `.github/scripts/test-summary-matrix.sh`, with the one difference that decides against sharing
+# the helper outright: that file's tool list is all real binaries, so it folds bare-with-no-file
+# into "absent" and returns 1. This file's list has `printf` on it, so the same fold would
+# `die "no printf available"` on any host whose printf is only a builtin — the case the comment
+# above the old function was written to protect. Hence a third outcome rather than a shared two.
+resolve_tool() {
+    _rt=$(command -v "$1" 2>/dev/null) || _rt=''
+    case $_rt in
+        /*) printf '%s\n' "$_rt"; return 0 ;;
+    esac
+    _rt_oifs=$IFS
+    IFS=:
+    for _rt_dir in $PATH; do
+        IFS=$_rt_oifs
+        [ -n "$_rt_dir" ] || _rt_dir=.
+        case $_rt_dir in /*) ;; *) _rt_dir=$(pwd)/$_rt_dir ;; esac
+        if [ -f "$_rt_dir/$1" ] && [ -x "$_rt_dir/$1" ]; then
+            printf '%s\n' "$_rt_dir/$1"
+            return 0
+        fi
+        IFS=:
+    done
+    IFS=$_rt_oifs
+    if [ -n "$_rt" ]; then
+        return 2
+    fi
+    return 1
+}
+
+# The harness's own utilities: a builtin is a pass with nothing linked, an absence is fatal.
 link_tool() {
-    resolved=$(command -v "$1" 2>/dev/null) || return 1
-    case $resolved in
-        /*) ln -s "$resolved" "$BARE_PATH/$1" ;;
-        *) ;;
+    _lt_rc=0
+    _lt=$(resolve_tool "$1") || _lt_rc=$?
+    case $_lt_rc in
+        0) ln -sf "$_lt" "$BARE_PATH/$1" ;;
+        2) : ;;
+        *) return 1 ;;
     esac
 }
+
+# The alternative shells: these get `exec`d out of `$BARE_PATH`, so only a file will do. Both of
+# the other two outcomes mean this shell cannot be run here, and reporting either as present is
+# #155.
+link_shell() {
+    _ls=$(resolve_tool "$1") || return 1
+    ln -sf "$_ls" "$BARE_PATH/$1"
+}
+
 for tool in ls sed head cut printf; do
     link_tool "$tool" || die "no $tool available to build the harness with"
 done
@@ -180,24 +245,35 @@ done
 # failure on any run whose result is meant to be reported. CI sets it, next to REQUIRE_SWAY and
 # REQUIRE_SPANREED, and for the same reason.
 ALT_ROSTER='dash|busybox sh'
-ALT_PRESENT=0
-ALT_TOTAL=0
-ALT_MISSING=''
-ALT_FOUND=''
-OLDIFS=$IFS
-IFS='|'
-for alt in $ALT_ROSTER; do
-    IFS=$OLDIFS
-    ALT_TOTAL=$((ALT_TOTAL + 1))
-    if link_tool "${alt%% *}"; then
-        ALT_PRESENT=$((ALT_PRESENT + 1))
-        ALT_FOUND="$ALT_FOUND $alt,"
-    else
-        ALT_MISSING="$ALT_MISSING ${alt%% *},"
-    fi
+
+# Classify a roster, linking every entry that can actually be run and counting only those.
+#
+# A function rather than an inline loop because #155 was not in the resolver, it was in *this
+# loop's reading* of the resolver — so a test of `link_shell` alone would not have caught it, and
+# the rows below drive this with a roster they control. Sets ALT_TOTAL / ALT_PRESENT / ALT_FOUND /
+# ALT_MISSING.
+roster_scan() {
+    ALT_PRESENT=0
+    ALT_TOTAL=0
+    ALT_MISSING=''
+    ALT_FOUND=''
+    _rs_oifs=$IFS
     IFS='|'
-done
-IFS=$OLDIFS
+    for _rs_alt in $1; do
+        IFS=$_rs_oifs
+        ALT_TOTAL=$((ALT_TOTAL + 1))
+        if link_shell "${_rs_alt%% *}"; then
+            ALT_PRESENT=$((ALT_PRESENT + 1))
+            ALT_FOUND="$ALT_FOUND $_rs_alt,"
+        else
+            ALT_MISSING="$ALT_MISSING ${_rs_alt%% *},"
+        fi
+        IFS='|'
+    done
+    IFS=$_rs_oifs
+}
+
+roster_scan "$ALT_ROSTER"
 
 note "launcher-matrix: alternative shells ${ALT_PRESENT} of ${ALT_TOTAL} —${ALT_FOUND%,}"
 if [ -n "$ALT_MISSING" ]; then
@@ -432,6 +508,127 @@ mkdir -p "$WORK/cfg-bad/awakener"
 printf '{"wm.dock.nonexistent": 1}\n' >"$WORK/cfg-bad/awakener/config.json"
 check "flags/awakener-registry names a key nothing declares" 0 "wm.dock.nonexistent" \
     -- "JAVA_HOME=$GOOD_HOME" "XDG_CONFIG_HOME=$WORK/cfg-bad" -- "$REAL/awakener-registry" list
+
+# --- the resolver answers two questions, not one (#155) ---------------------------------------
+#
+# The reason #155 survived is that no row exercised the bare-answer path for a roster shell: the
+# only bare answer any run ever produced was `printf`'s, and that one goes to the caller for which
+# bare is correct. So these rows synthesise both answers and drive both callers with them.
+#
+# **A shell function is how the bare answer is made**, and that is the deliberate part. `command
+# -v` prints a function's own name, bare, in every POSIX shell — the same shape a builtin gives
+# for `printf` and the same shape busybox ash gives for an applet. The alternative, running these
+# under busybox to get a real applet, would make the rows that prove the fix run only on hosts
+# that have busybox, and a row that reports "not installed" as a pass is the #98 shape this file
+# already carries thirty lines about. These rows run everywhere, every time.
+note ""
+note "# the resolver's three answers, and the two callers reading them differently (#155)"
+
+PROBE=$WORK/probe
+mkdir -p "$PROBE/path"
+printf '#!/bin/sh\nexit 0\n' >"$PROBE/path/probe-file"
+chmod +x "$PROBE/path/probe-file"
+# Resolves bare, with no file of that name on any PATH entry.
+probe_bare() { :; }
+
+expect() {
+    run_count=$((run_count + 1))
+    if [ "$2" = "$3" ]; then
+        note "ok   $1"
+    else
+        note "FAIL $1: got '$2', wanted '$3'"
+        fail_count=$((fail_count + 1))
+    fi
+}
+
+# **The three probes below are subshell functions — `name() ( … )`, not `name() { … }`.** Each one
+# points `BARE_PATH` at its own scratch directory and then `rm -rf`s it, and `probe_scan*` calls
+# `roster_scan`, which assigns the `ALT_*` globals the summary line at the bottom prints. Leak
+# either and the run reports its own fixture as the host's: a wiped `$WORK/bin` fails every later
+# row at exit 127, and a clobbered roster prints a plausible count that is not the host's.
+#
+# **What is not true is that the parentheses alone are what prevent it** — that was asserted here
+# in the first draft of this section and it is wrong, measured: converting all three to brace
+# bodies leaves the suite at `62 rows, 0 failed`, unchanged, because every call site is `"$( … )"`
+# and command substitution is already a subshell. The isolation is doubly held and either half
+# would do. The parentheses stay because they are the half that does not depend on how the next
+# editor writes the *call*; and because neither half is self-announcing, the row at the end of
+# this section asserts the property they exist for — the live harness is what it was — rather than
+# the mechanism, so it goes red for a leak however one is introduced.
+LIVE_STATE="$BARE_PATH|$ALT_PRESENT|$ALT_TOTAL|$ALT_FOUND|$ALT_MISSING"
+
+# Run one linker against one name in a scratch `$BARE_PATH`, and answer with both halves of what
+# the callers disagree about: the return value, and whether anything was actually linked.
+probe_link() (
+    PATH=$PROBE/path:$PATH
+    BARE_PATH=$PROBE/bin
+    rm -rf "$BARE_PATH"
+    mkdir -p "$BARE_PATH"
+    _p_rc=0
+    "$1" "$2" || _p_rc=$?
+    if [ -e "$BARE_PATH/$2" ]; then _p_l=linked; else _p_l=nolink; fi
+    printf '%s/%s\n' "$_p_rc" "$_p_l"
+)
+
+expect "resolver/tool loop: a file is linked" \
+    "$(probe_link link_tool probe-file)" "0/linked"
+# The half a blanket `return 1` breaks. `printf` is a builtin in every shell that could run the
+# launcher, so bare has to stay a pass here, and it has to stay one with nothing linked.
+expect "resolver/tool loop: a bare answer passes with nothing linked" \
+    "$(probe_link link_tool probe_bare)" "0/nolink"
+expect "resolver/tool loop: an absent tool is refused" \
+    "$(probe_link link_tool probe-absent-8f31)" "1/nolink"
+# And the same claim about the real thing, not only about the synthetic stand-in: `printf` is
+# accepted. Whether it also links is a property of the host's coreutils, so only the verdict is
+# asserted — the tool loop above would already have `die`d if this were not so.
+expect "resolver/tool loop: the real printf is accepted" \
+    "$(probe_link link_tool printf | cut -d/ -f1)" "0"
+
+expect "resolver/shell roster: a file is linked" \
+    "$(probe_link link_shell probe-file)" "0/linked"
+# #155 itself. On the single-function version this was `0/nolink`: counted present, nothing to
+# run.
+expect "resolver/shell roster: a bare answer is not a usable shell" \
+    "$(probe_link link_shell probe_bare)" "1/nolink"
+expect "resolver/shell roster: an absent shell is refused" \
+    "$(probe_link link_shell probe-absent-8f31)" "1/nolink"
+
+# The loop, not just the function it calls: the defect was in how the roster *read* the answer, so
+# reverting `link_shell` to `link_tool` up there has to turn a row here red.
+probe_scan() (
+    PATH=$PROBE/path:$PATH
+    BARE_PATH=$PROBE/bin
+    rm -rf "$BARE_PATH"
+    mkdir -p "$BARE_PATH"
+    roster_scan 'probe-file|probe_bare'
+    printf '%s of %s, found:%s missing:%s\n' \
+        "$ALT_PRESENT" "$ALT_TOTAL" "${ALT_FOUND%,}" "${ALT_MISSING%,}"
+)
+expect "roster/a bare answer is counted missing, not present" \
+    "$(probe_scan)" "1 of 2, found: probe-file missing: probe_bare"
+
+# The invariant underneath the count, checked the way the rows below check it: present means
+# there is something in `$BARE_PATH` to exec. This is what `AWAKENER_REQUIRE_SHELLS=1` is
+# asserting when it refuses to skip.
+probe_scan_links() (
+    PATH=$PROBE/path:$PATH
+    BARE_PATH=$PROBE/bin
+    rm -rf "$BARE_PATH"
+    mkdir -p "$BARE_PATH"
+    roster_scan 'probe-file|probe_bare'
+    _n=0
+    for _e in probe-file probe_bare; do
+        [ ! -e "$BARE_PATH/$_e" ] || _n=$((_n + 1))
+    done
+    printf '%s counted, %s runnable\n' "$ALT_PRESENT" "$_n"
+)
+expect "roster/every shell it counts present is one the rows can run" \
+    "$(probe_scan_links)" "1 counted, 1 runnable"
+
+# The fixtures above are the only thing in this file that writes to a `BARE_PATH` and calls
+# `roster_scan`. If one of them ever reaches the live ones, this is the row that says so.
+expect "probes/the fixtures left the live harness alone" \
+    "$BARE_PATH|$ALT_PRESENT|$ALT_TOTAL|$ALT_FOUND|$ALT_MISSING" "$LIVE_STATE"
 
 # --- under other POSIX shells ----------------------------------------------------------------
 #
