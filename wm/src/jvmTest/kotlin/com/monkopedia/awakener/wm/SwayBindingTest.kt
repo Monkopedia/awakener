@@ -1150,9 +1150,27 @@ class SwayBindingTest {
         )
     }
 
-    /** Hazard 2: sway leaves the dock standing when its surface dies. */
+    /**
+     * Hazard 2: sway leaves the dock standing when its surface dies.
+     *
+     * This drives the sweep by hand, so the collector #18 wired to the `close` event is turned
+     * off below. The same repair with nobody driving it is `SwayRepairTest`'s
+     * `an orphaned dock is reaped without anyone driving the sweep`.
+     */
     @Test
     fun `orphaned dock is reaped when its surface closes`() = swayTest {
+        // Not the vacuity #44 expected, and worth saying which it is, because the two ask for the
+        // same line for opposite reasons. #44 read the collector as reaping the dock before the
+        // assertion, leaving `reapOrphans` below nothing to do; measured on this tree it does not
+        // — delete that call and this fails 70 runs out of 70 whatever this line says, so the
+        // hand-driven sweep is what takes the dock down and the assertion is not trivially true.
+        //
+        // What the collector does beat is the *mutant*. It kills the same dock a beat earlier, so
+        // with the acknowledgement bug named under the assertion put back, the dock had already
+        // unmapped on 2 of 70 runs and the guard went green. The figure cited there is 70 out of
+        // 70; without this line it is 68. One extra killer of the same window is the difference
+        // between a guard that always catches that bug and one that catches 97% of it.
+        store.put(WmFlags.sweepOnClose, false)
         val app = openSurface("aw-app1")
         val handle = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1"))
 
@@ -1166,6 +1184,11 @@ class SwayBindingTest {
         // (there is one per `close` event) found the same dock still in the tree and killed it
         // again. Waiting here hid that: the dock was still standing on 70 runs out of 70 against
         // the unfixed code, so this assertion is where the race stops being a matter of luck.
+        //
+        // That 70 of 70 predates #18 and is re-taken rather than carried over, since a collector
+        // the measurement never saw now reaps the same dock: with `kill` put back to returning on
+        // sway's acknowledgement instead of on the unmap, this failed 70 of 70 with the line
+        // above and 68 of 70 without it.
         assertNull(wm.tree().find(handle.dockId.raw), "the dock must not outlive its surface")
     }
 
