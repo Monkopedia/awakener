@@ -1708,6 +1708,16 @@ class SwayBindingTest {
             "the dropped Forget: ${wm.residueDisposalFailures.value}",
         )
         assertEquals(dock.dockId, failure.dock, "and it names the dock the teardown was for")
+        // Both ids, and not just the dock. Review of #115 mutated `surface = dockId` in the
+        // record and the entire `:wm` suite stayed green — a field nothing asserted on and
+        // nothing printed, which is the shape this whole PR exists to remove. `app` and
+        // `dock.dockId` are different con_ids, so this assertion can tell them apart.
+        assertNotEquals(
+            app,
+            dock.dockId,
+            "the two ids have to differ, or the assertion below proves nothing",
+        )
+        assertEquals(app, failure.surface, "and the surface whose model is still on disk")
         assertEquals(key.canonical, failure.key)
         assertEquals(residue.absolutePathString(), failure.path, "and where the model still is")
         assertTrue(failure.reason.isNotBlank(), "and why, not merely that")
@@ -1754,6 +1764,12 @@ class SwayBindingTest {
             assertTrue(
                 failure.message.orEmpty().contains(WmFlags.detachResidueFailure.key),
                 "and which flag makes it carry on instead: ${failure.message}",
+            )
+            // The reader-side half of the same pin: `surface` reaches a human through
+            // `ResidueDisposalFailure.toString`, which is what this message is built from.
+            assertTrue(
+                failure.message.orEmpty().contains("surface ${app.raw}"),
+                "and the surface it was bound to: ${failure.message}",
             )
             assertEquals(
                 1,
