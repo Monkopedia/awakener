@@ -244,7 +244,10 @@ jobs:
           # `busybox sh` to make the launcher's `#!/bin/sh` an honest claim, and skipped them
           # silently when either was absent: 45 rows against 53, green both times (#98). Both are
           # on ubuntu-latest — dash as /bin/sh, busybox from busybox-static — so this asserts what
-          # is already true and reddens the day it stops being true.
+          # is already true and reddens the day it stops being true. Three suites read it now, not
+          # one: `summaryMatrixTest` since #138/#154 and `uploadOutcomeMatrixTest` since #156 each
+          # re-run their whole harness under the same two shells, for the same reason — a
+          # `#!/bin/sh` header nothing exercises renders identically whether it is true or false.
           AWAKENER_REQUIRE_SHELLS: '1'
         run: ./gradlew build --stacktrace
 

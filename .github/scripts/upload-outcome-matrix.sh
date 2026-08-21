@@ -16,7 +16,19 @@
 # the issue was filed — only the literal string `failure` reddens — and the rows tagged `pre99!`
 # assert it goes *green*, which is the defect reproduced rather than described.
 #
-# Written to run under dash and busybox sh as well as bash.
+# Written to run under dash and busybox sh as well as bash — and since #156 that sentence is a
+# phase rather than an assertion. The bottom of this file re-runs the whole suite under each
+# alternative shell on `ALT_ROSTER` and carries the child's three-state exit up unchanged.
+# `AWAKENER_MATRIX_SHELLS=none` runs under the invoking shell only, and `AWAKENER_REQUIRE_SHELLS=1`
+# — the flag CI already sets — turns an absent roster shell from a skip into a failure.
+#
+# Measured at `143318b`, before the phase existed: bash, dash and busybox sh each produced
+# **byte-identical output**, 34 rows / 0 failed / 8 of 8 mutants, exit 0. So unlike the sibling —
+# where the same sentence was false for busybox sh for as long as it had been written down (#138,
+# #154: `link_tool` read busybox ash's bare `command -v` answer as an absence and died) — the
+# claim here was true. It was still the same defect, because *true* and *unfalsifiable* are
+# different properties and only the second one was established. Nothing in a run could have told
+# the two apart, which is the whole complaint in #156.
 #
 # **Three exit statuses, because a suite that did not run is not a suite that passed** (#89,
 # fixed in `test-summary-matrix.sh` by #129 and propagated here by #133):
@@ -36,6 +48,10 @@ REPORT=$3
 # Exit 2: the suite could not run, which is not the same fact as a row failing. See `die`.
 [ -f "$SCRIPT" ] || { echo "upload-outcome-matrix: CANNOT VOUCH: no script at $SCRIPT" >&2; exit 2; }
 SCRIPT=$(CDPATH= cd -P -- "$(dirname "$SCRIPT")" && pwd)/$(basename "$SCRIPT")
+
+# This file's own path, absolutised now rather than when it is needed, because the alt-shell phase
+# at the bottom re-runs this harness and `$0` is whatever the caller typed.
+SELF=$(CDPATH= cd -P -- "$(dirname "$0")" && pwd)/$(basename "$0")
 
 rm -rf "$WORK"
 mkdir -p "$WORK"
@@ -142,6 +158,19 @@ case $MIN_MUTANTS in
     all) ;;
     ''|*[!0-9]*)
         die "AWAKENER_MATRIX_MIN_MUTANTS must be 'all' or a non-negative integer, got '$MIN_MUTANTS'" ;;
+esac
+
+# Whether the alt-shell phase at the bottom runs. `auto` — the default, and the behaviour that
+# would otherwise be hard-coded — re-runs this whole harness under each alternative shell on the
+# roster. `none` runs it under the invoking shell only, and is what the re-runs themselves are
+# handed, so the recursion terminates at depth one by a switch a reader can see rather than by an
+# internal marker. Validated here rather than at the bottom, so a typo costs nothing instead of a
+# full run. Same name, same values and same default as the sibling matrix, so one setting governs
+# the family.
+SHELLS_MODE=${AWAKENER_MATRIX_SHELLS:-auto}
+case $SHELLS_MODE in
+    auto|none) ;;
+    *) die "AWAKENER_MATRIX_SHELLS must be 'auto' or 'none', got '$SHELLS_MODE'" ;;
 esac
 
 GUARDS_SEEN=''
@@ -437,10 +466,151 @@ elif [ "$mutants_ran" -lt "$MIN_MUTANTS" ]; then
     die "$mutants_ran of $MUTANTS_DECLARED mutants ran, below the $MIN_MUTANTS required by AWAKENER_MATRIX_MIN_MUTANTS"
 fi
 
+# ------------------------------------------------------------- the shells this claims to run under
+#
+# The header says "written to run under dash and busybox sh as well as bash", and until #156
+# **nothing confronted that** — this file was only ever executed by the shell Gradle's `Exec`
+# picks, which is one shell. #156's complaint is not that the sentence was false; measured at
+# `143318b` it was true, all three shells producing byte-identical 34-row output. The complaint is
+# that a run rendered identically whether it was true or not, which is the same instrument-shaped
+# defect this suite exists to catch in `upload-outcome.sh` one level up, and the same one the
+# header two paragraphs above is proud of resisting for its own guards.
+#
+# So the claim is now a phase. Each alternative shell on the roster re-runs this entire harness —
+# every row, every mutant, the same `MIN_MUTANTS` bar — against the same script under test, in its
+# own work directory, and its exit status is read with the same three-state meaning the rest of
+# this file uses: 0 it held, 1 a row failed there, 2 it could not vouch there.
+#
+# **Transferred from `test-summary-matrix.sh` deliberately, not copied.** What came across is the
+# roster, the recursion, the `AWAKENER_MATRIX_SHELLS=none` terminator, the `AWAKENER_REQUIRE_SHELLS`
+# judgement and the separate alt-shell counter — each argued below. What did **not** come across is
+# that file's `no_leak` assertion over the phase, because it has no counterpart here: this harness
+# never writes a `GITHUB_STEP_SUMMARY`, and neither does the script under test, so there is no leak
+# path for a child to open. Copying the call would have asserted a property of a file that does not
+# exist, which reads like coverage and is not.
+#
+# **Whether a missing shell should fail is a judgement, and it takes the shape `cli/launcher-matrix.sh`
+# and `test-summary-matrix.sh` already chose for exactly this question**: not by default, and yes on
+# CI. kaladin has dash and busybox, adolin has neither, and dying by default would make the owner's
+# other machine unable to run `./gradlew build` at all over a suite that is not what that build is
+# about. `AWAKENER_REQUIRE_SHELLS=1` — the existing flag, the one CI already sets next to
+# REQUIRE_SWAY and REQUIRE_SPANREED, and deliberately *not* a fourth spelling of the same idea —
+# turns the skip into a `die`. Present or absent, the count is said out loud below, so what the run
+# covered is a fact in the log rather than an inference from a row count.
+ALT_ROSTER='dash|busybox sh'
+ALT_TOTAL=0
+ALT_PRESENT=0
+ALT_MISSING=''
+ALT_RAN=''
+# Counted apart from `fail_count`, which counts *rows*. An alt shell is a whole suite, not a row,
+# and folding one into the other would print `34 rows, 1 failed` when no row had failed and 34 was
+# not the denominator that failure came out of. Both still exit 1; they are just reported as the
+# two different facts they are.
+ALT_FAILED=0
+
+# Resolve one command name to an absolute path to a real executable file, or fail.
+#
+# This harness has no bare-PATH farm, so it does not have the sibling's `link_tool` caller — but
+# the question this phase asks is the same one, and so is the trap. **busybox ash resolves its own
+# applets before it walks PATH, and answers `command -v` with the bare applet name** — `busybox`,
+# not `/usr/bin/busybox`, rc 0 even on an empty PATH, where dash correctly gives rc 127. Two
+# consequences here, both of which this function removes: the log line below would name an applet
+# namespace instead of the binary that answered, which is exactly the provenance the line exists
+# for; and on a host where the roster shell is genuinely unreachable through PATH the phase would
+# report it as present and then fail at exec for a reason with no relation to the claim. Under bash
+# and dash the first branch always wins, so this is the behaviour those shells always had.
+resolve_tool() {
+    _rt=$(command -v "$1" 2>/dev/null) || _rt=''
+    case $_rt in
+        /*) printf '%s\n' "$_rt"; return 0 ;;
+    esac
+    _rt_oifs=$IFS
+    IFS=:
+    for _rt_dir in $PATH; do
+        IFS=$_rt_oifs
+        [ -n "$_rt_dir" ] || _rt_dir=.
+        case $_rt_dir in /*) ;; *) _rt_dir=$(pwd)/$_rt_dir ;; esac
+        if [ -f "$_rt_dir/$1" ] && [ -x "$_rt_dir/$1" ]; then
+            printf '%s\n' "$_rt_dir/$1"
+            return 0
+        fi
+        IFS=:
+    done
+    IFS=$_rt_oifs
+    return 1
+}
+
+if [ "$SHELLS_MODE" != none ]; then
+    note ""
+    note "# the same suite again under every alternative shell the header claims"
+    mkdir -p "$WORK/shells"
+    OLDIFS=$IFS
+    IFS='|'
+    for alt in $ALT_ROSTER; do
+        IFS=$OLDIFS
+        ALT_TOTAL=$((ALT_TOTAL + 1))
+        alt_label=$(printf '%s' "$alt" | tr ' ' '-')
+        alt_bin=${alt%% *}
+        case $alt in *' '*) alt_args=${alt#* } ;; *) alt_args='' ;; esac
+        if ! alt_path=$(resolve_tool "$alt_bin"); then
+            ALT_MISSING="$ALT_MISSING $alt_bin,"
+            note "  shell/(absent) $alt — no $alt_bin on PATH"
+            IFS='|'
+            continue
+        fi
+        ALT_PRESENT=$((ALT_PRESENT + 1))
+        set +e
+        alt_out=$(AWAKENER_MATRIX_SHELLS=none \
+            "$alt_path" $alt_args "$SELF" "$SCRIPT" \
+            "$WORK/shells/$alt_label" "$WORK/shells/$alt_label.txt" 2>&1 </dev/null)
+        alt_rc=$?
+        set -e
+        alt_tail=$(printf '%s\n' "$alt_out" | grep '^upload-outcome-matrix: ' | tail -1)
+        case $alt_rc in
+            0)
+                ALT_RAN="$ALT_RAN $alt"
+                note "  shell/$alt -> $alt_path $alt_args — ${alt_tail:-exit 0}"
+                ;;
+            1)
+                # A row failed *there* and not here. That is a red, not a could-not-vouch, so it
+                # exits 1 — but in its own counter, because it is one shell's whole suite rather
+                # than one of this run's rows.
+                ALT_FAILED=$((ALT_FAILED + 1))
+                note "FAIL shell/$alt: the suite went red under $alt_path $alt_args — ${alt_tail:-exit 1}"
+                detail "$alt_out"
+                ;;
+            *)
+                # Anything else is the child saying it never reached a verdict, and a parent that
+                # folded that into "a row failed" would be committing the defect this file is
+                # about — the three statuses are the whole point of the design #133 propagated
+                # here. Its word carries up unchanged.
+                die "under $alt_path $alt_args the suite could not vouch (exit $alt_rc): ${alt_tail:-$alt_out}"
+                ;;
+        esac
+        IFS='|'
+    done
+    IFS=$OLDIFS
+    if [ -n "$ALT_MISSING" ]; then
+        if [ "${AWAKENER_REQUIRE_SHELLS:-}" = 1 ]; then
+            die "AWAKENER_REQUIRE_SHELLS=1 and${ALT_MISSING%,} is not installed. The header claims this harness runs under it, and a run that never tried cannot contradict that claim however green it is."
+        fi
+        note "  not installed:${ALT_MISSING%,} — the header's claim about it is untested on this host. Set AWAKENER_REQUIRE_SHELLS=1 to make that a failure instead."
+    fi
+fi
+
 note ""
 note "upload-outcome-matrix: $run_count rows, $fail_count failed"
 # Printed on the green path too, and that is the point: the row count was the only trace #89 left
 # behind, and nobody compares row counts between runs. This states the fact the reader needs —
 # how much of the counterfactual phase actually happened — instead of leaving it to be inferred.
 note "  mutants: $mutants_ran of $MUTANTS_DECLARED declared ran (required: $MIN_MUTANTS)"
+if [ "$SHELLS_MODE" = none ]; then
+    note "  shell coverage: this shell only (AWAKENER_MATRIX_SHELLS=none)"
+else
+    # `${ALT_FAILED:+…}` would be wrong here: it tests set-and-non-empty, and `0` is both.
+    alt_red=''
+    [ "$ALT_FAILED" -eq 0 ] || alt_red=" ($ALT_FAILED went red)"
+    note "  shell coverage: the invoking shell plus $ALT_PRESENT of $ALT_TOTAL alternatives —${ALT_RAN:- none held}$alt_red"
+fi
 [ "$fail_count" -eq 0 ] || exit 1
+[ "$ALT_FAILED" -eq 0 ] || exit 1
