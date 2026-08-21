@@ -1644,7 +1644,7 @@ class SwayBindingTest {
         assertTrue(reopened != app, "sway must have minted a new con_id for the new window")
         assertEquals(
             AgentId("agent-1"),
-            wm.resolve(reopened),
+            resolveAgent(reopened),
             "the same surface must resolve to the same agent across a restart",
         )
     }
@@ -1655,7 +1655,7 @@ class SwayBindingTest {
         val app = openSurface("aw-app1")
         wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1")).detach()
 
-        assertEquals(AgentId("agent-1"), wm.resolve(app), "the durable binding outlives the dock")
+        assertEquals(AgentId("agent-1"), resolveAgent(app), "the durable binding outlives the dock")
     }
 
     @Test
@@ -1664,13 +1664,13 @@ class SwayBindingTest {
         val app = openSurface("aw-app1")
         wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1")).detach()
 
-        assertNull(wm.resolve(app), "with the flag on, the dock's lifetime is the agent's")
+        assertNull(resolveAgent(app), "with the flag on, the dock's lifetime is the agent's")
     }
 
     /** A window nobody has invoked a hotkey on is a Drab: enumerable, but bound to nothing. */
     @Test
     fun `an unbound surface resolves to nothing`() = swayTest {
-        assertNull(wm.resolve(openSurface("aw-app1")))
+        assertNull(resolveAgent(openSurface("aw-app1")))
     }
 
     /**
@@ -1711,7 +1711,7 @@ class SwayBindingTest {
 
         assertEquals(
             AgentId("agent-1"),
-            wm.resolve(app),
+            resolveAgent(app),
             "resolve answers from the registry, keyed on what outlives the window — a session's " +
                 "dock table has no way to turn a bound surface into a Drab",
         )
@@ -1728,11 +1728,11 @@ class SwayBindingTest {
         store.put(WmFlags.resolveKeySource, ResolveKeySource.ENUMERATION)
         val app = openSurface("aw-app1")
         registry.bind(SurfaceKey.Window("aw-app1"), AgentId("agent-1").asIdentity())
-        assertEquals(AgentId("agent-1"), wm.resolve(app), "an enumerable surface resolves either way")
+        assertEquals(AgentId("agent-1"), resolveAgent(app), "an enumerable surface resolves either way")
 
         command("[con_id=${app.raw}] mark --add ${markFor(app, app)}")
         assertNull(
-            wm.resolve(app),
+            resolveAgent(app),
             "and under ENUMERATION the table decides what resolve will answer for at all, so a " +
                 "hidden surface reads as a Drab however durably it is bound",
         )
@@ -1747,15 +1747,15 @@ class SwayBindingTest {
         val app = openSurface("aw-app1")
         val dock = wm.attach(app, dockFor("aw-dock"), AgentId("agent-1")).dockId
 
-        assertNull(wm.resolve(dock), "nothing has bound the dock's key, so there is nothing to say")
+        assertNull(resolveAgent(dock), "nothing has bound the dock's key, so there is nothing to say")
 
         registry.bind(SurfaceKey.Window("aw-dock"), AgentId("panel-agent").asIdentity())
         assertEquals(
             AgentId("panel-agent"),
-            wm.resolve(dock),
-            "a dock is an ordinary node to resolve, which is the disclosed cost of taking the " +
-                "table out of its path — callers get surface ids from surfaces(), which still " +
-                "excludes docks",
+            resolveAgent(dock),
+            "a dock is an ordinary node to the single-window resolve, which is the disclosed " +
+                "cost of taking the table out of its path — callers get surface ids from the " +
+                "enumerating form, which still excludes docks",
         )
         assertEquals(
             emptyList(),
@@ -1826,12 +1826,12 @@ class SwayBindingTest {
     @Test
     fun `attaching without an agent mints one and keeps it`() = swayTest {
         val app = openSurface("aw-app1")
-        assertNull(wm.resolve(app), "a Drab to start with")
+        assertNull(resolveAgent(app), "a Drab to start with")
 
         val handle = wm.attach(app, dockFor("aw-dock1"))
 
         assertEquals(1, minted, "the surface had no agent, so one had to be minted")
-        assertEquals(handle.agent, wm.resolve(app), "and the mint is what the surface resolves to")
+        assertEquals(handle.agent, resolveAgent(app), "and the mint is what the surface resolves to")
 
         handle.detach()
         wm.attach(app, dockFor("aw-dock2"))
@@ -1884,8 +1884,8 @@ class SwayBindingTest {
     /**
      * The same failure again, this time from two attaches overlapping rather than following one
      * another. Nothing about this class was written under a single-threaded assumption —
-     * `attach` is a public `suspend fun` with no stated contract, `DockHandle.close()` already
-     * launches `detach()` on a scope, and orphan reaping is driven off the `changes` flow — so
+     * `attach` is a public `suspend fun` with no stated contract, a `DockHandle`'s `detach()` is
+     * callable from any coroutine, and orphan reaping is driven off the `changes` flow — so
      * two hotkeys pressed together are an ordinary case. Unserialised, both attaches snapshot
      * the standing docks before either `exec` lands and both then accept the first new node:
      * one window carrying both marks, and the dock that really belongs to the second surface
@@ -2172,6 +2172,22 @@ class SwayBindingTest {
         assertNotNull(wm.tree().windows.firstOrNull { it.appId == appId }).id
 
     private suspend fun focusedId(): Long? = wm.tree().windows.firstOrNull { it.focused }?.id
+
+    /**
+     * The agent bound to one surface — what `WindowManager.resolve(id)` returned before
+     * enumeration was
+     * folded into it.
+     *
+     * Kept as a helper rather than inlined at eleven call sites because the folded signature makes
+     * the single-window question a two-step one: `resolve(id)` is a list, so every caller that
+     * wanted "which agent" unwraps it first. The list does buy something the old signature could
+     * not say — an empty list is "no such window", where a null `AgentId?` collapsed that with "a
+     * window with no agent" — and nothing in the suite had a use for the distinction, which is why
+     * this helper throws it away again. That is the fold's shape at a caller: one call site's
+     * worth of unwrapping, eleven times.
+     */
+    private suspend fun resolveAgent(surface: SurfaceId): AgentId? =
+        wm.resolve(surface).firstOrNull()?.agent
 
     /**
      * Waits until [surface]'s dock has been marked, which is the last of `attach`'s tree work.

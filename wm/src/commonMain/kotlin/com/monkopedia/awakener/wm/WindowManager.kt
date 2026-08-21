@@ -92,6 +92,30 @@ class CompositorSessionEnded(message: String, cause: Throwable? = null) :
     IllegalStateException(message, cause)
 
 /**
+ * Where a [DockHandle.focus] call is asking focus to end up.
+ *
+ * The two used to be separate methods — `focus()` and `settleFocus()` — and merging them is the
+ * `DockHandle` half of holding the interface at three calls. What the merge does **not** do is
+ * remove a branch: [DOCK] focuses the dock unconditionally and fails if it is gone, [RESTING]
+ * consults `wm.focus.resting` and does nothing at all if the node it picks has left the tree.
+ * The `when` that used to be the choice of method is now a `when` inside one, and the divergent
+ * tolerance of a missing node is the part a caller has to read the enum to learn.
+ */
+enum class FocusTarget {
+    /** The dock itself — a hotkey invocation on an already-bound surface, raising its panel. */
+    DOCK,
+
+    /**
+     * Whichever child `wm.focus.resting` names, so a later tab switch lands where the flag says.
+     *
+     * sway remembers the last focused child per container, so a tab left resting on the dock
+     * means the next switch into that tab puts the user's keystrokes into the agent panel
+     * instead of the application.
+     */
+    RESTING,
+}
+
+/**
  * A live dock bound to a surface.
  *
  * Teardown lives here rather than as a `detach` on [WindowManager] deliberately: the design's
@@ -101,51 +125,73 @@ class CompositorSessionEnded(message: String, cause: Throwable? = null) :
  *
  * Every method here is covered by [WindowManager]'s concurrency contract.
  */
-interface DockHandle : AutoCloseable {
+interface DockHandle {
     val surface: SurfaceId
     val agent: AgentId
     val dockId: SurfaceId
 
-    /** Raises the dock and focuses it, for a hotkey invocation on an already-bound surface. */
-    suspend fun focus()
-
-    /** Applies the resting-focus rule, so a later tab switch lands where the flag says. */
-    suspend fun settleFocus()
+    /** Puts focus where [target] says. */
+    suspend fun focus(target: FocusTarget = FocusTarget.DOCK)
 
     /** Tears the dock down and, per flags, normalises the container it leaves behind. */
     suspend fun detach()
-
-    override fun close() {
-        // AutoCloseable for try-with-resources at call sites that cannot suspend; the real
-        // work is in detach(). Implementations override this to bridge.
-    }
 }
+
+/**
+ * One bindable window and what awakener currently has bound to it.
+ *
+ * The pair exists because [WindowManager.resolve] answers both questions in one call now that
+ * enumeration is not a call of its own. **The [agent] half is not free**: producing it costs one
+ * `:registry` lookup per window, and under the default `registry.store.reload=BEFORE_READ` every
+ * one of those re-reads the bindings file. A caller that only wants the window list — the hotkey
+ * path, which needs the focused surface and then does its own binding work — pays that for an
+ * answer it discards.
+ */
+data class Resolution(
+    val surface: Surface,
+    /** Null means a Drab: a window with nothing bound to it. */
+    val agent: AgentId?,
+)
 
 /**
  * The compositor-agnostic binding interface.
  *
  * Deliberately tiny — `resolve`, `attach`, and change notification. Nothing above this may
- * learn which compositor is in use. [surfaces] is enumeration rather than a fourth behaviour:
- * it is how a caller obtains a [SurfaceId] to resolve in the first place.
+ * learn which compositor is in use.
  *
  * **Every call here, and every call on the [DockHandle]s it hands out, is safe to make
  * concurrently.** Two hotkeys pressed at once are an ordinary case — one on a Drab, which
- * attaches, and one on a bound surface, which focuses that surface's dock — and closing a handle
- * already tears its dock down from whatever coroutine happens to run it. None of these is a
+ * attaches, and one on a bound surface, which focuses that surface's dock — and a handle's
+ * `detach()` runs on whatever coroutine happens to call it. None of these is a
  * single compositor operation, so an implementation owes callers whatever serialisation that
  * takes: one hotkey landing in the middle of another must not be able to stand a dock up in
  * somebody else's tab.
  */
 interface WindowManager {
-    suspend fun surfaces(): List<Surface>
-
     /**
-     * The agent bound to [surface], or null if this is a Drab.
+     * What awakener has bound to [surface], or — with [surface] null — to every bindable window.
      *
      * Answered from the durable registry, so it resolves the same way after a reboot as it did
      * before one — a window is looked up by what outlives it, not by its compositor handle.
+     *
+     * ### The null argument is enumeration, and it is a second behaviour behind one name
+     *
+     * `surfaces()` used to be its own call, argued in this KDoc as "enumeration rather than a
+     * fourth behaviour — it is how a caller obtains a [SurfaceId] to resolve in the first place".
+     * Folding it in holds the interface at three, and the fold is what the two modes cost:
+     *
+     * - **A null [surface] enumerates**, so it must apply the dock filter — a dock is a genuine
+     *   tree node and reporting one as bindable is what mints an agent for an agent panel. A
+     *   non-null [surface] does not filter, because the durable answer for a window must not
+     *   depend on session-scoped state (#52). One name, two predicates.
+     * - **The result is a list either way.** A caller asking about one window writes
+     *   `resolve(id).firstOrNull()?.agent`, where it used to write `resolve(id)`. Empty means
+     *   "no such window", which is a different fact from "a window with no agent" and is now
+     *   carried by the list's length rather than by the value's nullity.
+     * - **Enumeration now costs a registry lookup per window**, because the one return type has
+     *   to carry the agent. See [Resolution].
      */
-    suspend fun resolve(surface: SurfaceId): AgentId?
+    suspend fun resolve(surface: SurfaceId? = null): List<Resolution>
 
     /**
      * Stands a dock up beside [surface] and records the binding it is standing for.
