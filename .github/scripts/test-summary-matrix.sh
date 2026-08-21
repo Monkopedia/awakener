@@ -53,7 +53,13 @@
 # row at all. `check_default_resolution` below pays it back explicitly.
 #
 # Written to run under dash and busybox sh as well as bash, so the harness cannot depend on
-# the shell whose behaviour it is testing around.
+# the shell whose behaviour it is testing around — and since #138 that sentence is a phase rather
+# than an assertion. The bottom of this file re-runs the whole suite under each alternative shell
+# on the roster and carries its exit status up, so the claim goes red when it stops being true.
+# It was false for busybox sh for as long as it had been written down: `link_tool` read busybox
+# ash's bare applet name as an absent tool and the harness died on the first tool it looked for.
+# `AWAKENER_MATRIX_SHELLS=none` runs under the invoking shell only, and `AWAKENER_REQUIRE_SHELLS=1`
+# — the flag CI already sets — turns an absent roster shell from a skip into a failure.
 #
 # **Three exit statuses, because a suite that did not run is not a suite that passed** (#89):
 #
@@ -72,6 +78,10 @@ REPORT=$3
 # Exit 2: the suite could not run, which is not the same fact as a row failing. See `die`.
 [ -f "$SCRIPT" ] || { echo "test-summary-matrix: CANNOT VOUCH: no script at $SCRIPT" >&2; exit 2; }
 SCRIPT=$(CDPATH= cd -P -- "$(dirname "$SCRIPT")" && pwd)/$(basename "$SCRIPT")
+
+# This file's own path, absolutised now rather than when it is needed, because the alt-shell phase
+# at the bottom re-runs this harness and `$0` is whatever the caller typed.
+SELF=$(CDPATH= cd -P -- "$(dirname "$0")" && pwd)/$(basename "$0")
 
 rm -rf "$WORK"
 mkdir -p "$WORK"
@@ -463,12 +473,48 @@ floors driftwide 'wm 90'
 # `#!/usr/bin/env bash`, and `env` resolves that name through PATH.
 BARE=$WORK/bin
 mkdir -p "$BARE"
-link_tool() {
-    resolved=$(command -v "$1" 2>/dev/null) || return 1
-    case $resolved in
-        /*) ln -sf "$resolved" "$BARE/$1" ;;
-        *) return 1 ;;
+
+# Resolve one command name to an absolute path to a real executable file, or fail.
+#
+# `command -v` is the portable answer in every shell except the one the header above claims this
+# harness runs under. **busybox ash resolves its own applets before it walks PATH, and answers
+# with the bare applet name** — `grep`, not `/usr/bin/grep`. That is a correct answer to the
+# question `command -v` asks ("what would running this name do here"), and it is not an answer to
+# the question both callers below are asking, which is "which file do I link into `$BARE`". They
+# read the bare name as "not a file" and treated it as an absence: `link_tool` died with
+# `CANNOT VOUCH: no grep available to build the harness with` on the first tool it tried, so the
+# header's claim about busybox sh was simply false, and `add_impl` silently dropped both `ambient`
+# and `busybox` from the awk roster, which would have taken the distinct-implementation count
+# under its own floor. Same defect, two different-looking symptoms, and neither one was a missing
+# tool.
+#
+# So: an absolute answer is the file. A bare answer is an answer from a namespace that is not the
+# filesystem, and PATH is where the filesystem's answer lives — walk it. Under bash and dash the
+# first branch always wins and this is the behaviour it always had.
+resolve_tool() {
+    _rt=$(command -v "$1" 2>/dev/null) || _rt=''
+    case $_rt in
+        /*) printf '%s\n' "$_rt"; return 0 ;;
     esac
+    _rt_oifs=$IFS
+    IFS=:
+    for _rt_dir in $PATH; do
+        IFS=$_rt_oifs
+        [ -n "$_rt_dir" ] || _rt_dir=.
+        case $_rt_dir in /*) ;; *) _rt_dir=$(pwd)/$_rt_dir ;; esac
+        if [ -f "$_rt_dir/$1" ] && [ -x "$_rt_dir/$1" ]; then
+            printf '%s\n' "$_rt_dir/$1"
+            return 0
+        fi
+        IFS=:
+    done
+    IFS=$_rt_oifs
+    return 1
+}
+
+link_tool() {
+    resolved=$(resolve_tool "$1") || return 1
+    ln -sf "$resolved" "$BARE/$1"
 }
 for tool in bash grep sort head cat tee; do
     link_tool "$tool" || die "no $tool available to build the harness with"
@@ -477,10 +523,21 @@ done
 # The fixture-validity check for every `noawk` case below. Without it "the script reported no
 # measurement" would be satisfied just as well by a PATH so bare that nothing worked, and the
 # case would stop being about awk.
-if PATH=$BARE command -v awk >/dev/null 2>&1; then
-    die "the bare PATH still resolves awk; the no-awk cases would test nothing"
+#
+# **Asked of `$BARE/bash`, not of this harness's own shell**, and that is the same lesson as
+# `resolve_tool` one layer up. The script under test is `#!/usr/bin/env bash`, so bash is the
+# process that will do the awk lookup; busybox ash finds its `awk` applet however bare the PATH
+# is, so run under busybox sh this probe answered "the bare PATH still resolves awk" about a PATH
+# on which the script under test finds no awk at all. An instrument asked the wrong question:
+# each shell answered correctly about itself, and only one of them is the shell whose answer the
+# rows depend on.
+bare_resolves() {
+    PATH=$BARE "$BARE/bash" -c 'command -v "$1" >/dev/null 2>&1' bare_resolves "$1"
+}
+if bare_resolves awk; then
+    die "the bare PATH still resolves awk for the shell that runs the script under test; the no-awk cases would test nothing"
 fi
-PATH=$BARE command -v grep >/dev/null 2>&1 ||
+bare_resolves grep ||
     die "the bare PATH lost grep; the no-awk cases would fail for the wrong reason"
 
 # ------------------------------------------------------------------ awk stubs and shims
@@ -524,14 +581,14 @@ add_impl() {
     label=$1
     cmd=$2
     extra=${3:-}
-    if ! resolved=$(command -v "$cmd" 2>/dev/null); then
+    # `resolve_tool` rather than `command -v` for the reason given where it is defined: under
+    # busybox sh the bare answer `awk` is not an absence, and reading it as one dropped `ambient`
+    # and `busybox` from this roster without a word — the roster whose whole job is to say out
+    # loud how much coverage answered.
+    if ! resolved=$(resolve_tool "$cmd"); then
         note "  awk/(absent) $label — no $cmd on PATH"
         return 0
     fi
-    case $resolved in
-        /*) ;;
-        *) note "  awk/(absent) $label — $cmd is not a file"; return 0 ;;
-    esac
     # Present is not the same as usable: `busybox` is on PATH on any host that has it, and
     # whether that build carries the awk applet is a per-distribution decision. Ask it to be an
     # awk before believing it is one, and say so in the roster either way — an entry dropped
@@ -711,6 +768,18 @@ case $MIN_MUTANTS in
     all) ;;
     ''|*[!0-9]*)
         die "AWAKENER_MATRIX_MIN_MUTANTS must be 'all' or a non-negative integer, got '$MIN_MUTANTS'" ;;
+esac
+
+# Whether the alt-shell phase at the bottom runs. `auto` — the default, and the behaviour that
+# would otherwise be hard-coded — re-runs this whole harness under each alternative shell on the
+# roster. `none` runs it under the invoking shell only, and is what the re-runs themselves are
+# handed, so the recursion terminates at depth one by a switch a reader can see rather than by an
+# internal marker. Validated here rather than at the bottom, so a typo costs nothing instead of a
+# full run.
+SHELLS_MODE=${AWAKENER_MATRIX_SHELLS:-auto}
+case $SHELLS_MODE in
+    auto|none) ;;
+    *) die "AWAKENER_MATRIX_SHELLS must be 'auto' or 'none', got '$SHELLS_MODE'" ;;
 esac
 
 check() {
@@ -1304,6 +1373,101 @@ default_row default-floors-absent 1 "$BADFLOORS" "$REASSURE"
 
 no_leak "the suite, over the whole run"
 
+# ------------------------------------------------------------- the shells this claims to run under
+#
+# The header says "written to run under dash and busybox sh as well as bash", and until #138
+# **nothing confronted that** — the file was only ever executed by the shell Gradle's `Exec` picks,
+# which is one shell, and the sentence had been false for busybox sh for as long as `link_tool`
+# had existed. A claim about portability that no run can contradict is the same instrument-shaped
+# defect this suite exists to catch in `test-summary.sh`, one level up: it renders identically
+# whether it is true or not.
+#
+# So the claim is now a phase. Each alternative shell on the roster re-runs this entire harness —
+# every row, every mutant, the same `MIN_MUTANTS` bar — against the same script under test, in its
+# own work directory, and its exit status is read with the same three-state meaning the rest of
+# this file uses: 0 it held, 1 a row failed there, 2 it could not vouch there.
+#
+# **Whether a missing shell should fail is a judgement, and it takes the shape `cli/launcher-matrix.sh`
+# already chose for exactly this question**: not by default, and yes on CI. kaladin has dash and
+# busybox, adolin has neither, and dying by default would make the owner's other machine unable to
+# run `./gradlew build` at all over a suite that is not what that build is about.
+# `AWAKENER_REQUIRE_SHELLS=1` — the flag CI already sets, next to REQUIRE_SWAY and
+# REQUIRE_SPANREED, for the launcher matrix's identical rows — turns the skip into a `die`.
+# Present or absent, the count is said out loud below, so a row count is coverage rather than
+# however many shells the host could manage.
+ALT_ROSTER='dash|busybox sh'
+ALT_TOTAL=0
+ALT_PRESENT=0
+ALT_MISSING=''
+ALT_RAN=''
+# Counted apart from `fail_count`, which counts *rows*. An alt shell is a whole suite, not a row,
+# and folding one into the other printed `120 rows, 2 failed` when no row had failed and 120 was
+# not the denominator either of those failures came out of. Both still exit 1; they are just
+# reported as the two different facts they are.
+ALT_FAILED=0
+if [ "$SHELLS_MODE" != none ]; then
+    note ""
+    note "# the same suite again under every alternative shell the header claims"
+    mkdir -p "$WORK/shells"
+    OLDIFS=$IFS
+    IFS='|'
+    for alt in $ALT_ROSTER; do
+        IFS=$OLDIFS
+        ALT_TOTAL=$((ALT_TOTAL + 1))
+        alt_label=$(printf '%s' "$alt" | tr ' ' '-')
+        alt_bin=${alt%% *}
+        case $alt in *' '*) alt_args=${alt#* } ;; *) alt_args='' ;; esac
+        if ! alt_path=$(resolve_tool "$alt_bin"); then
+            ALT_MISSING="$ALT_MISSING $alt_bin,"
+            note "  shell/(absent) $alt — no $alt_bin on PATH"
+            IFS='|'
+            continue
+        fi
+        ALT_PRESENT=$((ALT_PRESENT + 1))
+        set +e
+        alt_out=$(AWAKENER_MATRIX_SHELLS=none \
+            "$alt_path" $alt_args "$SELF" "$SCRIPT" \
+            "$WORK/shells/$alt_label" "$WORK/shells/$alt_label.txt" 2>&1 </dev/null)
+        alt_rc=$?
+        set -e
+        alt_tail=$(printf '%s\n' "$alt_out" | grep '^test-summary-matrix: ' | tail -1)
+        case $alt_rc in
+            0)
+                ALT_RAN="$ALT_RAN $alt"
+                note "  shell/$alt -> $alt_path $alt_args — ${alt_tail:-exit 0}"
+                ;;
+            1)
+                # A row failed *there* and not here. That is a red, not a could-not-vouch, so it
+                # exits 1 — but in its own counter, because it is one shell's whole suite rather
+                # than one of this run's rows.
+                ALT_FAILED=$((ALT_FAILED + 1))
+                note "FAIL shell/$alt: the suite went red under $alt_path $alt_args — ${alt_tail:-exit 1}"
+                detail "$alt_out"
+                ;;
+            *)
+                # Anything else is the child saying it never reached a verdict, and a parent that
+                # folded that into "a row failed" would be committing the defect this file is
+                # about. Its word carries up unchanged.
+                die "under $alt_path $alt_args the suite could not vouch (exit $alt_rc): ${alt_tail:-$alt_out}"
+                ;;
+        esac
+        IFS='|'
+    done
+    IFS=$OLDIFS
+    if [ -n "$ALT_MISSING" ]; then
+        if [ "${AWAKENER_REQUIRE_SHELLS:-}" = 1 ]; then
+            die "AWAKENER_REQUIRE_SHELLS=1 and${ALT_MISSING%,} is not installed. The header claims this harness runs under it, and a run that never tried cannot contradict that claim however green it is."
+        fi
+        note "  not installed:${ALT_MISSING%,} — the header's claim about it is untested on this host. Set AWAKENER_REQUIRE_SHELLS=1 to make that a failure instead."
+    fi
+    # The children inherit this process's `GITHUB_STEP_SUMMARY`, which is the canary, so they are
+    # a new way for the leak this file was written about to reach the caller's run summary. Each
+    # child holds the property for itself — it treats our canary as its ambient file and reddens
+    # if the size moves — and this asserts it from here as well, because the parent is the process
+    # whose canary the caller would see.
+    no_leak "the alt-shell phase"
+fi
+
 note ""
 note "test-summary-matrix: $run_count rows, $fail_count failed"
 # Printed on the green path too, and that is the point: the row count was the only trace #89 left
@@ -1311,6 +1475,14 @@ note "test-summary-matrix: $run_count rows, $fail_count failed"
 # how much of the counterfactual phase actually happened — instead of leaving it to be inferred.
 note "  mutants: $mutants_ran of $MUTANTS_DECLARED declared ran (required: $MIN_MUTANTS)"
 note "  awk coverage: $IMPL_COUNT distinct implementations —$IMPLS"
+if [ "$SHELLS_MODE" = none ]; then
+    note "  shell coverage: this shell only (AWAKENER_MATRIX_SHELLS=none)"
+else
+    # `${ALT_FAILED:+…}` would be wrong here: it tests set-and-non-empty, and `0` is both.
+    alt_red=''
+    [ "$ALT_FAILED" -eq 0 ] || alt_red=" ($ALT_FAILED went red)"
+    note "  shell coverage: the invoking shell plus $ALT_PRESENT of $ALT_TOTAL alternatives —${ALT_RAN:- none held}$alt_red"
+fi
 if [ -n "$AMBIENT_SUMMARY" ]; then
     # Recorded rather than inferred. This line is what lets a later reader confirm from the log
     # that the variable really was set during the step this ran in, instead of reasoning about
@@ -1321,3 +1493,4 @@ else
     note "  no ambient GITHUB_STEP_SUMMARY was set; the canary covered the leak path anyway"
 fi
 [ "$fail_count" -eq 0 ] || exit 1
+[ "$ALT_FAILED" -eq 0 ] || exit 1
