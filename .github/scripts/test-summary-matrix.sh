@@ -1400,6 +1400,11 @@ ALT_TOTAL=0
 ALT_PRESENT=0
 ALT_MISSING=''
 ALT_RAN=''
+# Counted apart from `fail_count`, which counts *rows*. An alt shell is a whole suite, not a row,
+# and folding one into the other printed `120 rows, 2 failed` when no row had failed and 120 was
+# not the denominator either of those failures came out of. Both still exit 1; they are just
+# reported as the two different facts they are.
+ALT_FAILED=0
 if [ "$SHELLS_MODE" != none ]; then
     note ""
     note "# the same suite again under every alternative shell the header claims"
@@ -1432,9 +1437,10 @@ if [ "$SHELLS_MODE" != none ]; then
                 note "  shell/$alt -> $alt_path $alt_args — ${alt_tail:-exit 0}"
                 ;;
             1)
-                # A row failed *there* and not here. That is a row failure, not a could-not-vouch,
-                # so it lands in `fail_count` and the suite exits 1 like any other red row.
-                fail_count=$((fail_count + 1))
+                # A row failed *there* and not here. That is a red, not a could-not-vouch, so it
+                # exits 1 — but in its own counter, because it is one shell's whole suite rather
+                # than one of this run's rows.
+                ALT_FAILED=$((ALT_FAILED + 1))
                 note "FAIL shell/$alt: the suite went red under $alt_path $alt_args — ${alt_tail:-exit 1}"
                 detail "$alt_out"
                 ;;
@@ -1472,7 +1478,10 @@ note "  awk coverage: $IMPL_COUNT distinct implementations —$IMPLS"
 if [ "$SHELLS_MODE" = none ]; then
     note "  shell coverage: this shell only (AWAKENER_MATRIX_SHELLS=none)"
 else
-    note "  shell coverage: the invoking shell plus $ALT_PRESENT of $ALT_TOTAL alternatives —$ALT_RAN"
+    # `${ALT_FAILED:+…}` would be wrong here: it tests set-and-non-empty, and `0` is both.
+    alt_red=''
+    [ "$ALT_FAILED" -eq 0 ] || alt_red=" ($ALT_FAILED went red)"
+    note "  shell coverage: the invoking shell plus $ALT_PRESENT of $ALT_TOTAL alternatives —${ALT_RAN:- none held}$alt_red"
 fi
 if [ -n "$AMBIENT_SUMMARY" ]; then
     # Recorded rather than inferred. This line is what lets a later reader confirm from the log
@@ -1484,3 +1493,4 @@ else
     note "  no ambient GITHUB_STEP_SUMMARY was set; the canary covered the leak path anyway"
 fi
 [ "$fail_count" -eq 0 ] || exit 1
+[ "$ALT_FAILED" -eq 0 ] || exit 1
