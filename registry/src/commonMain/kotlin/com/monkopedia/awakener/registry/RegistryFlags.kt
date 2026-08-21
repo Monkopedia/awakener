@@ -193,13 +193,13 @@ enum class ForgetResidue {
  * What preparing residue does when the directory it is about to write into can be written by
  * users other than this one.
  *
- * The check is on the nearest directory that already exists, not on the leaf: a residue
- * directory awakener creates is created `0700` under [RegistryFlags.filePermissions], so the
- * exposure that survives that is an *ancestor* somebody else can write to. In such a directory
- * another local user can create the residue path first — as their own directory, or as a symlink
- * pointing at something of theirs — and awakener would then write the user's model into it. The
- * sticky bit does not close that: `/tmp` being `1777` stops another user *removing* an entry
- * that is already there, and does nothing about one that is not there yet.
+ * *Which* directory is asked about is [ResidueExposureScope]'s question, and the two answers have
+ * different cadences — see that enum, which is where the once-per-deployment shape of the default
+ * is written down. Either way the hazard is the same: in a directory another local user can write,
+ * they can create the residue path first — as their own directory, or as a symlink pointing at
+ * something of theirs — and awakener would then write the user's model into it. The sticky bit
+ * does not close that: `/tmp` being `1777` stops another user *removing* an entry that is already
+ * there, and does nothing about one that is not there yet.
  *
  * Only the write permission is examined. A directory that is merely readable by others leaks the
  * *names* of surfaces, which are app ids, while the residue files inside it are `0600` — worth
@@ -226,6 +226,57 @@ enum class ResidueExposure {
      * Say nothing. For a shared machine where this is understood and the warning is noise.
      */
     ALLOW,
+}
+
+/**
+ * Which directory [RegistryFlags.residueExposure] asks about.
+ *
+ * The two differ in **cadence**, and that is the whole of the choice. A residue directory awakener
+ * creates is created `0700` under [RegistryFlags.filePermissions], so once it exists it is the
+ * deepest existing directory on the way to itself and it is private — which means
+ * [DEEPEST_EXISTING] answers "exposed" on the first `prepareResidue` of a deployment and "private"
+ * on every one after it, for as long as that directory survives. **That is not a suppression and
+ * not a latch**: nothing is remembered between presses, the filesystem underneath the question
+ * changed, and the answer honestly changed with it. [FileBindingStore.residueExposureCheck] names
+ * the directory each answer was about, which is how a reader tells the two apart.
+ */
+enum class ResidueExposureScope {
+    /**
+     * The nearest directory that already exists on the way to the residue directory.
+     *
+     * The default, because it is the scope on which the warning's sentence is *true*: everything
+     * below the deepest existing directory is about to be created by this call at `0700`, so the
+     * only component anybody else can still get to first is the next one down. Walking further up
+     * would answer a different question — whether an existing directory could be *swapped* — and
+     * would answer it badly, since `/tmp` is `1777` on every Linux system and a chain walk warns
+     * about every path under it, including ones nobody can reach because the directory below is
+     * `0700`.
+     *
+     * **Its consequence is stated rather than discovered**: with `registry.residue.dir` pointed
+     * somewhere shared, the warning appears on the first press and never again, because by the
+     * second press awakener owns the directory it was warning about and the race it named is over.
+     * Right on the narrow question, and easy to miss in a stream of startup output — which is what
+     * [PARENT] is for.
+     */
+    DEEPEST_EXISTING,
+
+    /**
+     * The directory the residue directory sits in, whether or not the residue directory exists.
+     *
+     * Asks a standing question instead of a race one — "is awakener's residue directory kept
+     * somewhere other local users can write" — so it keeps answering the same way on every press
+     * and the condition stays observable for as long as it holds. For a deployment that would
+     * rather see the line on every hotkey press than have one chance at it.
+     *
+     * The cost is the mirror of the benefit: on a sticky `/tmp` the creation race really is over
+     * once awakener owns the entry, so this keeps reporting a directory the user may have decided
+     * to accept. The warning text says which of the two it is talking about.
+     *
+     * If the parent does not exist either, this falls back to the nearest existing directory above
+     * it — the same walk [DEEPEST_EXISTING] does, and the same answer, since before the first
+     * press the two scopes are looking at the same place anyway.
+     */
+    PARENT,
 }
 
 /** How a surface's durable residue is laid out on disk. */
@@ -432,6 +483,21 @@ object RegistryFlags {
             "that would rather lose the hotkey than write a model somewhere another user " +
             "reached first. ALLOW says nothing. Only write permission is examined: a merely " +
             "readable directory leaks surface names, and the residue files in it are 0600.",
+    )
+
+    val residueExposureScope = Flags.enum(
+        "registry.residue.exposure_scope",
+        ResidueExposureScope.DEEPEST_EXISTING,
+        "Which directory registry.residue.exposed_dir examines. DEEPEST_EXISTING is the nearest " +
+            "directory that already exists on the way to the residue directory: the scope on " +
+            "which the warning's sentence is literally true, and the default. It is also why " +
+            "that warning fires once per deployment and not again — awakener creates the " +
+            "residue directory 0700 on the first press, which makes it the deepest existing " +
+            "directory from then on, so the race it named is genuinely over. PARENT examines " +
+            "the directory the residue directory sits in instead, exists or not, which is a " +
+            "standing condition rather than a race and so stays reported on every press. " +
+            "Neither value suppresses anything: the check runs in full every time and " +
+            "`residueExposureCheck` names the directory it answered about.",
     )
 
     val residueLayout = Flags.enum(

@@ -137,10 +137,10 @@ class FileBindingStore(
     val lockError: String? get() = unlocked
 
     @Volatile
-    private var exposedResidue: String? = null
+    private var exposureCheck = ResidueExposureCheck()
 
     /**
-     * Why the residue directory prepared most recently was reachable by other users, if it was.
+     * What the most recent exposure check looked at and what it found.
      *
      * The third property of this shape, for the third degradation only the store can see. It is
      * set by [prepareResidue] alone: that is the one call that creates anything under
@@ -148,8 +148,24 @@ class FileBindingStore(
      * matter. [residueLocation] deliberately does not set it — naming a path is not writing to
      * one, and a `awakener-registry residue` that warned would be reporting a hazard nobody had
      * yet run into.
+     *
+     * **A finding rather than a warning string**, because the interesting thing about this check
+     * is when it goes quiet and why. Under [ResidueExposureScope.DEEPEST_EXISTING] a deployment
+     * pointed at a shared directory is reported once and then reads
+     * [ResidueExposureFinding.PRIVATE] forever, and the only thing separating that from a
+     * deployment that was never exposed is [ResidueExposureCheck.examined] naming the `0700`
+     * directory awakener created rather than the shared one above it.
      */
-    val residueExposure: String? get() = exposedResidue
+    val residueExposureCheck: ResidueExposureCheck get() = exposureCheck
+
+    /**
+     * The sentence to print when the residue directory prepared most recently was reachable by
+     * other users, or null when there is nothing to say.
+     *
+     * Kept as its own property because a caller with a `println` wants exactly this and nothing
+     * else. Anything asking *why* there is nothing to say wants [residueExposureCheck].
+     */
+    val residueExposure: String? get() = exposureCheck.warning
 
     private val state = MutableStateFlow(snapshot.bindings)
 
@@ -318,6 +334,7 @@ class FileBindingStore(
         checkExposure(
             RegistryPaths.residueDir(cfg, path),
             cfg[RegistryFlags.residueExposure],
+            cfg[RegistryFlags.residueExposureScope],
         )
         when (cfg[RegistryFlags.residueLayout]) {
             ResidueLayout.PER_KEY_DIR -> PrivateFiles.createDirectories(location, permissions)
@@ -330,56 +347,97 @@ class FileBindingStore(
     }
 
     /**
-     * Applies [RegistryFlags.residueExposure] to the directory [residueDir] will be created in.
-     *
-     * The directory asked about is the nearest one that **already exists** on the way to
-     * [residueDir], because that is the only one anybody else has had a chance at: everything
-     * below it this call is about to create, at `0700`. `registry.residue.dir=/tmp/awakener` on a
-     * machine with a second user is the case — `/tmp` is `1777`, so they can create
-     * `/tmp/awakener` first, as a symlink onto a directory of theirs, and every model written
-     * afterwards lands there. The sticky bit is not a defence against that; it prevents removing
-     * an entry, not creating one.
+     * Applies [RegistryFlags.residueExposure] to the directory [scope] selects above [residueDir].
      *
      * The residue *directory* rather than the per-surface file, so that both layouts ask one
-     * question and so the answer does not change the second time a surface is prepared: under
-     * `PER_KEY_FILE` the file exists by then, is `0600`, and would make an exposed directory
-     * above it read as fine.
+     * question: under `PER_KEY_FILE` the file is `0600` and would make an exposed directory above
+     * it read as fine.
      *
-     * **The deepest existing directory, and not the whole chain above it.** That answers the
-     * question this can act on — whether somebody else can create the next component — and it
-     * is the question `registry.residue.dir` pointed somewhere shared actually raises. Walking
-     * every ancestor would answer a second one, whether an existing directory could be *swapped*
-     * for another, and would do it badly: `/tmp` is `1777` on every Linux system, so a chain walk
-     * warns about every path under it, including ones nobody can reach because the directory
-     * below is `0700` and `/tmp`'s sticky bit stops it being removed. A warning that fires where
-     * nothing is wrong is one nobody reads, and this one exists to be read.
+     * **The answer changes once awakener has created the residue directory, and that is
+     * deliberate.** This KDoc used to argue the opposite — that asking about the directory kept
+     * "the answer from changing the second time a surface is prepared" — and the mechanism it was
+     * written to rule out is the one that falsifies it (#120). Under
+     * [ResidueExposureScope.DEEPEST_EXISTING] the subject of the question is the deepest existing
+     * directory on the way to [residueDir]; before the first `prepareResidue` that is whatever
+     * `registry.residue.dir` was pointed into, and after it that is [residueDir] itself, which
+     * [prepareResidue] creates `0700` the moment this returns. So a deployment pointed at `/tmp/awakener` is reported on the
+     * first press and reads clean on every one after it. That is the correct answer to the narrow
+     * question — the race really is over once awakener owns the entry, and `/tmp`'s sticky bit
+     * keeps it — and it is a diagnostic with exactly one chance to be seen, which is why the
+     * subject is a flag. [ResidueExposureScope.PARENT] asks about the directory [residueDir] sits
+     * in instead, which awakener does not create and so does not change.
      *
-     * A path this cannot examine — a filesystem with no POSIX mode bits, a directory that
-     * vanishes between the walk and the read — is treated as unexposed rather than as exposed,
-     * for the same reason.
+     * **The scope is one directory either way, never the chain above it.** Walking every ancestor
+     * would answer a third question — whether an existing directory could be *swapped* for another
+     * — and would answer it badly: `/tmp` is `1777` on every Linux system, so a chain walk warns
+     * about every path under it, including ones nobody can reach because the directory below is
+     * `0700` and `/tmp`'s sticky bit stops it being removed. A warning that fires where nothing is
+     * wrong is one nobody reads, and this one exists to be read.
+     *
+     * A path this cannot examine — a filesystem with no POSIX mode bits, a directory that vanishes
+     * between the walk and the read — is treated as unexposed rather than as exposed, for the same
+     * reason.
      */
-    private fun checkExposure(residueDir: Path, policy: ResidueExposure) {
+    private fun checkExposure(
+        residueDir: Path,
+        policy: ResidueExposure,
+        scope: ResidueExposureScope,
+    ) {
         if (policy == ResidueExposure.ALLOW) {
-            exposedResidue = null
+            exposureCheck = ResidueExposureCheck(ResidueExposureFinding.ALLOWED)
             return
         }
-        val existing = generateSequence(residueDir.toAbsolutePath().normalize()) { it.parent }
-            .firstOrNull { it.exists() }
+        val absolute = residueDir.toAbsolutePath().normalize()
+        // `parent` is null only for a filesystem root, which is not a residue directory anybody
+        // configured; it keeps itself rather than turning the scope into a throw.
+        val from = when (scope) {
+            ResidueExposureScope.DEEPEST_EXISTING -> absolute
+            ResidueExposureScope.PARENT -> absolute.parent ?: absolute
+        }
+        val existing = generateSequence(from) { it.parent }.firstOrNull { it.exists() }
         val open = existing?.let {
             runCatching { Files.getPosixFilePermissions(it) }.getOrNull()
         }?.filter { it in WORLD_WRITABLE }.orEmpty()
         if (open.isEmpty()) {
-            exposedResidue = null
+            exposureCheck = ResidueExposureCheck(
+                ResidueExposureFinding.PRIVATE,
+                examined = existing?.toString(),
+            )
             return
         }
+        val reach = when (scope) {
+            // The race: the component below `existing` does not exist yet, so somebody else can
+            // be the one who creates it.
+            ResidueExposureScope.DEEPEST_EXISTING ->
+                "another local user can create $residueDir before awakener does — as a symlink " +
+                    "onto something of theirs — and the model written there would be theirs to " +
+                    "read"
+            // The standing condition: awakener keeps the model in a directory other users can add
+            // entries to. Whether they can also displace $residueDir depends on the sticky bit,
+            // which is not claimed here.
+            ResidueExposureScope.PARENT ->
+                "awakener keeps $residueDir in a directory other local users can add entries " +
+                    "to, so the model it holds is only as private as this directory allows"
+        }
         val why = "$existing is writable by others (${open.joinToString(", ") { it.name }}), so " +
-            "another local user can create $residueDir before awakener does — as a symlink onto " +
-            "something of theirs — and the model written there would be theirs to read"
+            reach
+        // Recorded before the refusal, not after it: REFUSE raises out of `prepareResidue`, and a
+        // store left reading `PRIVATE` — or `NOT_RUN` — while it is refusing to prepare anything
+        // would be the same instrument disagreeing with itself. No `warning` under REFUSE, since
+        // the sentence a human reads is the exception and printing it twice reads as two
+        // findings.
+        exposureCheck = ResidueExposureCheck(
+            ResidueExposureFinding.EXPOSED,
+            examined = existing.toString(),
+            warning = when (policy) {
+                ResidueExposure.REFUSE -> null
+                else -> "$why; set ${RegistryFlags.residueExposure.key}=REFUSE to make this " +
+                    "refuse instead, or point ${RegistryFlags.residueDir.key} somewhere private"
+            },
+        )
         if (policy == ResidueExposure.REFUSE) {
             throw IOException("$why; set ${RegistryFlags.residueExposure.key}=REPORT to proceed")
         }
-        exposedResidue = "$why; set ${RegistryFlags.residueExposure.key}=REFUSE to make this " +
-            "refuse instead, or point ${RegistryFlags.residueDir.key} somewhere private"
     }
 
     /**

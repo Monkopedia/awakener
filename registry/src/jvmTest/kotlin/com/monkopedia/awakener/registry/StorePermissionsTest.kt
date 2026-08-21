@@ -166,7 +166,49 @@ class StorePermissionsTest {
         val store = store()
         store.prepareResidue(SurfaceKey.Window("firefox"))
         assertNull(store.residueExposure)
+        assertEquals(ResidueExposureFinding.PRIVATE, store.residueExposureCheck.finding)
     }
+
+    /**
+     * #120. Three ways for this store to have nothing to say, and before the finding existed all
+     * three were the same `null`: nobody has prepared any residue yet, the flag says not to look,
+     * and a check that ran and found the directory private.
+     *
+     * The first is the one with teeth. `awakener-invoke` prints [FileBindingStore.residueExposure]
+     * in a `finally` that runs on **every** press, including the ones that never reached
+     * `prepareResidue` — a `list`, or an invoke that failed earlier — so "quiet" out of this
+     * store has always included "was never asked", and nothing on the page said which.
+     */
+    @Test
+    fun `not asked, not looked for, and looked at and clean are three different answers`() =
+        runTest {
+            val key = SurfaceKey.Window("firefox")
+
+            val untouched = store()
+            assertEquals(
+                ResidueExposureFinding.NOT_RUN,
+                untouched.residueExposureCheck.finding,
+                "a store nobody has prepared residue through has not answered anything",
+            )
+            assertNull(untouched.residueExposureCheck.examined, "and looked at nothing")
+
+            config.put(RegistryFlags.residueExposure, ResidueExposure.ALLOW)
+            val allowed = store("allowed.json")
+            allowed.prepareResidue(key)
+            assertEquals(ResidueExposureFinding.ALLOWED, allowed.residueExposureCheck.finding)
+            assertNull(allowed.residueExposureCheck.examined, "ALLOW does not look")
+
+            config.put(RegistryFlags.residueExposure, ResidueExposure.REPORT)
+            val reporting = store("reporting.json")
+            val residue = reporting.prepareResidue(key)
+            val check = reporting.residueExposureCheck
+            assertEquals(ResidueExposureFinding.PRIVATE, check.finding)
+            assertEquals(
+                residue.parent.toString(),
+                check.examined,
+                "and it says which directory it found private",
+            )
+        }
 
     /**
      * `registry.residue.dir` pointed at a world-writable directory is the case #102 names, and
@@ -229,6 +271,134 @@ class StorePermissionsTest {
         config.put(RegistryFlags.residueDir, dir.resolve("private").toString())
         store.prepareResidue(SurfaceKey.Window("firefox"))
         assertNull(store.residueExposure)
+    }
+
+    /**
+     * #120: the warning fires on the first press and never again, and the reason is not a latch.
+     *
+     * `prepareResidue` creates the residue directory `0700`, which from the second press on *is*
+     * the deepest existing directory on the way to itself — so the check runs in full, honestly
+     * finds a private directory, and says nothing. Nothing is remembered between the two calls;
+     * the filesystem under the question changed.
+     *
+     * That is the correct answer to the narrow question and a diagnostic with one chance to be
+     * seen, which is why this asserts on [ResidueExposureCheck.examined] rather than only on the
+     * silence. Suppressed-because-duplicate and never-happened are the same `null` warning; they
+     * are *not* the same finding-plus-subject, and the second press naming
+     * `<shared>/residue` where the first named `<shared>` is what tells a reader the question
+     * moved rather than the answer.
+     */
+    @Test
+    fun `the deepest-existing scope goes quiet once awakener owns the directory it warned about`() =
+        runTest {
+            val shared = wideOpenDirectory("shared")
+            val residueDir = shared.resolve("residue")
+            config.put(RegistryFlags.residueDir, residueDir.toString())
+            val key = SurfaceKey.Window("firefox")
+            val store = store()
+
+            store.prepareResidue(key)
+            val first = store.residueExposureCheck
+            assertEquals(ResidueExposureFinding.EXPOSED, first.finding, "the first press warns")
+            assertEquals(shared.toString(), first.examined, "about the shared directory")
+
+            store.prepareResidue(key)
+            val second = store.residueExposureCheck
+            assertEquals(
+                ResidueExposureFinding.PRIVATE,
+                second.finding,
+                "and every press after it is silent, because the race it named is over",
+            )
+            assertNull(second.warning, "which is the whole of #120")
+            assertEquals(
+                residueDir.toString(),
+                second.examined,
+                "the subject moved to the 0700 directory awakener created — that, and not the " +
+                    "silence, is what distinguishes this from a deployment never exposed at all",
+            )
+            assertEquals("rwx------", modeOf(residueDir), "which it did create 0700")
+        }
+
+    /**
+     * The other value, and the reason this is a flag rather than a rewrite: `PARENT` asks about
+     * the directory awakener was pointed *into*, which awakener never creates and so never
+     * secures. The condition therefore stays observable on every press, for as long as it holds.
+     *
+     * Run against the same directory as the test above and from the same second press, so the
+     * only difference between the two results is the flag.
+     */
+    @Test
+    fun `the parent scope keeps reporting the same shared directory on every press`() = runTest {
+        val shared = wideOpenDirectory("shared")
+        val residueDir = shared.resolve("residue")
+        config.put(RegistryFlags.residueDir, residueDir.toString())
+        config.put(RegistryFlags.residueExposureScope, ResidueExposureScope.PARENT)
+        val key = SurfaceKey.Window("firefox")
+        val store = store()
+
+        repeat(3) { press ->
+            store.prepareResidue(key)
+            val check = store.residueExposureCheck
+            assertEquals(
+                ResidueExposureFinding.EXPOSED,
+                check.finding,
+                "press ${press + 1} has to see it too, or the flag buys nothing",
+            )
+            assertEquals(shared.toString(), check.examined)
+            val warning = assertNotNull(check.warning, "and it has a sentence to print")
+            assertTrue(
+                warning.contains("other local users can add entries to"),
+                "which says what is standing rather than what race is open: $warning",
+            )
+        }
+        assertEquals("rwx------", modeOf(residueDir), "the directory itself is still private")
+    }
+
+    /**
+     * `PARENT` with a residue directory whose parent does not exist either falls back to the same
+     * walk `DEEPEST_EXISTING` does. Asserted because it is the arm where the two scopes have to
+     * agree: before anything exists there is only one directory to ask about, and a scope that
+     * answered differently there would be reporting on the strength of a path component nobody
+     * has created.
+     */
+    @Test
+    fun `the parent scope falls back to the deepest existing directory when the parent is absent`() =
+        runTest {
+            val shared = wideOpenDirectory("shared")
+            config.put(RegistryFlags.residueDir, shared.resolve("nested/residue").toString())
+            config.put(RegistryFlags.residueExposureScope, ResidueExposureScope.PARENT)
+
+            val store = store()
+            store.prepareResidue(SurfaceKey.Window("firefox"))
+
+            val check = store.residueExposureCheck
+            assertEquals(ResidueExposureFinding.EXPOSED, check.finding)
+            assertEquals(shared.toString(), check.examined)
+        }
+
+    /**
+     * REFUSE raises, and a store that raised still has to be able to say why when asked later.
+     * Recording the finding after the throw would leave it reading `NOT_RUN` — "nobody asked" —
+     * on a store that is refusing every press.
+     */
+    @Test
+    fun `a refusal records the finding it refused on`() = runTest {
+        val shared = wideOpenDirectory("shared")
+        config.put(RegistryFlags.residueDir, shared.resolve("residue").toString())
+        config.put(RegistryFlags.residueExposure, ResidueExposure.REFUSE)
+        val store = store()
+
+        val refusal =
+            runCatching { store.prepareResidue(SurfaceKey.Window("firefox")) }.exceptionOrNull()
+
+        assertIs<IOException>(refusal)
+        val check = store.residueExposureCheck
+        assertEquals(ResidueExposureFinding.EXPOSED, check.finding)
+        assertEquals(shared.toString(), check.examined)
+        assertNull(
+            check.warning,
+            "and nothing to print beside the exception, which already carries the sentence",
+        )
     }
 
     private companion object {
