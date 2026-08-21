@@ -88,6 +88,62 @@ sealed interface ResidueOutcome {
 }
 
 /**
+ * What an exposure check found, and about which directory.
+ *
+ * Four states rather than the `String?` this replaced, because that one collapsed three different
+ * situations into the same `null`: the flag being [ResidueExposure.ALLOW] so nothing was asked, a
+ * check that ran and found the directory private, and a store on which `prepareResidue` has never
+ * been called at all. "Did not happen" and "was not looked for" reaching a reader as the same
+ * silence is the shape this repository keeps finding, and the warning string cannot tell them
+ * apart on its own.
+ *
+ * @param examined the directory the finding is about, or null when none was looked at. This is
+ * the field that makes a *change* of answer legible: under
+ * [ResidueExposureScope.DEEPEST_EXISTING] the second `prepareResidue` of a deployment reports
+ * [ResidueExposureFinding.PRIVATE] naming the residue directory awakener has since created,
+ * where the first reported [ResidueExposureFinding.EXPOSED] naming the directory above it. Same
+ * check, different subject — and without this field that is indistinguishable from a deployment
+ * where nothing was ever exposed.
+ * @param warning the sentence to print, non-null exactly when the finding is
+ * [ResidueExposureFinding.EXPOSED] **and** the policy is [ResidueExposure.REPORT]. Under
+ * [ResidueExposure.REFUSE] the finding is still recorded and this stays null, because there the
+ * sentence a human reads is the exception `prepareResidue` raised and a caller printing both
+ * would report one hazard twice.
+ */
+data class ResidueExposureCheck(
+    val finding: ResidueExposureFinding = ResidueExposureFinding.NOT_RUN,
+    val examined: String? = null,
+    val warning: String? = null,
+)
+
+/** What [ResidueExposureCheck] found. */
+enum class ResidueExposureFinding {
+    /**
+     * No residue has been prepared through this store yet, so nothing has been asked.
+     *
+     * Distinct from [ALLOWED] because they differ in what a reader should do: this one clears the
+     * moment somebody presses the hotkey, and that one never will while the flag says so.
+     */
+    NOT_RUN,
+
+    /** `registry.residue.exposed_dir=ALLOW`, so the question was not put. */
+    ALLOWED,
+
+    /**
+     * Examined, and no other local user can write it.
+     *
+     * Read [ResidueExposureCheck.examined] before reading this as "the residue is somewhere
+     * private": under [ResidueExposureScope.DEEPEST_EXISTING] this is also what a deployment
+     * reports from its second press onward, about the `0700` directory awakener itself created
+     * inside a shared one.
+     */
+    PRIVATE,
+
+    /** Examined, and another local user can write it. [ResidueExposureCheck.warning] says why. */
+    EXPOSED,
+}
+
+/**
  * The durable half of the memory model.
  *
  * The design brief splits what an agent holds into durable residue — preferences, decisions,
