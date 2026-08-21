@@ -195,6 +195,22 @@ MUTANT_REASSURE=no
 RUN_SCRIPT=$SCRIPT
 GUARDS_SEEN=''
 ROW_ENV=''
+# The three per-row modifiers, all set immediately before a `check` and all cleared by it, so a row
+# cannot inherit the one above it.
+#
+#   ROW_ENV    env assignments the row runs under
+#   ROW_CWD    directory the row runs *in*, for the default-resolution row that passes no -C.
+#              This exists because the alternative was a second copy of `check` (#138): the
+#              default-cwd row used to be a hand-rolled `check_default_cwd()` whose verdict logic
+#              had been transcribed, and the transcription lost two things — the `detail` line on
+#              failure, and the real-mode loop that dies when a row names a guard matching no
+#              mutant. #89's shape again, latent only because `ancestryflip` happened to be named
+#              by other rows too. One variable is cheaper than one copy and cannot drift from it.
+#   ROW_LINES  `1` (the default) asserts the row's output is exactly one line, which is what a
+#              caller reading this with `$(…)` depends on. `any` is for the `-h` row, whose whole
+#              point is that it prints nine.
+ROW_CWD=''
+ROW_LINES=1
 
 check() {
     label=$1; guards=$2; want_exit=$3; want_text=$4
@@ -203,7 +219,7 @@ check() {
     if [ "$MODE" = mutant ]; then
         case " $guards " in
             *" $MUTANT "* | *" $MUTANT! "*) ;;
-            *) ROW_ENV=''; return 0 ;;
+            *) ROW_ENV=''; ROW_CWD=''; ROW_LINES=1; return 0 ;;
         esac
     else
         [ -n "$guards" ] || die "row $label names no guard"
@@ -221,11 +237,16 @@ check() {
     fi
 
     run_count=$((run_count + 1))
+    row_lines=$ROW_LINES
     set +e
-    got=$(env $ROW_ENV "$RUN_SCRIPT" "$@" 2>&1 </dev/null)
+    # `SCRIPT` is absolutised at the top and every `$FX` argument is absolute, so running the row
+    # from somewhere other than here changes only what the script under test sees as its cwd.
+    got=$(cd "${ROW_CWD:-.}" && env $ROW_ENV "$RUN_SCRIPT" "$@" 2>&1 </dev/null)
     rc=$?
     set -e
     ROW_ENV=''
+    ROW_CWD=''
+    ROW_LINES=1
 
     why=''
     if [ "$MODE" = mutant ]; then
@@ -253,8 +274,10 @@ check() {
                 *) why="output lacks '$want_text'" ;;
             esac
         fi
-        # One line, always. A caller reads this with `$(…)` and compares it to a word.
-        if [ -z "$why" ] && [ "$(printf '%s\n' "$got" | wc -l)" -ne 1 ]; then
+        # One line, always — for every row that is a verdict. A caller reads a verdict with `$(…)`
+        # and compares it to a word. `-h` is the one row that is not a verdict, and it says so.
+        if [ -z "$why" ] && [ "$row_lines" = 1 ] &&
+            [ "$(printf '%s\n' "$got" | wc -l)" -ne 1 ]; then
             why="output is not exactly one line"
         fi
     fi
@@ -274,8 +297,8 @@ rows() {
     check detached-answered 'ancestryflip' 0 current -C "$FX/detached"
     # The default resolution — no -C, cwd is the repo — is the only shape an agent types by hand,
     # and every other row here passes -C. Left unasserted it would be the one path nothing covers.
-    ROW_ENV=''
-    check_default_cwd
+    ROW_CWD="$FX/current"
+    check default-cwd 'ancestryflip' 0 current
 
     # --- answered, and the answer is no
     check ancestry-stale 'staleverdict' 1 STALE -C "$FX/stale"
@@ -307,44 +330,18 @@ rows() {
     ROW_ENV='AWAKENER_STALENESS_UNKNOWN=maybe'
     check bad-switch-value 'modevalidate' 2 \
         'UNKNOWN: AWAKENER_STALENESS_UNKNOWN must be' -C "$FX/current"
-}
 
-check_default_cwd() {
-    label=default-cwd
-    guards=ancestryflip
-    if [ "$MODE" = mutant ]; then
-        case " $guards " in
-            *" $MUTANT "*) ;;
-            *) return 0 ;;
-        esac
-    else
-        case " $GUARDS_SEEN " in
-            *" $guards "*) ;;
-            *) GUARDS_SEEN="$GUARDS_SEEN $guards" ;;
-        esac
-    fi
-    run_count=$((run_count + 1))
-    set +e
-    got=$( cd "$FX/current" && "$RUN_SCRIPT" 2>&1 </dev/null )
-    rc=$?
-    set -e
-    if [ "$MODE" = mutant ]; then
-        if [ "$rc" = 0 ] && [ "$got" = current ]; then
-            why="the guard was removed and the row still passed, so it does not test it"
-        else
-            why=''
-        fi
-    else
-        why=''
-        [ "$rc" = 0 ] || why="exit $rc, wanted 0"
-        [ -n "$why" ] || [ "$got" = current ] || why="output '$got', wanted 'current'"
-    fi
-    if [ -n "$why" ]; then
-        note "FAIL $label${MUTANT:+ [$MUTANT]}: $why"
-        fail_count=$((fail_count + 1))
-    else
-        note "ok   $label${MUTANT:+ [$MUTANT]}"
-    fi
+    # --- the help text, because that is where the three-status split is learnt
+    #
+    # `-h` prints a range of the script's own header, and the range was one line short of the three
+    # statuses it had just promised (#138): it ended on "Exactly one line on stdout, and one of
+    # three exit statuses:" and stopped. Nothing here covered `-h` at all, so the whole suite was
+    # green with the defect in place — the same silence #89 is about, one file over. The row
+    # asserts the *third* status is present, since it is the last line of the range and the two
+    # above it cannot be reached without it, and `usagerange` is the range put back the way it was.
+    ROW_LINES=any
+    check usage-lists-statuses 'usagerange' 0 \
+        'UNKNOWN: <reason>  2   the check could not be made' -h
 }
 
 # ------------------------------------------------------------------ the mutant table
@@ -376,6 +373,10 @@ warnmode|no|warnmode
 modevalidate|no|modevalidate
 ancestryflip|no|ancestryflip
 staleverdict|no|staleverdict
+
+# `-h` printing a range of the header that stops one line above the three exit statuses. Not a
+# guard that was removed but a number that was wrong, so the mutation is the wrong number put back.
+usagerange|no|usagerange
 '
 
 mutant_rows() {
@@ -471,6 +472,8 @@ apply() {
             splice "$f" "0) printf 'current\\n'; exit 0 ;;" "0) printf 'STALE\\n'; exit 1 ;;" ;;
         staleverdict)
             splice "$f" "1) printf 'STALE\\n'; exit 1 ;;" "1) printf 'current\\n'; exit 0 ;;" ;;
+        usagerange)
+            splice "$f" "sed -n '2,10p' \"\$0\"" "sed -n '2,6p' \"\$0\"" ;;
         *) die "apply: unknown mutation '$2'" ;;
     esac
 }

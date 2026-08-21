@@ -60,6 +60,22 @@ val summaryMatrixTest by tasks.registering(Exec::class) {
     // task input — undeclared, the cache would replay a run that checked a subset into a build
     // whose point was the full roster. Unset, the suite requires every declared mutant.
     inputs.property("minMutants", providers.environmentVariable("AWAKENER_MATRIX_MIN_MUTANTS").orElse("all"))
+    // New with #138: the suite now re-runs itself under every alternative shell its header claims
+    // to support, so which shells answered is part of what its green asserts — exactly the
+    // argument the `awkTooling` fingerprint above rests on, one roster over. Undeclared, the cache
+    // would replay a run that only ever saw bash onto a host that has dash and busybox, and the
+    // day busybox is uninstalled nothing would re-run the suite that exists to notice.
+    inputs.property("shellTooling", toolFingerprint("dash", "busybox"))
+    // The two switches over that phase. `AWAKENER_MATRIX_SHELLS=none` runs under the invoking
+    // shell alone and `AWAKENER_REQUIRE_SHELLS=1` turns a missing roster shell from a skip into a
+    // failure; both change what a pass asserts, which is what makes them inputs rather than
+    // environment. They are also forwarded explicitly, because an `Exec` inherits the daemon's
+    // environment rather than the invoking shell's — the same reason `cli:launcherTest` forwards
+    // `AWAKENER_REQUIRE_SHELLS` by hand.
+    inputs.property("shells", providers.environmentVariable("AWAKENER_MATRIX_SHELLS").orElse("auto"))
+    inputs.property("requireShells", System.getenv("AWAKENER_REQUIRE_SHELLS").orEmpty())
+    System.getenv("AWAKENER_MATRIX_SHELLS")?.let { environment("AWAKENER_MATRIX_SHELLS", it) }
+    System.getenv("AWAKENER_REQUIRE_SHELLS")?.let { environment("AWAKENER_REQUIRE_SHELLS", it) }
     outputs.file(report)
     commandLine(
         "sh",

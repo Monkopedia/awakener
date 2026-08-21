@@ -68,8 +68,14 @@ HEAD_REF=${AWAKENER_STALENESS_HEAD:-HEAD}
 UNKNOWN_MODE=${AWAKENER_STALENESS_UNKNOWN:-fail}
 DIR=''
 
+# The range ends at line 10, which is the last of the three exit statuses. It was `2,6p` — one line
+# short of them — so `-h` stopped on "Exactly one line on stdout, and one of three exit statuses:"
+# and never said what they were (#138). The three-status split is the whole of #123 and `-h` is
+# where someone goes to learn it. `staleness-matrix.sh`'s `usage-lists-statuses` row is what stops
+# it drifting back: it asserts the third status appears in this output, and the `usagerange` mutant
+# is this range put back to `2,6p`.
 usage() {
-    sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # Printed on stdout, because stdout is what a caller reads back and the reason is part of the
