@@ -276,6 +276,38 @@ enum class OrphanPolicy {
 }
 
 /**
+ * What a detach does when the residue disposal its `unbind` asked for did not happen.
+ *
+ * Reached only with `wm.dock.forget_binding_on_detach` on and `registry.binding.forget_residue`
+ * at `ARCHIVE` or `DELETE` — `KEEP`, the default, disposes of nothing and cannot fail. What is
+ * *not* in question is whether the detach worked: by the time the registry is touched the dock is
+ * already down and the binding is already durably gone, so this is a second operation against a
+ * second piece of state, and the only choice is how loudly its failure travels.
+ */
+enum class DetachResidueFailure {
+    /**
+     * Record it on [SwayWindowManager.residueDisposalFailures] and return normally.
+     *
+     * The default, and the same call `ResidueOutcome.Failed` itself documents: the forget did
+     * succeed, so failing the detach would name the half that worked. It is also what
+     * `awakener-registry forget` does one door along — it prints `STILL AT <path>` and exits 3
+     * rather than claiming the deletion did not happen.
+     */
+    REPORT,
+
+    /**
+     * Record it and then raise, so the caller's `detach` fails.
+     *
+     * For a deployment where `registry.binding.forget_residue=DELETE` means the model must be
+     * gone: a residue the user asked to be rid of that is still on disk is worth a failed key
+     * press. A caller choosing this owns one consequence — [DockHandle.close] bridges to `detach`
+     * by launching it on the manager's scope, so a raise from a `close()` lands there rather than
+     * at a call site, exactly as `wm.dock.wedged_dock_fails_detach` already does.
+     */
+    RAISE,
+}
+
+/**
  * Runtime switches for the window-management layer.
  *
  * Every one of these is a behaviour that the sway probe on 2026-07-30 showed to be a genuine
@@ -603,6 +635,19 @@ object WmFlags {
             "the design's memory model says the written-down residue outlives the window — " +
             "closing a panel is not the user saying they want a different agent. Turn it on to " +
             "make a dock's lifetime the agent's lifetime.",
+    )
+
+    val detachResidueFailure = Flags.enum(
+        "wm.dock.detach_residue_failure",
+        DetachResidueFailure.REPORT,
+        "What a detach does when wm.dock.forget_binding_on_detach dropped the binding and the " +
+            "residue disposal registry.binding.forget_residue asked for did not happen. REPORT " +
+            "records it on the manager's residueDisposalFailures and returns normally, which is " +
+            "the default because the detach and the forget both succeeded — failing the call " +
+            "would name the half that worked. RAISE records it and then fails the detach, for a " +
+            "deployment where forget_residue=DELETE means the model must actually be gone. " +
+            "Unreachable at default flags: forget_binding_on_detach is off and forget_residue " +
+            "is KEEP, which disposes of nothing and cannot fail.",
     )
 
     val restingFocus = Flags.enum(

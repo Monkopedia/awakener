@@ -5,11 +5,15 @@ import com.monkopedia.awakener.registry.AgentId
 import com.monkopedia.awakener.registry.BindingStore
 import com.monkopedia.awakener.registry.DerivedAgentIdentities
 import com.monkopedia.awakener.registry.FileBindingStore
+import com.monkopedia.awakener.registry.ForgetResidue
+import com.monkopedia.awakener.registry.RegistryFlags
 import com.monkopedia.awakener.registry.SurfaceKey
 import com.monkopedia.awakener.registry.asIdentity
 import java.nio.file.Path
 import kotlin.io.path.absolutePathString
 import kotlin.io.path.createTempDirectory
+import kotlin.io.path.readText
+import kotlin.io.path.writeText
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -1665,6 +1669,138 @@ class SwayBindingTest {
         wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1")).detach()
 
         assertNull(wm.resolve(app), "with the flag on, the dock's lifetime is the agent's")
+    }
+
+    /**
+     * #115. `unbind` returns a `Forget` whose residue half exists so that a disposal which failed
+     * — with the binding already durably gone — can be told from one that worked. `detach`
+     * discarded it, so the failure `awakener-registry forget` exits 3 for was silent here, on the
+     * path nobody invokes deliberately: a dock closing takes it automatically.
+     *
+     * Driven through the real [FileBindingStore] rather than a stub that returns a `Failed`,
+     * because the claim is about a failure the shipped disposal can actually produce. The lever is
+     * a read-only residue directory, which is the same one `BindingStoreTest`'s
+     * `a disposal that cannot happen is reported rather than thrown or hidden` uses and the one
+     * way to make a rename fail on an otherwise healthy filesystem. The bindings file lives in the
+     * directory *above* it, so the durable half of the forget still succeeds — which is exactly
+     * the situation under test.
+     */
+    @Test
+    fun `a residue disposal that fails on detach is reported instead of dropped`() = swayTest {
+        store.put(WmFlags.forgetBindingOnDetach, true)
+        store.put(RegistryFlags.forgetResidue, ForgetResidue.ARCHIVE)
+        val key = SurfaceKey.Window("aw-app1")
+        val residue = (registry as FileBindingStore).prepareResidue(key)
+        residue.writeText("prefers dark mode")
+
+        val app = openSurface("aw-app1")
+        val dock = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1"))
+        residue.parent.toFile().setWritable(false)
+        try {
+            dock.detach()
+        } finally {
+            residue.parent.toFile().setWritable(true)
+        }
+
+        assertNull(wm.resolve(app), "the binding really did go, which is why this is not a throw")
+        val failure = assertNotNull(
+            wm.residueDisposalFailures.value.singleOrNull(),
+            "the dropped Forget: ${wm.residueDisposalFailures.value}",
+        )
+        assertEquals(dock.dockId, failure.dock, "and it names the dock the teardown was for")
+        // Both ids, and not just the dock. Review of #115 mutated `surface = dockId` in the
+        // record and the entire `:wm` suite stayed green — a field nothing asserted on and
+        // nothing printed, which is the shape this whole PR exists to remove. `app` and
+        // `dock.dockId` are different con_ids, so this assertion can tell them apart.
+        assertNotEquals(
+            app,
+            dock.dockId,
+            "the two ids have to differ, or the assertion below proves nothing",
+        )
+        assertEquals(app, failure.surface, "and the surface whose model is still on disk")
+        assertEquals(key.canonical, failure.key)
+        assertEquals(residue.absolutePathString(), failure.path, "and where the model still is")
+        assertTrue(failure.reason.isNotBlank(), "and why, not merely that")
+        assertEquals(
+            "prefers dark mode",
+            residue.readText(),
+            "the model is still on disk — the whole reason this must not be silent",
+        )
+    }
+
+    /**
+     * The other arm of [WmFlags.detachResidueFailure], and the reason it is a flag: with
+     * `registry.binding.forget_residue=DELETE` a failed disposal means a model the user asked to
+     * be rid of is still there, which some deployments would rather have as a failed key press.
+     *
+     * The record goes in either way. A reader of `residueDisposalFailures` must not be able to
+     * tell which value of the flag was set by whether an entry is present, or the loud mode would
+     * be the quiet one with an exception bolted on.
+     */
+    @Test
+    fun `a failed disposal can be made to fail the detach, and is recorded either way`() =
+        swayTest {
+            store.put(WmFlags.forgetBindingOnDetach, true)
+            store.put(WmFlags.detachResidueFailure, DetachResidueFailure.RAISE)
+            store.put(RegistryFlags.forgetResidue, ForgetResidue.DELETE)
+            val key = SurfaceKey.Window("aw-app1")
+            val residue = (registry as FileBindingStore).prepareResidue(key)
+            residue.writeText("prefers dark mode")
+
+            val app = openSurface("aw-app1")
+            val dock = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1"))
+            residue.parent.toFile().setWritable(false)
+            val raised = try {
+                runCatching { dock.detach() }.exceptionOrNull()
+            } finally {
+                residue.parent.toFile().setWritable(true)
+            }
+
+            val failure = assertNotNull(raised, "RAISE has to fail the detach")
+            assertTrue(
+                failure.message.orEmpty().contains(residue.absolutePathString()),
+                "and say where the model still is: ${failure.message}",
+            )
+            assertTrue(
+                failure.message.orEmpty().contains(WmFlags.detachResidueFailure.key),
+                "and which flag makes it carry on instead: ${failure.message}",
+            )
+            // The reader-side half of the same pin: `surface` reaches a human through
+            // `ResidueDisposalFailure.toString`, which is what this message is built from.
+            assertTrue(
+                failure.message.orEmpty().contains("surface ${app.raw}"),
+                "and the surface it was bound to: ${failure.message}",
+            )
+            assertEquals(
+                1,
+                wm.residueDisposalFailures.value.size,
+                "and the entry is there too, because the raise is the caller's signal and the " +
+                    "list is the reader's",
+            )
+        }
+
+    /**
+     * The dock came down and the residue was disposed of, so there is nothing to report. Asserted
+     * because a collector that appended unconditionally would pass every assertion above while
+     * naming a failure on every successful detach — a warning that fires where nothing is wrong is
+     * one nobody reads, which is the state this instrument exists to avoid.
+     */
+    @Test
+    fun `a disposal that works leaves nothing to report`() = swayTest {
+        store.put(WmFlags.forgetBindingOnDetach, true)
+        store.put(RegistryFlags.forgetResidue, ForgetResidue.ARCHIVE)
+        val key = SurfaceKey.Window("aw-app1")
+        val residue = (registry as FileBindingStore).prepareResidue(key)
+        residue.writeText("prefers dark mode")
+
+        val app = openSurface("aw-app1")
+        wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1")).detach()
+
+        assertEquals(
+            emptyList(),
+            wm.residueDisposalFailures.value,
+            "an archive that happened is not a failure",
+        )
     }
 
     /** A window nobody has invoked a hotkey on is a Drab: enumerable, but bound to nothing. */

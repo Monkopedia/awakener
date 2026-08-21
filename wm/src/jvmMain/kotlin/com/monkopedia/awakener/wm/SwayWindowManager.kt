@@ -4,6 +4,7 @@ import com.monkopedia.awakener.config.Config
 import com.monkopedia.awakener.config.ConfigStore
 import com.monkopedia.awakener.registry.AgentId
 import com.monkopedia.awakener.registry.BindingStore
+import com.monkopedia.awakener.registry.ResidueOutcome
 import com.monkopedia.awakener.registry.SurfaceKey
 import com.monkopedia.awakener.registry.asIdentity
 import java.io.File
@@ -173,6 +174,39 @@ class SwayWindowManager(
      * a dock the flip stranded.
      */
     val unrecognisedDockMarks: StateFlow<Set<String>> = unrecognisedMarks.asStateFlow()
+
+    private val residueFailures = MutableStateFlow<List<ResidueDisposalFailure>>(emptyList())
+
+    /**
+     * Residue disposals a detach asked for and did not get, oldest first.
+     *
+     * `unbind` returns a `Forget` whose residue half can say the disposal failed while the binding
+     * really did go, and [SwayDockHandle.detach] discarded it — so the failure that
+     * `awakener-registry forget` exits 3 for was silent through the manager (#115). This is where
+     * it surfaces, and it is the same shape as [unrecognisedDockMarks] and [repairs] for the same
+     * reason: the operation continued and something in it did not happen.
+     *
+     * **A list rather than a set** because the *same* surface can fail twice — a rebind, another
+     * detach, another failed disposal — and two attempts on one model are two facts a reader may
+     * want, where a set would keep only the first. (Two *different* surfaces would not collide in
+     * a set anyway; their [ResidueDisposalFailure.key]s differ. That is why the reason has to be
+     * about repeats rather than about distinctness.) Ordered oldest first, so a reader taking the
+     * last entry gets the most recent.
+     *
+     * **Nothing clears it and nothing drains it, and the growth that allows is bounded by who
+     * causes it.** An entry costs one detach that a caller made — a person closing a panel — so
+     * the list grows at human pace and only when a disposal genuinely failed. That is the whole
+     * difference from [DockRepairStatus.lastFailure], which keeps one failure rather than a list
+     * precisely because *its* appends are collector-driven: that one is fed by compositor events
+     * for as long as a session lasts, and nobody is pressing anything. Appends here are safe
+     * without a lock — [MutableStateFlow.update] is a compare-and-set loop — and a reader is
+     * expected to take a snapshot rather than to be handed a drained queue.
+     *
+     * Appended to **before** [WmFlags.detachResidueFailure] decides whether to raise, so a caller
+     * that catches the raise and a caller that never sees one read the same list.
+     */
+    val residueDisposalFailures: StateFlow<List<ResidueDisposalFailure>> =
+        residueFailures.asStateFlow()
 
     /**
      * The session every command in this manager rides on, acquiring one if there is none.
@@ -1758,7 +1792,45 @@ class SwayWindowManager(
             }
             // Outside the section for the same reason as attach's bind: the registry is not the
             // tree, and the dock is already down by here.
-            if (cfg[WmFlags.forgetBindingOnDetach] && key != null) registry.unbind(key)
+            if (cfg[WmFlags.forgetBindingOnDetach] && key != null) {
+                // The `Forget` is read rather than discarded. Its residue half exists so that a
+                // disposal which failed with the binding already durably gone can be told from one
+                // that worked; dropping it made that failure loud through
+                // `awakener-registry forget`, which exits 3 for it, and silent here — on the path
+                // nobody invokes deliberately, since a dock closing takes it automatically (#115).
+                val forget = registry.unbind(key)
+                (forget.residue as? ResidueOutcome.Failed)?.let { failed ->
+                    reportResidueFailure(key, failed, cfg)
+                }
+            }
+        }
+
+        /**
+         * Records [failed] and, under [DetachResidueFailure.RAISE], fails the detach with it.
+         *
+         * The record goes in first. Under `RAISE` the throw is the caller's signal and the list is
+         * the reader's, and a reader who only ever sees the list must not be able to tell which
+         * flag was set by whether an entry is there.
+         */
+        private fun reportResidueFailure(
+            key: SurfaceKey,
+            failed: ResidueOutcome.Failed,
+            cfg: Config,
+        ) {
+            val failure = ResidueDisposalFailure(
+                surface = surface,
+                dock = dockId,
+                key = key.canonical,
+                path = failed.path,
+                reason = failed.reason,
+            )
+            residueFailures.update { it + failure }
+            if (cfg[WmFlags.detachResidueFailure] == DetachResidueFailure.RAISE) {
+                error(
+                    "$failure; set ${WmFlags.detachResidueFailure.key}=REPORT to let a detach " +
+                        "carry on past a disposal it could not make",
+                )
+            }
         }
 
         override fun close() {

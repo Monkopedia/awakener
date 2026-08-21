@@ -122,6 +122,47 @@ interface DockHandle : AutoCloseable {
 }
 
 /**
+ * A residue disposal a detach asked for and did not get.
+ *
+ * `BindingStore.unbind` returns a `Forget` whose `residue` half is reported rather than assumed,
+ * precisely so a disposal that failed while the binding really did go can be told from one that
+ * succeeded. `SwayDockHandle.detach` dropped that value on the floor (#115), so the same failure
+ * was loud through `awakener-registry forget` — which exits 3 for it — and silent through the
+ * window manager, on the path a user never invokes deliberately: closing a dock takes it
+ * automatically.
+ *
+ * Named after what it is *about* rather than after the detach it happened during, because the
+ * thing still on disk is what a reader has to act on. [path] is where the residue still is, and
+ * [reason] is the store's own account of why it is still there.
+ *
+ * **Every field is reachable from a test and from [toString].** That is not tidiness: review of
+ * #115 mutated [surface] to [dock] and the whole `:wm` suite stayed green, because nothing
+ * asserted on it and nothing printed it — a field carried with confidence that no observation
+ * could contradict, which is the exact defect family this class exists to remove. [surface] is
+ * kept rather than dropped because it is the only field naming a **live compositor window**:
+ * [key] is the durable identity that outlives the window, and [dock] is a panel that is already
+ * gone by the time this record exists, so a reader who wants to look at the window whose model
+ * is still on disk has nothing else to go on.
+ */
+data class ResidueDisposalFailure(
+    /** The surface whose binding was forgotten. */
+    val surface: SurfaceId,
+    /** The dock whose teardown asked for the forget. */
+    val dock: SurfaceId,
+    /** The durable key the residue belongs to, in its canonical form. */
+    val key: String,
+    /** Where the residue still is. */
+    val path: String,
+    /** Why it is still there, as the store reported it. */
+    val reason: String,
+) {
+    /** One line, for a caller with a `println` and no interest in the parts. */
+    override fun toString(): String =
+        "the binding for $key was forgotten when dock ${dock.raw} beside surface ${surface.raw} " +
+            "came down, but its residue is STILL AT $path — disposal failed: $reason"
+}
+
+/**
  * The compositor-agnostic binding interface.
  *
  * Deliberately tiny — `resolve`, `attach`, and change notification. Nothing above this may
