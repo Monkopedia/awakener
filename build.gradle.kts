@@ -91,14 +91,16 @@ tasks.named("check") { dependsOn(summaryMatrixTest) }
 // The `test-artifacts` job's body, and its suite.
 //
 // Wired to `check` for the same reason `summaryMatrixTest` is: the script is edited here, and a
-// red that only arrives after a push arrives after the change has been reported as verified. It
-// declares no tool fingerprint, and that is a decision rather than an omission — no row in it is
-// gated on a tool being present, so there is no reduced-coverage run for the cache to replay. It
-// dies outright if `awk` is missing (the splice needs one) or `grep`/`sed` (the mutant table is
-// parsed with them), which is the loud failure the fingerprints elsewhere exist to convert a
-// silent one into. That distinction is the test: a fingerprint earns its place when a *missing*
-// tool would leave the suite running with less coverage and still green, and nothing here has
-// that shape.
+// red that only arrives after a push arrives after the change has been reported as verified.
+//
+// It declared no tool fingerprint until #156, and the reason it did not is worth keeping, because
+// it is the test the new one has to pass: a fingerprint earns its place when a *missing* tool
+// would leave the suite running with less coverage and still green. That was not true of `awk`,
+// `grep` or `sed` here — the suite dies outright without them, which is the loud failure a
+// fingerprint exists to convert a silent one into — and it is exactly true of `dash` and
+// `busybox`, which #156 put on a roster the suite *skips* when they are absent. So the
+// fingerprint below is not a copy of the sibling's; it is the first tool dependency this task has
+// ever had that meets its own stated bar.
 val uploadOutcomeMatrixTest by tasks.registering(Exec::class) {
     group = LifecycleBasePlugin.VERIFICATION_GROUP
     description = "Runs .github/scripts/upload-outcome.sh against its input and mutant matrix."
@@ -114,6 +116,26 @@ val uploadOutcomeMatrixTest by tasks.registering(Exec::class) {
     // run that checked a subset into a build whose point was the full roster. Unset — the state
     // every build here is in — the suite requires every declared mutant.
     inputs.property("minMutants", providers.environmentVariable("AWAKENER_MATRIX_MIN_MUTANTS").orElse("all"))
+    // New with #156: the suite now re-runs itself under every alternative shell its header claims
+    // to support, and *skips* one that is absent — so which of dash and busybox is installed
+    // decides what a green here covers. Gradle tracks neither PATH nor the environment
+    // (`org.gradle.caching=true`, #28/#29), so undeclared, the cache would replay a run that only
+    // ever saw bash onto a host that has both, and the day busybox is uninstalled nothing would
+    // re-run the suite that exists to notice. Measured, not assumed: with this line deleted the
+    // task reported UP-TO-DATE on the same PATH move that makes it re-execute with it — the
+    // control #98 recorded for `cli:launcherTest` and #154 for `summaryMatrixTest`, repeated here.
+    inputs.property("shellTooling", toolFingerprint("dash", "busybox"))
+    // The two switches over that phase. `AWAKENER_MATRIX_SHELLS=none` runs under the invoking
+    // shell alone and `AWAKENER_REQUIRE_SHELLS=1` turns a missing roster shell from a skip into a
+    // failure; both change what a pass asserts, which is what makes them inputs rather than
+    // environment. They are also forwarded explicitly, because an `Exec` inherits the daemon's
+    // environment rather than the invoking shell's — the same reason `summaryMatrixTest` and
+    // `cli:launcherTest` forward them by hand. Forwarding without declaring is the #100 shape:
+    // an env var that reached the script, was recorded as an input by nobody, and gated nothing.
+    inputs.property("shells", providers.environmentVariable("AWAKENER_MATRIX_SHELLS").orElse("auto"))
+    inputs.property("requireShells", System.getenv("AWAKENER_REQUIRE_SHELLS").orEmpty())
+    System.getenv("AWAKENER_MATRIX_SHELLS")?.let { environment("AWAKENER_MATRIX_SHELLS", it) }
+    System.getenv("AWAKENER_REQUIRE_SHELLS")?.let { environment("AWAKENER_REQUIRE_SHELLS", it) }
     outputs.file(report)
     commandLine(
         "sh",
