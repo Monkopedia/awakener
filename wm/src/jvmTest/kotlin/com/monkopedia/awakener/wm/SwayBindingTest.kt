@@ -1162,14 +1162,14 @@ class SwayBindingTest {
         // Not the vacuity #44 expected, and worth saying which it is, because the two ask for the
         // same line for opposite reasons. #44 read the collector as reaping the dock before the
         // assertion, leaving `reapOrphans` below nothing to do; measured on this tree it does not
-        // — delete that call and this fails 70 runs out of 70 whatever this line says, so the
+        // — delete that call and this fails 100 runs out of 100 whatever this line says, so the
         // hand-driven sweep is what takes the dock down and the assertion is not trivially true.
         //
-        // What the collector does beat is the *mutant*. It kills the same dock a beat earlier, so
-        // with the acknowledgement bug named under the assertion put back, the dock had already
-        // unmapped on 2 of 70 runs and the guard went green. The figure cited there is 70 out of
-        // 70; without this line it is 68. One extra killer of the same window is the difference
-        // between a guard that always catches that bug and one that catches 97% of it.
+        // What the collector changes is how often the mutant named under the assertion escapes.
+        // It kills the same dock a beat earlier, widening the window in which the client has
+        // finished exiting before the tree is read. Measured over 400 repetitions per arm during
+        // #150's review: 22 escapes with this line absent, 1 with it present — roughly a
+        // twentyfold narrowing, Fisher one-sided p = 2.2e-6. Narrowing, not closing; see below.
         store.put(WmFlags.sweepOnClose, false)
         val app = openSurface("aw-app1")
         val handle = wm.attach(app, dockFor("aw-dock1"), AgentId("agent-1"))
@@ -1182,13 +1182,21 @@ class SwayBindingTest {
         // the client to close, not when the window unmaps, and detach used to return on that
         // acknowledgement — so a sweep reported a repair it had not yet made, and the next sweep
         // (there is one per `close` event) found the same dock still in the tree and killed it
-        // again. Waiting here hid that: the dock was still standing on 70 runs out of 70 against
-        // the unfixed code, so this assertion is where the race stops being a matter of luck.
+        // again. Waiting here would hide that outright; not waiting is what makes this assertion
+        // a detector of it at all.
         //
-        // That 70 of 70 predates #18 and is re-taken rather than carried over, since a collector
-        // the measurement never saw now reaps the same dock: with `kill` put back to returning on
-        // sway's acknowledgement instead of on the unmap, this failed 70 of 70 with the line
-        // above and 68 of 70 without it.
+        // **It detects reliably, not certainly, and the sentence that stood here claimed
+        // otherwise.** "The dock was still standing on 70 runs out of 70 against the unfixed
+        // code, so this assertion is where the race stops being a matter of luck" was wrong
+        // twice. The figure predated #18, which gave the repair collector a caller and with it a
+        // second kill of the same dock — but re-taking it at 70 would not have rescued the
+        // sentence, because 70 is far too small a sample for the arm it was about: at the escape
+        // rate this line leaves (1 of 400, 0.25%, CI 0.04–1.4%), 70 runs come back clean 84% of
+        // the time, so "70 of 70" cannot tell 0 apart from 0.25% however honestly it is measured.
+        // The residual is the same race with no second sweeper in it — `foot` can finish exiting
+        // between the acknowledgement and the tree read on its own. What closes it is
+        // `awaitGone(id)` in `kill`, which is production's job; this assertion's job is to notice
+        // reliably when that goes away.
         assertNull(wm.tree().find(handle.dockId.raw), "the dock must not outlive its surface")
     }
 
