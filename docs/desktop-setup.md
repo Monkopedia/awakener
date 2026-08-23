@@ -40,6 +40,27 @@ command -v claude spanreed
 invisible to `pacman -Q` and, more importantly, **off `PATH` in a non-login shell** — which
 is exactly the situation a GDM-launched sway session is in. That is gotcha 1.
 
+### Not needed yet: Chromium
+
+`:chrome` is **not built** (see [What is not built yet](#10-what-is-not-built-yet)), so
+nothing in the setup above launches a browser and you do not need one to stand awakener up
+today. It is listed here so the requirement is on the page before the module exists.
+
+| Tool | Why | Needed for |
+| --- | --- | --- |
+| `chromium` | The browser awakener will drive. **Chromium specifically, not `google-chrome-stable`** — see [the decision](design.md#substrate-decisions). | `:chrome` only. Not the toggle/dock setup. |
+
+`chromium --version` is the check. Two constraints that come with it and are not optional
+when `:chrome` does arrive:
+
+- **A dedicated profile**, per `docs/design.md`. `--remote-debugging-port` gives anything
+  that can reach localhost full drive of whatever profile the browser was started against,
+  so it must never be your own.
+- **`--ozone-platform=wayland`.** Chromium under sway needs it, and the Wayland path is the
+  only one measured — see
+  [the `app_id` probe](findings/2026-08-23-chromium-app-mode-app-id.md), which is also the
+  reason a browser window's `app_id` cannot be the binding key.
+
 ---
 
 ## 2. Build and install
@@ -658,6 +679,9 @@ Everything in this guide that is stated as a measurement was run. Where and how:
   `claude` — including the control run with the `flock` removed, which loses 11 or 12 of 12
   entries. A guard that cannot be made to fail is not evidence that it fired.
 - sway 1.12's proprietary-GPU strings, and `claude --help`'s trust-dialog wording.
+- The `--app=` `app_id` table of
+  [the Chromium probe](findings/2026-08-23-chromium-app-mode-app-id.md), against Chromium
+  151.0.7922.173 under `--ozone-platform=wayland` on a headless sway 1.12.
 - `./gradlew build` with `AWAKENER_REQUIRE_SWAY=1 AWAKENER_REQUIRE_SPANREED=1`.
 
 **On adolin (read-only inspection of a live, in-use desktop):**
@@ -668,6 +692,12 @@ Everything in this guide that is stated as a measurement was run. Where and how:
 - The missing `/etc/alsa/conf.d/99-pipewire-default.conf` symlink.
 - `nvidia-open` 610.57.04, `license: Dual MIT/GPL`, on an RTX 4070 Ti SUPER.
 - `handy --help`'s CLI flags, and `wtype` present.
+- Which browsers are installed, 2026-08-23: `google-chrome-stable` (151.0.7922.173) and
+  `epiphany` are on `PATH`; `/usr/bin/chromium` was **not present at that moment**, and Jason
+  said he would install it. That is a dated reading, not a standing claim — run
+  `chromium --version` rather than trusting this line.
+- `du -sh ~/.config/google-chrome` = **5.7 GB**, which is the size of the thing a dedicated
+  Chromium profile exists to keep `--remote-debugging-port` away from.
 
 **Reported from the bring-up session, not re-run here:** the 23px title bars on adolin's 4K
 display — kaladin reproduces the mechanism at 25px, which is font metrics, not a different

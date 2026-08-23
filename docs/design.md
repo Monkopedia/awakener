@@ -90,6 +90,30 @@ Waydroid costs the single best adapter available. Use CDP or an extension. If us
 `--remote-debugging-port`, it wants a dedicated profile — anything that can reach localhost
 can drive a logged-in browser.
 
+**Chromium, not Google Chrome** — decided by Jason, 2026-08-23:
+
+> *"Okay, you document Chromium as a dependency and start building out expectation for it.
+> I'll install it on Adolin"*
+
+So `:chrome` targets `chromium`, and the dependency is written down in
+[`desktop-setup.md`](desktop-setup.md#not-needed-yet-chromium). The reason is the second
+half of the isolation the paragraph above already demands: his personal Chrome profile is
+**5.7 GB** of live logged-in state, and `--remote-debugging-port` gives anything that can
+reach localhost full drive of whatever profile the browser was started against. A dedicated
+profile was already mandatory; a separate *binary* means a `:chrome` mistake cannot be a
+mistake against the browser he actually uses, and it keeps `google-chrome-stable` on adolin
+as an ordinary Drab. Which of CDP or an extension supplies the URL is **not** settled by
+this — see Open #3 and #6.
+
+**A browser window's `app_id` cannot be the binding key.** Measured 2026-08-23 against
+Chromium 151 on Wayland (`docs/findings/2026-08-23-chromium-app-mode-app-id.md`): the
+`app_id` of an `--app=URL` window is `chrome-<host>_<path>-<profile>`, which **drops scheme
+and port** — so `http://` and `https://` on one host collide onto a single agent across a
+security boundary — and **includes the path**, so one origin fragments across several. There
+is no `--class` override under Wayland. This does not settle *how* to get the origin; it
+settles that the WM layer alone cannot, which is why "use CDP or an extension" above is a
+constraint and not a preference.
+
 **Chrome binds to origin, not window or tab.** What accumulates is "how Jason deals with
 GitHub PRs," not anything about a tab you'll close in ten minutes. Hotkey on a tab resolves
 origin → agent, spawning cold on first invocation. Lifetime is tab-scoped, memory is
@@ -183,11 +207,26 @@ everything can't tell gist from noise.
    universally and kills the multiplexing special case entirely — but costs Chrome's tab
    search, tab groups, ctrl+shift+T, and drag reordering. i3-lineage mouse dragging is not
    Chrome-grade. Decide whether that's a loss or the point.
+
+   **Narrowed, not answered, 2026-08-23.** The `app_id` probe
+   (`docs/findings/2026-08-23-chromium-app-mode-app-id.md`) kills the version of this where
+   `--app=` carries the binding by itself: the window's `app_id` is not the origin and cannot
+   be made into it. `--app=` survives as a *window* strategy — one toplevel per origin, with
+   the origin resolved out-of-band — but it now costs a URL source it did not previously
+   need, which changes the trade against multiplexing behind a manager. **Still open**, and
+   both options are still live.
 4. **Distillation trigger and format.** What gets written back, when, and in what shape.
 5. **Dock swap race.** If the panel lags a tab switch you type into the previous origin's
    agent without noticing. The swap must beat the first keystroke, or the panel holds input
    until re-bound. Treat as correctness, not polish. Also: let the Chrome dock **pin**
    deliberately — reading one tab while talking to another agent is a real thing to want.
+6. **CDP or an extension.** Something has to tell awakener a browser window's real URL,
+   because the compositor cannot (Open #3). The two candidates have been named since the
+   brief was written and **neither has been chosen**: `--remote-debugging-port` is a local
+   port that fully drives whatever profile it is attached to, so its blast radius is the
+   argument against it and the dedicated Chromium profile is the mitigation; an extension is
+   narrower but needs installing, updating, and a channel out to awakener. Decide this
+   before writing `:chrome`, not during.
 
 ---
 
