@@ -51,6 +51,27 @@ sealed interface Awakened {
         val binding: Binding,
     ) : Awakened
 
+    /**
+     * The panel standing beside this surface was taken out of the layout, and its agent is still
+     * running behind it.
+     *
+     * A distinct outcome from [AlreadyAnimated] because the two are opposite answers to the same
+     * press: one declines to act and the other acts. The dock handle is carried so a caller can
+     * say which node went, and because the next press's [Restored] names the same one.
+     */
+    data class Hidden(
+        val surface: SurfaceId,
+        val key: SurfaceKey,
+        val dock: DockHandle,
+    ) : Awakened
+
+    /** A hidden panel was put back beside its surface, with its configured side and width. */
+    data class Restored(
+        val surface: SurfaceId,
+        val key: SurfaceKey,
+        val dock: DockHandle,
+    ) : Awakened
+
     /** There was nothing to act on. The ordinary answer to a hotkey on an empty workspace. */
     data class NoSurface(val reason: String) : Awakened
 }
@@ -105,6 +126,20 @@ class Awakening(
      * which one it has.
      */
     private val reapOrphans: suspend () -> Unit = {},
+    /**
+     * Finds the panel already standing beside a surface, if there is one.
+     *
+     * A lambda for exactly the reasons [reapOrphans] is one, and it is the piece that makes
+     * `invoke.when_animated=TOGGLE_HIDE` possible from a one-shot process at all: `attach` is the
+     * only thing that mints a [DockHandle], and this binary exits between presses. Recovering the
+     * handle is `SwayWindowManager.dockFor`'s, which reads it back out of the tree by mark — so it
+     * works across an awakener restart, and it is a concrete method rather than a fourth call on
+     * [WindowManager], whose three-call agreement is #94's to settle rather than this change's.
+     *
+     * Defaults to "no dock", which is what an implementation with no notion of one honestly
+     * reports; under that default `TOGGLE_HIDE` degrades to standing a panel up every press.
+     */
+    private val dockFor: suspend (SurfaceId) -> DockHandle? = { null },
 ) {
     private val config: Config get() = store.config.value
 
@@ -166,6 +201,29 @@ class Awakening(
         val key = SurfaceKey.of(surface.descriptor, cfg)
         // Read before binding, because binding is what makes it stop being true.
         val wasADrab = registry.resolve(key) == null
+        // Ahead of everything durable, and that order is the whole of what makes a toggle
+        // cheap: a press that only hides or restores a panel mints nothing, prepares nothing,
+        // and writes nothing. It is also correct rather than merely tidy — a surface with a
+        // panel standing beside it was bound by the attach that stood it up, so there is no
+        // identity here left to recall.
+        if (cfg[InvokeFlags.whenAnimated] == WhenAnimated.TOGGLE_HIDE) {
+            val dock = dockFor(surface.id)
+            if (dock != null) {
+                // Asked of the compositor rather than remembered, so a dock the user pulled out
+                // of the scratchpad by hand toggles from where it actually is. Nothing here holds
+                // a "hidden" bit; there is nowhere for one to be wrong.
+                return if (dock.hidden()) {
+                    dock.show()
+                    Awakened.Restored(surface.id, key, dock)
+                } else {
+                    dock.hide()
+                    Awakened.Hidden(surface.id, key, dock)
+                }
+            }
+            // No panel: fall through and stand one up. That is the first press of the toggle,
+            // and it is also what a press does after the panel has been closed by hand.
+        }
+
         // Before the bind rather than after, so that a cold Lifeless launched by the command
         // below finds an empty model at {residue} instead of a path that is not there yet.
         if (cfg[InvokeFlags.residuePrepare]) prepareResidue(key)

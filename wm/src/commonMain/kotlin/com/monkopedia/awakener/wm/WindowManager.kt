@@ -99,6 +99,17 @@ class CompositorSessionEnded(message: String, cause: Throwable? = null) :
  * the natural owner of its own lifetime. It is not optional politeness — sway leaves both the
  * dock and its split container standing when a surface dies, so something must close this.
  *
+ * **Visibility lives here for the same reason, and that placement is a decision rather than a
+ * convenience.** [hide] and [show] are two more verbs, and the working agreement in
+ * `docs/design.md` holds [WindowManager] itself to three calls — so they go on the handle, which
+ * is already the owner of one dock's lifetime and is not covered by that agreement. What is
+ * genuinely new is that a *fresh process* has to find an existing dock before it can hide one, and
+ * no handle survives a one-shot `awakener-invoke`. That lookup is deliberately **not** a fourth
+ * call on [WindowManager] either: it is `SwayWindowManager.dockFor`, a concrete method the
+ * composition root passes down as a lambda, exactly as `reapOrphans` already is. See #94, which is
+ * where the size of that interface is being settled; this is input to it, not a decision taken on
+ * its behalf.
+ *
  * Every method here is covered by [WindowManager]'s concurrency contract.
  */
 interface DockHandle : AutoCloseable {
@@ -111,6 +122,43 @@ interface DockHandle : AutoCloseable {
 
     /** Applies the resting-focus rule, so a later tab switch lands where the flag says. */
     suspend fun settleFocus()
+
+    /**
+     * Whether the dock is out of the layout right now — hidden rather than torn down.
+     *
+     * A read, not an edit: it answers from the compositor's current tree, so a dock a *user* took
+     * out or put back by hand reads exactly the same as one [hide] and [show] moved. That is
+     * deliberate. awakener holds no "is it hidden" bit of its own, because a bit would be the one
+     * thing a hand on the compositor could make wrong, and the hotkey's whole job is to do the
+     * opposite of whatever the window is doing now.
+     */
+    suspend fun hidden(): Boolean
+
+    /**
+     * Takes the dock out of the layout while leaving its process running, and returns whether
+     * this call is what did it.
+     *
+     * The distinction from [detach] is the entire point and is not stylistic: the dock is a
+     * terminal with a live agent session in it, so tearing it down destroys the accumulated
+     * context this project exists to keep. Hiding costs the window and nothing else — the process
+     * keeps running, its scrollback survives, and [show] brings it back where it was.
+     *
+     * Idempotent: hiding a dock that is already hidden is a no-op that returns false, so a caller
+     * racing another press cannot double-hide anything.
+     */
+    suspend fun hide(): Boolean
+
+    /**
+     * Puts a hidden dock back beside its surface, and returns whether this call is what did it.
+     *
+     * Restoring is not the inverse command of hiding — the geometry does not survive the trip, so
+     * an implementation owes the caller the dock's configured position and size back, not merely
+     * a window on screen again.
+     *
+     * Idempotent in the same way [hide] is: showing a dock that is already standing returns false
+     * and touches nothing.
+     */
+    suspend fun show(): Boolean
 
     /** Tears the dock down and, per flags, normalises the container it leaves behind. */
     suspend fun detach()

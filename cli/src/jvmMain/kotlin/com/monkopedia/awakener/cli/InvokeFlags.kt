@@ -26,6 +26,31 @@ enum class WhenAnimated {
      * because both answers are defensible.
      */
     SECOND_DOCK,
+
+    /**
+     * Hide the panel that is standing, and bring it back on the press after that.
+     *
+     * Jason's own framing, 2026-08-23: *"if we do Super A and the instance is present, we should
+     * probably shut it down, or actually it's probably more likely that we should just hide the
+     * window. What would it take for us to hide the window and then be able to bring it back if
+     * you hit Super A again?"* — and the answer to the alternative he raised first is why this
+     * hides rather than shutting down. The dock is a terminal running `claude`; killing it
+     * destroys a live session and everything the agent has accumulated about that surface, which
+     * is the one thing this project exists to keep.
+     *
+     * **It asks the tree, where [REUSE] asks the bus, and that is a real difference rather than an
+     * inconsistency.** `Awakening`'s note gives the reason [REUSE] is right to ask the bus: "is
+     * this Lifeless animated" survives a Chrome manager mirroring several origins behind one
+     * window, where "is there a panel beside this window" does not. But the question *this* value
+     * has to answer is literally about a panel — there is nothing to hide or restore otherwise —
+     * so the tree is the only thing that can answer it. The consequence is worth stating: with a
+     * live agent on the bus whose panel has been closed by hand, this stands a new one, where
+     * [REUSE] would decline.
+     *
+     * Not the default. An unconfigured system behaves exactly as it did before this value
+     * existed.
+     */
+    TOGGLE_HIDE,
 }
 
 /** How much a hotkey press prints when something on the bind path raises. */
@@ -108,7 +133,10 @@ object InvokeFlags {
         "What a hotkey does when this surface's Lifeless already has a live session on the bus. " +
             "Reusing declines to stand a second panel, since two sessions under one identity " +
             "accumulate two divergent residues; SECOND_DOCK stands another anyway, which is the " +
-            "deliberate second view onto one agent.",
+            "deliberate second view onto one agent; TOGGLE_HIDE makes the key a toggle — a press " +
+            "with the panel standing hides it, leaving the agent running, and the next press " +
+            "brings it back where it was. TOGGLE_HIDE asks the tree rather than the bus, because " +
+            "hiding is a question about a panel and only the tree knows whether there is one.",
     )
 
     /**

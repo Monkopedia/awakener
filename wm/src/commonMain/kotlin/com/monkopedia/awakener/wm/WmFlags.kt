@@ -664,6 +664,27 @@ object WmFlags {
             "after attaching already behaves.",
     )
 
+    val dockFocusOnShow = Flags.boolean(
+        "wm.dock.focus_on_show",
+        true,
+        "Whether restoring a hidden dock leaves it focused, before the resting-focus rule is " +
+            "applied. The mirror of wm.dock.focus_on_map for the other way a dock arrives on " +
+            "screen, and it is true for the same reason: a press that brings the panel back is a " +
+            "press aimed at the agent in it. Where focus finally rests is still " +
+            "wm.focus.restore_after_show's and wm.focus.resting's, so at the shipped defaults " +
+            "this decides a transient, exactly as focus_on_map does.",
+    )
+
+    val restoreFocusAfterShow = Flags.boolean(
+        "wm.focus.restore_after_show",
+        true,
+        "Apply the resting-focus rule at the end of a restore, so a dock that has been hidden " +
+            "and brought back leaves the tab resting where wm.focus.resting says — the same " +
+            "thing wm.focus.restore_after_attach does for an attach. Off leaves the tab resting " +
+            "wherever wm.dock.focus_on_show put it, which for a dock is the hazard the resting " +
+            "rule exists for: the next switch into this tab types at the agent.",
+    )
+
     val sweepOnClose = Flags.boolean(
         "wm.repair.sweep_on_close",
         true,

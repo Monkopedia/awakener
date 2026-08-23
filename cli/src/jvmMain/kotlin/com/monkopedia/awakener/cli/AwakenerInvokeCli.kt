@@ -26,13 +26,16 @@ import kotlinx.coroutines.runBlocking
  *
  * ### It is a one-shot process, and that bounds what it can promise
  *
- * Every invocation starts, acts and exits. Nothing is held between presses, so this cannot raise
- * a panel that is already standing or take one down on a later press — a `DockHandle` is what
- * knows which node a dock is, and this process has none from last time. What it can do is decline
- * to stand a second panel beside a Lifeless that is already animated, which is what
- * `invoke.when_animated` is for, and take down docks whose surface has gone, which is `reap`.
- * Raising and swapping are what a daemon adds; nothing here should read as though they already
- * work.
+ * Every invocation starts, acts and exits. Nothing is *held* between presses — no `DockHandle`
+ * survives one — but a handle can be recovered from the compositor, which is what
+ * `invoke.when_animated=TOGGLE_HIDE` rests on: `SwayWindowManager.dockFor` reads the panel back
+ * out of the tree by its mark, so a second press can hide it and a third bring it back, with the
+ * agent running throughout. That works across an awakener restart too, because the mark is on the
+ * window rather than in this process.
+ *
+ * What is still out of reach is anything needing state this process did not put in the tree —
+ * swapping which agent a panel holds, or reacting to something between presses. Those are what a
+ * daemon adds; nothing here should read as though they already work.
  *
  * That shape is also what keeps this on the right side of the design brief's "no unattended
  * autonomous action". This process does nothing until a key is pressed, and then it exits. There
@@ -97,6 +100,25 @@ object AwakenerInvokeCli {
             out("${awakened.binding.agentId} is already animated; standing no second panel")
             out("  ${awakened.key.canonical}")
             // Zero, not a failure: the hotkey did exactly what the flag asked of it.
+            0
+        }
+
+        // `agent.raw` and not `agent`: AgentId is a value class over a String, so interpolating
+        // it prints `AgentId(raw=agent-…)`. Measured through the shipped launcher, which is the
+        // only place that would have shown it — every other reader of an agent here goes through
+        // `Binding.agentId`, which is already the String.
+        is Awakened.Hidden -> {
+            out("hid dock ${awakened.dock.dockId.raw} beside surface ${awakened.surface.raw}")
+            out("  ${awakened.dock.agent.raw} is still running; press again to bring it back")
+            0
+        }
+
+        is Awakened.Restored -> {
+            out(
+                "restored dock ${awakened.dock.dockId.raw} beside surface " +
+                    "${awakened.surface.raw}",
+            )
+            out("  ${awakened.dock.agent.raw} is back on screen")
             0
         }
 
@@ -202,6 +224,7 @@ private fun awaken(args: Array<String>, store: FileConfigStore): Int {
                         store = store,
                         prepareResidue = { bindings.prepareResidue(it) },
                         reapOrphans = wm::reapOrphans,
+                        dockFor = wm::dockFor,
                     ),
                     ::println,
                 )

@@ -54,6 +54,7 @@ class AwakeningTest {
         store = config,
         prepareResidue = { prepared += it },
         reapOrphans = { sweeps++ },
+        dockFor = { wm.standing[it] },
     )
 
     @BeforeTest
@@ -238,6 +239,94 @@ class AwakeningTest {
     }
 
     /**
+     * Jason's ask, 2026-08-23, as a unit: *"if we do Super A and the instance is present … we
+     * should just hide the window … and then be able to bring it back if you hit Super A again"*.
+     *
+     * Three presses, three different things, and the panel is the same one throughout — which is
+     * what makes it a toggle rather than a stand-up followed by two no-ops.
+     */
+    @Test
+    fun `TOGGLE_HIDE hides the standing panel and brings it back on the next press`() = runTest {
+        config.put(InvokeFlags.whenAnimated, WhenAnimated.TOGGLE_HIDE)
+
+        val first = assertIs<Awakened.Animated>(awakening.invoke())
+        val panel = wm.standing.getValue(app.id)
+
+        val second = assertIs<Awakened.Hidden>(awakening.invoke())
+        assertEquals(panel.dockId, second.dock.dockId, "the panel it stood up is the one it hid")
+        assertTrue(panel.isHidden)
+
+        val third = assertIs<Awakened.Restored>(awakening.invoke())
+        assertEquals(panel.dockId, third.dock.dockId)
+        assertTrue(!panel.isHidden)
+
+        assertEquals(1, wm.attaches.size, "and no second panel was ever stood up")
+        assertEquals(1, panel.hides)
+        assertEquals(1, panel.shows)
+        assertEquals(first.binding.agent, third.dock.agent, "still the same Lifeless")
+    }
+
+    /**
+     * A toggle press must be free of everything durable. There is nothing to mint — a surface with
+     * a panel beside it was bound by the attach that stood the panel up — and preparing residue or
+     * re-binding on every keystroke would make a hide cost a registry write.
+     */
+    @Test
+    fun `a toggle press mints nothing, prepares nothing, and asks the bus nothing`() = runTest {
+        config.put(InvokeFlags.whenAnimated, WhenAnimated.TOGGLE_HIDE)
+        awakening.invoke()
+        prepared.clear()
+        val callsAfterAttach = bus.calls
+
+        assertIs<Awakened.Hidden>(awakening.invoke())
+
+        assertTrue(prepared.isEmpty(), "no residue was prepared for a press that only hid a panel")
+        assertEquals(callsAfterAttach, bus.calls, "and the bus was not consulted")
+    }
+
+    /**
+     * The other half of the same flag: with no panel beside the surface there is nothing to
+     * toggle, so the press stands one up. That is the first press, and it is also what happens
+     * after the panel has been closed by hand.
+     */
+    @Test
+    fun `TOGGLE_HIDE stands a panel up when the surface has none`() = runTest {
+        config.put(InvokeFlags.whenAnimated, WhenAnimated.TOGGLE_HIDE)
+        bus.live = emptyList()
+
+        val awakened = assertIs<Awakened.Animated>(awakening.invoke())
+        assertTrue(awakened.minted)
+        assertEquals(1, wm.attaches.size)
+    }
+
+    /**
+     * `TOGGLE_HIDE` asks the tree and not the bus, which is a deliberate difference from
+     * [WhenAnimated.REUSE] and the one consequence worth pinning: an animated Lifeless whose panel
+     * is standing gets hidden rather than declined.
+     */
+    @Test
+    fun `TOGGLE_HIDE hides an animated Lifeless where REUSE would decline`() = runTest {
+        val first = assertIs<Awakened.Animated>(awakening.invoke())
+        bus.live = listOf(LiveAgent(first.binding.agentId, first.binding.spanreedName))
+
+        assertIs<Awakened.AlreadyAnimated>(awakening.invoke())
+
+        config.put(InvokeFlags.whenAnimated, WhenAnimated.TOGGLE_HIDE)
+        assertIs<Awakened.Hidden>(awakening.invoke())
+    }
+
+    /**
+     * The default is what an unconfigured desktop gets, and this change must not have moved it.
+     * Asserted against the declared default rather than against behaviour, because behaviour that
+     * happens to match is what a wrong default looks like until the day it does not.
+     */
+    @Test
+    fun `REUSE is still the default, so an unconfigured system is unchanged`() = runTest {
+        assertEquals(WhenAnimated.REUSE, InvokeFlags.whenAnimated.default)
+        assertEquals(WhenAnimated.REUSE, config.config.value[InvokeFlags.whenAnimated])
+    }
+
+    /**
      * The stated cost of binding before attaching, pinned so it cannot drift into a surprise.
      * A failed attach leaves a durable binding to an agent with no panel — and the retry recalls
      * it, which is the behaviour wanted anyway: re-minting would strand the residue path the
@@ -301,6 +390,36 @@ class AwakeningTest {
         assertEquals(1, bus.calls)
     }
 
+    /**
+     * What the hotkey actually *prints*, which nothing else in this build looks at.
+     *
+     * It is here because the first version of these two lines interpolated `dock.agent` directly
+     * and printed `AgentId(raw=agent-…)` — [AgentId] is a value class over a `String`, so its
+     * `toString` is the wrapper's. Every other reader of an agent on this path goes through
+     * `Binding.agentId`, which is already a `String`, so nothing existing would have caught it and
+     * nothing did: it was found by running the shipped launcher against a live sway. This is the
+     * guard that makes the second occurrence cheaper than the first.
+     */
+    @Test
+    fun `a toggle press prints the agent id and not the wrapper around it`() = runTest {
+        config.put(InvokeFlags.whenAnimated, WhenAnimated.TOGGLE_HIDE)
+        val stood = assertIs<Awakened.Animated>(awakening.invoke())
+
+        val printed = mutableListOf<String>()
+        assertEquals(0, AwakenerInvokeCli.run(arrayOf("invoke"), awakening, printed::add))
+        assertEquals(0, AwakenerInvokeCli.run(arrayOf("invoke"), awakening, printed::add))
+
+        val id = stood.binding.agentId
+        assertTrue(printed.any { it.startsWith("hid dock ") }, printed.toString())
+        assertTrue(printed.any { it.startsWith("restored dock ") }, printed.toString())
+        assertTrue(printed.any { it.trim().startsWith("$id is still running") }, printed.toString())
+        assertTrue(printed.any { it.trim().startsWith("$id is back on screen") }, printed.toString())
+        assertTrue(
+            printed.none { "AgentId(" in it },
+            "the value class wrapper reached the user: $printed",
+        )
+    }
+
     @Test
     fun `reap delegates to the sweep the composition root supplied`() = runTest {
         awakening.reap()
@@ -328,6 +447,7 @@ class AwakeningTest {
      */
     private inner class FakeWindowManager(var surfaces: List<Surface>) : WindowManager {
         val attaches = mutableListOf<Attach>()
+        val standing = mutableMapOf<SurfaceId, FakeDock>()
         var attachFailure: Throwable? = null
 
         override suspend fun surfaces(): List<Surface> = surfaces
@@ -348,19 +468,48 @@ class AwakeningTest {
                 SurfaceKey.of(window.descriptor, config.config.value),
                 agent?.asIdentity(),
             )
+            // Kept, because a toggle's second press has to find the panel the first stood up —
+            // which is the fact `SwayWindowManager.dockFor` supplies in production.
             return FakeDock(surface, bound.agent, SurfaceId(surface.raw + 1000))
+                .also { standing[surface] = it }
         }
 
         override val changes: Flow<SurfaceChange> = emptyFlow()
     }
 
+    /**
+     * A panel that remembers whether it is hidden, which is the whole of what the toggle needs
+     * from a compositor it is not testing.
+     *
+     * The bit is here and not in `Awakening` on purpose: the loop under test must ask, and a fake
+     * that answered from something the loop handed it would prove nothing about that.
+     */
     private class FakeDock(
         override val surface: SurfaceId,
         override val agent: AgentId,
         override val dockId: SurfaceId,
     ) : DockHandle {
+        var isHidden = false
+        var hides = 0
+        var shows = 0
+
         override suspend fun focus() = Unit
         override suspend fun settleFocus() = Unit
         override suspend fun detach() = Unit
+        override suspend fun hidden(): Boolean = isHidden
+
+        override suspend fun hide(): Boolean {
+            if (isHidden) return false
+            isHidden = true
+            hides++
+            return true
+        }
+
+        override suspend fun show(): Boolean {
+            if (!isHidden) return false
+            isHidden = false
+            shows++
+            return true
+        }
     }
 }
