@@ -286,6 +286,33 @@ enum class ResidueLayout {
 
     /** One directory per surface, so distillation can write several artifacts side by side. */
     PER_KEY_DIR,
+
+    /**
+     * `<residue>/<app>/<session>/` — one directory per **application**, holding one directory
+     * per surface bound to it.
+     *
+     * Both values above are flat: every surface is a sibling of every other and nothing on disk
+     * says which of them are three windows of one editor. This one gives each application a
+     * directory of its own, which is a place two Lifelesses bound to two windows of the same
+     * app can both read and write — Jason's request, and the thing neither flat layout has
+     * anywhere to put.
+     *
+     * The app component is [SurfaceKey.appSlug] and the session component is
+     * [SurfaceKey.slug] — the same per-key identity the two flat layouts use, so a session
+     * folder here is recognisably the residue that layout would have named, moved one level
+     * down. Both components are slugs, which is what keeps a window-supplied `app_id` of
+     * `../../..` from naming anything outside the residue directory.
+     *
+     * The two components are also drawn from disjoint namespaces, so an application directory
+     * here is never the path [PER_KEY_DIR] calls some surface's residue directory — see
+     * [SurfaceKey.appScope]. Without that they coincided for every key with no discriminator,
+     * which is what `registry.key.window_identity=APP_ID` produces by default.
+     *
+     * **Nothing migrates.** Residue written under either flat layout stays exactly where it is,
+     * is not read here, and is not deleted; the first `prepareResidue` after a flip reports it
+     * through [FileBindingStore.residueStrandedCheck] rather than leaving it to be discovered.
+     */
+    PER_APP_SESSION_DIR,
 }
 
 /**
@@ -503,7 +530,19 @@ object RegistryFlags {
     val residueLayout = Flags.enum(
         "registry.residue.layout",
         ResidueLayout.PER_KEY_FILE,
-        "One markdown file per surface, or one directory per surface. The directory form " +
-            "leaves room for distillation to emit more than a single artifact.",
+        "How a surface's residue is laid out under registry.residue.dir. PER_KEY_FILE is one " +
+            "markdown file per surface and stays the default, so an unconfigured system is " +
+            "laid out exactly as it was. PER_KEY_DIR is one directory per surface, which " +
+            "leaves room for distillation to emit more than a single artifact. " +
+            "PER_APP_SESSION_DIR nests those directories one level deeper, <app>/<session>/, " +
+            "so every window of one application shares a parent directory the Lifelesses " +
+            "bound to them can both read and write — the flat layouts have nowhere to put " +
+            "anything two sessions of one app share. The app component is the key's app_id, " +
+            "title or origin depending on which field the key was read from, slugged: two " +
+            "applications whose names flatten to the same readable text still get separate " +
+            "directories, because the trailing digest is taken over the unflattened value. " +
+            "Flipping this moves where new residue is written and moves nothing that is " +
+            "already there; residue left behind under another layout is reported on the next " +
+            "prepare rather than silently orphaned.",
     )
 }

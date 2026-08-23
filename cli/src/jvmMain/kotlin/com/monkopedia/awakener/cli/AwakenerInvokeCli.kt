@@ -211,6 +211,11 @@ private fun awaken(args: Array<String>, store: FileConfigStore): Int {
                 // other reason has still created the directory, and on stderr for the reason
                 // every warning here is: stdout is what the press reports about its surface.
                 bindings.residueExposure?.let { System.err.println("warning: $it") }
+                // And whether a `registry.residue.layout` flip left this surface's earlier model
+                // in a file this build no longer opens. Beside the exposure warning because it
+                // has the same shape: a condition only the store can see, on the one call that
+                // was about to write the model somewhere.
+                bindings.residueStranded?.let { System.err.println("warning: $it") }
                 // The dock is sway's child, not this process's, so retiring the manager stops its
                 // collector and gives up its connection and leaves every panel standing.
                 //
