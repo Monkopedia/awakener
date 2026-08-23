@@ -64,4 +64,4 @@ Written in Kotlin.
 
 ## License
 
-Not yet chosen.
+[Apache-2.0](LICENSE).
