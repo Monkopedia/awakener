@@ -303,6 +303,11 @@ enum class ResidueLayout {
      * down. Both components are slugs, which is what keeps a window-supplied `app_id` of
      * `../../..` from naming anything outside the residue directory.
      *
+     * The two components are also drawn from disjoint namespaces, so an application directory
+     * here is never the path [PER_KEY_DIR] calls some surface's residue directory — see
+     * [SurfaceKey.appScope]. Without that they coincided for every key with no discriminator,
+     * which is what `registry.key.window_identity=APP_ID` produces by default.
+     *
      * **Nothing migrates.** Residue written under either flat layout stays exactly where it is,
      * is not read here, and is not deleted; the first `prepareResidue` after a flip reports it
      * through [FileBindingStore.residueStrandedCheck] rather than leaving it to be discovered.

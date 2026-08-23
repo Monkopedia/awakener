@@ -31,19 +31,36 @@ sealed interface SurfaceKey {
      * The *application* this surface belongs to, as a string that is injective over
      * applications exactly as [canonical] is over surfaces.
      *
-     * This is [canonical] with the per-window discriminator dropped and nothing else changed —
-     * so it keeps the kind prefix, and keeps it for the reason #95 put it there. `app_id` and
-     * window title are both chosen by the program that owns the window, so an app grouping that
-     * folded them into one slot would let `xterm -T firefox` share a residue *directory* with
-     * the real Firefox, and share it one level above the per-session folders rather than at the
-     * leaf. The namespaces are what stop that, and they have to be inside the string the digest
-     * is taken over.
+     * `app:` followed by [canonical] with the per-window discriminator dropped. Two namespaces
+     * are doing work here and they answer different objections:
+     *
+     * **The inner one — the kind — is #95.** `app_id` and window title are both chosen by the
+     * program that owns the window, so an app grouping that folded them into one slot would let
+     * `xterm -T firefox` share a residue *directory* with the real Firefox, and share it one
+     * level above the per-session folders rather than at the leaf, which is worse: an
+     * application directory is a place two Lifelesses are meant to read each other's writing.
+     *
+     * **The outer one — `app:` — separates applications from surfaces**, which is not the same
+     * claim and does not follow from the first. Dropping the discriminator is a no-op for every
+     * key that has none, and `registry.key.window_identity` **defaults to `APP_ID`**, the arm of
+     * [Companion.of] that passes `discriminator = null`; [Origin] has no discriminator at all.
+     * So without this prefix, an ordinary default-configured surface has `appScope == canonical`
+     * and therefore `appSlug == slug` — and [ResidueLayout.PER_KEY_DIR] calls `<residue>/<slug>`
+     * that surface's residue *directory*, which is byte-for-byte the application directory
+     * [ResidueLayout.PER_APP_SESSION_DIR] would create. One name, two meanings, and a `forget`
+     * under `registry.binding.forget_residue=DELETE` recursing through it.
+     *
+     * The separation is structural rather than probabilistic: `app` is not a kind
+     * [Companion.parse] knows, and every [canonical] begins with one that is, so no surface key
+     * can ever render a string in this namespace. That is the same argument #95 rests on, one
+     * level out — and like that one it has to be inside the string the digest is taken over,
+     * because a prefix bolted on after hashing separates the names and not the hashes.
      *
      * Every kind answers, including the ones whose head is empty or absent: [Unidentified]
      * carries no caller-supplied segment at all and answers with its bare kind, and a
      * `Window("")` — which [Companion.of] cannot mint but [Companion.parse] can read out of a
-     * hand-edited bindings file — answers `window:`. There is no "no app" case to handle at the
-     * call site, which is what makes [ResidueLayout.PER_APP_SESSION_DIR] total.
+     * hand-edited bindings file — answers `app:window:`. There is no "no app" case to handle at
+     * the call site, which is what makes [ResidueLayout.PER_APP_SESSION_DIR] total.
      */
     val appScope: String
 
@@ -59,7 +76,7 @@ sealed interface SurfaceKey {
         override val canonical: String = render("window", appId, discriminator)
 
         /** The `app_id`, which is the answer to "what application is this" for this kind. */
-        override val appScope: String = render("window", appId, null)
+        override val appScope: String = render("window", appId, null).inAppNamespace()
     }
 
     /**
@@ -93,7 +110,7 @@ sealed interface SurfaceKey {
          * too, rather than a new session folder inside the old one. That is the same
          * orphaning [MissingAppId.TITLE] already documents, one level up.
          */
-        override val appScope: String = render("title", title, null)
+        override val appScope: String = render("title", title, null).inAppNamespace()
     }
 
     /**
@@ -114,7 +131,7 @@ sealed interface SurfaceKey {
          * The bare kind. Every `app_id`-less window shares one app directory, which is the same
          * coarseness the key itself already has and not a new one.
          */
-        override val appScope: String = "unidentified"
+        override val appScope: String = "unidentified".inAppNamespace()
     }
 
     /**
@@ -133,7 +150,7 @@ sealed interface SurfaceKey {
          * [canonical] and the app directory holds exactly one session folder; when `:chrome`
          * gains a way to split one origin, the grouping is already the right one.
          */
-        override val appScope: String get() = canonical
+        override val appScope: String get() = canonical.inAppNamespace()
     }
 
     /**
@@ -168,6 +185,12 @@ sealed interface SurfaceKey {
      * `Foo:Bar` both read `foo-bar` — are separated by the digest, which is taken over
      * [appScope] and not over the flattened form. Two applications therefore never share a
      * residue directory, which would be two agents' models of Jason in one place.
+     *
+     * **And an application directory is never a surface's residue directory**, which is the
+     * separate claim [appScope]'s `app:` namespace carries. Without it this equals [slug] for
+     * every key with no discriminator — which is what `registry.key.window_identity=APP_ID`, the
+     * default, produces — and `<residue>/<appSlug>` would then be exactly the path
+     * [ResidueLayout.PER_KEY_DIR] calls that same surface's residue.
      */
     val appSlug: String get() = slugOf(appScope)
 
@@ -285,6 +308,17 @@ data class SurfaceDescriptor(
  * property that makes [SurfaceKey.canonical] injective over provenance and not merely over
  * content.
  */
+/**
+ * The namespace [SurfaceKey.appScope] lives in, separating an application from a surface.
+ *
+ * A literal this file chooses, and one that is not a kind [SurfaceKey.parse] accepts — so no
+ * value any window can supply renders a string in it, and no [SurfaceKey.canonical] collides with
+ * one. `ResidueAppLayoutTest` asserts both halves rather than leaving them to this comment.
+ */
+private const val APP_NAMESPACE = "app:"
+
+private fun String.inAppNamespace(): String = APP_NAMESPACE + this
+
 /** How many characters of the readable half of a slug survive; the digest follows it. */
 private const val SLUG_READABLE_MAX = 48
 

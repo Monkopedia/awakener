@@ -149,28 +149,35 @@ class ResidueAppLayoutTest {
             "%2e%2e%2f%2e%2e",
         )
 
-        hostile.forEach { appId ->
-            val key = SurfaceKey.Window(appId, "session")
-            val location = store.prepareResidue(key)
-            val real = location.toRealPath()
-            val root = residueDir.toRealPath()
+        // Both shapes. `registry.key.window_identity` defaults to APP_ID, which mints a key with
+        // no discriminator at all, and every hostile input below was previously tried only in the
+        // shape that has one — which is how a defect in exactly the discriminator-free shape
+        // survived twenty-one further hostile inputs in review.
+        hostile
+            .flatMap { listOf(SurfaceKey.Window(it, "session"), SurfaceKey.Window(it)) }
+            .forEach { key ->
+                val appId = (key as SurfaceKey.Window).appId
+                val shape = if (key.discriminator == null) "no discriminator" else "discriminated"
+                val location = store.prepareResidue(key)
+                val real = location.toRealPath()
+                val root = residueDir.toRealPath()
 
-            assertTrue(
-                real.startsWith(root) && real != root,
-                "app_id ${appId.escaped()} put residue at $real, outside $root",
-            )
-            assertEquals(
-                2,
-                root.relativize(real).nameCount,
-                "app_id ${appId.escaped()} produced $real, which is not <app>/<session>",
-            )
-            val app = root.relativize(real).getName(0).toString()
-            assertTrue(
-                app.matches(SAFE_NAME) && app != "." && app != "..",
-                "app_id ${appId.escaped()} became directory '$app'",
-            )
-            assertTrue(location.isDirectory(), "and it is a real directory: $location")
-        }
+                assertTrue(
+                    real.startsWith(root) && real != root,
+                    "app_id ${appId.escaped()} ($shape) put residue at $real, outside $root",
+                )
+                assertEquals(
+                    2,
+                    root.relativize(real).nameCount,
+                    "app_id ${appId.escaped()} ($shape) produced $real, not <app>/<session>",
+                )
+                val app = root.relativize(real).getName(0).toString()
+                assertTrue(
+                    app.matches(SAFE_NAME) && app != "." && app != "..",
+                    "app_id ${appId.escaped()} ($shape) became directory '$app'",
+                )
+                assertTrue(location.isDirectory(), "and it is a real directory: $location")
+            }
         // Nothing was created outside the residue directory by any of the above. Asserted as
         // "nothing unexpected is here" rather than "the escape target is absent", because the
         // list above aims at several different places and only one of them is nameable here.
@@ -186,8 +193,11 @@ class ResidueAppLayoutTest {
     fun `no window title escapes it either`() = runTest {
         nested()
         val store = store()
-        listOf("../../../etc", "/etc/passwd", "a\u0000b", "..").forEach { title ->
-            val real = store.prepareResidue(SurfaceKey.Titled(title)).toRealPath()
+        listOf("../../../etc", "/etc/passwd", "a\u0000b", "..").flatMap {
+            listOf(SurfaceKey.Titled(it, "session"), SurfaceKey.Titled(it))
+        }.forEach { key ->
+            val title = (key as SurfaceKey.Titled).title
+            val real = store.prepareResidue(key).toRealPath()
             val root = residueDir.toRealPath()
             assertTrue(real.startsWith(root), "title ${title.escaped()} landed at $real")
             assertEquals(2, root.relativize(real).nameCount, "title ${title.escaped()}: $real")
@@ -428,6 +438,183 @@ class ResidueAppLayoutTest {
         store.prepareResidue(key)
         assertEquals(ResidueStrandedFinding.STRANDED, store.residueStrandedCheck.finding)
         assertEquals(1, store.residueStrandedCheck.stranded.size)
+    }
+
+    // --- the default shape: a key with no discriminator ---------------------------------------
+
+    /**
+     * **The shape every other test in this file used to miss.**
+     *
+     * `registry.key.window_identity` defaults to `APP_ID`, and that arm of [SurfaceKey.of] passes
+     * `discriminator = null`; [SurfaceKey.Origin] has no discriminator by construction. Dropping
+     * the discriminator to get [SurfaceKey.appScope] is then a no-op, so on an ordinary
+     * default-configured desktop the app component and the session component are derived from
+     * *the same string* — and they must still not name the same directory, because
+     * [ResidueLayout.PER_KEY_DIR] calls `<residue>/<slug>` that surface's residue directory.
+     *
+     * This is the shape the hotkey actually produces. It is asserted here rather than assumed,
+     * by minting the key the way `Awakening` does instead of constructing one.
+     */
+    @Test
+    fun `the default window identity mints a key with no discriminator`() {
+        val key = SurfaceKey.of(
+            SurfaceDescriptor(appId = "firefox", title = "Notes", pid = 42),
+            config.config.value,
+        )
+        assertEquals(SurfaceKey.Window("firefox", null), key, "the default arm passes null")
+        assertEquals(null, (key as SurfaceKey.Window).discriminator)
+    }
+
+    /** Probe 1: an application directory is never any surface's residue directory. */
+    @Test
+    fun `an application directory is never a surface's own residue directory`() {
+        val defaults = listOf(
+            SurfaceKey.Window("firefox"),
+            SurfaceKey.Titled("Some Document"),
+            SurfaceKey.Unidentified(),
+            SurfaceKey.Origin("https://github.com"),
+        )
+        defaults.forEach { key ->
+            assertNotEquals(
+                key.slug,
+                key.appSlug,
+                "$key with no discriminator names one directory two ways",
+            )
+            assertEquals(
+                listOf(key.slug),
+                residueSegments(key, ResidueLayout.PER_KEY_DIR),
+                "sanity: PER_KEY_DIR is the surface's own slug",
+            )
+            assertNotEquals(
+                residueSegments(key, ResidueLayout.PER_KEY_DIR),
+                listOf(key.appSlug),
+                "$key: the application directory IS the PER_KEY_DIR residue directory",
+            )
+        }
+        // And not merely for a key against itself: no application directory is any *other*
+        // surface's residue directory either.
+        val apps = defaults.map { it.appSlug }.toSet()
+        val surfaces = defaults.map { it.slug }.toSet()
+        assertEquals(emptySet(), apps intersect surfaces, "the two namespaces overlap")
+    }
+
+    /**
+     * Probe 2, and the structural reason the one above holds for every input rather than for the
+     * four tried.
+     *
+     * `app` is not a kind [SurfaceKey.parse] accepts and every [SurfaceKey.canonical] begins with
+     * one that is, so no surface key can render a string in the application namespace — the same
+     * argument #95 rests on, one level out. A digest-width argument would not do: these are not
+     * two strings that might happen to collide, they were the *same* string.
+     */
+    @Test
+    fun `no surface key can render a string in the application namespace`() {
+        val keys = listOf(
+            SurfaceKey.Window("firefox"),
+            SurfaceKey.Window("app", "app"),
+            SurfaceKey.Window("app:window:firefox"),
+            SurfaceKey.Titled("app:title:x"),
+            SurfaceKey.Unidentified("app"),
+            SurfaceKey.Origin("app:"),
+        )
+        keys.forEach { key ->
+            assertFalse(
+                key.canonical.startsWith("app:"),
+                "${key.canonical} is in the application namespace",
+            )
+            assertTrue(key.appScope.startsWith("app:"), "${key.appScope} is not namespaced")
+            assertEquals(
+                null,
+                SurfaceKey.parse(key.appScope),
+                "${key.appScope} parses back as a surface key, so the namespaces are not disjoint",
+            )
+            assertNotEquals(key.slug, key.appSlug)
+        }
+    }
+
+    /**
+     * Probe 3, and the one that blocked review: a second prepare of a default-shaped surface must
+     * report nothing stranded.
+     *
+     * [FileBindingStore.residueStrandedCheck] is this build's whole answer to "a layout flip moves
+     * nothing", and [AwakenerInvokeCli] prints its warning to stderr on every awaken. While the
+     * application directory was also `<residue>/<slug>`, the first prepare created it and every
+     * prepare after that found it and called it residue stranded by another layout — the surface's
+     * own application directory, reported as an orphan, forever. A signal that cries wolf on every
+     * press cannot be read on the press that means something.
+     */
+    @Test
+    fun `a second prepare of a default-shaped surface strands nothing`() = runTest {
+        nested()
+        val store = store()
+        val key = SurfaceKey.of(SurfaceDescriptor("firefox", "Notes", 42), config.config.value)
+
+        store.prepareResidue(key)
+        assertEquals(ResidueStrandedFinding.NONE, store.residueStrandedCheck.finding)
+
+        repeat(3) { store.prepareResidue(key) }
+        assertEquals(
+            ResidueStrandedFinding.NONE,
+            store.residueStrandedCheck.finding,
+            "stranded: ${store.residueStrandedCheck.stranded}",
+        )
+        assertEquals(null, store.residueStranded, "nothing is printed on an ordinary press")
+
+        // A second surface of the same application shares the directory and still strands nothing.
+        store.prepareResidue(SurfaceKey.Window("firefox", "other"))
+        assertEquals(ResidueStrandedFinding.NONE, store.residueStrandedCheck.finding)
+    }
+
+    /**
+     * Probe 4: flipping a default-shaped surface to [ResidueLayout.PER_KEY_DIR] must land
+     * somewhere the nested layout was not already using.
+     */
+    @Test
+    fun `flipping a default-shaped surface to PER_KEY_DIR does not land on its app directory`() =
+        runTest {
+            val key = SurfaceKey.Window("firefox")
+            nested()
+            val session = store().prepareResidue(key)
+            val application = session.parent
+
+            config.put(RegistryFlags.residueLayout, ResidueLayout.PER_KEY_DIR)
+            val store = store()
+            val flat = store.prepareResidue(key)
+
+            assertNotEquals(application, flat, "PER_KEY_DIR reused the application directory")
+            assertTrue(session.exists(), "and the nested session folder is untouched")
+            // The *true* alarm still fires: this really is a flip that left residue behind, and
+            // it names the nested session folder rather than the directory holding it.
+            assertEquals(ResidueStrandedFinding.STRANDED, store.residueStrandedCheck.finding)
+            assertEquals(listOf(session.toString()), store.residueStrandedCheck.stranded)
+        }
+
+    /**
+     * Probe 5, the consequence with teeth: a `forget` under
+     * `registry.binding.forget_residue=DELETE` must not be able to reach another layout's residue.
+     *
+     * `disposeResidue` calls `deleteRecursively()` on a residue directory. While
+     * [ResidueLayout.PER_KEY_DIR]'s directory *was* the application directory, that recursion ran
+     * through the nested layout's session folders — so forgetting one surface deleted the written
+     * model of every window of that application, under the flag whose own KDoc says nothing above
+     * this layer undoes it. `ARCHIVE` has the same shape via `Files.move`.
+     */
+    @Test
+    fun `a delete under one layout cannot reach the other layout's residue`() = runTest {
+        val key = SurfaceKey.Window("firefox")
+        nested()
+        val session = store().prepareResidue(key)
+        session.resolve("model.md").writeText("six weeks of accumulated model")
+
+        config.put(RegistryFlags.residueLayout, ResidueLayout.PER_KEY_DIR)
+        config.put(RegistryFlags.forgetResidue, ForgetResidue.DELETE)
+        val store = store()
+        store.bind(key)
+        store.prepareResidue(key)
+        assertIs<ResidueOutcome.Deleted>(store.unbind(key).residue)
+
+        assertTrue(session.exists(), "the nested session folder was deleted with the flat one")
+        assertEquals("six weeks of accumulated model", session.resolve("model.md").readText())
     }
 
     private fun modeOf(path: Path): String =

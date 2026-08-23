@@ -371,7 +371,19 @@ class FileBindingStore(
      *
      * Run before anything is created, so the active location existing cannot be mistaken for a
      * stranded one. The layouts name three distinct paths for any given surface — `<slug>.md`,
-     * `<slug>`, `<app>/<slug>` — so no arm of this can report the path it is standing on.
+     * `<slug>`, `<appSlug>/<slug>` — so no arm of this can report the path it is standing on.
+     *
+     * **The path it stands *in* has to be distinct too, and that is a second claim.** The
+     * directory this layout creates above the session folder is `<residue>/<appSlug>`, and
+     * `<residue>/<slug>` is what [ResidueLayout.PER_KEY_DIR] calls the surface's residue. Those
+     * two were the same string for every key with no discriminator — which is what the default
+     * `registry.key.window_identity=APP_ID` produces — so the second prepare of an ordinary
+     * surface reported its own application directory as stranded, on every press. That is not a
+     * near miss in a diagnostic: `residueStrandedCheck` is the whole of this build's answer to
+     * "a layout flip moves nothing", and a warning that fires on every press is one nobody reads
+     * on the press that meant something. [SurfaceKey.appScope]'s `app:` namespace is what makes
+     * the two disjoint, and it makes them disjoint for *every* pair of keys rather than for this
+     * one.
      *
      * Two `exists()` calls on the hotkey path, and it changes no behaviour: there is no
      * alternative to switch between here, only this and silence, and silence is what makes a
