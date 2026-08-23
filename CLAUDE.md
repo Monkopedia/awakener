@@ -352,12 +352,15 @@ someone believes it — it is that an agent who measures, catches the loose clau
   **The browser awakener drives is `chromium`, not `google-chrome-stable`** — Jason,
   2026-08-23: *"Okay, you document Chromium as a dependency and start building out
   expectation for it. I'll install it on Adolin"*. Recorded with the reasoning in
-  `docs/design.md`. **Checked on adolin 2026-08-23:** `google-chrome-stable`
-  (151.0.7922.173) and `epiphany` are on `PATH`, and `/usr/bin/chromium` did not exist at
-  that moment — a dated reading, not a standing claim, and Jason said he was installing it,
-  so assume it is there and let `chromium --version` tell you otherwise. His own Chrome
-  profile is 5.7 GB, which is what a separate binary plus the already-mandatory dedicated
-  profile keeps `--remote-debugging-port` away from.
+  `docs/design.md`, and **CDP is the adapter** — decided the same day. **Checked on adolin
+  2026-08-23:** `/usr/bin/chromium` **151.0.7922.173** is now installed (Jason installed it
+  himself that afternoon; earlier the same day it was absent and only `google-chrome-stable`
+  and `epiphany` were there). Dated readings, not standing claims — run `chromium --version`
+  rather than trusting either. His own Chrome profile is 5.7 GB, which is what a separate
+  binary plus the already-mandatory dedicated profile keeps the debugging channel away from.
+  **Chromium 151 also supports `--remote-debugging-pipe`**, which is CDP over inherited file
+  descriptors with no listening port at all; see
+  `docs/findings/2026-08-23-chromium-cdp-pipe.md` for what it costs.
 
   **This file does not say what adolin is missing. Check, don't assume:**
   `ssh adolin 'bash -lc "command -v <tool>"'`. The **login shell is load-bearing** — some

@@ -102,8 +102,27 @@ half of the isolation the paragraph above already demands: his personal Chrome p
 reach localhost full drive of whatever profile the browser was started against. A dedicated
 profile was already mandatory; a separate *binary* means a `:chrome` mistake cannot be a
 mistake against the browser he actually uses, and it keeps `google-chrome-stable` on adolin
-as an ordinary Drab. Which of CDP or an extension supplies the URL is **not** settled by
-this — see Open #3 and #6.
+as an ordinary Drab. How the browser is *bound* is a separate question — see Open #3.
+
+**CDP is the adapter** — decided by Jason, 2026-08-23:
+
+> *"What's the decision whether we adopt CDP? Because we absolutely should."*
+
+So the "use CDP or an extension" above resolves to **CDP**, and `:chrome` is a CDP client.
+The measurement below says why something of the sort was needed at all; this decides which.
+
+**Prefer CDP over a pipe, not a port** — a recommendation with a measurement behind it, and
+**not** yet a decision. `--remote-debugging-pipe` carries CDP over a pair of inherited file
+descriptors, so there is **no listening socket and nothing on localhost to reach**: the risk
+the paragraph above names is *removed* rather than mitigated. Verified end to end on both
+hosts against Chromium 151 — `Browser.getVersion` answered over the pipe, `ss -ltnp` showed
+no chromium listening, and closing the pipe exited the browser cleanly, which is teardown for
+free. **The cost is a real constraint:** fd inheritance means **awakener must spawn the
+browser**, so pipe mode cannot attach to a Chromium the user already had open. For a
+dedicated profile awakener launches anyway that is arguably the right shape, but it is a
+capability given up, not a free win. Pipe-versus-port belongs to `:chrome` when `:chrome` is
+built. Either way the dedicated profile stays mandatory; this is defence in depth, not a
+replacement. See `docs/findings/2026-08-23-chromium-cdp-pipe.md`.
 
 **A browser window's `app_id` cannot be the binding key.** Measured 2026-08-23 against
 Chromium 151 on Wayland (`docs/findings/2026-08-23-chromium-app-mode-app-id.md`): the
@@ -111,8 +130,10 @@ Chromium 151 on Wayland (`docs/findings/2026-08-23-chromium-app-mode-app-id.md`)
 and port** — so `http://` and `https://` on one host collide onto a single agent across a
 security boundary — and **includes the path**, so one origin fragments across several. There
 is no `--class` override under Wayland. This does not settle *how* to get the origin; it
-settles that the WM layer alone cannot, which is why "use CDP or an extension" above is a
-constraint and not a preference.
+settles that the WM layer alone cannot, which is why reaching for CDP is a constraint and
+not a preference. And the derivation is from the **launch URL string**, not from the page
+that loaded — a window pointed at a URL that failed still claims that origin's `app_id` —
+so this is not a collision that careful normalisation could repair.
 
 **Chrome binds to origin, not window or tab.** What accumulates is "how Jason deals with
 GitHub PRs," not anything about a tab you'll close in ten minutes. Hotkey on a tab resolves
@@ -213,20 +234,21 @@ everything can't tell gist from noise.
    `--app=` carries the binding by itself: the window's `app_id` is not the origin and cannot
    be made into it. `--app=` survives as a *window* strategy — one toplevel per origin, with
    the origin resolved out-of-band — but it now costs a URL source it did not previously
-   need, which changes the trade against multiplexing behind a manager. **Still open**, and
-   both options are still live.
+   need, which changes the trade against multiplexing behind a manager. That source is now
+   decided (CDP, Open #6) but the binding shape is not: CDP can report a window's URL either
+   way, so adopting it does not pick between one toplevel per origin and one window
+   multiplexed behind a manager. **Still open**, and both options are still live.
 4. **Distillation trigger and format.** What gets written back, when, and in what shape.
 5. **Dock swap race.** If the panel lags a tab switch you type into the previous origin's
    agent without noticing. The swap must beat the first keystroke, or the panel holds input
    until re-bound. Treat as correctness, not polish. Also: let the Chrome dock **pin**
    deliberately — reading one tab while talking to another agent is a real thing to want.
-6. **CDP or an extension.** Something has to tell awakener a browser window's real URL,
-   because the compositor cannot (Open #3). The two candidates have been named since the
-   brief was written and **neither has been chosen**: `--remote-debugging-port` is a local
-   port that fully drives whatever profile it is attached to, so its blast radius is the
-   argument against it and the dedicated Chromium profile is the mitigation; an extension is
-   narrower but needs installing, updating, and a channel out to awakener. Decide this
-   before writing `:chrome`, not during.
+6. ~~**CDP or an extension.**~~ **RESOLVED 2026-08-23 — CDP**, by owner decision; the
+   wording and the reasoning are under Substrate decisions. What is *not* resolved is the
+   transport: `--remote-debugging-pipe` removes the localhost surface entirely but forces
+   awakener to spawn the browser, so it cannot attach to one already running
+   (`docs/findings/2026-08-23-chromium-cdp-pipe.md`). Pipe-versus-port is `:chrome`'s call
+   when `:chrome` exists, and neither option relaxes the dedicated-profile requirement.
 
 ---
 

@@ -1,8 +1,8 @@
 # Probe: what `app_id` Chromium gives an `--app=` window under Wayland
 
-**Date:** 2026-08-23 · **Chromium:** 151.0.7922.173 (Arch) · **sway:** 1.12 · **host:**
-kaladin (headless) · **status:** measured; rules out one approach, leaves the replacement
-open
+**Date:** 2026-08-23 · **Chromium:** 151.0.7922.173 (Arch) · **sway:** 1.12 · **hosts:**
+kaladin and adolin, both headless · **status:** measured; rules out one approach, leaves the
+replacement open
 
 `docs/design.md` binds a browser agent to an **origin**, and Open #3 asks whether
 tabs-as-toplevels (`--app=URL`) is the way to get there. The `:wm` layer's only handle on a
@@ -63,6 +63,33 @@ Three things that are *not* fallbacks:
   reported the same `pid`, because they are one Wayland client — the same substrate limit
   `docs/design.md` records for Waydroid, arrived at from a different direction.
 
+## Reproduced on adolin
+
+The same six launches were re-run on **adolin** — Chromium 151.0.7922.173, its own headless
+`WLR_BACKENDS=headless` sway 1.12 on a fresh `wayland-2`, with Jason's live GNOME session on
+`wayland-1` untouched. **Every `app_id` came back identical to kaladin's**, including the
+`--class` no-op. So this is a property of Chromium on Wayland, not of one host.
+
+### The launch string is the source, not the page
+
+adolin's `:8443` window is the sharpest single datapoint in this note. Nothing was listening
+on that port, so the window **never loaded the site** — its title came back `example.com_/`,
+the URL rendered as a failure, not `Example Domain`. Its `app_id` was minted identically to
+the two windows that did load. (On kaladin the same launch eventually resolved to an error
+page titled `example.com | 522: Connection timed out` — the same point by a different route:
+an error page, not the site.)
+
+**The `app_id` is derived from the launch URL string, not from what actually loaded.** So a
+window pointed at a URL that fails, redirects elsewhere, or is simply mistyped still claims
+that origin's identity, and an agent bound on that key would attach its accumulated model to
+a window that was never on the origin at all.
+
+This is a stronger objection than the scheme/port collision, and it is worth keeping separate
+from it: **a collision could in principle be normalised away** — canonicalise the key, refuse
+to bind when two schemes share a host — but nothing you can compute from a string tells you
+whether the page at the other end is the page. Only the loaded document knows, and reading
+the loaded document is exactly what the WM layer cannot do.
+
 ## What that rules out
 
 **The `app_id` is wrong in both directions at once.**
@@ -107,13 +134,18 @@ It differed only in `pid`.
 window's *real* URL is required — the design brief already said "use CDP or an extension",
 and this is the measurement that turns that from a preference into a constraint.
 
-Both of the questions downstream of it stay open, and this note settles neither:
+**That "something" is now settled: CDP**, decided by Jason on 2026-08-23; see
+[Substrate decisions](../design.md#substrate-decisions). This note is the argument for why
+one was needed, not the argument for which — and the URL it needs is one CDP demonstrably
+returns for exactly these windows, measured in the
+[pipe probe](2026-08-23-chromium-cdp-pipe.md).
 
-- **CDP versus an extension** for the component that supplies the URL.
-- **`--app=` per origin versus multiplexing behind a manager** — design.md Open #3. Note
-  that the measurement does not kill `--app=` as a *window strategy*; it kills `app_id` as
-  the *binding key*. An `--app=` window whose origin is resolved out-of-band is still on the
-  table.
+What this note still settles nothing about:
+
+- **`--app=` per origin versus multiplexing behind a manager** — design.md Open #3. The
+  measurement does not kill `--app=` as a *window strategy*; it kills `app_id` as the
+  *binding key*. An `--app=` window whose origin is resolved out-of-band is still on the
+  table, and so is one window multiplexed behind a manager.
 
 ## Scope of the claim
 

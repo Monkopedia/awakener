@@ -55,11 +55,18 @@ when `:chrome` does arrive:
 
 - **A dedicated profile**, per `docs/design.md`. `--remote-debugging-port` gives anything
   that can reach localhost full drive of whatever profile the browser was started against,
-  so it must never be your own.
+  so it must never be your own. This holds whichever transport `:chrome` picks.
 - **`--ozone-platform=wayland`.** Chromium under sway needs it, and the Wayland path is the
   only one measured — see
   [the `app_id` probe](findings/2026-08-23-chromium-app-mode-app-id.md), which is also the
   reason a browser window's `app_id` cannot be the binding key.
+
+The adapter is **CDP** (decided 2026-08-23). Chromium 151 will carry it over a **pipe** as
+well as a port — `--remote-debugging-pipe`, no listening socket at all — at the cost of
+awakener having to spawn the browser rather than attach to a running one. Which of the two
+`:chrome` uses is not decided; see
+[the pipe probe](findings/2026-08-23-chromium-cdp-pipe.md). Neither removes the dedicated
+profile.
 
 ---
 
@@ -693,9 +700,13 @@ Everything in this guide that is stated as a measurement was run. Where and how:
 - `nvidia-open` 610.57.04, `license: Dual MIT/GPL`, on an RTX 4070 Ti SUPER.
 - `handy --help`'s CLI flags, and `wtype` present.
 - Which browsers are installed, 2026-08-23: `google-chrome-stable` (151.0.7922.173) and
-  `epiphany` are on `PATH`; `/usr/bin/chromium` was **not present at that moment**, and Jason
-  said he would install it. That is a dated reading, not a standing claim — run
-  `chromium --version` rather than trusting this line.
+  `epiphany` were on `PATH` in the morning with `/usr/bin/chromium` absent; Jason installed
+  Chromium **151.0.7922.173** that afternoon and it was re-checked present. Dated readings,
+  not standing claims — run `chromium --version` rather than trusting this line.
+- The `--app=` `app_id` table again, on adolin's own headless sway (a fresh `wayland-2`, his
+  GNOME session on `wayland-1` untouched): **identical to kaladin on all six launches**.
+  Plus CDP over `--remote-debugging-pipe` answering `Browser.getVersion` with no listening
+  socket, and the switch list read out of `/usr/lib/chromium/chromium`.
 - `du -sh ~/.config/google-chrome` = **5.7 GB**, which is the size of the thing a dedicated
   Chromium profile exists to keep `--remote-debugging-port` away from.
 
