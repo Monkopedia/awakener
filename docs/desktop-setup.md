@@ -339,11 +339,14 @@ that holds them.
 
 **`default_border` applies to windows mapped after it takes effect, and to nothing else.** A
 `swaymsg reload` re-reads the setting but does not re-decorate what is already on screen —
-measured on kaladin, the two windows open across the reload stayed at `border=normal deco_h=25`
-while the next window to map came up `border=none deco_h=0`. So after a reload, walk the tree
-and apply it by `con_id`. **By `con_id`, not `app_id`**: every dock shares the `awakener-dock`
-`app_id`, so an `app_id` criterion cannot address them one at a time, and a `for_window` rule
-only ever fires on a window that has yet to appear.
+measured on kaladin, the two windows open across the reload stayed at `border=normal` while the
+next window to map came up `border=none`. **`border=` is the field that carries this**, not
+`deco_h`: under the `workspace_layout tabbed` of this config that new window is also a new tab,
+so it reports `deco_h=25` despite having no border at all, for the reason two paragraphs down.
+
+So after a reload, walk the tree and apply it by `con_id`. **By `con_id`, not `app_id`**: every
+dock shares the `awakener-dock` `app_id`, so an `app_id` criterion cannot address them one at a
+time, and a `for_window` rule only ever fires on a window that has yet to appear.
 
 ```sh
 swaymsg -t get_tree \
@@ -644,9 +647,11 @@ Everything in this guide that is stated as a measurement was run. Where and how:
 - The tabbed-plus-dock tree of §6, under `WLR_BACKENDS=headless sway`: a real `invoke` against
   a real `foot` surface, tree read back with `swaymsg -t get_tree`.
 - The window-decoration numbers of §6: `default_border normal` gives `deco_h=25` and `border
-  none` gives `deco_h=0`; a `swaymsg reload` re-decorates nothing already mapped, while the next
-  window to map comes up undecorated; the 25px tab header survives `border none` in both tab
-  shapes; and the control session without `workspace_layout tabbed` has no header at any level.
+  none` gives `deco_h=0`; a `swaymsg reload` leaves every window already mapped at
+  `border=normal` while the next window to map comes up `border=none`; the 25px tab header
+  survives `border none` in both tab shapes, which is why that last pair was read off `border=`
+  and not off `deco_h`; and the control session without `workspace_layout tabbed` has no header
+  at any level.
 - The `unbindsym` measurement: two headless sway sessions, 2 `Overwriting binding` lines and 1
   `namespace swaynag` layer surface without it, 0 and 0 with it.
 - The dock launcher's `cd`, `PATH` prepend and trust write, against a scratch `HOME` and a fake
