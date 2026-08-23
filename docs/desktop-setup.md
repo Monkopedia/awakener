@@ -94,7 +94,7 @@ correct. Set and read back:
 awakener-config set registry.agent.spanreed_command "$HOME/.local/bin/spanreed"
 awakener-config set invoke.dock.command \
   'foot -a {app_id} -- env SPANREED_AGENT_NAME={agent_name} '"$HOME"'/awakener/dock-launch.sh {residue}'
-awakener-config set registry.residue.layout PER_KEY_DIR
+awakener-config set registry.residue.layout PER_APP_SESSION_DIR
 
 awakener-config get registry.agent.spanreed_command
 awakener-config get invoke.dock.command
@@ -126,16 +126,33 @@ which layer fills each one in is load-bearing:
 - `{residue}` is where this surface's durable model lives.
 
 **`registry.residue.layout`** — the default `PER_KEY_FILE` gives each surface a single
-`<slug>.md` and no directory. `PER_KEY_DIR` gives each surface a directory instead, which is
-what makes `cd {residue}` in the launcher meaningful: the agent gets a workspace it can write
-several files into, not one file it has to append to. Measured on kaladin against headless
-sway, with `registry.residue.dir` pointed at a scratch path:
+`<slug>.md` and no directory. A directory is what makes `cd {residue}` in the launcher
+meaningful: the agent gets a workspace it can write several files into, not one file it has to
+append to. Two layouts give it one.
+
+`PER_APP_SESSION_DIR` is the one to set. It writes `<residue>/<app>/<session>/`, so every
+surface belonging to one application sits under a directory of that application's own — a place
+two Lifelesses bound to two windows of the same app can both read and write. Measured on kaladin
+against headless sway, one real `awakener-invoke invoke` against a `foot` surface, with
+`registry.residue.dir` pointed at a scratch path:
 
 ```
-residue/window-fake-surface-32b1ee1a9793de3ecdf75459f7d9f47b/   drwx------
+residue/                                                            drwx------
+  app-window-fake-surface-54a0a7421bcf5d6b7b1c021861a6d2f9/          drwx------
+    window-fake-surface-32b1ee1a9793de3ecdf75459f7d9f47b/            drwx------
 ```
 
-A directory per surface, created `0700`.
+Both levels created `0700`. The session directory is named exactly what the flat layout would
+have called that surface's residue, moved one level down; the application directory carries an
+`app-` prefix, which is what keeps it from ever colliding with some surface's own directory.
+
+`PER_KEY_DIR` is the flat version of the same thing — a directory per surface, all siblings, with
+nothing on disk saying which of them are three windows of one editor. It was the answer before
+the nested layout existed and is still fine if you do not want the extra level.
+
+**Changing this moves nothing already written.** Residue left behind under a previous layout is
+reported on the next prepare rather than silently orphaned, so a switch is visible rather than a
+quiet loss of the model.
 
 ---
 
@@ -184,7 +201,7 @@ exec "$HOME/.local/bin/claude" "$@"
 
 ### Why each part is there
 
-**`cd "$dir"`** gives the agent its own workspace. With `PER_KEY_DIR` (§4) that is a real
+**`cd "$dir"`** gives the agent its own workspace. With `PER_APP_SESSION_DIR` (§4) that is a real
 directory per surface.
 
 **Pre-accepting the workspace-trust prompt.** A fresh directory makes Claude Code ask whether
@@ -314,6 +331,11 @@ there rather than 23:
 | --- | --- | --- |
 | `default_border normal` | `normal` | 25 each |
 | after `border none` | `none` | 0 each |
+
+The undecorated row is not only a hand-built tree: a real `awakener-invoke invoke` against a
+`foot` surface, on a session started with the two `default_border` lines above, comes up
+`border=none deco_h=0` on both the surface and the dock, with the 25px on the `splith` container
+that holds them.
 
 **`default_border` applies to windows mapped after it takes effect, and to nothing else.** A
 `swaymsg reload` re-reads the setting but does not re-decorate what is already on screen —
@@ -617,7 +639,8 @@ Everything in this guide that is stated as a measurement was run. Where and how:
 
 - `awakener-config set` / `get` round trip for all three flags of §4, against an isolated
   `AWAKENER_CONFIG`.
-- `registry.residue.layout=PER_KEY_DIR` produces a `0700` directory per surface.
+- `registry.residue.layout=PER_APP_SESSION_DIR` produces the nested `<app>/<session>/` pair,
+  both `0700`, from a real `awakener-invoke invoke` against a `foot` surface.
 - The tabbed-plus-dock tree of §6, under `WLR_BACKENDS=headless sway`: a real `invoke` against
   a real `foot` surface, tree read back with `swaymsg -t get_tree`.
 - The window-decoration numbers of §6: `default_border normal` gives `deco_h=25` and `border
