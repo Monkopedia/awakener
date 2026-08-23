@@ -889,6 +889,79 @@ class SwayWindowManager(
         }
 
         /**
+         * Whether [id] is currently in sway's scratchpad.
+         *
+         * Answered from the tree and from nothing else, which is why [DockHandle.hidden] can
+         * promise what it does. A scratchpad window is a `floating_con` parented to the
+         * `__i3_scratch` workspace of the `__i3` output, and both are ordinary nodes reachable
+         * from the root — `Node.windows` walks `floating_nodes` as well as `nodes`, so a hidden
+         * dock is still enumerated, still carries its mark, and is still reachable by the orphan
+         * sweep. That is measured rather than assumed; see `SwayHideTest`.
+         *
+         * The name is sway's, inherited from i3, and it is hard-coded rather than configurable
+         * because it is a fact about the compositor and not a choice awakener gets to make.
+         */
+        suspend fun inScratchpad(id: SurfaceId): Boolean =
+            tree().workspace(SCRATCH_WORKSPACE)?.find(id.raw) != null
+
+        /**
+         * Moves [dock] into the scratchpad, and waits until the tree agrees.
+         *
+         * The wait is the same discipline `kill` keeps and for the same reason: sway acknowledges
+         * a `move` before the tree it describes has settled, and this section must not end over a
+         * dock that a concurrent press would still read as visible — which is precisely a second
+         * hotkey seeing "visible", issuing another hide, and the pair cancelling out.
+         *
+         * Nothing is done about focus here. sway hands focus back to whatever the dock was sharing
+         * its container with, which for a dock is the surface: measured on headless sway 1.12 with
+         * the dock focused at the moment of the move, focus landed on the surface.
+         */
+        suspend fun hideDock(dock: SurfaceId): Boolean {
+            if (inScratchpad(dock)) return false
+            run("[con_id=${dock.raw}] move scratchpad")
+            check(pollTree(config[WmFlags.unmapWaitMs]) { if (inScratchpad(dock)) true else null } == true) {
+                "dock ${dock.raw} was still outside the scratchpad " +
+                    "${config[WmFlags.unmapWaitMs]}ms after being moved into it"
+            }
+            return true
+        }
+
+        /**
+         * Brings a hidden dock back beside [surface], with its configured side and width.
+         *
+         * **Three commands, not one, and each of the extra two is a measurement rather than
+         * defensiveness.** `scratchpad show` returns the window *floating* — `type=floating_con`,
+         * `floating=user_on`, centred at whatever size the scratchpad kept — so a restore that
+         * stopped there would leave the panel hovering over the surface instead of docked beside
+         * it. And `floating disable` re-tiles the window next to whatever is **focused**, not next
+         * to where it came from, so the surface has to be focused first or the dock reattaches in
+         * a stranger's tab. Both on headless sway 1.12.
+         *
+         * The `con_id` is what every command here targets. Under the default
+         * [WmFlags.dockIdentity] every dock reports the same `app_id`, so once two docks can be
+         * hidden at once an `app_id` criterion names an arbitrary one of them.
+         */
+        suspend fun showDock(surface: SurfaceId, dock: SurfaceId): Boolean {
+            if (!inScratchpad(dock)) return false
+            val cfg = config
+            run("[con_id=${dock.raw}] scratchpad show")
+            check(pollTree(cfg[WmFlags.unmapWaitMs]) { if (!inScratchpad(dock)) true else null } == true) {
+                "dock ${dock.raw} was still in the scratchpad ${cfg[WmFlags.unmapWaitMs]}ms " +
+                    "after it was shown"
+            }
+            // Before `floating disable`, because that command re-tiles beside the focused node.
+            focus(surface)
+            run("[con_id=${dock.raw}] floating disable")
+            // The same two lines attach ends with, because a restore owes the caller the dock's
+            // configured geometry back: the scratchpad keeps neither the side nor the width.
+            if (cfg[WmFlags.dockSide] == DockSide.LEFT) run("[con_id=${dock.raw}] move left")
+            run("[con_id=${dock.raw}] resize set width ${cfg[WmFlags.dockSizePpt]} ppt")
+            if (cfg[WmFlags.dockFocusOnShow]) focus(dock)
+            if (cfg[WmFlags.restoreFocusAfterShow]) settleFocus(surface, dock)
+            return true
+        }
+
+        /**
          * Leaves the tab focused on whichever child the resting-focus flag names.
          *
          * This is the fix for the sharpest hazard the probe found: sway remembers the last
@@ -1702,6 +1775,47 @@ class SwayWindowManager(
         }
     }
 
+    /**
+     * A handle on the dock currently standing for [surface], or null if there is none.
+     *
+     * **The call a one-shot hotkey needs and could not previously have.** `attach` is the only
+     * thing that mints a [DockHandle], and `awakener-invoke` exits between presses, so the second
+     * press held nothing that knew which node the dock was — which is what `WhenAnimated.REUSE`'s
+     * doc means when it says raising is "what a daemon adds". Recovering the handle from the tree
+     * is what makes hide-and-restore reachable from a key press instead.
+     *
+     * **Deliberately not a fourth call on [WindowManager].** The working agreement holds that
+     * interface to three, and this is the same shape as [reapOrphans]: a concrete method that the
+     * composition root — the one place that already knows it has a sway — passes down as a lambda.
+     * `Awakening` therefore still holds a `WindowManager` and still learns nothing about
+     * compositors. See #94.
+     *
+     * Recognition is [dockedTo]'s, which is the same union enumeration answers from: this session's
+     * dock table first, and the mark otherwise. The mark is what makes this work **across an
+     * awakener restart** — a fresh process has an empty table, reads the mark off the node, and
+     * adopts it. Marks survive a scratchpad move, so a dock hidden by one awakener is re-adoptable
+     * by its successor; that is measured in `SwayHideTest`, not assumed.
+     *
+     * Hidden docks are found for the same reason enumeration excludes them: sway's scratchpad is
+     * an ordinary workspace on the `__i3` output, so a hidden dock is still in the tree this reads.
+     *
+     * Where two docks stand for one surface — [WhenAnimated.SECOND_DOCK] — this answers with the
+     * first the tree lists, and the caller gets one of them rather than a refusal. That is the
+     * honest shape for a hotkey: the alternative is a key press that does nothing and says why.
+     */
+    suspend fun dockFor(surface: SurfaceId): DockHandle? {
+        val cfg = config
+        val session = session()
+        val root = tree(session)
+        val table = docks.snapshot()
+        val node = root.windows.firstOrNull { dockedTo(it, table, cfg) == surface } ?: return null
+        // Derived here rather than carried, because this handle was not made by an attach: the
+        // key is what `detach` needs to forget the binding, and the agent is what a caller prints.
+        val key = keyFor(surface)
+        val agent = key?.let { registry.resolve(it)?.agent } ?: AgentId("")
+        return SwayDockHandle(surface, agent, SurfaceId(node.id), key, session)
+    }
+
     private inner class SwayDockHandle(
         override val surface: SurfaceId,
         override val agent: AgentId,
@@ -1750,11 +1864,44 @@ class SwayWindowManager(
             treeEdit { settleFocus(surface, dockId) }
         }
 
+        override suspend fun hidden(): Boolean {
+            checkSession("ask about")
+            // A read, so it takes the tree lock only for consistency with the two edits it is
+            // the query half of: `hidden()` immediately followed by `hide()` from one caller
+            // must not be able to interleave with another caller's `show()` between them any
+            // more than any other pair of tree operations can.
+            return treeEdit { inScratchpad(dockId) }
+        }
+
+        override suspend fun hide(): Boolean {
+            checkSession("hide")
+            return treeEdit { hideDock(dockId) }
+        }
+
+        override suspend fun show(): Boolean {
+            checkSession("show")
+            return treeEdit { showDock(surface, dockId) }
+        }
+
         override suspend fun detach() {
             checkSession("detach")
             val cfg = config
             treeEdit {
-                val parent = tree().parentOf(dockId.raw)
+                // Which container has to be flattened afterwards depends on where the dock *is*.
+                // Beside its surface, the dock's own parent is the split container `attach` made
+                // and the surface is the survivor in it. In the scratchpad, the dock's parent is
+                // the `__i3_scratch` workspace, whose other children are unrelated windows — so
+                // asking `parentOf(dockId)` there answers about somebody else's tree, and the
+                // split container the dock came out of is left standing to adopt the next window
+                // opened in that tab, which is exactly what wm.dock.normalize_container_on_detach
+                // exists to prevent. Asking from the surface's side answers both cases: for an
+                // orphan whose surface is already gone it is null, and sway has by then collapsed
+                // the empty container itself.
+                val parent = if (inScratchpad(dockId)) {
+                    tree().parentOf(surface.raw)
+                } else {
+                    tree().parentOf(dockId.raw)
+                }
                 // `kill` waits, and holding the tree across that wait is the point: the critical
                 // section must not end over a dock that is still standing, or the next teardown
                 // of it — a second detach, or the next orphan sweep — finds it in the tree and
@@ -1864,6 +2011,16 @@ class SwayWindowManager(
 
         /** How the kernel separates the entries in `/proc/<pid>/environ`. */
         const val NUL = '\u0000'
+
+        /**
+         * The workspace sway parks scratchpad windows on.
+         *
+         * i3's name, kept by sway, and a fact about the compositor rather than a setting: there is
+         * no command that renames it and no configuration that moves it. Hard-coded here — inside
+         * the one class that is allowed to know what a scratchpad is — rather than in `Tree.kt`,
+         * which models sway's tree but is shared with `commonMain`.
+         */
+        const val SCRATCH_WORKSPACE = "__i3_scratch"
 
         /**
          * The source spawn tokens are drawn from.

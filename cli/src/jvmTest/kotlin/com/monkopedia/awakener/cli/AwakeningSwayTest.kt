@@ -147,6 +147,7 @@ class AwakeningSwayTest {
             store = store,
             prepareResidue = { registry.prepareResidue(it) },
             reapOrphans = wm::reapOrphans,
+            dockFor = wm::dockFor,
         )
     }
 
@@ -429,6 +430,90 @@ class AwakeningSwayTest {
         awakening.reap()
 
         assertEquals(emptyList(), docks(), "and the sweep took it down")
+    }
+
+    /**
+     * **The product loop for Jason's toggle, end to end**: press, press, press.
+     *
+     * The assertion that carries it is that the *same process* is behind the panel all three
+     * times. `awaitReportedNames` counts one line per panel start, so a second line would mean
+     * the hotkey had re-launched the agent — the outcome the whole feature exists to avoid, and
+     * one that a tree assertion alone cannot tell from a genuine restore: a fresh panel is in the
+     * tab in exactly the same place a restored one is.
+     *
+     * The pid is checked too, and it is the sharper of the two: a dock that had been killed and
+     * re-`exec`'d would be a different process even if it somehow wrote no second line.
+     */
+    @Test
+    fun `the hotkey toggles the panel, and the agent behind it survives both presses`() = swayTest {
+        store.put(InvokeFlags.whenAnimated, WhenAnimated.TOGGLE_HIDE)
+        val app1 = openSurface("aw-app1")
+
+        val stood = assertIs<Awakened.Animated>(awakening.invoke())
+        assertEquals(listOf(stood.binding.spanreedName), awaitReportedNames(1))
+        val pid = assertNotNull(wm.tree().find(stood.dock.dockId.raw)?.pid)
+
+        val hidden = assertIs<Awakened.Hidden>(awakening.invoke())
+        assertEquals(stood.dock.dockId, hidden.dock.dockId)
+        assertEquals(
+            emptyList(),
+            assertNotNull(tabHolding(app1)).windows.map { it.id }.filter { it != app1.raw },
+            "the panel is out of the tab entirely; the surface is alone in it",
+        )
+        assertTrue(
+            ProcessHandle.of(pid.toLong()).map { it.isAlive }.orElse(false),
+            "and the agent is still running behind it, which is the entire point of hiding " +
+                "rather than shutting the panel down",
+        )
+
+        val restored = assertIs<Awakened.Restored>(awakening.invoke())
+        assertEquals(stood.dock.dockId, restored.dock.dockId, "the same node came back")
+        assertEquals(
+            listOf(stood.dock.dockId.raw),
+            assertNotNull(tabHolding(app1)).windows.map { it.id }.filter { it != app1.raw },
+            "back in the surface's own tab",
+        )
+        assertEquals(
+            pid,
+            wm.tree().find(stood.dock.dockId.raw)?.pid,
+            "and behind the same process as before — a panel that had been re-launched would " +
+                "be a different one",
+        )
+        assertEquals(
+            listOf(stood.binding.spanreedName),
+            awaitReportedNames(1),
+            "the panel reported its identity exactly once across three presses; a second line " +
+                "would mean the hotkey had stood a fresh agent up",
+        )
+        assertEquals(1, minted, "and nothing was minted for the two toggle presses")
+    }
+
+    /**
+     * A hidden panel whose surface dies must not be left running where nobody can see it.
+     *
+     * The invisible case is strictly worse than the orphan `reap` already exists for: an orphaned
+     * panel is at least on screen. sway's scratchpad is an ordinary workspace, so the sweep
+     * reaches it — proved here through the same `reap` a user would run.
+     */
+    @Test
+    fun `reap takes down a hidden panel whose surface has gone`() = swayTest {
+        store.put(InvokeFlags.whenAnimated, WhenAnimated.TOGGLE_HIDE)
+        val app1 = openSurface("aw-app1")
+        val stood = assertIs<Awakened.Animated>(awakening.invoke())
+        assertIs<Awakened.Hidden>(awakening.invoke())
+
+        command("[con_id=${app1.raw}] kill")
+        awaitGone(app1)
+        assertEquals(
+            listOf(stood.dock.dockId.raw),
+            docks(),
+            "the hidden orphan really is standing — sway does not take a scratchpad window " +
+                "down with the surface it was docked beside",
+        )
+
+        awakening.reap()
+
+        assertEquals(emptyList(), docks(), "and the sweep reached into the scratchpad for it")
     }
 
     /**
