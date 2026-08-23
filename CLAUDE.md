@@ -329,7 +329,9 @@ someone believes it — it is that an agent who measures, catches the loose clau
   comes up anyway, with `swaymsg -t get_version` → `sway 1.12` (2026-08-07, on kaladin; that
   is the probe described below). **`sudo` here is passwordless**, so installing a tool you
   need is your call to make, not something to ask Jason for. `sway`, `foot`, `chromium`, `jq`,
-  `qemu` and `waydroid` are already present. **KVM works** (Jason enabled SVM in firmware on
+  `qemu` and `waydroid` are already present — `chromium` is `/usr/bin/chromium`,
+  **151.0.7922.173** (2026-08-23), and it drives fine on the headless sway above with
+  `--ozone-platform=wayland`, which is how the `--app=` `app_id` probe was run. **KVM works** (Jason enabled SVM in firmware on
   2026-07-31): `kvm_amd` loads at boot, `/dev/kvm` is mode 0666, nested virtualisation is on.
   Binder needs nothing — the LTS kernel ships `CONFIG_ANDROID_BINDER_IPC_RUST=y`, so Waydroid
   runs natively with no DKMS module. `kernel.dmesg_restrict=1`, so read kernel messages with
@@ -346,6 +348,19 @@ someone believes it — it is that an agent who measures, catches the loose clau
   `foot 1.27.0`, `waydroid 1.6.3`, `spanreed`, `jq`, `qemu`. Reachable by passwordless ssh
   from kaladin, but **sudo there requires a password** — Jason runs any *further* installs
   himself.
+
+  **The browser awakener drives is `chromium`, not `google-chrome-stable`** — Jason,
+  2026-08-23: *"Okay, you document Chromium as a dependency and start building out
+  expectation for it. I'll install it on Adolin"*. Recorded with the reasoning in
+  `docs/design.md`, and **CDP is the adapter** — decided the same day. **Checked on adolin
+  2026-08-23:** `/usr/bin/chromium` **151.0.7922.173** is now installed (Jason installed it
+  himself that afternoon; earlier the same day it was absent and only `google-chrome-stable`
+  and `epiphany` were there). Dated readings, not standing claims — run `chromium --version`
+  rather than trusting either. His own Chrome profile is 5.7 GB, which is what a separate
+  binary plus the already-mandatory dedicated profile keeps the debugging channel away from.
+  **Chromium 151 also supports `--remote-debugging-pipe`**, which is CDP over inherited file
+  descriptors with no listening port at all; see
+  `docs/findings/2026-08-23-chromium-cdp-pipe.md` for what it costs.
 
   **This file does not say what adolin is missing. Check, don't assume:**
   `ssh adolin 'bash -lc "command -v <tool>"'`. The **login shell is load-bearing** — some
