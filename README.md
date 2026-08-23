@@ -45,6 +45,11 @@ symlinking the whole `bin` directory works too.
 All of that is covered by `gradlew :cli:launcherTest`, which runs the shipped scripts over that
 matrix; `check` depends on it.
 
+That gets you the commands. Turning them into a session you can log into — the sway config, the
+one manual step (installing the spanreed plugin in Claude Code), the flags to set, the dock
+launcher, and the failures that cost the most time to diagnose — is
+[`docs/desktop-setup.md`](docs/desktop-setup.md).
+
 ## Shape
 
 The binding layer is a tiny, compositor-agnostic interface — `resolve(surface)`,
