@@ -87,11 +87,28 @@ internal suspend inline fun Binding?.merge(
     return Binding(identity.id.raw, identity.spanreedName, now, now)
 }
 
-/** The residue path relative to the residue directory, per [RegistryFlags.residueLayout]. */
-internal fun residueLeaf(key: SurfaceKey, layout: ResidueLayout): String = when (layout) {
-    ResidueLayout.PER_KEY_FILE -> "${key.slug}.md"
-    ResidueLayout.PER_KEY_DIR -> key.slug
+/**
+ * The residue path relative to the residue directory, per [RegistryFlags.residueLayout], as its
+ * components.
+ *
+ * A list rather than a joined string because [ResidueLayout.PER_APP_SESSION_DIR] has two
+ * components and the guard that keeps them inside the residue directory has to see them
+ * separately: a single `"$app/$session"` handed to `Path.resolve` is a string in which an `app`
+ * of `../..` is indistinguishable from nesting, which is precisely the confusion the guard
+ * exists to refuse.
+ *
+ * Every component here is a slug — see [SurfaceKey.appSlug] — so none of them can contain a
+ * separator, be `.` or `..`, or be absolute, whatever the window called itself.
+ */
+internal fun residueSegments(key: SurfaceKey, layout: ResidueLayout): List<String> = when (layout) {
+    ResidueLayout.PER_KEY_FILE -> listOf("${key.slug}.md")
+    ResidueLayout.PER_KEY_DIR -> listOf(key.slug)
+    ResidueLayout.PER_APP_SESSION_DIR -> listOf(key.appSlug, key.slug)
 }
+
+/** [residueSegments] as one relative path, for a store with no filesystem under it. */
+internal fun residueLeaf(key: SurfaceKey, layout: ResidueLayout): String =
+    residueSegments(key, layout).joinToString("/")
 
 /**
  * Where [ForgetResidue.ARCHIVE] moves that residue to.
@@ -106,4 +123,8 @@ internal fun archiveLeaf(key: SurfaceKey, layout: ResidueLayout, stamp: String):
     when (layout) {
         ResidueLayout.PER_KEY_FILE -> "${key.slug}.$stamp.md"
         ResidueLayout.PER_KEY_DIR -> "${key.slug}.$stamp"
+        // A leaf, not a path: the caller resolves it as a *sibling* of the live residue, so
+        // under this layout the archive stays inside the application's own directory rather
+        // than being flattened back up beside every other app's.
+        ResidueLayout.PER_APP_SESSION_DIR -> "${key.slug}.$stamp"
     }

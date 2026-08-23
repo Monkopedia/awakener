@@ -50,6 +50,50 @@ object RegistryPaths {
     private fun Path.holder(): Path = toAbsolutePath().let { it.parent ?: it }
 
     fun residueLocation(config: Config, storePath: Path, key: SurfaceKey): Path =
-        residueDir(config, storePath)
-            .resolve(residueLeaf(key, config[RegistryFlags.residueLayout]))
+        containedResolve(
+            residueDir(config, storePath),
+            residueSegments(key, config[RegistryFlags.residueLayout]),
+        )
+
+    /**
+     * Resolves [segments] under [base] one component at a time, refusing any that leaves it.
+     *
+     * The second of two guards, and it exists because the first one is unfalsifiable on its own.
+     * [SurfaceKey.appSlug] makes an escaping component unconstructible, which is the right
+     * primary defence and is also the kind of defence that quietly stops holding the day someone
+     * adds a layout whose component is not a slug. This one is about the property itself — no
+     * residue path leaves the residue directory — so it can be handed a hostile component
+     * directly and made to fail, which is what a test needs in order to prove it fires.
+     *
+     * Component at a time rather than `base.resolve(segments.joinToString("/"))`, because the
+     * joined form cannot distinguish nesting from traversal, and rather than one `normalize` at
+     * the end, because `a/../b` normalises back inside while having named `a`'s parent on the way.
+     *
+     * The returned path keeps [base]'s own shape — relative if it was relative — since callers
+     * print it and one test pins a relative `registry.store.path`. Only the containment
+     * arithmetic is done on the absolute, normalised form.
+     */
+    internal fun containedResolve(base: Path, segments: List<String>): Path {
+        val root = base.toAbsolutePath().normalize()
+        var probe = root
+        var at = base
+        segments.forEach { segment ->
+            // `Path.resolve` raises InvalidPathException — an IllegalArgumentException — on a NUL,
+            // and returns the argument itself when it is absolute; both end up refused here.
+            val before = probe
+            probe = probe.resolve(segment).normalize()
+            // One condition rather than a list of hazards, and it is the stronger claim: each
+            // component must name a child of the directory the previous one named. `..` and an
+            // absolute path fail it by landing elsewhere, `""` by landing on `before` itself, and
+            // `a/b` by landing two levels down — which is not an escape but is a component
+            // inventing a nesting level the layout did not ask for. Containment follows by
+            // induction from the first component, so it does not need asserting separately.
+            require(probe.parent == before) {
+                "residue component '$segment' is not a single name under $before " +
+                    "(resolved to $probe, root $root)"
+            }
+            at = at.resolve(segment)
+        }
+        return at
+    }
 }

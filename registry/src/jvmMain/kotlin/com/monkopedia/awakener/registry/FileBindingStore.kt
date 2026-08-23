@@ -167,6 +167,21 @@ class FileBindingStore(
      */
     val residueExposure: String? get() = exposureCheck.warning
 
+    @Volatile
+    private var strandedCheck = ResidueStrandedCheck()
+
+    /**
+     * What the most recent prepare found of this deployment's residue under *other* layouts.
+     *
+     * Set by [prepareResidue] alone, exactly like [residueExposureCheck] and for the same reason:
+     * that is the call that was about to write residue somewhere, so it is the moment "there is
+     * a model of you in a file nothing reads any more" is both knowable and worth saying.
+     */
+    val residueStrandedCheck: ResidueStrandedCheck get() = strandedCheck
+
+    /** The sentence to print when residue was left behind by a layout flip, else null. */
+    val residueStranded: String? get() = strandedCheck.warning
+
     private val state = MutableStateFlow(snapshot.bindings)
 
     override val bindings: StateFlow<Map<SurfaceKey, Binding>> = state.asStateFlow()
@@ -336,14 +351,53 @@ class FileBindingStore(
             cfg[RegistryFlags.residueExposure],
             cfg[RegistryFlags.residueExposureScope],
         )
+        checkStranded(cfg, key, location)
         when (cfg[RegistryFlags.residueLayout]) {
-            ResidueLayout.PER_KEY_DIR -> PrivateFiles.createDirectories(location, permissions)
+            // Both directory layouts create every missing ancestor at the same mode, which is
+            // what puts PER_APP_SESSION_DIR's application directory at 0700 as well as the
+            // session directory inside it.
+            ResidueLayout.PER_KEY_DIR, ResidueLayout.PER_APP_SESSION_DIR ->
+                PrivateFiles.createDirectories(location, permissions)
             ResidueLayout.PER_KEY_FILE -> {
                 PrivateFiles.createParentDirectories(location, permissions)
                 if (!location.exists()) PrivateFiles.createFile(location, permissions)
             }
         }
         location
+    }
+
+    /**
+     * Records residue this surface has under a layout other than the one in force.
+     *
+     * Run before anything is created, so the active location existing cannot be mistaken for a
+     * stranded one. The layouts name three distinct paths for any given surface — `<slug>.md`,
+     * `<slug>`, `<app>/<slug>` — so no arm of this can report the path it is standing on.
+     *
+     * Two `exists()` calls on the hotkey path, and it changes no behaviour: there is no
+     * alternative to switch between here, only this and silence, and silence is what makes a
+     * layout flip look like a surface that never wrote anything down.
+     */
+    private fun checkStranded(cfg: Config, key: SurfaceKey, active: Path) {
+        val layout = cfg[RegistryFlags.residueLayout]
+        val residueDir = RegistryPaths.residueDir(cfg, path)
+        val stranded = ResidueLayout.entries.filter { it != layout }.mapNotNull { other ->
+            runCatching { RegistryPaths.containedResolve(residueDir, residueSegments(key, other)) }
+                .getOrNull()
+                ?.takeIf { it.exists() }
+                ?.toString()
+        }
+        strandedCheck = if (stranded.isEmpty()) {
+            ResidueStrandedCheck(ResidueStrandedFinding.NONE, active = active.toString())
+        } else {
+            ResidueStrandedCheck(
+                ResidueStrandedFinding.STRANDED,
+                active = active.toString(),
+                stranded = stranded,
+                warning = "${key.canonical} has residue at ${stranded.joinToString(", ")} " +
+                    "written under a different ${RegistryFlags.residueLayout.key}; this run " +
+                    "reads and writes $active instead, and nothing moves the old model there",
+            )
+        }
     }
 
     /**

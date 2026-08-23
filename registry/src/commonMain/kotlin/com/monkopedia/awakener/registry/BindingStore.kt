@@ -144,6 +144,44 @@ enum class ResidueExposureFinding {
 }
 
 /**
+ * Residue this deployment wrote under a different [RegistryFlags.residueLayout] and no longer
+ * reads.
+ *
+ * Flipping the layout flag changes where residue is written and moves nothing that is already
+ * there. Nothing is lost and nothing is overwritten — but the accumulated model the previous
+ * layout was building is now a file nobody opens, and on its own that is indistinguishable from
+ * a surface that never wrote anything down. Migrating automatically would be the worse answer:
+ * it would move a user's model on a config edit, with no undo above this layer. So it is
+ * reported, on the one call that was about to write residue and therefore the one moment it
+ * matters.
+ *
+ * Same four-state shape as [ResidueExposureCheck], for the same reason: "no residue was left
+ * behind" and "nobody asked" must not reach a reader as the same silence.
+ *
+ * @param active where the layout in force writes this surface's residue.
+ * @param stranded every other layout's location for this surface that actually exists on disk.
+ * @param warning the sentence to print, non-null exactly when [stranded] is non-empty.
+ */
+data class ResidueStrandedCheck(
+    val finding: ResidueStrandedFinding = ResidueStrandedFinding.NOT_RUN,
+    val active: String? = null,
+    val stranded: List<String> = emptyList(),
+    val warning: String? = null,
+)
+
+/** What [ResidueStrandedCheck] found. */
+enum class ResidueStrandedFinding {
+    /** No residue has been prepared through this store yet, so nothing has been asked. */
+    NOT_RUN,
+
+    /** Asked, and no other layout has residue for this surface on disk. */
+    NONE,
+
+    /** Asked, and [ResidueStrandedCheck.stranded] names residue the active layout will not read. */
+    STRANDED,
+}
+
+/**
  * The durable half of the memory model.
  *
  * The design brief splits what an agent holds into durable residue — preferences, decisions,
