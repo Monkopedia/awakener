@@ -94,7 +94,7 @@ correct. Set and read back:
 awakener-config set registry.agent.spanreed_command "$HOME/.local/bin/spanreed"
 awakener-config set invoke.dock.command \
   'foot -a {app_id} -- env SPANREED_AGENT_NAME={agent_name} '"$HOME"'/awakener/dock-launch.sh {residue}'
-awakener-config set registry.residue.layout PER_KEY_DIR
+awakener-config set registry.residue.layout PER_APP_SESSION_DIR
 
 awakener-config get registry.agent.spanreed_command
 awakener-config get invoke.dock.command
@@ -126,16 +126,33 @@ which layer fills each one in is load-bearing:
 - `{residue}` is where this surface's durable model lives.
 
 **`registry.residue.layout`** — the default `PER_KEY_FILE` gives each surface a single
-`<slug>.md` and no directory. `PER_KEY_DIR` gives each surface a directory instead, which is
-what makes `cd {residue}` in the launcher meaningful: the agent gets a workspace it can write
-several files into, not one file it has to append to. Measured on kaladin against headless
-sway, with `registry.residue.dir` pointed at a scratch path:
+`<slug>.md` and no directory. A directory is what makes `cd {residue}` in the launcher
+meaningful: the agent gets a workspace it can write several files into, not one file it has to
+append to. Two layouts give it one.
+
+`PER_APP_SESSION_DIR` is the one to set. It writes `<residue>/<app>/<session>/`, so every
+surface belonging to one application sits under a directory of that application's own — a place
+two Lifelesses bound to two windows of the same app can both read and write. Measured on kaladin
+against headless sway, one real `awakener-invoke invoke` against a `foot` surface, with
+`registry.residue.dir` pointed at a scratch path:
 
 ```
-residue/window-fake-surface-32b1ee1a9793de3ecdf75459f7d9f47b/   drwx------
+residue/                                                            drwx------
+  app-window-fake-surface-54a0a7421bcf5d6b7b1c021861a6d2f9/          drwx------
+    window-fake-surface-32b1ee1a9793de3ecdf75459f7d9f47b/            drwx------
 ```
 
-A directory per surface, created `0700`.
+Both levels created `0700`. The session directory is named exactly what the flat layout would
+have called that surface's residue, moved one level down; the application directory carries an
+`app-` prefix, which is what keeps it from ever colliding with some surface's own directory.
+
+`PER_KEY_DIR` is the flat version of the same thing — a directory per surface, all siblings, with
+nothing on disk saying which of them are three windows of one editor. It was the answer before
+the nested layout existed and is still fine if you do not want the extra level.
+
+**Changing this moves nothing already written.** Residue left behind under a previous layout is
+reported on the next prepare rather than silently orphaned, so a switch is visible rather than a
+quiet loss of the model.
 
 ---
 
@@ -184,7 +201,7 @@ exec "$HOME/.local/bin/claude" "$@"
 
 ### Why each part is there
 
-**`cd "$dir"`** gives the agent its own workspace. With `PER_KEY_DIR` (§4) that is a real
+**`cd "$dir"`** gives the agent its own workspace. With `PER_APP_SESSION_DIR` (§4) that is a real
 directory per surface.
 
 **Pre-accepting the workspace-trust prompt.** A fresh directory makes Claude Code ask whether
@@ -229,6 +246,12 @@ set $awk /home/YOU/awakener/cli/build/install/awakener/bin
 ### tabbed by default #########################################################
 workspace_layout tabbed
 
+### no per-window decoration ##################################################
+# A surface and its dock share one tab. Title bars make them read as two
+# separate windows instead of one attached unit.
+default_border none
+default_floating_border none
+
 ### awakener ##################################################################
 # $mod+a is stock sway's "focus parent". Take it, and put focus parent back
 # somewhere reachable.
@@ -242,7 +265,8 @@ bindsym --no-repeat $mod+o exec foot -a awakener-list -- sh -c '$awk/awakener-in
 # Take down docks whose surface has gone.
 bindsym --no-repeat $mod+p exec $awk/awakener-invoke reap
 
-# Make a dock obvious at a glance.
+# Optional, cosmetic. With borders off this text only ever appears in the tab
+# bar; it is not part of the setup.
 for_window [app_id="awakener-dock"] title_format "◆ DOCK — %title"
 ```
 
@@ -287,6 +311,83 @@ workspace  layout=splith  1280x697@0
 
 Both leaves report `visible=true`: the surface and its dock are side by side inside the one
 tab, not two tabs you flip between.
+
+### `default_border none`, and the row that survives it
+
+Stock sway draws a title bar on every window. On adolin's 4K display that is a **23px** row per
+window, and with a dock attached you get two of them side by side — which is exactly the wrong
+read, because a surface and its dock are one unit, not two windows:
+
+```
+[google-chrome]   border=normal bw=2 deco_h=23  title=Claude Code - Google Chrome
+[awakener-dock]   border=normal bw=2 deco_h=23  title=✳ Claude Code
+```
+
+The two `default_border` lines in the config above remove them. Corroborated on kaladin under
+`WLR_BACKENDS=headless sway` 1.12 — same mechanism, different font metrics, so the row is **25px**
+there rather than 23:
+
+| surface and dock, split inside one tab | `border` | `deco_rect.height` |
+| --- | --- | --- |
+| `default_border normal` | `normal` | 25 each |
+| after `border none` | `none` | 0 each |
+
+The undecorated row is not only a hand-built tree: a real `awakener-invoke invoke` against a
+`foot` surface, on a session started with the two `default_border` lines above, comes up
+`border=none deco_h=0` on both the surface and the dock, with the 25px on the `splith` container
+that holds them.
+
+**`default_border` applies to windows mapped after it takes effect, and to nothing else.** A
+`swaymsg reload` re-reads the setting but does not re-decorate what is already on screen —
+measured on kaladin, the two windows open across the reload stayed at `border=normal` while the
+next window to map came up `border=none`. **`border=` is the field that carries this**, not
+`deco_h`: under the `workspace_layout tabbed` of this config that new window is also a new tab,
+so it reports `deco_h=25` despite having no border at all, for the reason two paragraphs down.
+
+So after a reload, walk the tree and apply it by `con_id`. **By `con_id`, not `app_id`**: every
+dock shares the `awakener-dock` `app_id`, so an `app_id` criterion cannot address them one at a
+time, and a `for_window` rule only ever fires on a window that has yet to appear.
+
+```sh
+swaymsg -t get_tree \
+  | jq -r '.. | objects | select(.app_id != null or .window != null) | .id' \
+  | while read id; do swaymsg "[con_id=$id]" border none; done
+```
+
+That is the whole re-decoration path without a re-login. New windows need nothing.
+
+**The row that remains is the tab bar, not a title bar.** Turning borders off does not empty the
+top of the workspace, and the leftover header belongs to the tab, not to the window — including
+when the container holds exactly one tab. Two shapes, measured on kaladin, both with `border
+none` applied everywhere:
+
+| shape | where the 25px sits |
+| --- | --- |
+| a single window, the only tab | on the **leaf**: `border=none` and `deco_h=25` |
+| surface + dock split inside one tab (what `attach` builds) | on the **splith container**, `deco_h=25`; both leaves `deco_h=0` |
+
+The attribution moves because sway hangs the tab's decoration on whatever node *is* the tab. So
+`border=none deco_h=25` on a window is not a failed `border none` — it is a window that happens
+to be a tab. The control says the same thing from the other side: drop `workspace_layout tabbed`
+and the header is gone entirely, `deco_h=0` at every level, with nothing else in the config
+changed.
+
+There is no setting that keeps the tabbing and hides its header. `workspace_layout tabbed` and a
+header-free workspace are mutually exclusive, so choose one — this guide keeps the tabs, and the
+25px is the price. Do not go looking for a `tab_bar` toggle; it does not exist.
+
+**Verify with `deco_rect.height`, not `rect.height - window_rect.height`.** The subtraction
+answers a different question — it yields the *border width*, `2`, whether or not sway is drawing
+a title bar, and reads as "sway draws almost nothing" when there is a full title row above the
+window. `deco_rect` is the decoration sway actually allocates:
+
+```sh
+swaymsg -t get_tree | jq -r '.. | objects | select(.app_id != null)
+  | "\(.app_id) border=\(.border) deco_h=\(.deco_rect.height)"'
+```
+
+`current_border_width` is not the field either: it stays `2` on a window whose `border` is
+`none`, because it records the width a border *would* have.
 
 ### Optionally, pinning the layout
 
@@ -541,9 +642,16 @@ Everything in this guide that is stated as a measurement was run. Where and how:
 
 - `awakener-config set` / `get` round trip for all three flags of §4, against an isolated
   `AWAKENER_CONFIG`.
-- `registry.residue.layout=PER_KEY_DIR` produces a `0700` directory per surface.
+- `registry.residue.layout=PER_APP_SESSION_DIR` produces the nested `<app>/<session>/` pair,
+  both `0700`, from a real `awakener-invoke invoke` against a `foot` surface.
 - The tabbed-plus-dock tree of §6, under `WLR_BACKENDS=headless sway`: a real `invoke` against
   a real `foot` surface, tree read back with `swaymsg -t get_tree`.
+- The window-decoration numbers of §6: `default_border normal` gives `deco_h=25` and `border
+  none` gives `deco_h=0`; a `swaymsg reload` leaves every window already mapped at
+  `border=normal` while the next window to map comes up `border=none`; the 25px tab header
+  survives `border none` in both tab shapes, which is why that last pair was read off `border=`
+  and not off `deco_h`; and the control session without `workspace_layout tabbed` has no header
+  at any level.
 - The `unbindsym` measurement: two headless sway sessions, 2 `Overwriting binding` lines and 1
   `namespace swaynag` layer surface without it, 0 and 0 with it.
 - The dock launcher's `cd`, `PATH` prepend and trust write, against a scratch `HOME` and a fake
@@ -561,7 +669,9 @@ Everything in this guide that is stated as a measurement was run. Where and how:
 - `nvidia-open` 610.57.04, `license: Dual MIT/GPL`, on an RTX 4070 Ti SUPER.
 - `handy --help`'s CLI flags, and `wtype` present.
 
-**Reported from the bring-up session, not re-run here:** the `arecord` before/after byte count,
+**Reported from the bring-up session, not re-run here:** the 23px title bars on adolin's 4K
+display — kaladin reproduces the mechanism at 25px, which is font metrics, not a different
+behaviour — the `arecord` before/after byte count,
 the `PATH`-less dock environment read from `/proc/<pid>/environ`, the Handy Tauri shortcut log
 line, and the repeated-`$mod+a` dock storm. These are all facts about a live GDM session on a
 seat, which kaladin does not have.
