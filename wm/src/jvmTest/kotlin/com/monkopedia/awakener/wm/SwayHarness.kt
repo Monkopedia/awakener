@@ -30,6 +30,27 @@ class SwayHarness private constructor(
     fun windowCommand(appId: String): String = "$FOOT -a $appId -- sleep 3600"
 
     /**
+     * The Wayland socket name this session is serving on, or null before anything has connected.
+     *
+     * **Read out of a client rather than out of sway**, because sway picks the name at runtime —
+     * `wl_display_add_socket_auto` takes the first free `wayland-N`, so two harnesses sharing an
+     * `XDG_RUNTIME_DIR` get different ones — and then publishes it by `setenv`, which never reaches
+     * `/proc/self/environ`: that file is the environment the process was *started* with. The
+     * compositor's own children are where the name actually is, and [spawned] already knows how to
+     * find them.
+     *
+     * Null until this session has spawned something, which is exactly when there is nothing to
+     * screenshot either.
+     */
+    fun waylandDisplay(): String? = spawned()
+        .firstNotNullOfOrNull { handle ->
+            environOf(handle.pid()).split('\u0000')
+                .firstOrNull { it.startsWith(WAYLAND_DISPLAY_VAR) }
+                ?.removePrefix(WAYLAND_DISPLAY_VAR)
+                ?.takeIf { it.isNotEmpty() }
+        }
+
+    /**
      * Every process belonging to this session: the terminals sway launched, and what each runs.
      *
      * Found by the environment rather than by descent, because descent is not stable. sway 1.12
@@ -143,6 +164,19 @@ class SwayHarness private constructor(
         private const val FOOT = "foot"
 
         /**
+         * The screenshotter, and the only way anything here can read back a rendered title.
+         *
+         * sway exposes `title_format` through no IPC request and no event — `GET_TREE` carries
+         * `name` and nothing derived from the format, checked on 1.12 — so a test that wants to
+         * know what a tab *says* has to look at the pixels. `grim` does that against the headless
+         * backend, because the renderer runs under pixman with no display involved (#177).
+         */
+        private const val GRIM = "grim"
+
+        /** How a spawned client's environment names the socket. Trailing `=` on purpose. */
+        private const val WAYLAND_DISPLAY_VAR = "WAYLAND_DISPLAY="
+
+        /**
          * Whether the tools these tests need are present.
          *
          * Absence is a skip locally and a failure in CI: a green run on a machine that silently
@@ -180,6 +214,32 @@ class SwayHarness private constructor(
         fun assumeAvailable() {
             assumeTrue("sway and/or foot are not installed", available())
         }
+
+        /**
+         * Whether the screenshotter is present, on the same terms as [available].
+         *
+         * **Deliberately a second gate rather than a third tool in [available].** Only the visual
+         * suite needs it, and folding it in would make one missing package skip every
+         * window-management test in two modules — a blast radius out of all proportion to what it
+         * protects. It answers to the *same* `AWAKENER_REQUIRE_SWAY`, though, which is the half
+         * that matters: on CI, where that flag is set, a missing `grim` is a failed build rather
+         * than a quiet skip, so `skipped="0"` keeps meaning what `CLAUDE.md` says it means.
+         */
+        fun grimAvailable(): Boolean {
+            val present = which(GRIM) != null
+            if (!present && System.getenv("AWAKENER_REQUIRE_SWAY") == "1") {
+                fail("AWAKENER_REQUIRE_SWAY=1 but grim is not installed")
+            }
+            return present
+        }
+
+        /** Skips the calling test — for real, see [assumeAvailable] — when `grim` is missing. */
+        fun assumeGrim() {
+            assumeTrue("grim is not installed", grimAvailable())
+        }
+
+        /** The screenshotter's name, for a test that has to build a command line. */
+        fun grimCommand(): String = GRIM
 
         /**
          * Executable and `File.pathSeparator`, matching `toolFingerprint` in the build scripts.

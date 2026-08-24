@@ -693,6 +693,55 @@ class SwayWindowManager(
          * A [survivor] that has left the tree is not a failure: the container it was alone in
          * went with it.
          */
+        /**
+         * Names the tab of the container [surface] is docked in after [surface]'s own title.
+         *
+         * **The container, not the window.** Attaching a dock puts the surface inside a split, and
+         * sway names a split out of its layout description — so the tab reads
+         * `H[chromium awakener-dock]` where a page title used to be, which is the whole of #177.
+         * `%title` is no use for putting it back: on a container it expands to that same synthetic
+         * name (measured), so awakener has to interpolate the surface's title itself. What that
+         * costs, and the escaping it therefore needs, is [TabTitle]'s.
+         *
+         * **The dock is not named here, and not looked for either.** Every caller has already
+         * established that this surface has one; what this needs is the container, and the
+         * container is not always the dock's parent — hiding a dock leaves the split standing with
+         * a single child (measured on 1.12: sway does not collapse it), so a hidden dock's tab is
+         * still synthetic and still wants this. Asking from the surface's side answers both cases.
+         *
+         * [CON] is the one thing checked, and it is checked rather than assumed because
+         * [Node.parentOf] answers about whatever the tree currently holds: a surface with no
+         * container above it is a child of its **workspace**, and naming that would put a page
+         * title where the workspace name goes.
+         *
+         * Silent where there is nothing to name — no such surface, or a surface sitting directly
+         * in its workspace — because both mean the tab is a leaf already showing the right thing.
+         */
+        suspend fun applyTabTitle(surface: SurfaceId) {
+            val cfg = config
+            if (cfg[WmFlags.dockTabTitle] != TabTitleSource.SURFACE) return
+            val tree = tree()
+            val node = tree.find(surface.raw) ?: return
+            val container = tree.parentOf(surface.raw)?.takeIf { it.type == CON } ?: return
+            // app_id is the fallback because it is what sway's own leaf title falls back to, so a
+            // window with no title keeps reading the way it read before the dock existed. With
+            // neither, there is nothing to say that beats what sway would put there itself.
+            val title = node.name ?: node.appId ?: return
+            run(TabTitle.command(SurfaceId(container.id), cfg[WmFlags.dockTabTitleFormat], title))
+        }
+
+        /**
+         * Hands [container]'s tab back to the compositor's own naming.
+         *
+         * Gated by no flag, and that asymmetry with [applyTabTitle] is deliberate: the flag decides
+         * whether awakener *sets* a title, and a container still carrying one set before the flag
+         * was turned off is exactly the state a reset exists for. `%title` is sway's own default,
+         * so a container that was never titled is unchanged by this.
+         */
+        suspend fun resetTabTitle(container: SurfaceId) {
+            run(TabTitle.resetCommand(container))
+        }
+
         suspend fun normalizeContainer(survivor: SurfaceId) {
             if (tree().find(survivor.raw) == null) return
             focus(survivor)
@@ -997,6 +1046,13 @@ class SwayWindowManager(
                 "dock ${dock.raw} was not docked beside surface ${surface.raw} " +
                     "${cfg[WmFlags.unmapWaitMs]}ms after the restore went out: $fault"
             }
+
+            // Re-issued rather than relied upon. The container usually survives a hide — sway
+            // leaves the split standing with one child — so the title is normally already right
+            // and this changes nothing. What it covers is the case where it is not: a user who
+            // flattened the tab by hand while the dock was away gets a *new* container out of
+            // `floating disable`, and that one has never been named.
+            applyTabTitle(surface)
 
             if (cfg[WmFlags.dockFocusOnShow]) focus(dock)
             if (cfg[WmFlags.restoreFocusAfterShow]) settleFocus(surface, dock)
@@ -1470,6 +1526,12 @@ class SwayWindowManager(
                     }
                     run("[con_id=${dockId.raw}] resize set width ${cfg[WmFlags.dockSizePpt]} ppt")
 
+                    // After the dock is in its final place, so the container this names is the one
+                    // the user will be looking at. Inside the unwind's reach on purpose: a title
+                    // set on a container a failed attach then flattens would otherwise be the one
+                    // edit the unwind could not take back.
+                    applyTabTitle(surface)
+
                     // The correction is part of the suppression, not of resting focus, so it runs
                     // whatever restore_after_attach says: that flag decides whether the
                     // resting-focus rule is applied, and with it off the one outcome
@@ -1559,6 +1621,11 @@ class SwayWindowManager(
                         )
                         "close" -> trySend(SurfaceChange.Vanished(id))
                         "focus" -> trySend(SurfaceChange.Focused(id))
+                        // The event that keeps a woken tab honest: a page retitles itself and the
+                        // container awakener named after it is now naming something that has
+                        // moved. sway reports this against the *view*, which is the surface, so
+                        // the id here is the one the dock table is keyed on.
+                        "title" -> trySend(SurfaceChange.Retitled(id, container.name))
                     }
                 }
                 null
@@ -1617,6 +1684,7 @@ class SwayWindowManager(
                 // picks up whatever replaced that snapshot, from a test's `put` today and from
                 // `FileConfigStore.watch` once something calls it (nothing does: #43).
                 if (change is SurfaceChange.Vanished && config[WmFlags.sweepOnClose]) sweep()
+                if (change is SurfaceChange.Retitled) refreshTabTitle(change.id)
             }
         } catch (ended: CompositorSessionEnded) {
             // The session boundary, mechanically: connection loss *is* the boundary, and #20 is
@@ -1801,6 +1869,28 @@ class SwayWindowManager(
      * reaped. A dock an attach has reserved but not yet identified is not swept either: nothing
      * knows yet which surface it belongs to, so nothing can know it is an orphan.
      */
+    /**
+     * Re-issues the tab title for [surface], if a dock of this manager's is standing beside it.
+     *
+     * The other half of `wm.dock.tab_title=SURFACE`: a page title moves under the tab that was
+     * named after it, so a title set once at attach goes stale the first time the user follows a
+     * link. This is what #177 means by "re-issued on `window::title`".
+     *
+     * **A read of the dock table, so it answers only for surfaces this manager docked.** A title
+     * event arrives for every window on the desktop and the overwhelming majority are nobody's
+     * business here; the lookup is what makes this cost a map read rather than a compositor round
+     * trip for each one. It also means it does nothing for a dock this process did not stand up —
+     * an adopted one from a previous manager is in the table, a dock nothing recorded is not.
+     *
+     * Not a poll and not a schedule: it runs when the user's window says it changed, which is the
+     * same grant [collectRepairs] documents.
+     */
+    private suspend fun refreshTabTitle(surface: SurfaceId) {
+        if (config[WmFlags.dockTabTitle] != TabTitleSource.SURFACE) return
+        if (docks.snapshot().entries.none { (_, entry) -> entry.surface == surface }) return
+        treeEdit { applyTabTitle(surface) }
+    }
+
     suspend fun reapOrphans() {
         val cfg = config
         if (cfg[WmFlags.orphanPolicy] != OrphanPolicy.CLOSE) return
@@ -1975,6 +2065,26 @@ class SwayWindowManager(
                 } else {
                     tree().parentOf(dockId.raw)
                 }
+                // Ungated, and **before** the kill, which is where it has to be rather than
+                // where it reads most naturally. A dock whose surface has already gone is the
+                // ordinary reap case, and there the container's only remaining child is the dock
+                // itself — so the kill takes the container with it and a reset issued afterwards
+                // names a node that has stopped existing, which sway refuses and `run` raises. The
+                // whole orphan sweep went red on exactly that.
+                //
+                // What it is for is the container that *survives*: under
+                // `wm.dock.normalize_container_on_detach=false` it stands there holding only the
+                // surface, and a title left on it is frozen at whatever the page said when the
+                // panel closed — a tab that looks right and is lying, which is worse than the
+                // synthetic name it replaced. Where the container does go, this is one round trip
+                // spent on a node about to be collapsed.
+                //
+                // The cost of the early placement is narrow and named: a dock that then refuses to
+                // die leaves a still-standing panel in a container sway has gone back to naming
+                // itself. That is a wedged dock either way, and `wm.dock.wedged_dock_fails_detach`
+                // is what reports it.
+                parent?.takeIf { it.type == CON }?.let { resetTabTitle(SurfaceId(it.id)) }
+
                 // `kill` waits, and holding the tree across that wait is the point: the critical
                 // section must not end over a dock that is still standing, or the next teardown
                 // of it — a second detach, or the next orphan sweep — finds it in the tree and
@@ -2059,6 +2169,15 @@ class SwayWindowManager(
     }
 
     private companion object {
+        /**
+         * sway's `type` for a container, as opposed to a workspace, an output or the root.
+         *
+         * The one question `applyTabTitle` asks before naming a node: `parentOf` a surface with no
+         * dock is its *workspace*, and titling that would put a page title where the workspace
+         * name goes.
+         */
+        private const val CON = "con"
+
         /**
          * How many times an unwind will try to flatten the container it is taking back while the
          * dock it spawned is still unidentified. Two, and the second is what covers a dock that

@@ -166,11 +166,11 @@ jobs:
       # :wm asserts on real compositor behaviour — tree shape, focus memory, what sway does
       # and does not collapse. Headless wlroots needs no GPU, seat, or display, so the runner
       # can host a genuine sway rather than a stub that would only test itself.
-      - name: Install sway and foot
+      - name: Install sway, foot and grim
         id: install-sway
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends sway foot
+          sudo apt-get install -y --no-install-recommends sway foot grim
 
       # The summary script below parses the JUnit XML with a hand-rolled awk program that has to
       # stay mawk-compatible, because mawk is `/usr/bin/awk` here. `summaryMatrixTest` proves
@@ -268,7 +268,7 @@ jobs:
             echo
             echo "| phase | outcome |"
             echo "|---|---|"
-            echo "| install sway and foot | \`${SWAY:-did-not-run}\` |"
+            echo "| install sway, foot and grim | \`${SWAY:-did-not-run}\` |"
             echo "| install extra awks | \`${AWKS:-did-not-run}\` |"
             echo "| install spanreed | \`${SPANREED:-did-not-run}\` |"
             echo "| build and test | \`${GRADLE:-did-not-run}\` |"

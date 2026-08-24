@@ -308,6 +308,42 @@ enum class DetachResidueFailure {
 }
 
 /**
+ * Who names the tab of the container a dock is standing in.
+ *
+ * A tab holding a woken surface is a split container, and sway names one of those out of its own
+ * layout description: `H[chromium awakener-dock]` where the page title used to be (#177). So the
+ * choice is between awakener putting the surface's own title back and the compositor's synthetic
+ * name standing.
+ */
+enum class TabTitleSource {
+    /**
+     * awakener sets the container's title to the surface's own, and keeps it there.
+     *
+     * The default, because it is the behaviour that would have been hard-coded: the tab reads
+     * what it read before the agent was woken, which is the whole of what #177 asks for. It costs
+     * one compositor command per attach, one per restore, and one per title change on a woken
+     * surface — and the last of those is why `wm.events.enabled` matters here: with events off
+     * nothing observes a title change, so the tab holds whatever the title was when the dock went
+     * up. That is a stale title rather than a wrong mechanism, and it is stated rather than
+     * fixed, because attaching a dock deliberately does not depend on the event connection.
+     *
+     * A title the *window* chose is bytes any web page can pick, so what reaches the compositor
+     * is escaped — see `TabTitle`, which is where the injection this would otherwise be lives.
+     */
+    SURFACE,
+
+    /**
+     * Leave the container alone, which is sway's synthetic name and the pre-#177 behaviour.
+     *
+     * Here so the mechanism can be switched off against a live desktop without a rebuild, and
+     * for anyone who would rather see the layout description than a title awakener interpolated.
+     * A detach still resets a container this manager titled, so turning it off does not strand a
+     * title already set.
+     */
+    COMPOSITOR,
+}
+
+/**
  * Runtime switches for the window-management layer.
  *
  * Every one of these is a behaviour that the sway probe on 2026-07-30 showed to be a genuine
@@ -977,6 +1013,48 @@ object WmFlags {
             "adopted ones included, and a teardown that fails is raised once the rest have been " +
             "attempted — the retirement itself still completes, since a wedged panel must not " +
             "leave a collector running.",
+    )
+
+    val dockTabTitle = Flags.enum(
+        "wm.dock.tab_title",
+        TabTitleSource.SURFACE,
+        "Who names the tab of the container a dock stands in. Attaching a dock turns the " +
+            "surface's leaf into a split container, and sway names a container from its own " +
+            "layout description rather than from a window — so the tab that read the page " +
+            "title reads H[chromium awakener-dock] the moment an agent is woken (#177). " +
+            "SURFACE puts the surface's own title back, via sway's title_format, and re-issues " +
+            "it whenever the surface is retitled; it is what the tab showed before the dock " +
+            "existed. Two things follow from where the title comes from. It is interpolated by " +
+            "awakener rather than by %title, which on a container expands to the synthetic name " +
+            "and would reinstate the bug; and it is a string the window's own client chooses, " +
+            "so it is escaped into the compositor command — a title carrying a quote and a " +
+            "semicolon is otherwise an exec, which was measured rather than supposed. Updates " +
+            "ride the change-notification connection, so with wm.events.enabled=false the tab " +
+            "keeps whatever the title was when the dock went up; attaching still works, since " +
+            "attach polls the tree rather than listening. COMPOSITOR leaves the container " +
+            "unnamed and is the behaviour before #177. Either way a detach hands the container " +
+            "back to sway's own naming, so a title this manager set never outlives its dock.",
+    )
+
+    val dockTabTitleFormat = Flags.string(
+        "wm.dock.tab_title.format",
+        TabTitle.TITLE_PLACEHOLDER,
+        "The tab title of a woken surface, with ${TabTitle.TITLE_PLACEHOLDER} standing for the " +
+            "surface's own title. Read only under wm.dock.tab_title=SURFACE. The default is " +
+            "the placeholder alone, so a woken tab is indistinguishable from an unwoken one — " +
+            "which is what #177 asks for and so what an unconfigured system does. It is a flag " +
+            "because the opposite is just as defensible and nobody can be told which they want " +
+            "from here: '* ${TabTitle.TITLE_PLACEHOLDER}' or " +
+            "'${TabTitle.TITLE_PLACEHOLDER} [agent]' marks which tabs hold a woken agent, at " +
+            "the cost of the tab no longer looking like a plain one. sway's own %title and its " +
+            "siblings do not expand in here: the whole rendered string is escaped as one " +
+            "compositor argument, because the half of it the window supplied has to be. A " +
+            "format that never mentions the placeholder is refused rather than accepted — it " +
+            "would put one fixed string on every woken tab, which loses more than it could be " +
+            "meant to gain.",
+        Flags.requires("a format containing ${TabTitle.TITLE_PLACEHOLDER}") {
+            it.contains(TabTitle.TITLE_PLACEHOLDER)
+        },
     )
 
     val eventsEnabled = Flags.boolean(
