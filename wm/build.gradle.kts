@@ -74,7 +74,11 @@ tasks.withType<Test>().configureEach {
     // build cache handing a skipped suite to the very run that set AWAKENER_REQUIRE_SWAY=1 to
     // forbid one. Observed, not theorised: a REQUIRE=1 clean build on a host with sway
     // installed came back in 904ms with skipped=32.
-    inputs.property("swayTooling", toolFingerprint("sway", "foot"))
+    // `grim` is here for the same reason `sway` and `foot` are, and it is not optional to declare
+    // just because one suite uses it: `SwayTabTitleTest` reads a rendered tab back off the
+    // compositor's output, so a cached run from a host without a screenshotter would replay as
+    // this run's result with the only visual assertions in the build silently skipped.
+    inputs.property("swayTooling", toolFingerprint("sway", "foot", "grim"))
     inputs.property("requireSway", System.getenv("AWAKENER_REQUIRE_SWAY").orEmpty())
 
     testLogging {

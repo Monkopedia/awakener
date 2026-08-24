@@ -73,6 +73,27 @@ sealed interface SurfaceChange {
     data class Appeared(override val id: SurfaceId, val surface: Surface) : SurfaceChange
     data class Vanished(override val id: SurfaceId) : SurfaceChange
     data class Focused(override val id: SurfaceId) : SurfaceChange
+
+    /**
+     * The window's title changed, and [title] is what it is now.
+     *
+     * Compositor-agnostic in the way the other three are: a title is a fact about a window, not a
+     * sway concept, and nothing here says how the change was noticed. It is separate from
+     * [Appeared] because it is the *only* change that carries a fresh value for something a
+     * caller may already be displaying — the tab of a woken surface is named from it (#177) — and
+     * folding it into [Appeared] would tell a collector a window it already knows about had just
+     * been created.
+     *
+     * [title] is null where the window has none, which is an honest absence rather than an empty
+     * string: a window that dropped its title and one that set it to `""` are different things,
+     * and only the second is a title.
+     *
+     * **These bytes are the window's own.** Whatever runs in the window picks them — any web page
+     * sets `document.title` — so a consumer that puts this anywhere with a syntax owes that
+     * syntax an escaping. `:connector` calls this class of fact `Trust.WINDOW` and refuses it by
+     * default; `TabTitle` is the escaping for the one consumer inside this module.
+     */
+    data class Retitled(override val id: SurfaceId, val title: String?) : SurfaceChange
 }
 
 /**

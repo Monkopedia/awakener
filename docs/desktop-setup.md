@@ -296,6 +296,12 @@ bindsym --no-repeat $mod+p exec $awk/awakener-invoke reap
 # Optional, cosmetic. With borders off this text only ever appears in the tab
 # bar; it is not part of the setup.
 for_window [app_id="awakener-dock"] title_format "◆ DOCK — %title"
+
+### the colour of a woken tab #################################################
+# NOT optional if you do not want your current tab to grey out the moment you
+# wake an agent. See "A woken tab greys out" below for why awakener cannot set
+# this for you. Copy the three colours from your own `client.focused`.
+client.focused_tab_title #4c7899 #285577 #ffffff
 ```
 
 ### `unbindsym` before every override
@@ -416,6 +422,55 @@ swaymsg -t get_tree | jq -r '.. | objects | select(.app_id != null)
 
 `current_border_width` is not the field either: it stays `2` on a window whose `border` is
 `none`, because it records the width a border *would* have.
+
+### A woken tab greys out, and this is the one line that fixes it
+
+Waking an agent turns the surface's leaf into a **split container** — that is what `attach`
+builds — and sway paints a tab holding a split from a different colour class than a tab holding a
+window. The class is `client.focused_tab_title`. Leave it unset and sway falls back to
+`client.focused_inactive`, so **the tab you are working in renders as inactive from the moment the
+dock appears**. Nothing is wrong; it is a colour class you have never heard of, reached by a
+condition awakener created.
+
+Measured on headless sway 1.12 with `grim`: with the class set to `#285577`, the tab holding the
+split sampled `(40, 85, 119)` — the focused blue — and **only** that tab changed. A leaf tab in the
+same workspace was untouched.
+
+**awakener does not set this, and the reason is that it cannot do so narrowly.** `client.*` is a
+global colour class with no criteria: there is no `for_window` form of it and no per-container
+form. So the only way awakener could "fix" this from code is to issue
+`client.focused_tab_title …` at runtime, which would repaint **every** split container on your
+desktop for the rest of the session, including the ones you built yourself — and would silently
+override a value you had chosen deliberately. Overwriting a user's colour scheme to hide a side
+effect of our own layout is a worse trade than one documented line, so this is the line.
+
+The tab's *text* is a different matter and awakener does handle it: see below.
+
+### A woken tab's title, which awakener manages
+
+The same split container is why a woken tab used to read `H[chromium awakener-dock]` — sway names
+a container from its own layout description, because a container has no title of its own. awakener
+puts the surface's title back with `title_format` on the container, and re-issues it whenever the
+window retitles itself, so a woken tab reads what it read before (#177). What is worth knowing:
+
+- **`wm.dock.tab_title=COMPOSITOR`** turns it off and gives you sway's synthetic name back.
+- **`wm.dock.tab_title.format`** is the template, `{title}` standing for the surface's own title.
+  The default is `{title}` alone, so a woken tab looks like any other. Set it to `* {title}` if you
+  would rather be able to tell at a glance which tabs hold an agent.
+- **A page's title is shown as text, never as markup.** If your `font` line starts `pango:`, sway
+  parses a title bar as pango markup — and sway escapes what it substitutes for `%title` but *not*
+  the literal text of a `title_format`. Since awakener interpolates the title itself, an unescaped
+  one would let any page recolour, resize or hide its own tab, `* ` marker included. awakener
+  neutralises `<` and `&` so the characters the page typed are what you see, in either mode.
+- **A `"` in a page title renders with a backslash in front of it** — `say \"hi\"`. That is sway's
+  own unquoting keeping the escape, and the escape is not optional: a title is chosen by whatever
+  is running in the window, and an unescaped one reaching sway's command parser is `exec`.
+- It follows the title over the change-notification connection, so with `wm.events.enabled=false`
+  a woken tab keeps whatever the title was when the dock went up.
+- **Your sway has to be new enough.** Naming a *container* is refused by **sway 1.9** — `Only views
+  can have a title_format` — and accepted by **1.12**; adolin and kaladin are both on 1.12, Ubuntu
+  noble ships 1.9. On a sway that refuses, the tab keeps sway's synthetic name and everything else
+  works: the refusal is reported, never raised, so it costs the tab's title and not your dock.
 
 ### Optionally, pinning the layout
 
