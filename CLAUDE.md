@@ -500,9 +500,21 @@ From `docs/design.md`; these bind agent work here:
   attach to a real browser profile, `:pairing-mcp` gaining a way for one agent to address
   another's surface, `:bus` gaining an inbound path a local process could inject on, or
   anything running as a daemon against Jason's live desktop. Those are the reaches the tier-3
-  rule was written for, and none of them exists yet — which is exactly why suspending it now
-  costs nothing and why it stops being free the moment one arrives. Say so and re-tier rather
-  than letting the suspension become the permanent state by inertia.
+  rule was written for, and suspending the rule is only free while they are absent — which is
+  why it stops being free the moment one arrives. Say so and re-tier rather than letting the
+  suspension become the permanent state by inertia.
+
+  **The `:chrome` trigger fired on 2026-08-23** — CDP is the adapter, by owner decision
+  (`docs/design.md` Open #6 and `docs/findings/2026-08-23-chromium-cdp-pipe.md`, merged as
+  `30743cd`), so `:chrome` is now a client that attaches to a real browser profile. It was put
+  to Jason as exactly that choice — tier 3 for `:chrome` work, or deliberately stay at tier 2 —
+  and he answered *"no change to tiers for now"*. So the hold here is **considered, not
+  overlooked**, which is the distinction this bullet exists to keep visible. *"For now"* is his
+  word and it is load-bearing: the tier-3 rule is not retired and the trigger is not spent, so
+  raise it again when `:chrome` work makes the reach concrete rather than treating this line as
+  the question having been settled once. **The other three are unfired and unchanged** —
+  `:pairing-mcp` cross-surface addressing, a `:bus` inbound path, a daemon against the live
+  desktop — and each still gets the same treatment on arrival.
 - **Review tiers when the suspension lifts** (re-tiered 2026-07-30 against the real stack; see
   `review-policy.md` in the urithiru fleet config, which is authoritative). `public_api` and
   `breaking_change` are **tier 2** — this is an application, not a published library, so module
