@@ -1,16 +1,19 @@
 package com.monkopedia.awakener.connector
 
 import com.monkopedia.awakener.config.Config
+import com.monkopedia.awakener.config.FilePermissions
 import com.monkopedia.awakener.config.Flags
 import com.monkopedia.awakener.config.InMemoryConfigStore
 import java.nio.file.Files
 import java.nio.file.attribute.PosixFilePermission
+import java.nio.file.attribute.PosixFilePermissions
 import kotlin.io.path.createDirectories
 import kotlin.io.path.exists
 import kotlin.io.path.isExecutable
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.listDirectoryEntries
 import kotlin.io.path.readText
+import kotlin.io.path.getPosixFilePermissions
 import kotlin.io.path.setPosixFilePermissions
 import kotlin.io.path.writeText
 import kotlin.test.AfterTest
@@ -471,6 +474,60 @@ class FileConnectorCatalogTest {
         val listing = catalog().list()
         assertEquals(listOf("x"), listing.connectors.map { it.name })
         assertEquals(emptyList(), listing.broken)
+    }
+
+    /**
+     * A connector writes into the residue directory, beside the accumulated model of the user,
+     * and every file it writes carries this window's title and pid. Measured before this held:
+     * a live run left the residue directory `0700` and every connector file inside it `0644`, so
+     * the containment was entirely somebody else's directory two levels up — which is exactly
+     * the shape of #102, one directory over.
+     */
+    @Test
+    fun `connector files are created private`() {
+        define("x", "a.md" to "a", "deep/b.md" to "b")
+        catalog().apply("x", facts)
+        assertEquals(
+            "rw-------",
+            PosixFilePermissions.toString(residue.resolve("a.md").getPosixFilePermissions()),
+        )
+        assertEquals(
+            "rw-------",
+            PosixFilePermissions.toString(
+                residue.resolve(FileConnectorCatalog.FACTS).getPosixFilePermissions(),
+            ),
+        )
+        assertEquals(
+            "rwx------",
+            PosixFilePermissions.toString(residue.resolve("deep").getPosixFilePermissions()),
+        )
+    }
+
+    @Test
+    fun `an executable connector file is private and still executable`() {
+        define("x", "run.sh" to "#!/bin/sh\n")
+        val source = definitions.resolve("x/run.sh")
+        source.setPosixFilePermissions(
+            Files.getPosixFilePermissions(source) + PosixFilePermission.OWNER_EXECUTE,
+        )
+        catalog().apply("x", facts)
+        assertEquals(
+            "rwx------",
+            PosixFilePermissions.toString(residue.resolve("run.sh").getPosixFilePermissions()),
+        )
+    }
+
+    /** The deployment `FilePermissions.UMASK` exists for: a group meant to read the directory. */
+    @Test
+    fun `UMASK leaves the process umask to decide`() {
+        define("x", "a.md" to "a")
+        catalog { put(ConnectorFlags.permissions, FilePermissions.UMASK) }.apply("x", facts)
+        assertEquals(
+            PosixFilePermissions.toString(
+                Files.getPosixFilePermissions(definitions.resolve("x/a.md")),
+            ),
+            PosixFilePermissions.toString(residue.resolve("a.md").getPosixFilePermissions()),
+        )
     }
 
     @Test

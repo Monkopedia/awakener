@@ -1,13 +1,14 @@
 package com.monkopedia.awakener.connector
 
 import com.monkopedia.awakener.config.Config
+import com.monkopedia.awakener.config.FilePermissions
+import com.monkopedia.awakener.config.PrivateFiles
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.PosixFilePermission
 import kotlin.io.path.Path
 import kotlin.io.path.absolutePathString
-import kotlin.io.path.createDirectories
 import kotlin.io.path.exists
 import kotlin.io.path.isDirectory
 import kotlin.io.path.isExecutable
@@ -17,7 +18,6 @@ import kotlin.io.path.name
 import kotlin.io.path.readText
 import kotlin.io.path.relativeTo
 import kotlin.io.path.setPosixFilePermissions
-import kotlin.io.path.writeText
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
@@ -265,14 +265,20 @@ class FileConnectorCatalog(
                 " to nothing; this window has no such fact and $MANIFEST does not require it"
         }
 
+        val permissions = config[ConnectorFlags.permissions]
         val written = mutableListOf<String>()
         runCatching {
             plan.forEach { (source, destination, rendered) ->
-                destination.parent?.createDirectories()
-                destination.writeText(rendered.text)
-                // The execute bit and nothing else. A connector may ship a helper script, and a
-                // script that arrives non-executable fails as "command not found" — a message
-                // that sends the reader looking for a missing program rather than a mode.
+                // Through `PrivateFiles` rather than `writeText`, so the mode is a creation
+                // attribute rather than a chmod afterwards: a connector's files carry this
+                // window's title and pid, and the interval between "exists" and "is private" is
+                // exactly the interval another local process would need.
+                PrivateFiles.createParentDirectories(destination, permissions)
+                PrivateFiles.writeString(destination, rendered.text, permissions)
+                // The execute bit and nothing else, added to whatever the mode already is. A
+                // connector may ship a helper script, and a script that arrives non-executable
+                // fails as "command not found" — a message that sends the reader looking for a
+                // missing program rather than for a mode bit.
                 if (source.isExecutable()) {
                     runCatching {
                         destination.setPosixFilePermissions(
@@ -283,7 +289,7 @@ class FileConnectorCatalog(
                 }
                 written += destination.absolutePathString()
             }
-            written += writeFacts(target, connector, facts, missing)
+            written += writeFacts(target, connector, facts, missing, permissions)
         }.getOrElse {
             return ConnectorOutcome.Refused(
                 name,
@@ -316,6 +322,7 @@ class FileConnectorCatalog(
         connector: Connector,
         facts: SurfaceFacts,
         missing: List<SurfaceFact>,
+        permissions: FilePermissions,
     ): String {
         fun text(value: String?) = value?.let(::JsonPrimitive) ?: JsonNull
         val json = JsonObject(
@@ -337,9 +344,17 @@ class FileConnectorCatalog(
             ),
         )
         val out = target.resolve(FACTS)
-        out.parent?.createDirectories()
+        PrivateFiles.createParentDirectories(out, permissions)
         val staging = out.resolveSibling("${out.name}.tmp")
-        staging.writeText(PRETTY.encodeToString(JsonObject.serializer(), json))
+        PrivateFiles.writeString(
+            staging,
+            PRETTY.encodeToString(JsonObject.serializer(), json),
+            permissions,
+        )
+        // Through a staging file and a rename, so an agent reading this while a second press is
+        // rewriting it sees one press's answer or the other's and never half of either. The
+        // residue directory is the agent's working directory, so a concurrent reader is the
+        // ordinary case rather than a contrived one.
         Files.move(staging, out, StandardCopyOption.REPLACE_EXISTING)
         return out.absolutePathString()
     }

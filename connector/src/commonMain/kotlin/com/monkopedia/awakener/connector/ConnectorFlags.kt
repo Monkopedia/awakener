@@ -1,5 +1,6 @@
 package com.monkopedia.awakener.connector
 
+import com.monkopedia.awakener.config.FilePermissions
 import com.monkopedia.awakener.config.Flags
 
 /** What happens when a connector needs a fact about the window and awakener does not have it. */
@@ -164,6 +165,31 @@ object ConnectorFlags {
             "invocation, since a panel that comes up without the tool you asked for looks " +
             "exactly like one that came up with it; IGNORE stands the panel up and warns, for a " +
             "connector.default shared across machines where only some have the definition.",
+    )
+
+    /**
+     * What permissions a connector's files and directories are created with.
+     *
+     * `OWNER_ONLY` by default, and the same enum `:config` and `:registry` already share rather
+     * than a third convention: a connector writes **into the residue directory**, beside the
+     * accumulated model of the user, and every file it writes carries this window's title and
+     * pid. Measured on a live run before this flag existed — the residue directory was `0700`
+     * and every connector file inside it `0644`, so the containment was entirely somebody
+     * else's `0700` two levels up. That is exactly the argument `FilePermissions` was written
+     * for (#102), one directory over.
+     *
+     * `UMASK` for the same deployment [FilePermissions.UMASK] exists for: a group or a backup
+     * agent that is meant to read the state directory.
+     */
+    val permissions = Flags.enum(
+        "connector.permissions",
+        FilePermissions.OWNER_ONLY,
+        "What permissions a connector's materialised files and directories are created with. " +
+            "OWNER_ONLY writes 0600 on files and 0700 on directories, as a creation attribute " +
+            "rather than a chmod afterwards, because a connector writes into the residue " +
+            "directory and its files carry this window's title and pid; UMASK is whatever the " +
+            "process umask leaves, for a deployment that means a group to read the state " +
+            "directory. Matches registry.store.permissions and config.store.permissions.",
     )
 
     /**

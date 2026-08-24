@@ -66,10 +66,30 @@ CDP has two transports and awakener can use neither by fiat:
 - **`--remote-debugging-port`** can be reached by anything else on the machine that can open a
   socket, which is why it is only ever acceptable against a dedicated throwaway profile.
 
-**This connector uses port mode, and refuses when the port is not this window's.** `cdp.sh`
-checks `/proc/{pid}/cmdline` for `--remote-debugging-port=$AWAKENER_CDP_PORT` (default 9222)
-before it talks to anything. A listening 9222 that this pid did not open belongs to some other
-browser, and driving it would be worse than doing nothing.
+**This connector uses port mode, and establishes the port from the browser rather than being told
+it.** `./cdp.sh` reads `/proc/{pid}/cmdline` — that pid is the one the compositor reports for
+*this* window — and takes two things out of it: `--user-data-dir=`, which gives this window's
+profile, and `--remote-debugging-port=`. If the profile holds a `DevToolsActivePort`, that wins,
+because it is written by the browser *after* it has bound and so names the port it is on rather
+than the port it was asked for.
+
+**Both sources are needed, and that is measured rather than defensive.** Chromium 151 writes no
+`DevToolsActivePort` at all when given an explicit port — checked against a live browser that was
+demonstrably serving CDP on 9333 — so a check that consulted only the file would refuse every
+explicitly-ported browser there is. It *does* write it for `--remote-debugging-port=0`, which is
+the shape a supervisor should prefer, and which the command line cannot answer.
+
+A listening 9222 that this pid did not open belongs to some other browser, and driving it would be
+worse than doing nothing. `AWAKENER_CDP_PORT` overrides, and is cross-checked rather than trusted:
+if it disagrees with what this window's browser reports, `cdp.sh` refuses instead of picking one.
+
+It also refuses a browser running with **no** `--user-data-dir`, which is the everyday profile.
+
+One thing that will trip you up if you go poking at this by hand: **`/proc/<pid>/cmdline` is not
+reliably NUL-separated for Chromium.** It rewrites its own argv, so on 151.0.7922.173 it comes back
+as one space-separated line — which means a per-argument match against it silently finds nothing on
+a browser that was launched with exactly the flag you are looking for. Measured; it is why
+`cdp.sh` normalises with `tr` and strips prefixes rather than splitting words.
 
 If the check fails, say so and offer the relaunch — do not go looking for another way in:
 

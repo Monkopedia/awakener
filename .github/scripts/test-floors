@@ -106,12 +106,16 @@
 # reader ever did — #143 is the code-health pass filing that fact rather than a person. The
 # note was narrowed instead, and the rule that replaced the remedy is at the top of this file.
 #
-# `connector` is new with the connector feature and its floor is stated rather than derived from
-# a merged tree, for the reason the head of this file gives: a count read off a feature branch
-# describes a tree `main` has not got. It is set to the number that branch measured, so it starts
-# as a real floor rather than a `0` that constrains nothing.
+# `connector` is new with the connector feature, and its floor is the count that branch measured:
+# 54, read out of `connector/build/test-results/jvmTest/*.xml` after `--rerun-tasks`
+# (FileConnectorCatalogTest 38, RenderTest 8, ShippedConnectorsTest 8; skipped=0, failures=0).
+# The head of this file warns that a count off a feature branch describes a tree `main` has not
+# got — that warning is about a floor being *raised* past what the merged tree runs, and it cannot
+# bite here: no commit on `main` contains this module, so nothing `main` has done since can have
+# removed a test from it. A `0` would have been the safe-looking answer and would have constrained
+# nothing at all.
 cli 60
 config 64
-connector 24
+connector 54
 registry 109
 wm 114
