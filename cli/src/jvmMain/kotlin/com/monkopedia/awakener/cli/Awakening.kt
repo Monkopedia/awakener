@@ -2,6 +2,11 @@ package com.monkopedia.awakener.cli
 
 import com.monkopedia.awakener.config.Config
 import com.monkopedia.awakener.config.ConfigStore
+import com.monkopedia.awakener.connector.ConnectorCatalog
+import com.monkopedia.awakener.connector.ConnectorFlags
+import com.monkopedia.awakener.connector.ConnectorListing
+import com.monkopedia.awakener.connector.ConnectorOutcome
+import com.monkopedia.awakener.connector.SurfaceFacts
 import com.monkopedia.awakener.registry.AgentBus
 import com.monkopedia.awakener.registry.AgentId
 import com.monkopedia.awakener.registry.Binding
@@ -36,6 +41,13 @@ sealed interface Awakened {
         val dock: DockHandle,
         /** Whether this invocation is what first gave the surface an agent. */
         val minted: Boolean,
+        /**
+         * What the connector did, if one was selected.
+         *
+         * [ConnectorOutcome.None] is the unconfigured answer and is the default, so a caller
+         * that never heard of connectors reads exactly what it read before they existed.
+         */
+        val connector: ConnectorOutcome = ConnectorOutcome.None,
     ) : Awakened
 
     /**
@@ -70,6 +82,29 @@ sealed interface Awakened {
         val surface: SurfaceId,
         val key: SurfaceKey,
         val dock: DockHandle,
+    ) : Awakened
+
+    /**
+     * A connector was asked for and could not be applied, so no panel was stood up.
+     *
+     * **Withholding the panel is the decision, and it is deliberate.** The tempting alternative
+     * — stand it up anyway, print the warning — produces an agent that looks exactly like a
+     * connected one and is not, in a window the user is about to ask it to act on. Every fact
+     * awakener can hand a connector is measured to be non-unique on its own (see
+     * [ConnectorCatalog]), so "connected to something" is a real possible outcome of proceeding,
+     * and it is worse than not coming up.
+     *
+     * The binding survives. It was minted before this point for the reason [Awakening] already
+     * states about a failed attach, and the retry recalls it rather than stranding its residue.
+     *
+     * `connector.unknown=IGNORE` is the escape hatch for the one case where the opposite answer
+     * is right: a `connector.default` that is only installed on some machines.
+     */
+    data class ConnectorRefused(
+        val surface: SurfaceId,
+        val key: SurfaceKey,
+        val binding: Binding,
+        val refusal: ConnectorOutcome.Refused,
     ) : Awakened
 
     /** There was nothing to act on. The ordinary answer to a hotkey on an empty workspace. */
@@ -115,6 +150,19 @@ class Awakening(
     private val registry: BindingStore,
     private val bus: AgentBus,
     private val store: ConfigStore,
+    /**
+     * Where connector definitions come from, and what applies one.
+     *
+     * A collaborator rather than a lambda — unlike [prepareResidue] and friends, which are
+     * lambdas because only a *concrete* store or compositor can answer them. A catalog is
+     * already compositor-agnostic and store-agnostic by construction: it is handed
+     * [com.monkopedia.awakener.connector.SurfaceFacts], which is strings.
+     *
+     * Defaults to one that finds nothing and applies nothing, which is what makes every
+     * existing construction site — and every test written before connectors existed — mean
+     * exactly what it meant.
+     */
+    private val connectors: ConnectorCatalog = NoConnectors,
     /**
      * Creates this surface's residue location. A lambda because only the concrete store can —
      * `prepareResidue` is `FileBindingStore`'s, and an in-memory store has nothing to create.
@@ -178,7 +226,10 @@ class Awakening(
      * one read is deliberate. A hotkey press is one operation and must act on one set of
      * values, and it would still have to whether or not this process were following the file.
      */
-    suspend fun invoke(target: SurfaceId? = null): Awakened {
+    suspend fun invoke(
+        target: SurfaceId? = null,
+        connector: ConnectorChoice = ConnectorChoice.FromConfig,
+    ): Awakened {
         val cfg = config
         val surfaces = wm.surfaces()
         val surface = if (target == null) {
@@ -237,10 +288,40 @@ class Awakening(
             return Awakened.AlreadyAnimated(surface.id, key, binding)
         }
 
+        val residue = registry.residueLocation(key)
+
+        // Before the attach, so the dock command's process finds the connector's files already
+        // in its working directory. That ordering is the whole of "starts up claude code with
+        // initial data": there is no message to deliver and no protocol to speak, because the
+        // agent's cwd is the residue directory and the files are simply there when it opens it.
+        //
+        // After the bind, because a connector is told which agent it belongs to, and after
+        // `prepareResidue`, because it writes into the directory that call creates.
+        val applied = connectors.apply(
+            when (connector) {
+                is ConnectorChoice.FromConfig -> cfg[ConnectorFlags.default].ifEmpty { null }
+                is ConnectorChoice.None -> null
+                is ConnectorChoice.Named -> connector.name
+            },
+            SurfaceFacts(
+                surfaceId = surface.id.raw,
+                appId = surface.appId,
+                title = surface.title,
+                pid = surface.pid,
+                surfaceKey = key.canonical,
+                agentId = binding.agentId,
+                agentName = binding.spanreedName,
+                residue = residue,
+            ),
+        )
+        if (applied is ConnectorOutcome.Refused) {
+            return Awakened.ConnectorRefused(surface.id, key, binding, applied)
+        }
+
         val command = cfg[InvokeFlags.dockCommand]
             .replace(AGENT_NAME, binding.spanreedName)
             .replace(AGENT_ID, binding.agentId)
-            .replace(RESIDUE, registry.residueLocation(key))
+            .replace(RESIDUE, residue)
 
         // The agent is handed to `attach` rather than left for it to work out. Its own bind is
         // then a recall of the row this method just wrote, so the identity baked into the command
@@ -251,8 +332,11 @@ class Awakening(
             DockSpec(cfg[InvokeFlags.dockAppId], command),
             binding.agent,
         )
-        return Awakened.Animated(surface.id, key, binding, dock, minted = wasADrab)
+        return Awakened.Animated(surface.id, key, binding, dock, wasADrab, applied)
     }
+
+    /** Every connector definition on the search path, and the directories that nearly are one. */
+    fun connectors(): ConnectorListing = connectors.list()
 
     /** Takes down docks whose surface has gone. See [reapOrphans]. */
     suspend fun reap() = reapOrphans()
@@ -263,4 +347,39 @@ class Awakening(
         const val AGENT_ID = "{agent_id}"
         const val RESIDUE = "{residue}"
     }
+}
+
+/** Which connector an invocation applies. */
+sealed interface ConnectorChoice {
+    /**
+     * Whatever `connector.default` says, which unconfigured is none.
+     *
+     * The default value of the parameter, so a caller that has never heard of connectors gets
+     * the configured behaviour rather than a hard-coded one.
+     */
+    data object FromConfig : ConnectorChoice
+
+    /**
+     * None, whatever the flag says — `awakener-invoke invoke --no-connector`.
+     *
+     * Its own value rather than `Named("")`, because "the user asked for no connector" and "the
+     * user did not say" are different requests that happen to agree on an unconfigured machine.
+     */
+    data object None : ConnectorChoice
+
+    /** This one — `--connector chromium`. */
+    data class Named(val name: String) : ConnectorChoice
+}
+
+/**
+ * The catalog an [Awakening] has when nobody gave it one: nothing is installed, nothing applies.
+ *
+ * Not merely a test double. It is what makes the no-connector path *structurally* identical to
+ * the path that existed before this feature — [ConnectorOutcome.None] is returned without any
+ * filesystem access at all, so an unconfigured invocation cannot be slowed down, cannot warn,
+ * and cannot fail for a reason connectors introduced.
+ */
+private object NoConnectors : ConnectorCatalog {
+    override fun list() = ConnectorListing(emptyList(), emptyList(), emptyList())
+    override fun apply(name: String?, facts: SurfaceFacts) = ConnectorOutcome.None
 }

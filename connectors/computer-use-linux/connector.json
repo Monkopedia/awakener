@@ -1,0 +1,6 @@
+{
+  "description": "AT-SPI reach for this window. PROVISIONAL and NOT WIRED: carries facts and rules only, because the audited server cannot be scoped to one window.",
+  "requires": ["pid", "title"],
+  "provisional": true,
+  "provisional_reason": "the 2026-08-23 audit of agent-sh/computer-use-linux found its acting tools unscopable to a window (perform_action/set_value/drag take no window parameter and resolve against a server-wide cache) and its window backend non-functional on sway, so this definition deliberately wires no MCP server: it carries the surface facts and the rules a proxy would have to hold"
+}

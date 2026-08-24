@@ -114,6 +114,16 @@ fun launcher(name: String, mainClass: String): String =
     # loop above never fires, and a logical `cd link/..` lands outside the install tree.
     APP_HOME=${'$'}(CDPATH= cd -P -- "${'$'}{app_dir:-.}/.." && pwd)
 
+    # Where the connector definitions shipped with this build live. Exported rather than passed
+    # as a flag because it is the *install layout*, which is this script's knowledge and nobody
+    # else's: deriving it inside the JVM from the code source location works for a jar in lib/
+    # and silently yields nothing for a test classpath, a fat jar or an IDE run — an answer
+    # indistinguishable from "no connectors are installed". Respects an existing value, so a
+    # deployment that lays the definitions down elsewhere is one environment variable away, and
+    # `connector.dir` overrides both.
+    AWAKENER_CONNECTORS=${'$'}{AWAKENER_CONNECTORS:-${'$'}APP_HOME/connectors}
+    export AWAKENER_CONNECTORS
+
     # Java 21 or newer, checked against whichever branch below chose the JVM rather than only
     # the last one. JAVA_HOME is ambient — distro profiles, sdkman/jenv and IDE-launched
     # shells all set it, often to something older — so it is no more a deliberate 21 than PATH
@@ -194,6 +204,18 @@ val installDist by tasks.registering(Sync::class) {
     into("bin") {
         from(launchers)
         filePermissions { unix("rwxr-xr-x") }
+    }
+    // The connector definitions, which are data and live at the repository root rather than
+    // inside any module — a connector is a directory that awakener renders and never compiles,
+    // so putting them under a module's `src` would imply a relationship that does not exist.
+    // The launcher points $AWAKENER_CONNECTORS here.
+    into("connectors") {
+        from(rootProject.layout.projectDirectory.dir("connectors"))
+        // A connector may ship a helper script, and `chromium` does. Gradle's Sync does not
+        // carry the source mode across on every filesystem, and a script that arrives
+        // non-executable fails as "command not found" — a message that sends the reader looking
+        // for a missing program rather than for a mode bit.
+        filesMatching("**/*.sh") { permissions { unix("rwxr-xr-x") } }
     }
 }
 

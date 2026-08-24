@@ -284,6 +284,15 @@ Planned module boundaries, from `docs/design.md`:
 - `:pairing-mcp` — read-on-demand surface tools, via the official Kotlin MCP SDK.
 - `:chrome` — CDP client; needs a dedicated Chrome profile, because anything that can reach
   the debugging port can drive a logged-in browser.
+- `:connector` — a **connector** is a named directory of data describing how an agent reaches
+  its own window: the tool to make available, a skill/markdown telling it how, and the surface
+  facts the tool needs to be pointed at that window. Definitions are discovered at runtime from
+  `connector.dir`, rendered with `{pid}`/`{title}`/`{app_id}`/… substituted, and copied into the
+  surface's residue directory — which is the agent's working directory. **There is no
+  hard-coded list of connector names anywhere**; adding one is adding a directory, and if you
+  ever find yourself branching on a connector's name the design has been lost. It depends on
+  `:config` alone, so a connector cannot reach a compositor type. `connectors/README.md` is the
+  format, and it carries the disambiguation rule every definition has to state.
 - `:cli` — entry points that need the whole flag set (`awakener-config`), and **the only
   module allowed to depend on every other one**. That dependency is what puts every
   flag-declaring class on one classpath; a `main` in a module that cannot see them enumerates
