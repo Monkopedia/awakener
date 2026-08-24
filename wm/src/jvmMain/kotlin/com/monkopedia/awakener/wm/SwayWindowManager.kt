@@ -9,6 +9,7 @@ import com.monkopedia.awakener.registry.SurfaceKey
 import com.monkopedia.awakener.registry.asIdentity
 import java.io.File
 import java.security.SecureRandom
+import kotlin.math.abs
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.TimeSource
 import kotlinx.coroutines.CancellationException
@@ -929,13 +930,40 @@ class SwayWindowManager(
         /**
          * Brings a hidden dock back beside [surface], with its configured side and width.
          *
-         * **Three commands, not one, and each of the extra two is a measurement rather than
+         * **Four commands, not one, and each of the extra three is a measurement rather than
          * defensiveness.** `scratchpad show` returns the window *floating* — `type=floating_con`,
          * `floating=user_on`, centred at whatever size the scratchpad kept — so a restore that
          * stopped there would leave the panel hovering over the surface instead of docked beside
          * it. And `floating disable` re-tiles the window next to whatever is **focused**, not next
          * to where it came from, so the surface has to be focused first or the dock reattaches in
          * a stranger's tab. Both on headless sway 1.12.
+         *
+         * **They go out as one IPC message, and that is #172.** sway executes a `;`-separated
+         * sequence in a single `RUN_COMMAND` from end to end before it presents anything, whereas
+         * a separate round trip per command presents each half-finished layout to the user.
+         * Measured on headless sway 1.12 by sampling the dock's geometry continuously across a run
+         * of restores, with the un-batched sequence and this one as the only difference: unbatched,
+         * **39 of 218 readings** were an intermediate layout — 23 with the panel visible, floating
+         * and centred over the surface, 16 with it tiled 50/50 — against **0 of 170** batched. #172
+         * reports the same thing for a single restore, at 84 floating and 1 tiled out of 400.
+         * Jason reported it as *"a bit of a flicker in the toggle"*, and the flicker is a real
+         * layout that reached the screen rather than a rendering artefact.
+         *
+         * The order inside the batch is the order the separate commands ran in, `scratchpad show`
+         * first and the surface focused between it and `floating disable`. That is deliberate: the
+         * show focuses the window it reveals, so focusing the surface *before* it would leave the
+         * dock focused at the moment `floating disable` picks a neighbour, which is the failure
+         * `a restore lands beside its own surface and not beside whatever is focused` covers.
+         *
+         * **The wait that used to sit mid-sequence cannot survive that, so it is now a readback of
+         * the outcome** — see [restoreFault]. It asks a strictly stronger question than the poll
+         * it replaces: that one established only that the window had left the scratchpad and said
+         * nothing about where it landed, so a `floating disable` that never took would have passed
+         * it. The two focus flags stay outside the batch, and only they: [settleFocus] is *defined*
+         * by a tree read — it refuses to focus a target that has left the tree — so it cannot be
+         * written as a blind command, and neither it nor [WmFlags.dockFocusOnShow] may run before
+         * the readback has confirmed there is a restored dock to focus. Neither changes geometry,
+         * which is what the sampling above measures.
          *
          * The `con_id` is what every command here targets. Under the default
          * [WmFlags.dockIdentity] every dock reports the same `app_id`, so once two docks can be
@@ -944,21 +972,66 @@ class SwayWindowManager(
         suspend fun showDock(surface: SurfaceId, dock: SurfaceId): Boolean {
             if (!inScratchpad(dock)) return false
             val cfg = config
-            run("[con_id=${dock.raw}] scratchpad show")
-            check(pollTree(cfg[WmFlags.unmapWaitMs]) { if (!inScratchpad(dock)) true else null } == true) {
-                "dock ${dock.raw} was still in the scratchpad ${cfg[WmFlags.unmapWaitMs]}ms " +
-                    "after it was shown"
+            val sizePpt = cfg[WmFlags.dockSizePpt]
+            val restore = buildList {
+                add("[con_id=${dock.raw}] scratchpad show")
+                // Before `floating disable`, because that re-tiles beside the focused node.
+                add("[con_id=${surface.raw}] focus")
+                add("[con_id=${dock.raw}] floating disable")
+                // The same two commands attach ends with, because a restore owes the caller the
+                // dock's configured geometry back: the scratchpad keeps neither side nor width.
+                if (cfg[WmFlags.dockSide] == DockSide.LEFT) add("[con_id=${dock.raw}] move left")
+                add("[con_id=${dock.raw}] resize set width $sizePpt ppt")
+            }.joinToString("; ")
+            run(restore)
+
+            // Held from inside the poll rather than re-read after it: a diagnosis taken once the
+            // deadline has expired races a tree that may have settled in the meantime, and would
+            // report "nothing wrong" for the run that just failed.
+            var fault: String? = null
+            val landed = pollTree(cfg[WmFlags.unmapWaitMs]) {
+                fault = restoreFault(dock, sizePpt)
+                if (fault == null) true else null
+            } == true
+            check(landed) {
+                "dock ${dock.raw} was not docked beside surface ${surface.raw} " +
+                    "${cfg[WmFlags.unmapWaitMs]}ms after the restore went out: $fault"
             }
-            // Before `floating disable`, because that command re-tiles beside the focused node.
-            focus(surface)
-            run("[con_id=${dock.raw}] floating disable")
-            // The same two lines attach ends with, because a restore owes the caller the dock's
-            // configured geometry back: the scratchpad keeps neither the side nor the width.
-            if (cfg[WmFlags.dockSide] == DockSide.LEFT) run("[con_id=${dock.raw}] move left")
-            run("[con_id=${dock.raw}] resize set width ${cfg[WmFlags.dockSizePpt]} ppt")
+
             if (cfg[WmFlags.dockFocusOnShow]) focus(dock)
             if (cfg[WmFlags.restoreFocusAfterShow]) settleFocus(surface, dock)
             return true
+        }
+
+        /**
+         * What is wrong with [dock] as a restored dock, or null when nothing is.
+         *
+         * Three questions in the order that makes each one's answer mean something, because sway
+         * reports a `percent` for a floating window too — 0.37 for a panel hovering over the
+         * surface, measured on 1.12 — and none at all for one in the scratchpad. So a width test
+         * on its own would pass a dock that never re-tiled.
+         *
+         * The tolerance is not slack. `resize set width 30 ppt` reads back as
+         * `0.29999999999999999`, and the layouts this is here to reject are nowhere near: the
+         * 50/50 sway leaves behind when only `floating disable` has run is `0.5`.
+         */
+        private suspend fun restoreFault(dock: SurfaceId, sizePpt: Int): String? {
+            val tree = tree()
+            val node = tree.find(dock.raw) ?: return "it is not in the tree at all"
+            if (tree.workspace(SCRATCH_WORKSPACE)?.find(dock.raw) != null) {
+                return "it is still in the scratchpad"
+            }
+            if (node.type == FLOATING_CON) {
+                return "it is floating over the surface rather than tiled beside it"
+            }
+            val percent = node.percent
+                ?: return "sway reports no width fraction for it, so it is in no tiled container"
+            val wanted = sizePpt / 100.0
+            if (abs(percent - wanted) > PPT_TOLERANCE) {
+                return "it is ${percent * 100}% of its container wide rather than the " +
+                    "configured $sizePpt%"
+            }
+            return null
         }
 
         /**
@@ -2021,6 +2094,24 @@ class SwayWindowManager(
          * which models sway's tree but is shared with `commonMain`.
          */
         const val SCRATCH_WORKSPACE = "__i3_scratch"
+
+        /**
+         * The `type` sway gives a node that is floating rather than tiled.
+         *
+         * A fact about the compositor like [SCRATCH_WORKSPACE], and the one a restore reads back:
+         * a panel that came out of the scratchpad and was never re-tiled is `type=floating_con`,
+         * `floating=user_on`, centred over the surface. Measured on 1.12.
+         */
+        const val FLOATING_CON = "floating_con"
+
+        /**
+         * How far [Node.percent] may sit from the configured fraction and still count as landed.
+         *
+         * Half a percentage point. It absorbs the double sway reports — 30 ppt comes back as
+         * `0.29999999999999999` — and nothing else: the intermediate layouts a restore has to
+         * reject differ by tens of points, not by a rounding error.
+         */
+        const val PPT_TOLERANCE = 0.005
 
         /**
          * The source spawn tokens are drawn from.

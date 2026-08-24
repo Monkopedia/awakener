@@ -17,6 +17,20 @@ data class Node(
     @SerialName("app_id") val appId: String? = null,
     val pid: Int? = null,
     val focused: Boolean = false,
+    /**
+     * The fraction of its parent this node occupies, or null where sway reports none.
+     *
+     * The readback for `resize set width <n> ppt`, which is the only reason it is modelled: a
+     * restore has to be able to assert that the dock *landed* at its configured width rather than
+     * that the command was accepted. sway reports it as a double, so `0.29999999999999999` is what
+     * 30 ppt comes back as and a comparison against it has to carry a tolerance.
+     *
+     * Null in two cases that both matter here: a window in the scratchpad has no parent to be a
+     * fraction of, and a `floating_con` reports whatever fraction it last had rather than one that
+     * means anything. So this is never on its own enough to say a dock is docked — see
+     * [SwayWindowManager] `restoreFault`, which asks about the scratchpad and about [type] first.
+     */
+    val percent: Double? = null,
     val marks: List<String> = emptyList(),
     val nodes: List<Node> = emptyList(),
     @SerialName("floating_nodes") val floatingNodes: List<Node> = emptyList(),
