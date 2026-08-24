@@ -142,10 +142,48 @@ object AwakenerInvokeCli {
     private fun named(name: String): ConnectorChoice? =
         if (ConnectorFlags.isConnectorName(name)) ConnectorChoice.Named(name) else null
 
+    /**
+     * One line, safe to print, for a string whose bytes the window chose.
+     *
+     * `awakener-invoke list` prints an `app_id` and a `SurfaceKey`, and both carry whatever the
+     * program owning the window declared — `SurfaceKey.escapeSegment` escapes `%` and `:` and
+     * passes newlines through, because its job is injectivity rather than safety. A window whose
+     * `app_id` is four lines of Markdown therefore rendered as four lines of this command's
+     * output, one of them beginning `# NEW INSTRUCTIONS FOR THE AGENT`.
+     *
+     * That is the same class `connector.window_facts` closes for rendered files, one layer over:
+     * a hotkey press writes to a terminal, but `awakener-invoke list` is exactly the command an
+     * agent runs to find out what is on the desktop, and its stdout is then something an agent
+     * reads. Found by re-running the reviewer's own payload against the fixed build rather than
+     * by being told, which is the argument for fixing a class rather than a case.
+     *
+     * Not a flag. A one-line-per-surface listing that a window can turn into four lines is wrong
+     * for a human reader too, so there is no second behaviour to offer — this is the report being
+     * correct rather than a choice about it.
+     */
+    internal fun oneLine(value: String): String = buildString(value.length) {
+        value.forEach { c ->
+            when {
+                c == '\\' -> append("\\\\")
+                c == '\n' -> append("\\n")
+                c == '\r' -> append("\\r")
+                c == '\t' -> append("\\t")
+                // C0 and DEL, escaped as `\xNN` rather than dropped: the value stays reversible,
+                // so two surfaces differing only in a control character still print differently.
+                // This is a listing people match windows against.
+                c.code < 0x20 || c.code == 0x7F -> append("\\x%02X".format(c.code))
+                else -> append(c)
+            }
+        }
+    }
+
     private fun report(standing: Standing, out: (String) -> Unit) {
         val focus = if (standing.surface.focused) "* " else "  "
-        out("$focus${standing.surface.id.raw}  ${standing.surface.appId ?: "(no app_id)"}")
-        out("    ${standing.key.canonical}")
+        out(
+            "$focus${standing.surface.id.raw}  " +
+                (standing.surface.appId?.let(::oneLine) ?: "(no app_id)"),
+        )
+        out("    ${oneLine(standing.key.canonical)}")
         out(
             "    " + when (val binding = standing.binding) {
                 // The vocabulary is load-bearing: a Drab is a window with nothing bound to it,
@@ -161,7 +199,7 @@ object AwakenerInvokeCli {
         is Awakened.Animated -> {
             out(
                 (if (awakened.minted) "minted " else "recalled ") +
-                    "${awakened.binding.agentId} for ${awakened.key.canonical}",
+                    "${awakened.binding.agentId} for ${oneLine(awakened.key.canonical)}",
             )
             out("  SPANREED_AGENT_NAME=${awakened.binding.spanreedName}")
             out("  dock ${awakened.dock.dockId.raw} beside surface ${awakened.surface.raw}")
@@ -171,7 +209,7 @@ object AwakenerInvokeCli {
 
         is Awakened.AlreadyAnimated -> {
             out("${awakened.binding.agentId} is already animated; standing no second panel")
-            out("  ${awakened.key.canonical}")
+            out("  ${oneLine(awakened.key.canonical)}")
             // Zero, not a failure: the hotkey did exactly what the flag asked of it.
             0
         }
@@ -198,9 +236,12 @@ object AwakenerInvokeCli {
         is Awakened.ConnectorRefused -> {
             out(
                 "connector '${awakened.refusal.name}' refused, so no panel was stood up: " +
-                    awakened.refusal.reason,
+                    oneLine(awakened.refusal.reason),
             )
-            out("  ${awakened.key.canonical} stays bound to ${awakened.binding.agentId}")
+            out(
+                "  ${oneLine(awakened.key.canonical)} stays bound to " +
+                    awakened.binding.agentId,
+            )
             // Distinct from 1 (nothing to awaken) and 2 (bad usage): the surface was found, the
             // agent was recalled, and the one thing that did not happen is the connector.
             3

@@ -220,24 +220,20 @@ class FileConnectorCatalog(
 
         val windowPolicy = config[ConnectorFlags.windowFacts]
 
-        // **Two maps, and conflating them is a bug this had for one test run.** `available` is
-        // what awakener *knows* about the window; `values` is what may be *substituted into a
-        // file*. `requires` asks the first question — chromium requires `title` because the title
-        // is its join column, and it reads it from surface.json precisely because it may not be
-        // rendered. Withholding window facts from the map the requires-check consulted made every
-        // shipped connector report its own join column as missing and refuse.
+        // **What awakener knows, which is not the same as what may be written down.** `requires`
+        // asks whether awakener *has* the fact — chromium requires `title` because the title is
+        // its join column, and it reads it from surface.json precisely because a window-chosen
+        // fact may not be rendered. Filtering this map by trust made every shipped connector
+        // report its own join column as missing and refuse; the trust rule belongs in `render`.
         val available = LinkedHashMap<SurfaceFact, String>()
         SurfaceFact.entries.forEach { fact -> facts.value(fact)?.let { available[fact] = it } }
         available[SurfaceFact.CONNECTOR] = connector.name
         available[SurfaceFact.CONNECTOR_DIR] = connector.dir
 
-        val values = LinkedHashMap(available)
-        if (windowPolicy == WindowFacts.REFUSE) {
-            // Withheld here as well as refused at load, and the redundancy is the point: this is
-            // the last line that decides whether window-chosen bytes can reach a rendered file,
-            // so it does not depend on the scan at load having been right.
-            SurfaceFact.windowChosen.forEach { values.remove(it) }
-        }
+        // Not a filtered copy of `available`. The trust rule is enforced inside `render`, which
+        // is the one function that emits bytes, so it holds whatever this map contains and can be
+        // unit-tested on its own — see the note on `render`'s `allowWindowFacts`.
+        val allowWindowFacts = windowPolicy == WindowFacts.RENDER_RAW
         if (windowPolicy == WindowFacts.RENDER_RAW && connector.windowFacts.isNotEmpty()) {
             warnings += "connector '$name' is rendering window-chosen bytes into " +
                 connector.windowFacts.entries.joinToString("; ") { (file, facts) ->
@@ -333,7 +329,7 @@ class FileConnectorCatalog(
                     ExistingFile.REPLACE -> Unit
                 }
             }
-            val rendered = runCatching { render(source.readText(), values) }
+            val rendered = runCatching { render(source.readText(), available, allowWindowFacts) }
                 .getOrElse {
                     return ConnectorOutcome.Refused(
                         name,

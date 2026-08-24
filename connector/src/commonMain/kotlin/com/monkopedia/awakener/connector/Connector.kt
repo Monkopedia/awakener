@@ -194,9 +194,16 @@ fun windowFactsIn(template: String): List<SurfaceFact> =
  * @param values what each fact expands to. A fact absent from the map expands to the empty
  * string; deciding whether that is acceptable is [ConnectorFlags.missingFact]'s and has already
  * happened by the time this is called.
+ * @param allowWindowFacts whether a [Trust.WINDOW] fact may be emitted at all. False — the
+ * default, and what [WindowFacts.REFUSE] passes — makes this function structurally incapable of
+ * putting bytes the window chose into a file, whatever is in [values].
  * @return the rendered text, and every fact whose placeholder was present but had no value.
  */
-fun render(template: String, values: Map<SurfaceFact, String>): Rendered {
+fun render(
+    template: String,
+    values: Map<SurfaceFact, String>,
+    allowWindowFacts: Boolean = false,
+): Rendered {
     val out = StringBuilder(template.length)
     val absent = LinkedHashSet<SurfaceFact>()
     var i = 0
@@ -217,7 +224,13 @@ fun render(template: String, values: Map<SurfaceFact, String>): Rendered {
             continue
         }
         out.append(template, i, open)
-        val value = values[fact]
+        // The policy lives here rather than in the map handed in, and that placement is the
+        // point. It used to be a `remove` in the caller, which made it defence-in-depth that no
+        // test could observe: the load-time scan refuses such a connector first, so deleting the
+        // removal changed nothing anywhere. A guard that cannot fail is the defect this repo
+        // keeps finding, and putting the rule in the one function that emits bytes makes it a
+        // unit test instead of a claim.
+        val value = if (!allowWindowFacts && fact.trust == Trust.WINDOW) null else values[fact]
         if (value == null) absent += fact else out.append(value)
         i = close + 1
     }

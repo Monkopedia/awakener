@@ -2,8 +2,13 @@ package com.monkopedia.awakener.connector
 
 import com.monkopedia.awakener.config.Flags
 import com.monkopedia.awakener.config.InMemoryConfigStore
-import kotlin.io.path.Path
+import java.nio.file.Files
+import java.nio.file.Path
 import kotlin.io.path.createDirectories
+import kotlin.io.path.isDirectory
+import kotlin.io.path.isRegularFile
+import kotlin.io.path.listDirectoryEntries
+import kotlin.io.path.relativeTo
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.exists
 import kotlin.io.path.readText
@@ -30,7 +35,7 @@ import kotlin.test.assertTrue
  * declares its *contents* as a task input so an edit re-runs this rather than replaying a green.
  */
 class ShippedConnectorsTest {
-    private val shipped = Path(
+    private val shipped: Path = Path.of(
         assertNotNull(
             System.getProperty("awakener.connectors"),
             "the build did not say where the shipped connectors are",
@@ -65,6 +70,28 @@ class ShippedConnectorsTest {
     fun cleanUp() {
         root.toFile().deleteRecursively()
     }
+
+    /**
+     * Every file a shipped definition would materialise, read straight off disk.
+     *
+     * Not `catalog.list()`, which makes any scan over it vacuous — a definition referencing a
+     * window fact is *refused at load* under the default policy, so it vanishes from
+     * `connectors` and a loop over that finds nothing to complain about. Measured: putting
+     * `| app_id | {app_id} |` back into the chromium skill left the loader-based version GREEN.
+     *
+     * `connectors/README.md` is excluded because it is not inside a connector directory and is
+     * never materialised — it documents the placeholders, so it names them on purpose. Only
+     * immediate subdirectories of the search root are definitions, which is the same rule the
+     * catalog applies.
+     */
+    private fun materialisedFiles(): List<Path> =
+        shipped.listDirectoryEntries().filter { it.isDirectory() }.flatMap { dir ->
+            Files.walk(dir).use { stream ->
+                stream.filter {
+                    it.isRegularFile() && it.fileName.toString() != FileConnectorCatalog.MANIFEST
+                }.toList()
+            }
+        }
 
     @Test
     fun `every shipped definition loads`() {
@@ -190,12 +217,14 @@ class ShippedConnectorsTest {
      */
     @Test
     fun `no shipped file prints a fact whose bytes the window chose`() {
+        // **Walks the directory, deliberately not `catalog.list()`.** Reading through the loader
+        // makes this vacuous: a definition that references a window fact is *refused at load*
+        // under the default policy, so it is absent from `connectors`, the loop has nothing to
+        // iterate, and the test passes for the reason it should fail. Measured — adding
+        // `| app_id | {app_id} |` back to the chromium skill left the loader-based version GREEN.
         val offences = mutableListOf<String>()
-        catalog.list().connectors.forEach { connector ->
-            connector.files.forEach { relative ->
-                val text = Path(connector.dir).resolve(relative).readText()
-                windowFactsIn(text).forEach { offences += "${connector.name}/$relative: $it" }
-            }
+        materialisedFiles().forEach { file ->
+            windowFactsIn(file.readText()).forEach { offences += "${file.relativeTo(shipped)}: $it" }
         }
         assertEquals(
             emptyList(),
@@ -208,11 +237,9 @@ class ShippedConnectorsTest {
     /** The control: the guard above is only meaningful if it could have fired. */
     @Test
     fun `the shipped definitions do still reference awakener-minted facts`() {
-        val referenced = catalog.list().connectors.flatMap { connector ->
-            connector.files.flatMap { relative ->
-                val text = Path(connector.dir).resolve(relative).readText()
-                SurfaceFact.entries.filter { text.contains(it.placeholder) }
-            }
+        val referenced = materialisedFiles().flatMap { file ->
+            val text = file.readText()
+            SurfaceFact.entries.filter { text.contains(it.placeholder) }
         }.toSet()
         assertTrue(
             SurfaceFact.PID in referenced && SurfaceFact.SURFACE_ID in referenced,
@@ -234,7 +261,7 @@ class ShippedConnectorsTest {
         val suspicious = mutableListOf<String>()
         catalog.list().connectors.forEach { connector ->
             connector.files.forEach { relative ->
-                val text = Path(connector.dir).resolve(relative).readText()
+                val text = Path.of(connector.dir).resolve(relative).readText()
                 pattern.findAll(text).map { it.groupValues[1] }.distinct().forEach { candidate ->
                     // Anything shaped like a fact and not one. The bound and the character class
                     // are what keep shell `${VAR}` and JSON out of it; the risk this catches is

@@ -107,9 +107,9 @@
 # note was narrowed instead, and the rule that replaced the remedy is at the top of this file.
 #
 # `connector` is new with the connector feature, and its floor is the count that branch measured:
-# 69, read out of `connector/build/test-results/jvmTest/*.xml` (FileConnectorCatalogTest 38,
-# RenderTest 8, ShippedConnectorsTest 11, WindowFactContainmentTest 12; skipped=0, failures=0).
-# It was 54 before review; the containment suite is the difference.
+# 73, read out of `connector/build/test-results/jvmTest/*.xml` (FileConnectorCatalogTest 38,
+# RenderTest 12, ShippedConnectorsTest 11, WindowFactContainmentTest 12; skipped=0, failures=0).
+# It was 54 before review; the containment suite and the render-trust cases are the difference.
 # The head of this file warns that a count off a feature branch describes a tree `main` has not
 # got — that warning is about a floor being *raised* past what the merged tree runs, and it cannot
 # bite here: no commit on `main` contains this module, so nothing `main` has done since can have
@@ -117,6 +117,6 @@
 # nothing at all.
 cli 60
 config 64
-connector 69
+connector 73
 registry 109
 wm 114
