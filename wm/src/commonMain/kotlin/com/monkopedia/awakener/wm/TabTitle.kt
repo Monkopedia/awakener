@@ -52,6 +52,10 @@ package com.monkopedia.awakener.wm
  *   quote renders with a visible `\` before it — measured, and asserted by
  *   `TabTitleTest`. Cosmetic, and the honest
  *   trade: the alternative is deleting a character the page really put in its title.
+ * - **`<` and `&` → the character + [ZERO_WIDTH_SPACE].** Pango markup, which a page would
+ *   otherwise get to write into the tab strip. See below — this rule and its shape are the part of
+ *   this file a reader is most likely to think is over-clever, and the part with the most
+ *   measurement behind it.
  * - **`%` → `%` + [ZERO_WIDTH_SPACE].** Not a security rule, a fidelity one, and it has no
  *   escape to use instead: `%%` renders as `%%` — measured — so sway offers no literal. What it
  *   does is a plain substring scan, so a page titling itself `%title` would otherwise put the
@@ -74,10 +78,53 @@ package com.monkopedia.awakener.wm
  * name must never cost an attach** — the first version of this raised on the refusal and took every
  * dock attach on sway 1.9 down with it.
  *
- * **Pango markup is not a vector here, and that was checked rather than assumed.** With
- * `font pango:monospace 10` set, a title of `X<span foreground='#ff0000'>REDTEXT</span>Y` rendered
- * literally on sway 1.12. If a later sway starts honouring markup in titles this file is where
- * the fourth rule goes.
+ * ### Pango markup, and a measurement that lied
+ *
+ * **A title reaching a title bar is markup, not text, on any config whose `font` line starts
+ * `pango:`.** sway markup-escapes the value it substitutes for `%title`; it does **not** escape the
+ * format string's own literal text. Interpolating a page's title into that format string is
+ * precisely what moves those bytes across that boundary, so this is a hazard this file created
+ * rather than one it inherited.
+ *
+ * Not `exec` — markup cannot run anything — but the tab strip becomes chrome the page controls,
+ * and the first casualty is [WmFlags.dockTabTitleFormat]'s own marker: a user who sets
+ * `* {title}` so they can spot a woken tab has that asterisk restyled or hidden by any page that
+ * wants to.
+ *
+ * **The first version of this file said markup rendered literally here, and cited a measurement
+ * for it. The measurement was real and the conclusion was wrong**, in a way worth keeping on the
+ * page: the probe used a *double*-quoted attribute, `<span foreground="#ff0000">`, and the `"` in
+ * it is escaped to `\"` by the rule above — which breaks pango's parse, so the whole string fell
+ * back to literal. The one syntax that self-defeats was the one the probe used. Re-measured on
+ * sway 1.12 with `font pango:monospace 10` **in the config file** (a runtime `font` command does
+ * not turn markup on — also measured), against one node with only `title_format` differing:
+ *
+ * | title | rendered |
+ * | --- | --- |
+ * | `<span foreground='#ff0000'>RED</span>` — single-quoted | **red**, markup honoured |
+ * | `<span foreground="#ff0000">RED</span>` — double-quoted | literal, self-defeated by `\"` |
+ * | `<b>BOLD</b>` — no attribute at all | **bold**, markup honoured |
+ * | `Tom &amp; Jerry` | `Tom & Jerry`, entity resolved |
+ *
+ * ### Why the rule is a zero-width space rather than `&amp;`-escaping
+ *
+ * Entity-escaping is what markup wants and it is **wrong half the time here**, because whether
+ * markup is on is the *user's* choice and awakener cannot see it: markup is enabled only by a
+ * `font pango:…` line, and under sway's default font the same `&amp;` renders as the literal
+ * five characters `&amp;` (measured). An escaping that depends on a setting this code cannot read
+ * is a coin flip.
+ *
+ * So `<` and `&` are neutralised the same way `%` is, and for a reason that holds in **both**
+ * modes: pango falls back to rendering the raw string when its parse fails, so a tag whose name
+ * cannot start (`<` + [ZERO_WIDTH_SPACE]) and an entity that cannot resolve (`&` +
+ * [ZERO_WIDTH_SPACE]) both come out as the text the page actually typed. Measured on 1.12 across
+ * `<span …>`, `<b>`, `&amp;` and a bare `&`: the neutralised title renders **pixel-identical**
+ * with markup on and markup off — 0 differing pixels in all four cases. `>` needs nothing, since
+ * no tag can begin without a `<`.
+ *
+ * The cost is that awakener's tab titles are text in both directions: an operator cannot put
+ * markup in [WmFlags.dockTabTitleFormat] either. That is the same call the `%` rule already
+ * makes, and it is the one that does not depend on a config file this code cannot see.
  */
 internal object TabTitle {
 
@@ -96,11 +143,13 @@ internal object TabTitle {
     const val COMPOSITOR_DEFAULT = "%title"
 
     /**
-     * U+200B, which breaks sway's scan for `%title` and occupies no width when drawn.
+     * U+200B: breaks a scan, occupies no width when drawn.
      *
-     * Both halves are measurements and both are necessary — U+200C behaves identically and either
-     * would do; what would not is any character with a glyph, since a title bar that grew a dot
-     * every time a page mentioned a percentage would be a fidelity bug of its own.
+     * Three rules lean on it and each wants a different scan broken — sway's substring search for
+     * `%title`, pango's tag-name start after `<`, and pango's entity name after `&`. Both halves
+     * are measurements and both are necessary: U+200C behaves identically and either would do,
+     * while any character with a glyph would not, since a title bar that grew a dot every time a
+     * page mentioned a percentage would be a fidelity bug of its own.
      */
     private const val ZERO_WIDTH_SPACE = '\u200b'
 
@@ -129,7 +178,8 @@ internal object TabTitle {
         for (ch in text) {
             when {
                 ch == '\\' || ch == '"' -> out.append('\\').append(ch)
-                ch == '%' -> out.append(ch).append(ZERO_WIDTH_SPACE)
+                ch == '%' || ch == '<' || ch == '&' ->
+                    out.append(ch).append(ZERO_WIDTH_SPACE)
                 ch < ' ' || ch == '\u007f' -> out.append(' ')
                 else -> out.append(ch)
             }

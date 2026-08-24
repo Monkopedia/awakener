@@ -762,7 +762,8 @@ class SwayWindowManager(
             // window with no title keeps reading the way it read before the dock existed. With
             // neither, there is nothing to say that beats what sway would put there itself.
             val title = node.name ?: node.appId ?: return
-            nameTab(TabTitle.command(SurfaceId(container.id), cfg[WmFlags.dockTabTitleFormat], title))
+            val target = SurfaceId(container.id)
+            nameTab(target, TabTitle.command(target, cfg[WmFlags.dockTabTitleFormat], title))
         }
 
         /**
@@ -779,10 +780,20 @@ class SwayWindowManager(
          * sets is also what stops this being retried on every title event for the rest of the
          * session.
          */
-        private suspend fun nameTab(command: String) {
+        private suspend fun nameTab(container: SurfaceId, command: String) {
             // `attempt` answers with the first result that was NOT a success, so a non-null
             // return is already the refusal; there is no second check to make here.
             val failure = attempt(command) ?: return
+            // **Which refusal it was decides whether anything is latched, and the two are not
+            // distinguishable from the reply.** A compositor that will not name containers and a
+            // container that left the tree between the read above and this command both come back
+            // `success:false` — measured, a dead `con_id` answers `No matching node.` So the tree
+            // is asked, rather than the message parsed: a node that is gone is a race this attach
+            // lost, which costs one tab its title, while a node that is still standing and was
+            // still refused is the capability. Latching on the race would turn one lost race into
+            // tab titles switched off for the rest of the session, on a compositor that supports
+            // them perfectly well.
+            if (tree().find(container.raw) == null) return
             tabTitleRefusal.value = failure.error
                 ?: "the compositor rejected '$command' without saying why"
         }
@@ -799,7 +810,7 @@ class SwayWindowManager(
             // Through the same tolerant path, and not gated on the latch: a compositor that
             // refuses to *set* a container title refuses to reset one too, and a detach must not
             // fail on either. Where a title really was set, this is the command that takes it off.
-            nameTab(TabTitle.resetCommand(container))
+            nameTab(container, TabTitle.resetCommand(container))
         }
 
         suspend fun normalizeContainer(survivor: SurfaceId) {

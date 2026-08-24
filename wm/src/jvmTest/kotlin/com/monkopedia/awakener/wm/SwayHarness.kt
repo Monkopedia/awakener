@@ -23,6 +23,8 @@ class SwayHarness private constructor(
     private var process: Process,
     val socket: Path,
     private val runtimeDir: Path,
+    /** Kept so [restart] rebuilds the same session rather than a differently configured one. */
+    private val extraConfig: String = "",
 ) : AutoCloseable {
     fun connection(): SwayConnection = SwayConnection.open(socket.absolutePathString())
 
@@ -109,7 +111,7 @@ class SwayHarness private constructor(
     fun restart() {
         process.destroyForcibly().waitFor()
         socket.deleteIfExists()
-        process = launch(runtimeDir, socket)
+        process = launch(runtimeDir, socket, extraConfig)
     }
 
     /**
@@ -252,10 +254,22 @@ class SwayHarness private constructor(
                 .firstOrNull { it.isExecutable() }
                 ?.absolutePathString()
 
-        fun start(): SwayHarness {
+        /**
+         * A session, optionally with [extraConfig] appended to the generated `sway.conf`.
+         *
+         * The parameter exists for one question that cannot be asked any other way: pango markup in
+         * title bars is switched on by a `font pango:…` line **in the config file**, and a runtime
+         * `font` command does not turn it on — both measured on 1.12. So a suite that needs to know
+         * what a markup-enabled compositor does with a title has to be handed one at launch.
+         *
+         * Kept to a suffix rather than a replacement so every session still gets the base config,
+         * whose three lines are what stop an unrelated window or a focus rule showing up in a tree
+         * assertion.
+         */
+        fun start(extraConfig: String = ""): SwayHarness {
             val runtimeDir = Files.createTempDirectory("awakener-sway")
             val socket = runtimeDir.resolve("sway-ipc.sock")
-            return SwayHarness(launch(runtimeDir, socket), socket, runtimeDir)
+            return SwayHarness(launch(runtimeDir, socket, extraConfig), socket, runtimeDir, extraConfig)
         }
 
         /**
@@ -265,7 +279,7 @@ class SwayHarness private constructor(
          * rest of the suite runs against — a second launcher would drift, and the whole point of a
          * restart test is that the successor is an ordinary session.
          */
-        private fun launch(runtimeDir: Path, socket: Path): Process {
+        private fun launch(runtimeDir: Path, socket: Path, extraConfig: String = ""): Process {
             val config = runtimeDir.resolve("sway.conf")
             // No bar, no xwayland, no autostart: the tests assert on tree shape, and anything
             // that maps a window of its own would show up as a surface.
@@ -274,7 +288,7 @@ class SwayHarness private constructor(
                 xwayland disable
                 default_border pixel 1
                 focus_follows_mouse no
-                """.trimIndent(),
+                """.trimIndent() + if (extraConfig.isEmpty()) "" else "\n" + extraConfig + "\n",
             )
 
             val process = ProcessBuilder(SWAY, "-c", config.absolutePathString())

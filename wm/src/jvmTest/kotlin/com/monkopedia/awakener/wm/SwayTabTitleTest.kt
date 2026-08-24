@@ -17,6 +17,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -362,6 +363,59 @@ class SwayTabTitleTest {
             "awakener's account of this compositor has to match what it actually does with a " +
                 "container title_format. Probe accepted=$accepted, reported " +
                 "unsupported=${wm.tabTitleUnsupported.value}",
+        )
+    }
+
+    /**
+     * A whole dock lifecycle must not switch tab titles off, and the latch is why that needs
+     * saying.
+     *
+     * `nameTab` remembers a compositor that refused, so it can stop asking. The hazard is that a
+     * refusal and a **lost race** arrive identically: a `con_id` whose node has left the tree
+     * answers `success:false, error: "No matching node."` — measured — so a latch that fired on any
+     * non-success would let one unlucky moment disable the feature for the rest of the session, on
+     * a compositor that supports it perfectly well. That is why the failure path asks the tree
+     * whether the container is still there rather than reading the message.
+     *
+     * This drives every path that issues one of these commands — attach, hide, show, detach, and
+     * the reap — and asserts the report is still empty at the end. It cannot manufacture the race
+     * (there is no seam between the tree read and the command through the public API), so what it
+     * holds is the reachable half: no **routine** operation may latch. That is not a hypothetical
+     * class of bug — the detach reset raised on a collapsed container earlier in this same PR, and
+     * under a latch it would have gone quiet instead of loud.
+     */
+    @Test
+    fun `no ordinary dock lifecycle switches tab titles off`() = swayTest {
+        val app = openTitled("aw-app1", PAGE)
+        val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+        assumeContainerTitles()
+
+        assertTrue(dock.hide(), "hidden")
+        assertTrue(dock.show(), "and back")
+        dock.detach()
+
+        val second = openTitled("aw-app2", NEXT_PAGE)
+        val orphan = wm.attach(second, dockSpec("aw-dock2"), AgentId("agent-2"))
+        command("[con_id=${second.raw}] kill")
+        assertTrue(
+            withTimeoutOrNull(WAIT_MS) {
+                while (wm.tree().find(second.raw) != null) yield()
+                true
+            } ?: false,
+            "the surface has to be gone before the sweep can be about an orphan",
+        )
+        wm.reapOrphans()
+        assertNull(
+            wm.tree().find(orphan.dockId.raw),
+            "the orphaned dock is gone, so the reap really ran the detach path",
+        )
+
+        assertNull(
+            wm.tabTitleUnsupported.value,
+            "an ordinary attach/hide/show/detach/reap must leave the capability believed-good. " +
+                "A latch here would mean one of these paths issues a title command against a " +
+                "node that has already left the tree, and every later tab would go unnamed with " +
+                "nothing but this flow to say why",
         )
     }
 

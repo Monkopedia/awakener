@@ -95,6 +95,65 @@ class TabTitleTest {
     }
 
     /**
+     * Pango markup, which a page would otherwise get to write into the tab strip.
+     *
+     * sway markup-escapes what it substitutes for `%title` and does **not** escape the format
+     * string's literal text, so interpolating a title is what carries these bytes across that
+     * boundary. Measured live: `<span foreground='#ff0000'>` in a title renders **red** on a
+     * `font pango:` config, and `<b>` renders **bold**.
+     */
+    @Test
+    fun `a tag cannot start, so markup stays text`() {
+        // The zero width space goes immediately after the `<`, so a closing tag becomes
+        // `<`+ZWSP+`/b>` rather than `</`+ZWSP+`b>`. Either defeats the parse; this is the one the
+        // rule actually produces, and asserting the other was a bug in this test.
+        assertEquals("\"<\u200bb>hi<\u200b/b>\"", TabTitle.quote("<b>hi</b>"))
+        assertFalse(
+            TabTitle.quote("<span foreground='#ff0000'>x</span>").contains("<span"),
+            "the literal tag opening must not survive, or pango parses it",
+        )
+    }
+
+    /**
+     * The other half of the same rule: an entity that cannot resolve.
+     *
+     * Without it a page titling itself `Tom &amp; Jerry` would have that resolved to `Tom & Jerry`
+     * on a markup config — sway showing something the page did not type.
+     */
+    @Test
+    fun `an entity cannot resolve`() {
+        assertEquals("\"Tom &\u200bamp; Jerry\"", TabTitle.quote("Tom &amp; Jerry"))
+        assertEquals("\"a &\u200b b\"", TabTitle.quote("a & b"))
+    }
+
+    /**
+     * `>` is left alone, and that is a decision rather than an oversight.
+     *
+     * No tag can begin without a `<`, and a bare `>` is ordinary text to pango — so escaping it
+     * would cost fidelity (`a -> b` is a common title) and buy nothing.
+     */
+    @Test
+    fun `a closing angle bracket is not markup on its own`() {
+        assertEquals("\"a -> b\"", TabTitle.quote("a -> b"))
+    }
+
+    /**
+     * Entity-escaping is the obvious fix and is wrong half the time; this pins that it was not
+     * used.
+     *
+     * `&amp;` renders as `&` on a compositor parsing markup and as five literal characters on one
+     * that is not, and which of those a user has is a `font pango:` line this code cannot see.
+     * `SwayTabTitleMarkupTest` holds the positive form — the neutralised string renders identically
+     * in both modes.
+     */
+    @Test
+    fun `the markup rule does not entity-escape`() {
+        val quoted = TabTitle.quote("<b>&</b>")
+        assertFalse(quoted.contains("&lt;"), "an entity would render literally without markup on")
+        assertFalse(quoted.contains("&amp;"), "same, and it would also double on the next pass")
+    }
+
+    /**
      * Control characters parse safely inside the quotes; they do not *render* safely.
      *
      * A newline came out of the renderer as a stray glyph in the middle of the strip, captured on

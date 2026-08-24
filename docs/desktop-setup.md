@@ -451,13 +451,17 @@ The tab's *text* is a different matter and awakener does handle it: see below.
 The same split container is why a woken tab used to read `H[chromium awakener-dock]` — sway names
 a container from its own layout description, because a container has no title of its own. awakener
 puts the surface's title back with `title_format` on the container, and re-issues it whenever the
-window retitles itself, so a woken tab reads what it read before (#177). Three things worth
-knowing:
+window retitles itself, so a woken tab reads what it read before (#177). What is worth knowing:
 
 - **`wm.dock.tab_title=COMPOSITOR`** turns it off and gives you sway's synthetic name back.
 - **`wm.dock.tab_title.format`** is the template, `{title}` standing for the surface's own title.
   The default is `{title}` alone, so a woken tab looks like any other. Set it to `* {title}` if you
   would rather be able to tell at a glance which tabs hold an agent.
+- **A page's title is shown as text, never as markup.** If your `font` line starts `pango:`, sway
+  parses a title bar as pango markup — and sway escapes what it substitutes for `%title` but *not*
+  the literal text of a `title_format`. Since awakener interpolates the title itself, an unescaped
+  one would let any page recolour, resize or hide its own tab, `* ` marker included. awakener
+  neutralises `<` and `&` so the characters the page typed are what you see, in either mode.
 - **A `"` in a page title renders with a backslash in front of it** — `say \"hi\"`. That is sway's
   own unquoting keeping the escape, and the escape is not optional: a title is chosen by whatever
   is running in the window, and an unescaped one reaching sway's command parser is `exec`.
