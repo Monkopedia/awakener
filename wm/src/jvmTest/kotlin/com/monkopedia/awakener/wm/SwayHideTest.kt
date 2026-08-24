@@ -6,6 +6,7 @@ import com.monkopedia.awakener.registry.BindingStore
 import com.monkopedia.awakener.registry.DerivedAgentIdentities
 import com.monkopedia.awakener.registry.FileBindingStore
 import java.nio.file.Path
+import java.util.Collections.synchronizedList
 import kotlin.io.path.createTempDirectory
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
@@ -16,15 +17,20 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -138,6 +144,97 @@ class SwayHideTest {
             )
             assertEquals(surfaced, geometryOf(app), "the surface got its width back too")
         }
+
+    /**
+     * **#172, and the only shape of test that can see it.** Jason: *"there is a bit of a flicker in
+     * the toggle when it happens."*
+     *
+     * A `get_tree` before and a `get_tree` after proves nothing here, because both endpoints were
+     * already correct while the defect was live: the panel arrived at the right place, having been
+     * *drawn* somewhere else twice on the way. So this samples the compositor continuously across
+     * a run of toggles and asserts on the whole census rather than on the ends — every reading of
+     * the dock has to be either hidden or finished, and anything else is a layout that reached the
+     * screen.
+     *
+     * Measured on this sampler with the un-batched sequence put back, everything else unchanged:
+     * **39 of 218 readings were an intermediate layout** — 23 caught the panel visible, *floating*
+     * and centred over the surface (`w≈640 x=319`) and 16 caught it tiled 50/50 (`w=640 x=640`)
+     * on the way to `w=384 x=896`. `scratchpad show` reveals the window floating, and the commands
+     * that re-tile it were separate IPC round trips which sway presents one at a time; the poll for
+     * "has it left the scratchpad yet" then ran for the length of the floating frame, with the user
+     * looking at it.
+     *
+     * **The sampler is fast enough because the un-batched code fails this test**, not because a
+     * rate was asserted: the frames the defect produces are the ones it catches. That is the
+     * negative control, and it is the only thing that makes a count of zero mean anything.
+     */
+    @Test
+    fun `a restore presents no intermediate layout on the way to its final one`() = swayTest {
+        val app = openSurface("aw-app1")
+        val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+        val landed = assertNotNull(frameOf(dock.dockId), "the panel is on screen after an attach")
+        dock.hide()
+        assertTrue(dock.hidden(), "and off it again before the restore under test")
+
+        val census = sampling(dock.dockId) {
+            repeat(TOGGLES) {
+                assertTrue(dock.show(), "the show is what changed things")
+                assertTrue(dock.hide(), "and the hide is, on the way to the next one")
+            }
+            assertTrue(dock.show(), "ending on screen, so the census closes on the final layout")
+        }
+
+        assertEquals(
+            HIDDEN,
+            census.first(),
+            "the sampler was already running while the panel was still hidden, so it cannot " +
+                "have missed the transition by starting late. Census:\n${report(census)}",
+        )
+        assertEquals(
+            landed,
+            census.last(),
+            "and it was still running once the panel had settled. Census:\n${report(census)}",
+        )
+        assertEquals(
+            listOf(HIDDEN, landed).sorted(),
+            census.distinct().sorted(),
+            "every reading of the panel across the restore is either hidden or the layout it " +
+                "ends at. Any third entry is a layout that was presented to the user — which is " +
+                "the flicker, and it is a real frame rather than a rendering artefact. " +
+                "${census.size} readings:\n${report(census)}",
+        )
+    }
+
+    /**
+     * `wm.dock.side=LEFT` is the one command in the restore that is not always issued, and
+     * batching the sequence is exactly the change that could drop it.
+     *
+     * There was no coverage of the flag on this path at all before #172 — a restore that silently
+     * put a left-hand panel back on the right would have been green — so this is the guard rather
+     * than a re-check. Asserted on the geometry the user sees: at 30 ppt of a 1280-wide output the
+     * panel is 384 wide, and the whole question is whether it starts at x=0 or at x=896.
+     */
+    @Test
+    fun `a restore puts a left-hand dock back on the left`() = swayTest {
+        store.put(WmFlags.dockSide, DockSide.LEFT)
+        val app = openSurface("aw-app1")
+        val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+        val docked = geometryOf(dock.dockId)
+
+        dock.hide()
+        assertTrue(dock.show())
+
+        assertEquals(
+            docked,
+            geometryOf(dock.dockId),
+            "the `move left` the batch only carries under wm.dock.side=LEFT survived it",
+        )
+        assertTrue(
+            geometryOf(dock.dockId).startsWith("x=0 "),
+            "and it is genuinely on the left rather than merely back where it started: " +
+                geometryOf(dock.dockId),
+        )
+    }
 
     /**
      * Both verbs are idempotent, which is what stops two presses landing at once from cancelling
@@ -414,6 +511,81 @@ class SwayHideTest {
             .joinToString(" ") { "$it=${rect.getValue(it).jsonPrimitive.int}" }
     }
 
+    /**
+     * Reads the dock continuously on a connection of its own while [body] runs, and hands back
+     * every reading in order.
+     *
+     * A separate connection because the manager's carries the restore itself, and the i3 protocol
+     * has no request ids — one connection serialises, so sampling down the same socket would
+     * interleave with the commands being measured and pace them.
+     *
+     * The loop is deliberately unpaced. What it is looking for is a layout that exists for a
+     * handful of milliseconds, and [SwayWindowManager]'s own polling discipline — which exists to
+     * stop a *wait* costing thousands of tree reads — would be the wrong instrument here: this one
+     * runs for the length of one test body and the reads are the measurement.
+     */
+    private suspend fun sampling(dock: SurfaceId, body: suspend () -> Unit): List<String> =
+        coroutineScope {
+            val census = synchronizedList(mutableListOf<String>())
+            val connection = sway.connection()
+            val sampler = launch(Dispatchers.IO) {
+                connection.use {
+                    while (isActive) {
+                        val raw = it.request(I3Ipc.Request.GET_TREE, "")
+                        census += frameOf(Json.parseToJsonElement(raw).jsonObject, dock.raw, false)
+                    }
+                }
+            }
+            // So the census opens on the state the restore starts from. Without it a sampler that
+            // took its first reading after the batch had already run would report a clean census
+            // for having watched nothing at all, which is the reading this test exists to refuse.
+            while (census.isEmpty()) yield()
+            body()
+            sampler.cancelAndJoin()
+            census.toList()
+        }
+
+    /** One reading of the dock, taken through the tree the way the compositor presents it. */
+    private suspend fun frameOf(dock: SurfaceId): String? {
+        val raw = sway.connection().use { it.request(I3Ipc.Request.GET_TREE, "") }
+        return frameOf(Json.parseToJsonElement(raw).jsonObject, dock.raw, false)
+            .takeIf { it != HIDDEN }
+    }
+
+    /**
+     * How the dock looks in one `get_tree`: [HIDDEN] while it is in the scratchpad or absent, and
+     * otherwise the geometry a user would see, floating included.
+     *
+     * [inScratch] carries down the walk rather than being asked separately, so that a single pass
+     * answers both "is it on screen" and "what does it look like" — the two have to come from the
+     * same reading or the pair describes no moment in particular.
+     */
+    private fun frameOf(node: JsonObject, dock: Long, inScratch: Boolean): String {
+        val type = node["type"]?.jsonPrimitive?.contentOrNull
+        val scratch = inScratch ||
+            (type == "workspace" && node["name"]?.jsonPrimitive?.contentOrNull == SCRATCH)
+        if (node["id"]?.jsonPrimitive?.longOrNull == dock) {
+            if (scratch) return HIDDEN
+            val rect = node.getValue("rect").jsonObject
+            val floating = type == FLOATING
+            return "floating=$floating " +
+                "w=${rect.getValue("width").jsonPrimitive.int} " +
+                "x=${rect.getValue("x").jsonPrimitive.int}"
+        }
+        return listOf("nodes", "floating_nodes")
+            .mapNotNull { node[it]?.jsonArray }
+            .flatten()
+            .map { frameOf(it.jsonObject, dock, scratch) }
+            .firstOrNull { it != HIDDEN }
+            ?: HIDDEN
+    }
+
+    /** The census as the issue reports it: each distinct reading, with how many samples saw it. */
+    private fun report(census: List<String>): String =
+        census.groupingBy { it }.eachCount().entries
+            .sortedByDescending { it.value }
+            .joinToString("\n") { "  ${it.key}  ${it.value} samples" }
+
     /** The `rect` of the node with [id], found by walking `nodes` and `floating_nodes`. */
     private fun rectOf(node: JsonObject, id: Long): JsonObject? {
         if (node["id"]?.jsonPrimitive?.longOrNull == id) return node["rect"]?.jsonObject
@@ -467,5 +639,36 @@ class SwayHideTest {
 
     private companion object {
         const val WAIT_MS = 5_000L
+
+        /**
+         * The reading for a dock that is not on screen — in the scratchpad, or not in the tree.
+         *
+         * One value for both because the census is about what the user is shown, and a window that
+         * is not there shows nothing either way. Sorting ahead of every geometry reading is why it
+         * starts with a space: the assertions compare sorted lists.
+         */
+        const val HIDDEN = " hidden"
+
+        /**
+         * How many hide/show cycles one census covers.
+         *
+         * More than one because a single restore at the fixed code takes about 5ms end to end, and
+         * a census of five readings is a weak thing to conclude "no intermediate layout" from. The
+         * hides are in the census too and are held to the same rule: a toggle is what the user
+         * presses, and a frame presented on the way down would be the same defect facing the other
+         * way.
+         */
+        const val TOGGLES = 20
+
+        /**
+         * sway's own names, spelled out here rather than borrowed from [SwayWindowManager].
+         *
+         * Deliberate duplication: these are facts about the compositor, and a test that read them
+         * off the code under test would agree with it about a typo. Both measured on 1.12 — a
+         * scratchpad window is parented to the `__i3_scratch` workspace, and a window that has not
+         * been re-tiled reports `type=floating_con`.
+         */
+        const val SCRATCH = "__i3_scratch"
+        const val FLOATING = "floating_con"
     }
 }
