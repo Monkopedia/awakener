@@ -463,6 +463,10 @@ knowing:
   is running in the window, and an unescaped one reaching sway's command parser is `exec`.
 - It follows the title over the change-notification connection, so with `wm.events.enabled=false`
   a woken tab keeps whatever the title was when the dock went up.
+- **Your sway has to be new enough.** Naming a *container* is refused by **sway 1.9** — `Only views
+  can have a title_format` — and accepted by **1.12**; adolin and kaladin are both on 1.12, Ubuntu
+  noble ships 1.9. On a sway that refuses, the tab keeps sway's synthetic name and everything else
+  works: the refusal is reported, never raised, so it costs the tab's title and not your dock.
 
 ### Optionally, pinning the layout
 

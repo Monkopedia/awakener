@@ -26,6 +26,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
+import org.junit.Assume.assumeTrue
 
 /**
  * What a woken tab actually says, read off the screen, against a real headless sway.
@@ -57,7 +58,22 @@ import kotlinx.coroutines.yield
  * Every frame is written into `build/reports/tab-title/`, named for the test and the state. They
  * are the screenshots #177 asks for, produced by the run rather than alongside it.
  *
- * Exercised against **sway 1.12** on the headless wlroots backend, with **grim 1.5**.
+ * ### Not every sway can do this
+ *
+ * `title_format` on a **container** is refused by sway 1.9 — *"Only views can have a title_format"*
+ * — and accepted by 1.12. Both are current somewhere: 1.9 is what Ubuntu noble ships and what this
+ * repository's CI runs, 1.12 is on kaladin and adolin. So the visual assertions below are gated on
+ * an assumption, and the probe is **awakener's own attempt**: after an attach,
+ * [SwayWindowManager.tabTitleUnsupported] is non-null exactly when this compositor said no. That
+ * costs no extra windows and no extra commands, and it cannot drift from what the product does,
+ * because it *is* what the product did.
+ *
+ * `attach survives a compositor that will not name a container's tab` is the one that runs
+ * everywhere, and it is what holds the degradation: the assumption above is only honest if a
+ * refusal is a reported no-op rather than a failed hotkey press.
+ *
+ * Exercised against **sway 1.12** on the headless wlroots backend, with **grim 1.5**. On CI, the
+ * gated tests report as genuinely skipped against **sway 1.9**.
  */
 class SwayTabTitleTest {
     private lateinit var sway: SwayHarness
@@ -115,6 +131,7 @@ class SwayTabTitleTest {
             val app = openTitled("aw-app1", PAGE)
             val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
             assertTrue(inTab(app, dock.dockId), "the dock is beside its surface")
+            assumeContainerTitles()
             val container = containerOf(app)
 
             val managed = capture("woken-managed")
@@ -151,7 +168,8 @@ class SwayTabTitleTest {
     fun `a tab follows the surface when the window retitles itself`() = swayTest {
         val flag = stateDir.resolve("retitle").toFile()
         val app = openTitled("aw-app1", PAGE, then = NEXT_PAGE, on = flag)
-        val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+        wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+        assumeContainerTitles()
         val container = containerOf(app)
         val first = capture("retitle-before")
 
@@ -233,6 +251,7 @@ class SwayTabTitleTest {
     fun `a hidden dock leaves its surface's title on the tab`() = swayTest {
         val app = openTitled("aw-app1", PAGE)
         val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+        assumeContainerTitles()
         assertTrue(dock.hide(), "the hide is what changed things")
         val container = containerOf(app)
         assertNotNull(
@@ -261,6 +280,7 @@ class SwayTabTitleTest {
         store.put(WmFlags.normalizeContainerOnDetach, false)
         val app = openTitled("aw-app1", PAGE)
         val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+        assumeContainerTitles()
         val container = containerOf(app)
 
         dock.detach()
@@ -296,7 +316,12 @@ class SwayTabTitleTest {
         val container = containerOf(app)
 
         val unmanaged = capture("flag-off")
-        command(TabTitle.resetCommand(container))
+        // Awakener issues nothing under COMPOSITOR, so its own report cannot be the probe here.
+        // This reset is both the probe and the comparison state the assertion below needs.
+        assumeTrue(
+            "this sway will not name a container's tab",
+            tryCommand(TabTitle.resetCommand(container)),
+        )
         assertEquals(
             unmanaged,
             capture("flag-off-by-hand"),
@@ -306,7 +331,60 @@ class SwayTabTitleTest {
         assertNotEquals(unmanaged, capture("flag-off-titled"), "the control still distinguishes")
     }
 
+    /**
+     * The one test here that asserts the same thing on every sway, and the reason the rest may
+     * assume.
+     *
+     * A tab's name is cosmetic; a dock is not. So a compositor that refuses to name a container has
+     * to cost the tab's title and **nothing else** — not the panel, not the binding, not the press.
+     * Before this was true, sway 1.9 turned every attach in the repository into a failed hotkey:
+     * 83 tests across five classes, all of them raising out of one `run` on a `title_format` the
+     * compositor would not take.
+     *
+     * The refusal is reported rather than swallowed, and this asserts the report against a *direct*
+     * probe of the same capability rather than against itself. Both sides are measured on whatever
+     * compositor is running, so this is a real assertion on 1.9 and on 1.12 and says the opposite
+     * thing on each.
+     */
+    @Test
+    fun `attach survives a compositor that will not name a container's tab`() = swayTest {
+        val app = openTitled("aw-app1", PAGE)
+        val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+        assertTrue(
+            inTab(app, dock.dockId),
+            "the attach has to go through whatever the compositor thinks of container titles",
+        )
+
+        val accepted = tryCommand(TabTitle.resetCommand(containerOf(app)))
+        assertEquals(
+            !accepted,
+            wm.tabTitleUnsupported.value != null,
+            "awakener's account of this compositor has to match what it actually does with a " +
+                "container title_format. Probe accepted=$accepted, reported " +
+                "unsupported=${wm.tabTitleUnsupported.value}",
+        )
+    }
+
     // ------------------------------------------------------------------ harness
+
+    /**
+     * Skips when this compositor will not name a container's tab, naming its own complaint.
+     *
+     * Called after an attach, because the attach is the probe: awakener has by then tried exactly
+     * the command the rest of the test depends on, and [SwayWindowManager.tabTitleUnsupported]
+     * carries what came back. A separate probe would be a second claim about the compositor that
+     * could disagree with the product's.
+     */
+    private fun assumeContainerTitles() {
+        val refusal = wm.tabTitleUnsupported.value
+        assumeTrue("this sway will not name a container's tab: $refusal", refusal == null)
+    }
+
+    /** Whether sway accepted [text]; for asking about a capability rather than relying on one. */
+    private suspend fun tryCommand(text: String): Boolean {
+        val raw = sway.connection().use { it.request(I3Ipc.Request.RUN_COMMAND, text) }
+        return swayJson.decodeFromString<List<CommandResult>>(raw).all { it.success }
+    }
 
     private fun swayTest(body: suspend CoroutineScope.() -> Unit) {
         if (!enabled) return

@@ -1033,7 +1033,13 @@ object WmFlags {
             "keeps whatever the title was when the dock went up; attaching still works, since " +
             "attach polls the tree rather than listening. COMPOSITOR leaves the container " +
             "unnamed and is the behaviour before #177. Either way a detach hands the container " +
-            "back to sway's own naming, so a title this manager set never outlives its dock.",
+            "back to sway's own naming, so a title this manager set never outlives its dock. " +
+            "SURFACE is a request rather than a guarantee, because not every sway can carry it: " +
+            "1.9 refuses title_format on a container outright ('Only views can have a " +
+            "title_format') where 1.12 accepts it. A refusal degrades to COMPOSITOR's behaviour " +
+            "for the rest of the compositor session and is reported through " +
+            "SwayWindowManager.tabTitleUnsupported; it never fails an attach, because a tab's " +
+            "name is cosmetic and the panel standing beside it is not.",
     )
 
     val dockTabTitleFormat = Flags.string(

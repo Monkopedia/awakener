@@ -64,6 +64,16 @@ package com.monkopedia.awakener.wm
  * - **C0 controls and DEL → a space.** Also fidelity: they parse safely inside the quotes, but a
  *   newline came out of the renderer as a stray glyph in the middle of the strip (captured).
  *
+ * ### Not every sway will accept one
+ *
+ * `title_format` on a **container** is refused by sway 1.9 — *"Only views can have a
+ * title_format"* — and accepted by 1.12. Both are current: 1.9 is Ubuntu noble's and this
+ * repository's CI, 1.12 is on kaladin and adolin. Nothing here can ask in advance; there is no IPC
+ * request for it, so the only way to find out is to issue the command and read the answer. That is
+ * `SwayWindowManager.tabTitleUnsupported`, and the rule it exists to hold is that a **cosmetic tab
+ * name must never cost an attach** — the first version of this raised on the refusal and took every
+ * dock attach on sway 1.9 down with it.
+ *
  * **Pango markup is not a vector here, and that was checked rather than assumed.** With
  * `font pango:monospace 10` set, a title of `X<span foreground='#ff0000'>REDTEXT</span>Y` rendered
  * literally on sway 1.12. If a later sway starts honouring markup in titles this file is where

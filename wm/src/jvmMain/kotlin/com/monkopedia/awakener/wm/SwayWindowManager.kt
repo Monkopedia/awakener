@@ -176,6 +176,21 @@ class SwayWindowManager(
      */
     val unrecognisedDockMarks: StateFlow<Set<String>> = unrecognisedMarks.asStateFlow()
 
+    /**
+     * The compositor's own words for refusing to name a container's tab, or null while it has not.
+     *
+     * **A capability, discovered rather than configured, and the reason it is a field is that the
+     * answer differs between sways that are both current somewhere.** Measured: sway 1.12 accepts
+     * `title_format` on a split container and 1.9 — what Ubuntu noble ships, and what this
+     * repository's CI runs — refuses it with *"Only views can have a title_format"*. There is no
+     * IPC request that asks, so the only way to find out is to try.
+     *
+     * Latched, so a compositor that has said no is asked once per session rather than once per
+     * attach and once per title change; cleared with the session in [invalidate], since a
+     * successor is a different compositor process and may be a different build.
+     */
+    private val tabTitleRefusal = MutableStateFlow<String?>(null)
+
     private val residueFailures = MutableStateFlow<List<ResidueDisposalFailure>>(emptyList())
 
     /**
@@ -206,6 +221,20 @@ class SwayWindowManager(
      * Appended to **before** [WmFlags.detachResidueFailure] decides whether to raise, so a caller
      * that catches the raise and a caller that never sees one read the same list.
      */
+    /**
+     * Why this compositor will not carry a woken tab's title, or null while nothing says it will
+     * not.
+     *
+     * Non-null means `wm.dock.tab_title=SURFACE` is doing nothing on this desktop: the tab of a
+     * woken surface keeps the layout description sway builds for it, which is #177 unfixed. It is
+     * reported rather than raised because the title is **cosmetic and the dock is not** — failing
+     * an attach over a tab's name would cost the user their agent panel on every press, on a
+     * compositor where everything else works.
+     *
+     * Read it, and say so, rather than treating an empty tab-title feature as a bug in awakener.
+     */
+    val tabTitleUnsupported: StateFlow<String?> = tabTitleRefusal.asStateFlow()
+
     val residueDisposalFailures: StateFlow<List<ResidueDisposalFailure>> =
         residueFailures.asStateFlow()
 
@@ -274,6 +303,11 @@ class SwayWindowManager(
      * caller blocked in a request on it should learn now.
      */
     private suspend fun invalidate(ended: CompositorSessionEnded) {
+        // The successor is a different compositor process and may be a different build, so what
+        // the dead one refused says nothing about it. Cleared here rather than left latched
+        // because the cost of being wrong is one wasted round trip and the cost of the other way
+        // is a feature that stays off for the rest of the process.
+        tabTitleRefusal.value = null
         val dead = sessionLock.withLock {
             boundary = ended
             liveSession.also { liveSession = null }
@@ -720,6 +754,7 @@ class SwayWindowManager(
         suspend fun applyTabTitle(surface: SurfaceId) {
             val cfg = config
             if (cfg[WmFlags.dockTabTitle] != TabTitleSource.SURFACE) return
+            if (tabTitleRefusal.value != null) return
             val tree = tree()
             val node = tree.find(surface.raw) ?: return
             val container = tree.parentOf(surface.raw)?.takeIf { it.type == CON } ?: return
@@ -727,7 +762,29 @@ class SwayWindowManager(
             // window with no title keeps reading the way it read before the dock existed. With
             // neither, there is nothing to say that beats what sway would put there itself.
             val title = node.name ?: node.appId ?: return
-            run(TabTitle.command(SurfaceId(container.id), cfg[WmFlags.dockTabTitleFormat], title))
+            nameTab(TabTitle.command(SurfaceId(container.id), cfg[WmFlags.dockTabTitleFormat], title))
+        }
+
+        /**
+         * Issues a tab-naming command, recording a refusal instead of raising one.
+         *
+         * **The one place in this class where a rejected command does not fail its caller**, and
+         * the exception is argued rather than convenient: every other command here changes what
+         * the user can *do* — a dock that did not spawn, a window that did not move — whereas this
+         * one changes what a tab says. sway 1.9 refuses it outright, so raising would turn every
+         * attach on Ubuntu's current sway into a failed hotkey press over a cosmetic name.
+         *
+         * Not swallowed either: [tabTitleUnsupported] carries the compositor's own words, and a
+         * caller that wants to know why its tabs are unnamed has somewhere to look. The latch it
+         * sets is also what stops this being retried on every title event for the rest of the
+         * session.
+         */
+        private suspend fun nameTab(command: String) {
+            // `attempt` answers with the first result that was NOT a success, so a non-null
+            // return is already the refusal; there is no second check to make here.
+            val failure = attempt(command) ?: return
+            tabTitleRefusal.value = failure.error
+                ?: "the compositor rejected '$command' without saying why"
         }
 
         /**
@@ -739,7 +796,10 @@ class SwayWindowManager(
          * so a container that was never titled is unchanged by this.
          */
         suspend fun resetTabTitle(container: SurfaceId) {
-            run(TabTitle.resetCommand(container))
+            // Through the same tolerant path, and not gated on the latch: a compositor that
+            // refuses to *set* a container title refuses to reset one too, and a detach must not
+            // fail on either. Where a title really was set, this is the command that takes it off.
+            nameTab(TabTitle.resetCommand(container))
         }
 
         suspend fun normalizeContainer(survivor: SurfaceId) {
