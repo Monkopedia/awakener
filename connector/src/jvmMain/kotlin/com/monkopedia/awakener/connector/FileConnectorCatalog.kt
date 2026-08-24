@@ -4,6 +4,7 @@ import com.monkopedia.awakener.config.Config
 import com.monkopedia.awakener.config.FilePermissions
 import com.monkopedia.awakener.config.PrivateFiles
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.PosixFilePermission
@@ -132,17 +133,51 @@ class FileConnectorCatalog(
                     "nothing would tell the user what has not been vouched for",
             )
         }
-        val files = runCatching {
-            Files.walk(dir).use { stream ->
-                stream.filter { it.isRegularFile() }
-                    .map { it.relativeTo(dir).joinToString("/") }
-                    .filter { it != MANIFEST }
-                    .sorted()
-                    .toList()
-            }
+        // `Files.walk` does not follow directory links, but `isRegularFile` follows *file* links,
+        // so a symlink in a definition used to be dereferenced and its target copied into the
+        // residue directory — a connector directory that reads as four harmless files while
+        // materialising something outside it. A symlink is refused rather than skipped: a
+        // definition that quietly materialises fewer files than it contains is a connector that
+        // half works, and the author would have no way to tell.
+        val entries = runCatching {
+            Files.walk(dir).use { stream -> stream.toList() }
         }.getOrElse { return broken("could not be listed: ${it.message}") }
+        entries.firstOrNull { Files.isSymbolicLink(it) }?.let {
+            return broken(
+                "${it.relativeTo(dir).joinToString("/")} is a symbolic link. A connector is " +
+                    "materialised into the agent's working directory, so a link would copy " +
+                    "whatever it points at; copy the file in instead.",
+            )
+        }
+        val files = entries
+            .filter { it.isRegularFile(LinkOption.NOFOLLOW_LINKS) }
+            .map { it.relativeTo(dir).joinToString("/") }
+            .filter { it != MANIFEST }
+            .sorted()
         if (files.isEmpty()) return broken("holds no files to materialise")
-        return Loaded.Ok(Connector(name, dir.absolutePathString(), manifest, files))
+
+        // The window-fact scan, at load rather than at apply, so `awakener-invoke connectors`
+        // reports it and a hotkey press is not where you find out. See [WindowFacts].
+        val windowFacts = LinkedHashMap<String, List<SurfaceFact>>()
+        files.forEach { relative ->
+            val text = runCatching { dir.resolve(relative).readText() }
+                .getOrElse { return broken("$relative could not be read as text: ${it.message}") }
+            windowFactsIn(text).takeIf { it.isNotEmpty() }?.let { windowFacts[relative] = it }
+        }
+        if (windowFacts.isNotEmpty() && config[ConnectorFlags.windowFacts] == WindowFacts.REFUSE) {
+            return broken(
+                windowFacts.entries.joinToString("; ") { (file, facts) ->
+                    "$file references ${facts.joinToString(", ") { it.placeholder }}"
+                } +
+                    " — those bytes are chosen by the program that owns the window, and a " +
+                    "connector's files are rendered into the agent's working directory as " +
+                    "instructions. Read them from $FACTS instead, where they are JSON-escaped " +
+                    "(connector.window_facts=REFUSE).",
+            )
+        }
+        return Loaded.Ok(
+            Connector(name, dir.absolutePathString(), manifest, files, windowFacts),
+        )
     }
 
     override fun apply(name: String?, facts: SurfaceFacts): ConnectorOutcome {
@@ -183,14 +218,38 @@ class FileConnectorCatalog(
             warnings += note
         }
 
-        val values = LinkedHashMap<SurfaceFact, String>()
-        SurfaceFact.entries.forEach { fact -> facts.value(fact)?.let { values[fact] = it } }
-        values[SurfaceFact.CONNECTOR] = connector.name
-        values[SurfaceFact.CONNECTOR_DIR] = connector.dir
+        val windowPolicy = config[ConnectorFlags.windowFacts]
+
+        // **Two maps, and conflating them is a bug this had for one test run.** `available` is
+        // what awakener *knows* about the window; `values` is what may be *substituted into a
+        // file*. `requires` asks the first question — chromium requires `title` because the title
+        // is its join column, and it reads it from surface.json precisely because it may not be
+        // rendered. Withholding window facts from the map the requires-check consulted made every
+        // shipped connector report its own join column as missing and refuse.
+        val available = LinkedHashMap<SurfaceFact, String>()
+        SurfaceFact.entries.forEach { fact -> facts.value(fact)?.let { available[fact] = it } }
+        available[SurfaceFact.CONNECTOR] = connector.name
+        available[SurfaceFact.CONNECTOR_DIR] = connector.dir
+
+        val values = LinkedHashMap(available)
+        if (windowPolicy == WindowFacts.REFUSE) {
+            // Withheld here as well as refused at load, and the redundancy is the point: this is
+            // the last line that decides whether window-chosen bytes can reach a rendered file,
+            // so it does not depend on the scan at load having been right.
+            SurfaceFact.windowChosen.forEach { values.remove(it) }
+        }
+        if (windowPolicy == WindowFacts.RENDER_RAW && connector.windowFacts.isNotEmpty()) {
+            warnings += "connector '$name' is rendering window-chosen bytes into " +
+                connector.windowFacts.entries.joinToString("; ") { (file, facts) ->
+                    "$file (${facts.joinToString(", ") { it.placeholder }})"
+                } +
+                " — the program that owns the window picks those, and these files are read by " +
+                "the agent as instructions (connector.window_facts=RENDER_RAW)"
+        }
 
         // Before a single byte is written. A refusal that had already half-materialised would
         // leave the agent a directory it cannot tell from a complete one.
-        val missing = connector.required.filter { it !in values }
+        val missing = connector.required.filter { it !in available }
         if (missing.isNotEmpty()) {
             val named = missing.joinToString(", ") { it.id }
             val reason = "requires $named, and this window has no $named"
@@ -219,7 +278,23 @@ class FileConnectorCatalog(
             )
         }
         val targetSub = config[ConnectorFlags.target]
-        val target = if (targetSub.isBlank()) residue else residue.resolve(targetSub)
+        // Resolved against the residue directory's *real* path and required to stay under it.
+        // The flag declares the same rule over the string a user typed, and neither check
+        // subsumes the other: the requirement cannot see a symlink, and this cannot refuse a
+        // value before it is used. `connector.default` was validated for exactly this reason
+        // from the start and `connector.target` was not, which is the gap review found — an
+        // absolute path and a `../ESCAPED` both returned Applied.
+        val realResidue = runCatching { residue.toRealPath() }.getOrElse { residue }
+        val target = realResidue.resolve(targetSub).normalize()
+        if (!target.startsWith(realResidue)) {
+            return ConnectorOutcome.Refused(
+                name,
+                "connector.target '$targetSub' resolves to ${target.absolutePathString()}, " +
+                    "which is outside this surface's residue directory " +
+                    "($realResidue). A connector writes into the residue directory and " +
+                    "nowhere else.",
+            )
+        }
 
         // Two passes: decide everything, then write. `ExistingFile.REFUSE` has to be able to
         // touch nothing, and it cannot promise that from inside a loop that has already written.
@@ -229,7 +304,20 @@ class FileConnectorCatalog(
         connector.files.forEach { relative ->
             val source = Path(connector.dir).resolve(relative)
             val destination = target.resolve(relative)
-            if (destination.exists()) {
+            // A symlink anywhere on the way down, or at the leaf, is refused outright and is not
+            // `connector.existing`'s to decide. That flag is about a *file* that is already
+            // there; a link is about where the write lands, and `REPLACE` following one out of
+            // the residue directory would write this window's facts wherever it pointed. The
+            // residue directory is 0700, so planting one takes a foothold already — which is
+            // exactly the case containment is for.
+            escapingLink(target, destination)?.let {
+                return ConnectorOutcome.Refused(
+                    name,
+                    "${it.absolutePathString()} is a symbolic link, so writing $relative would " +
+                        "follow it out of the residue directory; nothing was written",
+                )
+            }
+            if (destination.exists(LinkOption.NOFOLLOW_LINKS)) {
                 when (config[ConnectorFlags.existing]) {
                     ExistingFile.REFUSE -> return ConnectorOutcome.Refused(
                         name,
@@ -279,7 +367,9 @@ class FileConnectorCatalog(
                 // connector may ship a helper script, and a script that arrives non-executable
                 // fails as "command not found" — a message that sends the reader looking for a
                 // missing program rather than for a mode bit.
-                if (source.isExecutable()) {
+                if (source.isExecutable() &&
+                    config[ConnectorFlags.executable] == ExecutableFiles.PRESERVE
+                ) {
                     runCatching {
                         destination.setPosixFilePermissions(
                             Files.getPosixFilePermissions(destination) +
@@ -305,6 +395,21 @@ class FileConnectorCatalog(
             kept = kept,
             warnings = warnings,
         )
+    }
+
+    /**
+     * The first symbolic link between [root] (exclusive) and [path] (inclusive), or null.
+     *
+     * Only components that already exist are looked at — the rest are about to be created by this
+     * call, as real directories, so there is nothing there to follow.
+     */
+    private fun escapingLink(root: Path, path: Path): Path? {
+        var current: Path? = path
+        while (current != null && current != root && current.startsWith(root)) {
+            if (Files.isSymbolicLink(current)) return current
+            current = current.parent
+        }
+        return null
     }
 
     /**
@@ -344,6 +449,12 @@ class FileConnectorCatalog(
             ),
         )
         val out = target.resolve(FACTS)
+        escapingLink(target, out)?.let {
+            throw IllegalStateException(
+                "${it.absolutePathString()} is a symbolic link, so writing $FACTS would follow " +
+                    "it out of the residue directory",
+            )
+        }
         PrivateFiles.createParentDirectories(out, permissions)
         val staging = out.resolveSibling("${out.name}.tmp")
         PrivateFiles.writeString(

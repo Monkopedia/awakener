@@ -29,6 +29,12 @@ data class ConnectorManifest(
      * Checked **before anything is written**, so a refusal leaves the residue directory exactly
      * as it found it. Declaring nothing is legal and means "render what you have"; it is not a
      * claim that the connector needs no facts, only that it will not be stopped by their absence.
+     *
+     * **This asks whether awakener *has* the fact, not whether it may be substituted into a
+     * file.** The two come apart for exactly the facts that matter: `chromium` requires `title`
+     * because the title is its join column, and it reads it from `.awakener/surface.json`
+     * precisely because [Trust.WINDOW] facts are not rendered into instruction files. A connector
+     * may — and the shipped ones do — require a fact it is forbidden to print.
      */
     val requires: List<String> = emptyList(),
     /**
@@ -55,6 +61,14 @@ data class Connector(
      * `connector.json` is not among them: the manifest is awakener's input, not the agent's.
      */
     val files: List<String>,
+    /**
+     * Which files reference a [Trust.WINDOW] fact, and which facts.
+     *
+     * Computed at load, so `awakener-invoke connectors` can report it and so a press does not
+     * pay to rediscover it. Empty under [WindowFacts.REFUSE] — a connector that has any is not
+     * loaded at all under that policy, which is the default.
+     */
+    val windowFacts: Map<String, List<SurfaceFact>> = emptyMap(),
 ) {
     /** The facts [manifest] declares, resolved; unknown ids are rejected at load time. */
     val required: List<SurfaceFact>
@@ -157,6 +171,16 @@ interface ConnectorCatalog {
      */
     fun apply(name: String?, facts: SurfaceFacts): ConnectorOutcome
 }
+
+/**
+ * Every [Trust.WINDOW] fact whose placeholder appears in [template], in declaration order.
+ *
+ * Derived from the enum rather than from a list of names, so a fact added later is covered
+ * without anyone remembering this function exists — which is the whole difference between this
+ * and the comment it replaces.
+ */
+fun windowFactsIn(template: String): List<SurfaceFact> =
+    SurfaceFact.windowChosen.filter { template.contains(it.placeholder) }
 
 /**
  * Expands every `{fact}` placeholder in [template].

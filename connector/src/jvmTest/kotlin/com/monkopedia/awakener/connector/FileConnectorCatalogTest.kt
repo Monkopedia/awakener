@@ -234,14 +234,16 @@ class FileConnectorCatalogTest {
 
     @Test
     fun `facts are substituted into every file`() {
+        // Awakener-minted facts only. A window-chosen one in a connector file is refused at load
+        // under the default `connector.window_facts`, which `WindowFactContainmentTest` covers.
         define(
             "x",
-            "a.md" to "pid={pid} title={title} app={app_id} agent={agent_name}",
+            "a.md" to "pid={pid} surface={surface_id} agent={agent_name} at {residue}",
             "sub/b.md" to "{connector} at {connector_dir}",
         )
         val outcome = assertIs<ConnectorOutcome.Applied>(catalog().apply("x", facts))
         assertEquals(
-            "pid=4242 title=Example Domain app=chrome-example.com__-Default agent=surface-editor",
+            "pid=4242 surface=7 agent=surface-editor at $residue",
             residue.resolve("a.md").readText(),
         )
         assertEquals(
@@ -304,13 +306,14 @@ class FileConnectorCatalogTest {
 
     @Test
     fun `ANNOTATE applies it anyway and says so`() {
-        define("x", "connector.json" to """{"requires":["title"]}""", "a.md" to "t=[{title}]")
+        define("x", "connector.json" to """{"requires":["pid"]}""", "a.md" to "p=[{pid}]")
         val applied = assertIs<ConnectorOutcome.Applied>(
-            catalog { put(ConnectorFlags.missingFact, MissingFact.ANNOTATE) }.apply("x", facts.copy(title = null)),
+            catalog { put(ConnectorFlags.missingFact, MissingFact.ANNOTATE) }
+                .apply("x", facts.copy(pid = null)),
         )
-        assertEquals("t=[]", residue.resolve("a.md").readText())
+        assertEquals("p=[]", residue.resolve("a.md").readText())
         assertTrue(
-            applied.warnings.any { "title" in it && "ANNOTATE" in it },
+            applied.warnings.any { "pid" in it && "ANNOTATE" in it },
             applied.warnings.toString(),
         )
     }
@@ -321,12 +324,15 @@ class FileConnectorCatalogTest {
      */
     @Test
     fun `an undeclared placeholder that expands to nothing is a warning, not a refusal`() {
-        define("x", "a.md" to "title=[{title}]")
+        // `{pid}` rather than `{title}`: it is the one awakener-minted fact that can genuinely be
+        // absent — a compositor need not report a pid — so it exercises this without colliding
+        // with the window-fact policy, which is a different rule about different facts.
+        define("x", "a.md" to "pid=[{pid}]")
         val applied = assertIs<ConnectorOutcome.Applied>(
-            catalog().apply("x", facts.copy(title = null)),
+            catalog().apply("x", facts.copy(pid = null)),
         )
-        assertEquals("title=[]", residue.resolve("a.md").readText())
-        assertTrue(applied.warnings.any { "{title}" in it }, applied.warnings.toString())
+        assertEquals("pid=[]", residue.resolve("a.md").readText())
+        assertTrue(applied.warnings.any { "{pid}" in it }, applied.warnings.toString())
     }
 
     @Test

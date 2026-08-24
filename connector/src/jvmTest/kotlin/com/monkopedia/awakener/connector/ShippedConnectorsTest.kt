@@ -89,7 +89,13 @@ class ShippedConnectorsTest {
 
     @Test
     fun `chromium applies to a surface and carries its skill`() {
-        val applied = assertIs<ConnectorOutcome.Applied>(catalog.apply("chromium", facts))
+        val applied = assertIs<ConnectorOutcome.Applied>(
+            catalog.apply("chromium", facts),
+            // The refusal reason, not just the type. Every shipped connector refusing at once is
+            // the shape this suite is most likely to see, and "expected Applied, got Refused"
+            // sends the reader nowhere.
+            (catalog.apply("chromium", facts) as? ConnectorOutcome.Refused)?.reason.orEmpty(),
+        )
         assertTrue(applied.warnings.isEmpty(), applied.warnings.toString())
         assertTrue(residue.resolve("cdp.sh").exists())
         assertTrue(residue.resolve(".claude/skills/chromium-window/SKILL.md").exists())
@@ -97,6 +103,20 @@ class ShippedConnectorsTest {
         // The pid is substituted into the helper, which is the only fact that may be: a title is
         // chosen by the program that owns the window, so it is read from surface.json at runtime.
         assertContains(residue.resolve("cdp.sh").readText(), "pid=4242")
+    }
+
+    /**
+     * The pairing that broke once and would break silently: `chromium` **requires** `title` and
+     * is **forbidden to render** it. `requires` asks whether awakener has the fact;
+     * `connector.window_facts` asks whether it may go in a file. Conflating them made every
+     * shipped connector report its own join column as missing and refuse.
+     */
+    @Test
+    fun `chromium requires a fact it is not allowed to print`() {
+        val connector = catalog.list().connectors.single { it.name == "chromium" }
+        assertTrue(SurfaceFact.TITLE in connector.required, connector.manifest.requires.toString())
+        assertEquals(emptyMap(), connector.windowFacts)
+        assertIs<ConnectorOutcome.Applied>(catalog.apply("chromium", facts))
     }
 
     @Test
@@ -154,6 +174,50 @@ class ShippedConnectorsTest {
         // And the other one is unaffected, so the flag is about provisionality and not a
         // blanket off-switch.
         assertIs<ConnectorOutcome.Applied>(catalog.apply("chromium", facts))
+    }
+
+    /**
+     * **No shipped definition prints a window-chosen fact into any of its files.**
+     *
+     * The catalog would refuse one at load, so `every shipped definition loads` already fails if
+     * this is violated — but it fails saying "a connector does not load", which sends the reader
+     * to the loader. This says what is actually wrong and names the file, and it reads the files
+     * directly rather than through the policy, so it still holds if somebody sets
+     * `connector.window_facts=RENDER_RAW` in a fixture.
+     *
+     * Derived from `SurfaceFact.windowChosen`, so a fact classified `WINDOW` later is covered
+     * here without anyone editing this test.
+     */
+    @Test
+    fun `no shipped file prints a fact whose bytes the window chose`() {
+        val offences = mutableListOf<String>()
+        catalog.list().connectors.forEach { connector ->
+            connector.files.forEach { relative ->
+                val text = Path(connector.dir).resolve(relative).readText()
+                windowFactsIn(text).forEach { offences += "${connector.name}/$relative: $it" }
+            }
+        }
+        assertEquals(
+            emptyList(),
+            offences,
+            "these are rendered into the agent's working directory as instructions, and their " +
+                "bytes are chosen by the program that owns the window",
+        )
+    }
+
+    /** The control: the guard above is only meaningful if it could have fired. */
+    @Test
+    fun `the shipped definitions do still reference awakener-minted facts`() {
+        val referenced = catalog.list().connectors.flatMap { connector ->
+            connector.files.flatMap { relative ->
+                val text = Path(connector.dir).resolve(relative).readText()
+                SurfaceFact.entries.filter { text.contains(it.placeholder) }
+            }
+        }.toSet()
+        assertTrue(
+            SurfaceFact.PID in referenced && SurfaceFact.SURFACE_ID in referenced,
+            "no shipped file substitutes anything, so the scan above proves nothing: $referenced",
+        )
     }
 
     /**

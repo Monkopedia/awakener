@@ -15,18 +15,20 @@ desktop-driving tool. Report what you were asked to do and stop.
 
 ## What you were told about the window
 
-`.awakener/surface.json`, in your working directory:
+`.awakener/surface.json`, in your working directory. It holds `pid`, `title`, `app_id`,
+`surface_id`, `surface_key`, `agent_id`, `agent_name` and `residue`.
 
-| field | value here |
+| printed here | value |
 | --- | --- |
 | `pid` | `{pid}` |
-| `title` | (read it from the file) |
-| `app_id` | `{app_id}` |
 | `surface_id` | `{surface_id}` |
 
-**Read `title` and `app_id` from the file, not from this page.** Both are chosen by the program
-that owns the window, so neither may be pasted into a shell command; in the file they are
-JSON-escaped.
+**`title`, `app_id` and `surface_key` are not printed here.** They are chosen by the program that
+owns the window, and this page is a skill file you read as instructions — a multi-line `app_id`
+printed into a table like the one above has been measured breaking out of its code span into
+top-level Markdown. Read them from `.awakener/surface.json`, where they are JSON-escaped, and do
+not paste them into a shell command either. Awakener enforces this: under the default
+`connector.window_facts=REFUSE` a connector file referencing one of them is refused at load.
 
 ## Why the obvious wiring is the wrong wiring
 

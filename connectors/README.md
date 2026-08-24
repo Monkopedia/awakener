@@ -46,13 +46,50 @@ An unknown `{…}` is copied through untouched, so JSON objects and shell parame
 no escaping. Substitution is a single pass, so an expansion is never rescanned — a window titled
 `{residue}` stays a window titled `{residue}`.
 
-### Two facts are attacker-controlled, in the ordinary sense
+### Three facts carry bytes the window chose, and awakener refuses to render them
 
-`{title}` and `{app_id}` are chosen by the program that owns the window. **Never substitute
-either into a shell script, a command line, or anything else with quoting.** A window titled
-`'; rm -rf ~; '` is a window any web page can produce. Read them from `.awakener/surface.json`
-at runtime instead, where they are JSON-escaped by the writer — that is one of the two reasons
-that file exists. `{pid}` and `{surface_id}` are numeric and safe inline.
+`{title}`, `{app_id}` and `{surface_key}` are chosen by the program that owns the window. Any web
+page sets `document.title`; any Wayland client declares its own `app_id`; `surface_key` is built
+from one of those by an escape that guarantees *injectivity* rather than safety, so it passes
+newlines and backticks straight through.
+
+**Under the default `connector.window_facts=REFUSE`, a connector file that references any of the
+three is refused at load** — `awakener-invoke connectors` reports it, and nothing is rendered.
+`connector.window_facts=RENDER_RAW` substitutes them verbatim and warns on every press.
+
+The rule is on the **trust class**, not on those three names: `SurfaceFact` carries a `Trust`, it
+is a required constructor argument with no default, and everything that enforces this iterates the
+class. A fact added later is covered without anybody remembering this paragraph.
+
+#### Two contexts, and the second is the one every connector here actually uses
+
+- **Quoting contexts** — a shell script, a command line. A window titled `'; rm -rf ~; '` is a
+  window any web page can produce.
+- **Instruction contexts** — a `.claude/skills/.../SKILL.md`, a `CLAUDE.md`, anything the agent
+  reads as *directions rather than data*. This is the one that bites, because it is what a
+  connector is mostly made of, and because the injection needs no metacharacter a reader would
+  recognise: a newline and a `#` is enough. A window whose client declared a multi-line `app_id`
+  had it substituted into the shipped chromium skill's fact table, broke out of the backtick
+  span, and became top-level Markdown twenty lines above the disambiguation rule that skill
+  exists to state.
+
+Escaping cannot be chosen for you, because Markdown is not shell is not JSON, and only you know
+what each of your files is. **The safe carrier already exists**: read them from
+`.awakener/surface.json` at runtime, where the writer escapes them as JSON strings — that is one
+of the two reasons that file exists, and its escaping is held under hostile input by its own
+tests. `{pid}` and `{surface_id}` are integers and are safe anywhere; `{residue}`, `{agent_id}`
+and `{agent_name}` are built from a slug in `[a-z0-9-]`.
+
+### Awakener will not write outside the residue directory
+
+`connector.target` must be a relative path with no `..` segment, and the resolved path is checked
+against the residue directory's real path — the flag requirement cannot see a symlink and the
+resolved check cannot refuse a value before it is used, so both run. A symlink **inside** a
+definition is refused at load rather than dereferenced, and a symlink on the destination path is
+refused outright rather than being `connector.existing`'s to decide.
+
+`connector.executable=STRIP` drops the execute bit awakener would otherwise carry across, for a
+deployment that does not want executables minted in the residue directory at all.
 
 ## How a connector points its tool at *one* window
 

@@ -53,6 +53,68 @@ enum class ExistingFile {
     REFUSE,
 }
 
+/**
+ * What rendering does with a fact whose bytes the window chose.
+ *
+ * See [Trust] for why this is a question about a *class* rather than about three named facts.
+ */
+enum class WindowFacts {
+    /**
+     * Refuse the connector, at load, naming the file and the facts.
+     *
+     * The default, and the reason is a demonstrated injection rather than a theory. A connector's
+     * files are rendered into the agent's working directory as **instructions** — a
+     * `.claude/skills/…/SKILL.md` is read by the agent as directions, not as data. A window whose
+     * client declared a multi-line `app_id` had that `app_id` substituted into the shipped
+     * chromium skill's fact table, broke out of the backtick span it was in, and became top-level
+     * Markdown twenty lines above the disambiguation rule that skill exists to state. Any web page
+     * can set `document.title`; any Wayland client can declare an `app_id`.
+     *
+     * Refusing at **load** rather than at apply is deliberate: `awakener-invoke connectors` then
+     * reports it, so the problem is a line in a listing rather than a surprise on a hotkey press.
+     *
+     * This is not a loss of capability, because the safe carrier already exists and every shipped
+     * connector already points at it: `.awakener/surface.json` holds every fact, JSON-escaped by
+     * the writer, and its escaping is held under hostile input by its own tests. An instruction
+     * file says *"read `title` and `app_id` from the file"*; it does not print them.
+     */
+    REFUSE,
+
+    /**
+     * Substitute them verbatim, and warn on every press naming which facts landed in which files.
+     *
+     * **This puts bytes a web page chose into files your agent reads as instructions.** It exists
+     * because a connector may have a context where that is genuinely fine — a file the agent
+     * never reads as directions — and awakener cannot know which. Escaping cannot be done here on
+     * the connector's behalf: Markdown is not shell is not JSON, and only the connector's author
+     * knows what each file is. If you turn this on, you own that choice per file.
+     */
+    RENDER_RAW,
+}
+
+/** What a connector's materialised files do with the execute bit the definition carried. */
+enum class ExecutableFiles {
+    /**
+     * Keep it: a source file that is executable arrives executable.
+     *
+     * The default because a connector may ship a helper and `chromium` does, and a script that
+     * arrives non-executable fails as "command not found" — a message that sends the reader
+     * looking for a missing program rather than for a mode bit.
+     */
+    PRESERVE,
+
+    /**
+     * Drop it: everything arrives non-executable.
+     *
+     * For a deployment that does not want awakener minting executables in the residue directory
+     * at all. Worth having as a switch rather than a paragraph, because awakener setting the
+     * execute bit is what turns any content defect in a rendered `.sh` from a bad file into a
+     * runnable one — [WindowFacts.REFUSE] is what keeps window bytes out of it, and this is the
+     * second, independent lever for someone who wants both.
+     */
+    STRIP,
+}
+
 /** What happens when the connector asked for is not in the search path. */
 enum class UnknownConnector {
     /**
@@ -137,6 +199,32 @@ object ConnectorFlags {
         "Path under the surface's residue directory that a connector's files are written to. " +
             "Empty means the residue directory itself, which is the agent's working directory " +
             "and therefore the only place its own tooling will find them.",
+        Flags.requires(
+            "empty, or a relative path under the residue directory with no .. segment",
+        ) { isContainedSubPath(it) },
+    )
+
+    val windowFacts = Flags.enum(
+        "connector.window_facts",
+        WindowFacts.REFUSE,
+        "What rendering does with a fact whose bytes the window chose — app_id, title and " +
+            "surface_key, which is built from one of them. REFUSE fails the connector at load, " +
+            "naming the file, because a connector's files are rendered into the agent's working " +
+            "directory as instructions and a client-declared app_id has been demonstrated " +
+            "breaking out of a code span into top-level Markdown in a skill file. The safe " +
+            "carrier already exists: .awakener/surface.json holds every fact, JSON-escaped. " +
+            "RENDER_RAW substitutes them verbatim and warns on every press; escaping cannot be " +
+            "done on the connector's behalf, since Markdown is not shell is not JSON.",
+    )
+
+    val executable = Flags.enum(
+        "connector.executable",
+        ExecutableFiles.PRESERVE,
+        "Whether a connector file that is executable in the definition arrives executable. " +
+            "PRESERVE keeps it, which is what a shipped helper script needs; STRIP drops it, " +
+            "for a deployment that does not want awakener minting executables in the residue " +
+            "directory. Independent of connector.window_facts, which is what keeps " +
+            "window-chosen bytes out of a rendered script in the first place.",
     )
 
     val missingFact = Flags.enum(
@@ -215,6 +303,22 @@ object ConnectorFlags {
      * Shared by the flag requirement above and by `--connector` parsing, so the CLI cannot be
      * laxer than the config file about the same string.
      */
+    /**
+     * A path that stays under the directory it is resolved against.
+     *
+     * Shared by [target]'s requirement and by the resolved-path check in the catalog, which are
+     * two different questions that must not be allowed to disagree: this one is about the string
+     * a user typed, and the catalog's is about where it landed once symlinks in the residue
+     * directory have had their say. Neither subsumes the other, so both run.
+     */
+    fun isContainedSubPath(value: String): Boolean =
+        value.isEmpty() ||
+            (
+                !value.startsWith("/") &&
+                    !value.startsWith("\\") &&
+                    value.split('/', '\\').none { it == ".." }
+                )
+
     fun isConnectorName(value: String): Boolean =
         value.isNotEmpty() &&
             value != "." &&
