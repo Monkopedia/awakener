@@ -105,7 +105,13 @@
 # someone acting on a line that fires on every healthy build, and across every run since, no
 # reader ever did — #143 is the code-health pass filing that fact rather than a person. The
 # note was narrowed instead, and the rule that replaced the remedy is at the top of this file.
+#
+# `connector` is new with the connector feature and its floor is stated rather than derived from
+# a merged tree, for the reason the head of this file gives: a count read off a feature branch
+# describes a tree `main` has not got. It is set to the number that branch measured, so it starts
+# as a real floor rather than a `0` that constrains nothing.
 cli 60
 config 64
+connector 24
 registry 109
 wm 114

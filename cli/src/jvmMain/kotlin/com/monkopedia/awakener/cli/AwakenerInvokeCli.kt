@@ -2,6 +2,9 @@ package com.monkopedia.awakener.cli
 
 import com.monkopedia.awakener.config.ConfigCli
 import com.monkopedia.awakener.config.FileConfigStore
+import com.monkopedia.awakener.connector.ConnectorFlags
+import com.monkopedia.awakener.connector.ConnectorOutcome
+import com.monkopedia.awakener.connector.FileConnectorCatalog
 import com.monkopedia.awakener.registry.FileBindingStore
 import com.monkopedia.awakener.registry.SpanreedCli
 import com.monkopedia.awakener.wm.SurfaceId
@@ -54,11 +57,76 @@ object AwakenerInvokeCli {
             }
 
             "invoke" -> {
-                val target = args.getOrNull(1)?.let { raw ->
-                    raw.toLongOrNull()?.let(::SurfaceId)
-                        ?: return usage(out, "surface id must be a number, got '$raw'")
+                var connector: ConnectorChoice = ConnectorChoice.FromConfig
+                var target: SurfaceId? = null
+                var index = 1
+                while (index < args.size) {
+                    val arg = args[index]
+                    when {
+                        arg == "--no-connector" -> connector = ConnectorChoice.None
+                        arg == "--connector" -> {
+                            val name = args.getOrNull(index + 1)
+                                ?: return usage(out, "--connector needs a name")
+                            index++
+                            connector = named(name) ?: return usage(
+                                out,
+                                "'$name' is not usable as a connector name: a connector is one " +
+                                    "directory on connector.dir, so the name may not contain a " +
+                                    "path separator, a space, or be . or ..",
+                            )
+                        }
+
+                        arg.startsWith("--connector=") -> {
+                            val name = arg.substringAfter('=')
+                            connector = named(name) ?: return usage(
+                                out,
+                                "'$name' is not usable as a connector name: a connector is one " +
+                                    "directory on connector.dir, so the name may not contain a " +
+                                    "path separator, a space, or be . or ..",
+                            )
+                        }
+
+                        // Refused rather than ignored. An unrecognised flag on a hotkey path is
+                        // almost always a misspelt one, and silently treating `--connectr=x` as
+                        // a surface id — which is what a bare else that fell through to the
+                        // number parse would do — reports the wrong problem.
+                        arg.startsWith("-") -> return usage(out, "unknown option '$arg'")
+
+                        target != null -> return usage(out, "more than one surface id given")
+
+                        else -> target = arg.toLongOrNull()?.let(::SurfaceId)
+                            ?: return usage(out, "surface id must be a number, got '$arg'")
+                    }
+                    index++
                 }
-                report(awakening.invoke(target), out)
+                report(awakening.invoke(target, connector), out)
+            }
+
+            "connectors" -> {
+                val listing = awakening.connectors()
+                if (listing.connectors.isEmpty() && listing.broken.isEmpty()) {
+                    out("no connectors")
+                    // Where it looked, because "none installed" and "looking in the wrong
+                    // place" are the same line otherwise, and connector.dir is a flag.
+                    listing.searched.forEach { out("  searched $it") }
+                }
+                listing.connectors.forEach { connector ->
+                    val provisional = if (connector.manifest.provisional) "  [provisional]" else ""
+                    out("${connector.name}$provisional")
+                    connector.manifest.description.takeIf { it.isNotBlank() }
+                        ?.let { out("    $it") }
+                    if (connector.manifest.provisional) {
+                        out("    provisional: ${connector.manifest.provisionalReason}")
+                    }
+                    connector.manifest.requires.takeIf { it.isNotEmpty() }
+                        ?.let { out("    requires ${it.joinToString(", ")}") }
+                    out("    ${connector.dir}")
+                    out("    ${connector.files.size} file(s): ${connector.files.joinToString(" ")}")
+                }
+                listing.broken.forEach { out("error: ${it.name}: ${it.dir}: ${it.reason}") }
+                // Non-zero when something on the path looks like a connector and is not: this
+                // is the command someone runs to find out why `--connector x` refused.
+                if (listing.broken.isEmpty()) 0 else 1
             }
 
             "reap" -> {
@@ -69,6 +137,10 @@ object AwakenerInvokeCli {
 
             else -> usage(out, "unknown command '${args[0]}'")
         }
+
+    /** A `--connector` value, or null when it is not a name a connector directory could have. */
+    private fun named(name: String): ConnectorChoice? =
+        if (ConnectorFlags.isConnectorName(name)) ConnectorChoice.Named(name) else null
 
     private fun report(standing: Standing, out: (String) -> Unit) {
         val focus = if (standing.surface.focused) "* " else "  "
@@ -93,6 +165,7 @@ object AwakenerInvokeCli {
             )
             out("  SPANREED_AGENT_NAME=${awakened.binding.spanreedName}")
             out("  dock ${awakened.dock.dockId.raw} beside surface ${awakened.surface.raw}")
+            reportConnector(awakened.connector, out)
             0
         }
 
@@ -122,16 +195,52 @@ object AwakenerInvokeCli {
             0
         }
 
+        is Awakened.ConnectorRefused -> {
+            out(
+                "connector '${awakened.refusal.name}' refused, so no panel was stood up: " +
+                    awakened.refusal.reason,
+            )
+            out("  ${awakened.key.canonical} stays bound to ${awakened.binding.agentId}")
+            // Distinct from 1 (nothing to awaken) and 2 (bad usage): the surface was found, the
+            // agent was recalled, and the one thing that did not happen is the connector.
+            3
+        }
+
         is Awakened.NoSurface -> {
             out("nothing to awaken: ${awakened.reason}")
             1
         }
     }
 
+    private fun reportConnector(outcome: ConnectorOutcome, out: (String) -> Unit) {
+        when (outcome) {
+            // Silence is the point. An unconfigured press prints exactly what it always did.
+            is ConnectorOutcome.None -> Unit
+            is ConnectorOutcome.Applied -> {
+                out("  connector ${outcome.name} -> ${outcome.target}")
+                out("    ${outcome.written.size} file(s) written from ${outcome.dir}")
+                outcome.kept.takeIf { it.isNotEmpty() }?.let {
+                    out("    ${it.size} kept (connector.existing=KEEP): ${it.joinToString(" ")}")
+                }
+                outcome.warnings.forEach { out("    warning: $it") }
+            }
+
+            is ConnectorOutcome.Skipped -> out("  warning: ${outcome.reason}")
+            // Never reaches here: `invoke` turns a refusal into Awakened.ConnectorRefused before
+            // a dock exists. Exhaustive rather than `else` so that a new outcome is a compile
+            // error at this reporting site rather than a silently unreported one.
+            is ConnectorOutcome.Refused -> out("  error: ${outcome.reason}")
+        }
+    }
+
     private fun usage(out: (String) -> Unit, error: String): Int {
         out("error: $error")
-        out("usage: awakener-invoke [list | invoke [<surface id>] | reap]")
+        out(
+            "usage: awakener-invoke [list | invoke [--connector <name> | --no-connector] " +
+                "[<surface id>] | connectors | reap]",
+        )
         out("  invoke with no id acts on the focused window, which is what a hotkey has")
+        out("  --connector names a directory on connector.dir; `connectors` lists them")
         return 2
     }
 }
@@ -225,6 +334,11 @@ private fun awaken(args: Array<String>, store: FileConfigStore): Int {
                         prepareResidue = { bindings.prepareResidue(it) },
                         reapOrphans = wm::reapOrphans,
                         dockFor = wm::dockFor,
+                        // The snapshot, not the store. One press is one operation, and the
+                        // catalog reads `connector.*` — a reload landing between "which
+                        // connector" and "where does it write" would materialise half of one
+                        // deployment's answer and half of another's.
+                        connectors = FileConnectorCatalog(store.config.value),
                     ),
                     ::println,
                 )

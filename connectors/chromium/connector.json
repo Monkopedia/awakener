@@ -1,0 +1,4 @@
+{
+  "description": "Find and drive this window's page over the Chrome DevTools Protocol.",
+  "requires": ["pid", "title"]
+}
