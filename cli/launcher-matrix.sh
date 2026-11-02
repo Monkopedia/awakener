@@ -99,6 +99,7 @@ mktree() {
     dir=$WORK/tree/$1
     mkdir -p "$dir/bin"
     ln -s "$INSTALL/lib" "$dir/lib"
+    ln -s "$INSTALL/connectors" "$dir/connectors"
     for script in "$INSTALL"/bin/*; do
         base=${script##*/}
         if [ -z "$2" ]; then
@@ -117,6 +118,12 @@ mktree() {
 mktree real ''
 mktree nobuild "$WORK/jvm/absent/bin/java"
 mktree badbuild "$WORK/jvm/java8/bin/java"
+
+# The connector definitions one directory away from `$APP_HOME/connectors` — the layout that left a
+# woken agent in an empty working directory on real hardware with nothing on screen to say why.
+mktree misplaced ''
+mkdir -p "$WORK/tree/misplaced/share"
+mv "$WORK/tree/misplaced/connectors" "$WORK/tree/misplaced/share/connectors"
 
 REAL=$WORK/tree/real/bin
 NOBUILD=$WORK/tree/nobuild/bin
@@ -629,6 +636,46 @@ expect "roster/every shell it counts present is one the rows can run" \
 # `roster_scan`. If one of them ever reaches the live ones, this is the row that says so.
 expect "probes/the fixtures left the live harness alone" \
     "$BARE_PATH|$ALT_PRESENT|$ALT_TOTAL|$ALT_FOUND|$ALT_MISSING" "$LIVE_STATE"
+
+# --- the shipped connector definitions are where the launcher says they are (#195) ----------
+#
+# `installDist` lays down `connectors/` beside `lib/`, and the launcher exports
+# `AWAKENER_CONNECTORS=$APP_HOME/connectors` for `FileConnectorCatalog` to read. Neither half is
+# visible to a JVM test, which reads the source directory, and an empty listing is exactly what
+# a missing export or a missing directory produces — so the rows assert the listing names each
+# shipped definition *by its path in the tree*, which only the export can put there. The names
+# are read out of the install, not written here, so these rows do not move as definitions do.
+note ""
+note "# the launcher points the catalog at the shipped connectors/ (#195)"
+SHIPPED=$(ls "$INSTALL/connectors")
+shipped_any=''
+for name in $SHIPPED; do
+    [ -d "$INSTALL/connectors/$name" ] || continue
+    shipped_any=1
+    check "connectors/lists shipped $name from \$APP_HOME/connectors" 0 \
+        "$WORK/tree/real/connectors/$name" \
+        -- "JAVA_HOME=$GOOD_HOME" -- "$REAL/awakener-invoke" connectors
+done
+[ -n "$shipped_any" ] || die "installDist laid down no connector definitions under $INSTALL/connectors"
+# The negative control: the same command against a tree whose definitions sit one directory off
+# has to come back empty and say where it looked. If this row passes for the listing above, the
+# rows above are not measuring the layout.
+check "connectors/misplaced definitions are not found" 0 \
+    "searched $WORK/tree/misplaced/connectors" \
+    -- "JAVA_HOME=$GOOD_HOME" -- "$WORK/tree/misplaced/bin/awakener-invoke" connectors
+# The export respects a value already set, which is how a deployment that lays definitions down
+# elsewhere points at them.
+mkdir -p "$WORK/connectors-elsewhere"
+check "connectors/a pre-set AWAKENER_CONNECTORS wins" 0 \
+    "searched $WORK/connectors-elsewhere" \
+    -- "JAVA_HOME=$GOOD_HOME" "AWAKENER_CONNECTORS=$WORK/connectors-elsewhere" \
+    -- "$REAL/awakener-invoke" connectors
+# `installDist` fixes the mode of every helper script up explicitly, because Sync does not carry
+# it across on every filesystem. Read back from what it laid down, not from git.
+for helper in $(find "$INSTALL/connectors/" -type f -name '*.sh'); do
+    if [ -x "$helper" ]; then mode=executable; else mode=not-executable; fi
+    expect "connectors/${helper#"$INSTALL/connectors/"} arrives executable" "$mode" executable
+done
 
 # --- under other POSIX shells ----------------------------------------------------------------
 #
