@@ -247,9 +247,14 @@ class SwayTabTitleTest {
      * this. The title therefore stays set across a hide, deliberately: clearing it would put
      * `H[aw-app1]` on screen for the whole time the panel is away, which is the bug wearing a
      * shorter name.
+     *
+     * That is the shape under `wm.dock.flatten_on_hide=false`, which this test therefore sets. By
+     * default the hide collapses the split (#187), the surface is a bare tab again, and sway's own
+     * leaf title is the page's — there is no container left to name.
      */
     @Test
     fun `a hidden dock leaves its surface's title on the tab`() = swayTest {
+        store.put(WmFlags.flattenOnHide, false)
         val app = openTitled("aw-app1", PAGE)
         val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
         assumeContainerTitles()
