@@ -625,6 +625,21 @@ object WmFlags {
             "split containers, and a leftover one silently swallows the next window opened.",
     )
 
+    val flattenOnHide = Flags.boolean(
+        "wm.dock.flatten_on_hide",
+        true,
+        "Collapse the split container when a dock is hidden, and split the surface again when " +
+            "it is shown. A hide moves the dock to the scratchpad and sway leaves the surface " +
+            "alone in the split attach made, so with this off every window opened in that tab " +
+            "while the dock is hidden lands beside the surface instead of in a tab of its own " +
+            "(#187). Only a split holding nothing but the surface is collapsed: one that has " +
+            "already taken in another window is left as it is, since collapsing it is refused " +
+            "and moving that window out is not this flag's call. Off restores the old shape, " +
+            "where the split stands for as long as the dock is hidden. It does not cover a " +
+            "window opened while the dock is visible: sway places a new window beside the " +
+            "focused one, which is the surface or the dock, and both are inside the split.",
+    )
+
     val unwindFailedAttach = Flags.boolean(
         "wm.dock.unwind_failed_attach",
         true,

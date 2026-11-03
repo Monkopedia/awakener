@@ -739,17 +739,20 @@ class SwayWindowManager(
          *
          * **The dock is not named here, and not looked for either.** Every caller has already
          * established that this surface has one; what this needs is the container, and the
-         * container is not always the dock's parent — hiding a dock leaves the split standing with
-         * a single child (measured on 1.12: sway does not collapse it), so a hidden dock's tab is
-         * still synthetic and still wants this. Asking from the surface's side answers both cases.
+         * container is not always the dock's parent — with wm.dock.flatten_on_hide off, hiding a
+         * dock leaves the split standing with a single child (measured on 1.12: sway does not
+         * collapse it), so a hidden dock's tab is still synthetic and still wants this. Asking
+         * from the surface's side answers both cases; with the flag on, the hidden surface has no
+         * split above it and there is nothing to name.
          *
-         * [CON] is the one thing checked, and it is checked rather than assumed because
+         * That the parent is a split [CON] is checked rather than assumed because
          * [Node.parentOf] answers about whatever the tree currently holds: a surface with no
          * container above it is a child of its **workspace**, and naming that would put a page
-         * title where the workspace name goes.
+         * title where the workspace name goes; a surface directly in a `tabbed` strip is a tab
+         * already, and naming the strip names the wrong thing. See [dockSplitOf].
          *
-         * Silent where there is nothing to name — no such surface, or a surface sitting directly
-         * in its workspace — because both mean the tab is a leaf already showing the right thing.
+         * Silent where there is nothing to name — no such surface, or a surface with no split
+         * above it — because both mean the tab is a leaf already showing the right thing.
          */
         suspend fun applyTabTitle(surface: SurfaceId) {
             val cfg = config
@@ -757,7 +760,11 @@ class SwayWindowManager(
             if (tabTitleRefusal.value != null) return
             val tree = tree()
             val node = tree.find(surface.raw) ?: return
-            val container = tree.parentOf(surface.raw)?.takeIf { it.type == CON } ?: return
+            // A split, specifically: under wm.dock.flatten_on_hide a hidden dock's surface sits
+            // directly in the tab strip, and a `tabbed` or `stacked` parent is the user's tab
+            // strip rather than a container attach made — naming it would put a page title on
+            // the wrong thing.
+            val container = dockSplitOf(tree, surface) ?: return
             // app_id is the fallback because it is what sway's own leaf title falls back to, so a
             // window with no title keeps reading the way it read before the dock existed. With
             // neither, there is nothing to say that beats what sway would put there itself.
@@ -1037,12 +1044,27 @@ class SwayWindowManager(
          * its container with, which for a dock is the surface: measured on headless sway 1.12 with
          * the dock focused at the moment of the move, focus landed on the surface.
          */
-        suspend fun hideDock(dock: SurfaceId): Boolean {
+        suspend fun hideDock(surface: SurfaceId, dock: SurfaceId): Boolean {
             if (inScratchpad(dock)) return false
+            val cfg = config
             run("[con_id=${dock.raw}] move scratchpad")
-            check(pollTree(config[WmFlags.unmapWaitMs]) { if (inScratchpad(dock)) true else null } == true) {
+            check(pollTree(cfg[WmFlags.unmapWaitMs]) { if (inScratchpad(dock)) true else null } == true) {
                 "dock ${dock.raw} was still outside the scratchpad " +
-                    "${config[WmFlags.unmapWaitMs]}ms after being moved into it"
+                    "${cfg[WmFlags.unmapWaitMs]}ms after being moved into it"
+            }
+            // #187. With the dock gone the surface is alone in the split attach made, and sway
+            // places a new window beside the focused one *inside its parent* — so the next window
+            // opened in this tab would land in that split, sharing the tab with the surface,
+            // rather than getting a tab of its own. Collapsing it here leaves nothing for a
+            // newcomer to walk into; `showDock` splits again on the way back.
+            //
+            // Only a split holding nothing but the surface. One that already took a window in
+            // while the dock was visible cannot be collapsed (`split none` is refused while the
+            // surface has siblings), and moving that window out is a decision about somebody
+            // else's window that a hide has no business making. Targeted by criteria rather than
+            // by focus, so the hide leaves focus exactly where sway put it.
+            if (cfg[WmFlags.flattenOnHide] && dockSplitOf(tree(), surface)?.nodes?.size == 1) {
+                run("[con_id=${surface.raw}] split none")
             }
             return true
         }
@@ -1093,10 +1115,21 @@ class SwayWindowManager(
             if (!inScratchpad(dock)) return false
             val cfg = config
             val sizePpt = cfg[WmFlags.dockSizePpt]
+            // Read before the batch, because the batch cannot ask: whether the surface still sits
+            // in a split decides whether one has to be made. A surface with no split above it —
+            // the hide collapsed it under wm.dock.flatten_on_hide, or a user flattened the tab
+            // by hand — would otherwise have `floating disable` tile the dock in beside it *as a
+            // tab of its own*, measured on headless sway 1.12, rather than beside it. Decided by
+            // the tree rather than by the flag, because the flag can have been flipped between
+            // the hide and this show and the tree is what the batch will actually meet.
+            val resplit = dockSplitOf(tree(), surface) == null
             val restore = buildList {
                 add("[con_id=${dock.raw}] scratchpad show")
                 // Before `floating disable`, because that re-tiles beside the focused node.
                 add("[con_id=${surface.raw}] focus")
+                // After the focus, because `split` applies to the focused node — the same order
+                // attach uses, and inside the batch for #172's reason: one message, one present.
+                if (resplit) add("split horizontal")
                 add("[con_id=${dock.raw}] floating disable")
                 // The same two commands attach ends with, because a restore owes the caller the
                 // dock's configured geometry back: the scratchpad keeps neither side nor width.
@@ -1118,11 +1151,10 @@ class SwayWindowManager(
                     "${cfg[WmFlags.unmapWaitMs]}ms after the restore went out: $fault"
             }
 
-            // Re-issued rather than relied upon. The container usually survives a hide — sway
-            // leaves the split standing with one child — so the title is normally already right
-            // and this changes nothing. What it covers is the case where it is not: a user who
-            // flattened the tab by hand while the dock was away gets a *new* container out of
-            // `floating disable`, and that one has never been named.
+            // Re-issued rather than relied upon. Under wm.dock.flatten_on_hide the hide collapsed
+            // the split, so the `split horizontal` above made a *new* container that has never
+            // been named; with the flag off the old one usually survives a hide and this changes
+            // nothing. A user who flattened the tab by hand lands in the first case either way.
             applyTabTitle(surface)
 
             if (cfg[WmFlags.dockFocusOnShow]) focus(dock)
@@ -2109,7 +2141,7 @@ class SwayWindowManager(
 
         override suspend fun hide(): Boolean {
             checkSession("hide")
-            return treeEdit { hideDock(dockId) }
+            return treeEdit { hideDock(surface, dockId) }
         }
 
         override suspend fun show(): Boolean {
@@ -2131,8 +2163,13 @@ class SwayWindowManager(
                 // exists to prevent. Asking from the surface's side answers both cases: for an
                 // orphan whose surface is already gone it is null, and sway has by then collapsed
                 // the empty container itself.
+                //
+                // From the surface's side, the parent is only the dock's container if it is still
+                // a split: under wm.dock.flatten_on_hide the hide already collapsed it, and the
+                // surface's parent is then the tab strip, whose title is not awakener's to reset
+                // and whose "survivor" is some other tab that `split none` would be refused on.
                 val parent = if (inScratchpad(dockId)) {
-                    tree().parentOf(surface.raw)
+                    dockSplitOf(tree(), surface)
                 } else {
                     tree().parentOf(dockId.raw)
                 }
@@ -2248,6 +2285,19 @@ class SwayWindowManager(
          * name goes.
          */
         private const val CON = "con"
+
+        /**
+         * The split container [surface] sits in, or null when its parent is anything else.
+         *
+         * A split is what `attach` makes — `split horizontal`, or `splitv` once a user has toggled
+         * it — so this is the shape of the container a dock lives in. A `tabbed` or `stacked`
+         * parent is a tab strip, and a workspace parent is no container at all; under
+         * [WmFlags.flattenOnHide] both are where a hidden dock's surface ordinarily sits, and
+         * neither is awakener's to name, flatten, or treat as holding a survivor.
+         */
+        private fun dockSplitOf(tree: Node, surface: SurfaceId): Node? =
+            tree.parentOf(surface.raw)
+                ?.takeIf { it.type == CON && (it.layout == "splith" || it.layout == "splitv") }
 
         /**
          * How many times an unwind will try to flatten the container it is taking back while the
