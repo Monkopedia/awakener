@@ -216,11 +216,17 @@ jobs:
       # is the repository owner's own. And a pin freezes the CLI contract :registry tests against
       # — CI no longer picks up a new spanreed the day it ships, so bumping SPANREED_VERSION and
       # SPANREED_SHA256 together is now part of releasing one.
+      #
+      # 0.0.8 sat here past the release that changed `list`'s output (0.0.9 made it a report and
+      # moved the JSON behind `--json`), so CI stayed green while kaladin's 0.3.0 failed (#201).
+      # The pin now tracks what the hosts run. The pre-0.0.9 fallback in `SpanreedCli` is held by
+      # a recorded test over 0.0.8's verbatim refusal: 0.0.8 is a frozen release, so that answer
+      # cannot move under the test the way the newest spanreed's can.
       - name: Install spanreed
         id: install-spanreed
         env:
-          SPANREED_VERSION: '0.0.8'
-          SPANREED_SHA256: '7ab7c0128235751da1ff466916047df3e94716e11a2e27c5403227de5bae87d1'
+          SPANREED_VERSION: '0.3.0'
+          SPANREED_SHA256: 'cc20b571f892f99277333d630c89b150bf726dfdcd19ac7c13dece27bdac817e'
         run: |
           set -euo pipefail
           wheel_dir="$RUNNER_TEMP/spanreed-wheel"

@@ -23,6 +23,28 @@ enum class WindowIdentity {
     APP_ID_AND_PID,
 }
 
+/**
+ * How `spanreed list` is asked for the JSON array awakener decodes.
+ *
+ * spanreed 0.0.9 made the plain `list` a human-readable report and moved the array behind
+ * `--json`; 0.0.8 and earlier print the array by default and reject `--json` as an unrecognized
+ * argument (argparse, exit 2). Both are in use on the hosts awakener runs on (#201).
+ */
+enum class SpanreedListForm {
+    /**
+     * Ask with `--json`, and only if spanreed rejects that *specific* argument as unrecognized,
+     * ask again without it. Any other failure is still raised, so a locked or broken bus is never
+     * retried into a different answer. Costs a second subprocess per read on a pre-0.0.9 spanreed.
+     */
+    AUTO,
+
+    /** Always pass `--json`: one subprocess, and a pre-0.0.9 spanreed fails the read loudly. */
+    JSON,
+
+    /** Never pass it: the pre-0.0.9 form. On 0.0.9 and later the report fails to decode. */
+    PLAIN,
+}
+
 /** Where an agent id comes from when a surface is first bound. */
 enum class AgentIdSource {
     /**
@@ -427,6 +449,15 @@ object RegistryFlags {
         // empty string — so it degrades to the default and is reported, rather than reaching
         // ProcessBuilder to come back as "could not run ''".
         Flags.nonBlank(),
+    )
+
+    val spanreedListForm = Flags.enum(
+        "registry.agent.spanreed_list_form",
+        SpanreedListForm.AUTO,
+        "How `spanreed list` is asked for JSON. spanreed 0.0.9 moved the array behind --json and " +
+            "0.0.8 rejects that flag. AUTO passes --json and retries without it only when " +
+            "spanreed rejects --json as an unrecognized argument; JSON always passes it, so an " +
+            "old spanreed fails loudly; PLAIN never does, for a spanreed older than 0.0.9.",
     )
 
     val commandTimeoutMs = Flags.long(

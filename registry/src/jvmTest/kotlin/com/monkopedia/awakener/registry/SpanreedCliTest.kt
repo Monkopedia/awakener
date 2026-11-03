@@ -151,7 +151,7 @@ class SpanreedCliTest {
         assertEquals(emptyList(), cli.liveAgents())
 
         val (command, environment) = calls.single()
-        assertEquals(listOf("spanreed", "list"), command)
+        assertEquals(listOf("spanreed", "list", "--json"), command)
         assertTrue(
             "SPANREED_AGENT_NAME" in environment,
             "the variable has to be named to be cleared; leaving it out inherits it instead",
@@ -162,6 +162,82 @@ class SpanreedCliTest {
             "null is removal — awakener's own process usually has one set, and asking the bus " +
                 "who is live while wearing a name asks as somebody",
         )
+    }
+
+    /**
+     * spanreed-bus 0.0.8's answer to `list --json`, verbatim (measured 2026-11-02 against
+     * `uv tool run --from spanreed-bus==0.0.8`). 0.0.9 moved the array behind that flag; 0.0.8
+     * still prints it by default and rejects the flag through argparse (#201).
+     */
+    private val rejectsJsonFlag = ProcessResult(
+        2,
+        "",
+        "usage: spanreed [-h]\n                {agent-id,inbox-path,register,deregister,list," +
+            "send,recv,inbox-watch,session-start,name,focus,status,status-tracking," +
+            "activity-log,log,conjoin}\n                ...\n" +
+            "spanreed: error: unrecognized arguments: --json\n",
+    )
+
+    /** A runner that answers each argv from [answers], in call order. */
+    private fun scripted(vararg answers: ProcessResult): SpanreedCli {
+        val queue = ArrayDeque(answers.toList())
+        return SpanreedCli(
+            configStore = config,
+            runner = { command, environment ->
+                calls += command to environment
+                queue.removeFirst()
+            },
+            ownPid = { 4321L },
+        )
+    }
+
+    @Test
+    fun `a spanreed that predates --json is asked again without it`() = runTest {
+        val cli = scripted(
+            rejectsJsonFlag,
+            ProcessResult(0, """[{"agent_id": "agent-lifeless-a", "name": "lifeless-a"}]""" + "\n", ""),
+        )
+
+        assertEquals(listOf("agent-lifeless-a"), cli.liveAgents().map { it.agentId })
+        assertEquals(
+            listOf(listOf("spanreed", "list", "--json"), listOf("spanreed", "list")),
+            calls.map { it.first },
+        )
+        assertTrue(
+            calls.all { (_, env) -> "SPANREED_AGENT_NAME" in env && env["SPANREED_AGENT_NAME"] == null },
+            "the retry asks under no name too",
+        )
+    }
+
+    /**
+     * The retry is for one refusal only. A plain `list` on 0.0.9+ prints a report, so retrying
+     * any other failure turns "the bus is locked" into a decode error that names the wrong thing
+     * — and a usage error about some *other* argument is not a spanreed that predates --json.
+     */
+    @Test
+    fun `any other failure of list --json is raised without a retry`() = runTest {
+        for (failure in listOf(
+            ProcessResult(2, "", "spanreed: registry is locked"),
+            ProcessResult(2, "", "spanreed: error: unrecognized arguments: --include-stale"),
+            ProcessResult(1, "", "spanreed: error: unrecognized arguments: --json"),
+        )) {
+            calls.clear()
+            val cli = scripted(failure)
+            assertFailsWith<IllegalStateException> { cli.liveAgents() }
+            assertEquals(1, calls.size, "retried after ${failure.stderr} (exit ${failure.exitCode})")
+        }
+    }
+
+    @Test
+    fun `the list form is switchable to always or never pass --json`() = runTest {
+        config.put(RegistryFlags.spanreedListForm, SpanreedListForm.JSON)
+        assertFailsWith<IllegalStateException> { scripted(rejectsJsonFlag).liveAgents() }
+        assertEquals(listOf(listOf("spanreed", "list", "--json")), calls.map { it.first })
+
+        calls.clear()
+        config.put(RegistryFlags.spanreedListForm, SpanreedListForm.PLAIN)
+        assertEquals(emptyList(), scripted(ProcessResult(0, "[]\n", "")).liveAgents())
+        assertEquals(listOf(listOf("spanreed", "list")), calls.map { it.first })
     }
 
     @Test
