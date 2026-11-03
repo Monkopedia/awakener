@@ -438,11 +438,14 @@ class SpanreedCli(
      * answer's every prefix is a valid — and a *different* — answer (#110).
      */
     override suspend fun liveAgents(): List<LiveAgent> {
-        val result = withContext(Dispatchers.IO) {
-            runner.run(
-                listOf(config[RegistryFlags.spanreedCommand], "list"),
-                mapOf("SPANREED_AGENT_NAME" to null),
-            )
+        // One snapshot for both attempts, so a reload between them cannot ask two spanreeds.
+        val cfg = config
+        val result = when (cfg[RegistryFlags.spanreedListForm]) {
+            SpanreedListForm.JSON -> list(cfg, json = true)
+            SpanreedListForm.PLAIN -> list(cfg, json = false)
+            SpanreedListForm.AUTO -> list(cfg, json = true).let { first ->
+                if (first.rejectedJsonFlag) list(cfg, json = false) else first
+            }
         }
         check(result.succeeded) { "spanreed list failed — ${result.problem}" }
         val listing = result.stdout.ifBlank {
@@ -453,6 +456,28 @@ class SpanreedCli(
         // distinguishes an empty bus from an unread one.
         return busJson.decodeFromString(listing)
     }
+
+    /**
+     * `spanreed list`, under no agent name: awakener's own process usually has one set, and
+     * asking the bus who is live while wearing a name asks as somebody.
+     */
+    private suspend fun list(config: Config, json: Boolean): ProcessResult =
+        withContext(Dispatchers.IO) {
+            runner.run(
+                listOf(config[RegistryFlags.spanreedCommand], "list") +
+                    if (json) listOf("--json") else emptyList(),
+                mapOf("SPANREED_AGENT_NAME" to null),
+            )
+        }
+
+    /**
+     * A pre-0.0.9 spanreed refusing `--json`, and nothing else: argparse's usage-error exit
+     * naming that argument. Measured against spanreed-bus 0.0.8 on 2026-11-02 — exit 2,
+     * `spanreed: error: unrecognized arguments: --json`. Matching any non-zero exit instead
+     * would retry a locked or broken bus as a plain `list` and read a 0.0.9+ report back.
+     */
+    private val ProcessResult.rejectedJsonFlag: Boolean
+        get() = exitCode == 2 && "unrecognized arguments: --json" in stderr
 
     /**
      * Mints the identity for a surface.
