@@ -640,6 +640,30 @@ object WmFlags {
             "focused one, which is the surface or the dock, and both are inside the split.",
     )
 
+    val evictOnHide = Flags.boolean(
+        "wm.dock.evict_on_hide",
+        false,
+        "On a hide, move every window sharing the dock's split that is neither the surface nor " +
+            "its dock out of that split first, so each becomes a sibling of the dock's split " +
+            "(#187) — a tab of its own when that split is a tab, as it is unless the surface was " +
+            "already inside a split of the user's, in which case the window joins that split. " +
+            "sway places a new window beside the focused one, and while the dock is visible the " +
+            "focused one is the surface or the dock, both inside the split attach made — so a " +
+            "window opened then shares the tab with them, and wm.dock.flatten_on_hide cannot " +
+            "collapse a split that holds it. The windows land directly after the dock's split, " +
+            "in the order they had inside it, or directly before it when the next sibling is a " +
+            "container of its own — sway would move the window into that container — and they " +
+            "are left where they are for that press when containers stand on both sides. Focus " +
+            "is left where it was. Only the " +
+            "split the visible dock sits in is touched, and only when the surface sits in it " +
+            "too, so a split awakener did not make is never emptied. It runs on the hide press " +
+            "and nowhere else: a show finds the dock in the scratchpad, where nothing identifies " +
+            "which split above the surface, if any, is one attach made. Off, the default, " +
+            "leaves such a window where sway put it, beside the dock, which is visible on " +
+            "screen from the moment it lands; on moves windows a user may have put there on " +
+            "purpose.",
+    )
+
     val unwindFailedAttach = Flags.boolean(
         "wm.dock.unwind_failed_attach",
         true,
