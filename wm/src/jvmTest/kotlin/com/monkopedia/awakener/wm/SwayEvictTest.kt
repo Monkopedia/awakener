@@ -170,6 +170,98 @@ class SwayEvictTest {
         )
     }
 
+    /**
+     * sway 1.12 moves a window leaving a split by its edge *into* the neighbour on that side when
+     * the neighbour is a container. A user's split tab after the dock's must not take the intruder
+     * in, so it leaves by the other side and lands before the dock's split instead.
+     */
+    @Test
+    fun `a split tab after the dock's is not entered`() = swayTest {
+        store.put(WmFlags.evictOnHide, true)
+        val app = openSurface("aw-app1")
+        val (x, y) = userSplitTab("aw-x", "aw-y")
+        val (dock, intruder) = dockWithIntruder(app)
+        assertEquals(
+            listOf(app.raw, x.raw),
+            tabStrip().nodes.map { it.nodes.firstOrNull()?.id },
+            "the dock's split is followed by the user's: ${describe(tabStrip())}",
+        )
+
+        assertTrue(dock.hide())
+
+        val strip = tabStrip()
+        assertEquals(
+            listOf(intruder.raw, app.raw, null),
+            strip.nodes.map { it.id.takeIf { _ -> it.nodes.isEmpty() } },
+            "the intruder is a tab before the surface's, and the user's tab follows. ${describe(strip)}",
+        )
+        assertEquals(
+            listOf(x.raw, y.raw),
+            strip.nodes.last().nodes.map { it.id },
+            "the user's split holds what it held. ${describe(strip)}",
+        )
+    }
+
+    /** A single window after the dock's split is a clear side: the intruder lands between. */
+    @Test
+    fun `a single-window tab after the dock's keeps its place`() = swayTest {
+        store.put(WmFlags.evictOnHide, true)
+        val app = openSurface("aw-app1")
+        val x = openSurface("aw-x")
+        val (dock, intruder) = dockWithIntruder(app)
+
+        assertTrue(dock.hide())
+
+        assertEquals(
+            listOf(app.raw, intruder.raw, x.raw),
+            tabStrip().nodes.map { it.id },
+            describe(tabStrip()),
+        )
+    }
+
+    /** Containers on both sides: no exit is safe, so the press leaves the window where it is. */
+    @Test
+    fun `with split tabs on both sides nothing is moved`() = swayTest {
+        store.put(WmFlags.evictOnHide, true)
+        val (b1, b2) = userSplitTab("aw-b1", "aw-b2")
+        command("[con_id=${b1.raw}] focus; focus parent")
+        val app = openSurface("aw-app1")
+        val (x, y) = userSplitTab("aw-x", "aw-y")
+        val (dock, intruder) = dockWithIntruder(app)
+        assertEquals(
+            listOf(b1.raw, app.raw, x.raw),
+            tabStrip().nodes.map { it.nodes.firstOrNull()?.id },
+            "user split, dock split, user split: ${describe(tabStrip())}",
+        )
+
+        assertTrue(dock.hide())
+
+        val strip = tabStrip()
+        assertEquals(listOf(b1.raw, b2.raw), strip.nodes[0].nodes.map { it.id }, describe(strip))
+        assertEquals(listOf(app.raw, intruder.raw), strip.nodes[1].nodes.map { it.id }, describe(strip))
+        assertEquals(listOf(x.raw, y.raw), strip.nodes[2].nodes.map { it.id }, describe(strip))
+    }
+
+    /** Opens [first] and [second] as one `splitv` tab after whatever is focused. */
+    private suspend fun userSplitTab(first: String, second: String): Pair<SurfaceId, SurfaceId> {
+        val a = openSurface(first)
+        command("[con_id=${a.raw}] focus; split vertical")
+        val b = openSurface(second)
+        return a to b
+    }
+
+    private suspend fun dockWithIntruder(app: SurfaceId): Pair<DockHandle, SurfaceId> {
+        val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+        command("[con_id=${app.raw}] focus")
+        val intruder = openSurface("aw-intruder")
+        assertTrue(
+            assertNotNull(tabHolding(app)).nodes.any { it.id == intruder.raw },
+            "sway put it in the dock's split: ${describe(tabStrip())}",
+        )
+        command("[con_id=${app.raw}] focus")
+        return dock to intruder
+    }
+
     // -- helpers ------------------------------------------------------------------------
 
     private fun swayTest(body: suspend () -> Unit) {
