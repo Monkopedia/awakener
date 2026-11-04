@@ -1047,7 +1047,15 @@ class SwayWindowManager(
         suspend fun hideDock(surface: SurfaceId, dock: SurfaceId): Boolean {
             if (inScratchpad(dock)) return false
             val cfg = config
-            run("[con_id=${dock.raw}] move scratchpad")
+            // #187, the visible-dock half. Planned from one read and sent in the same message as
+            // the move, for #172's reason: one message, one present, so the user never sees the
+            // windows leaving the tab as a separate frame from the panel going away.
+            val evict = if (cfg[WmFlags.evictOnHide]) {
+                evictionCommands(tree(), surface, dock)
+            } else {
+                emptyList()
+            }
+            run((evict + "[con_id=${dock.raw}] move scratchpad").joinToString("; "))
             check(pollTree(cfg[WmFlags.unmapWaitMs]) { if (inScratchpad(dock)) true else null } == true) {
                 "dock ${dock.raw} was still outside the scratchpad " +
                     "${cfg[WmFlags.unmapWaitMs]}ms after being moved into it"
@@ -2298,6 +2306,58 @@ class SwayWindowManager(
         private fun dockSplitOf(tree: Node, surface: SurfaceId): Node? =
             tree.parentOf(surface.raw)
                 ?.takeIf { it.type == CON && (it.layout == "splith" || it.layout == "splitv") }
+
+        /**
+         * The commands that move every window sharing [dock]'s split, other than [surface] and
+         * [dock], out of it — empty when there is nothing to move or no split that is the dock's.
+         *
+         * **Whose split.** The dock is visible when this is asked, so its parent is the container
+         * attach put it in, and that is the only container this will empty; the surface has to
+         * sit in it too, so a dock a user dragged into some other split of theirs leaves that
+         * split alone. Asked of the dock rather than from the surface's side ([dockSplitOf]),
+         * because a surface's parent split is not evidence that awakener made it.
+         *
+         * **Where they go.** sway has no command that names a destination beside a container: a
+         * `move … to mark` onto a split puts the window *inside* it, and onto a leaf beside the
+         * leaf. A `move` in a direction, though, takes a window that is at the edge of its
+         * container out to the parent's level, directly after the container — measured on
+         * headless sway 1.12 for a split under a `tabbed` strip, a `stacked` strip and a
+         * workspace split, and for a `splitv` dock split, every one landing the window as the
+         * next sibling of the split. So the direction is the one along the *parent's* axis, and
+         * the count is one step per sibling between the window and that edge, plus the one that
+         * leaves — or just the one when the split runs across that axis, since then the window
+         * is at the edge already. A step past a sibling is a swap only when the sibling is a
+         * leaf (sway walks into a container), which is why the windows go rightmost first: by
+         * the time each moves, everything between it and the edge is the surface or the dock,
+         * both of them windows. It also keeps their order — each lands directly after the split,
+         * in front of the one that left before it.
+         *
+         * **Focus.** Every command targets by `con_id`, and a criteria-targeted `move` leaves
+         * focus where it was — measured on 1.12 with the surface focused and an intruder moved.
+         */
+        private fun evictionCommands(tree: Node, surface: SurfaceId, dock: SurfaceId): List<String> {
+            val split = tree.parentOf(dock.raw)
+                ?.takeIf { it.type == CON && (it.layout == "splith" || it.layout == "splitv") }
+                ?: return emptyList()
+            if (split.nodes.none { it.id == surface.raw }) return emptyList()
+            val parent = tree.parentOf(split.id) ?: return emptyList()
+            val outward = when (parent.layout) {
+                "splith", "tabbed" -> "right"
+                "splitv", "stacked" -> "down"
+                else -> return emptyList()
+            }
+            val along = (split.layout == "splith") == (outward == "right")
+            val order = split.nodes.map { it.id }
+            return order.indices.reversed()
+                .filter { order[it] != surface.raw && order[it] != dock.raw }
+                .flatMap { index ->
+                    // Siblings still between this one and the edge: the windows after it that are
+                    // staying, since every intruder after it has already gone.
+                    val between = order.drop(index + 1).count { it == surface.raw || it == dock.raw }
+                    val steps = if (along) between + 1 else 1
+                    List(steps) { "[con_id=${order[index]}] move $outward" }
+                }
+        }
 
         /**
          * How many times an unwind will try to flatten the container it is taking back while the
