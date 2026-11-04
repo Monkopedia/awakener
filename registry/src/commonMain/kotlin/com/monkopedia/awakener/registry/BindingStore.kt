@@ -88,6 +88,21 @@ sealed interface ResidueOutcome {
 }
 
 /**
+ * One line saying where the model now is.
+ *
+ * Every case names a path, so none of them can be read as any of the others at a glance —
+ * "left in place" and "archived" differ by the thing the user is about to go and look at.
+ * Shared by every command that forgets, so the sentence cannot differ between them.
+ */
+fun ResidueOutcome.describe(): String = when (this) {
+    is ResidueOutcome.Kept -> "left in place at $path"
+    is ResidueOutcome.Archived -> "archived to $archive (the fresh agent starts empty)"
+    is ResidueOutcome.Deleted -> "deleted from $path"
+    is ResidueOutcome.Absent -> "nothing had been written to $path"
+    is ResidueOutcome.Failed -> "STILL AT $path — could not be disposed of: $reason"
+}
+
+/**
  * What an exposure check found, and about which directory.
  *
  * Four states rather than the `String?` this replaced, because that one collapsed three different

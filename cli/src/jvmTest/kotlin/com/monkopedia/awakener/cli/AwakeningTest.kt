@@ -426,6 +426,74 @@ class AwakeningTest {
         assertEquals(1, sweeps)
     }
 
+    /**
+     * #170: a binding written before awakener's own windows were refused. It stays where it is
+     * under the default, and `list` says what it is and how to remove it.
+     */
+    @Test
+    fun `a binding already written for a panel is reported and left alone`() = runTest {
+        val panel = SurfaceKey.Window("awakener-dock")
+        val bound = registry.bind(panel)
+        wm.surfaces = listOf(app, Surface(SurfaceId(7), "awakener-dock", "claude", pid = 102))
+
+        assertEquals(listOf(app.id), awakening.list().map { it.surface.id }, "not a surface")
+        assertEquals(
+            listOf(BoundFurniture(panel, bound, forgotten = null)),
+            awakening.boundFurniture(),
+        )
+        assertEquals(bound, registry.resolve(panel), "and REPORT took nothing away")
+
+        val printed = mutableListOf<String>()
+        assertEquals(0, AwakenerInvokeCli.run(arrayOf("list"), awakening, printed::add))
+        assertTrue(
+            printed.any { it.startsWith("warning: window:awakener-dock is bound to") },
+            printed.toString(),
+        )
+        assertTrue(
+            printed.any { "awakener-registry forget window:awakener-dock" in it },
+            printed.toString(),
+        )
+    }
+
+    /** The other answer: `list` forgets it, and an ordinary surface's binding is untouched. */
+    @Test
+    fun `FORGET removes a furniture binding and nothing else`() = runTest {
+        config.put(InvokeFlags.furnitureBound, FurnitureBound.FORGET)
+        val list = SurfaceKey.Window("awakener-list")
+        val perSurface = SurfaceKey.Window("awakener-dock-42")
+        registry.bind(list)
+        registry.bind(perSurface)
+        val ordinary = registry.bind(key(app))
+
+        val printed = mutableListOf<String>()
+        assertEquals(0, AwakenerInvokeCli.run(arrayOf("list"), awakening, printed::add))
+
+        assertNull(registry.resolve(list))
+        assertNull(registry.resolve(perSurface), "the PER_SURFACE_APP_ID name is the panel too")
+        assertEquals(ordinary, registry.resolve(key(app)), "and a real surface keeps its agent")
+        assertTrue(printed.any { it.startsWith("forgot window:awakener-list") }, printed.toString())
+    }
+
+    /**
+     * What the rule does not catch, pinned so it cannot widen by accident: a name that merely
+     * begins with the panel's is somebody else's window unless what follows is a `con_id`.
+     */
+    @Test
+    fun `only the panel's name, bare or with a con_id after it, is furniture`() = runTest {
+        val lookalike = Surface(SurfaceId(8), "awakener-dock-notes", "x", pid = 103, focused = true)
+        wm.surfaces = listOf(lookalike)
+        assertIs<Awakened.Animated>(awakening.invoke())
+
+        config.put(InvokeFlags.dockAppId, "my-panel")
+        wm.surfaces = listOf(Surface(SurfaceId(9), "awakener-dock", "x", pid = 104, focused = true))
+        assertIs<Awakened.Animated>(
+            awakening.invoke(),
+            "the rule follows invoke.dock.app_id rather than remembering the shipped name",
+        )
+        wm.surfaces = listOf(Surface(SurfaceId(10), "my-panel-9", "x", pid = 105, focused = true))
+        assertIs<Awakened.NoSurface>(awakening.invoke())
+    }
+
     private class FakeBus : AgentBus {
         var live: List<LiveAgent> = emptyList()
         var calls = 0

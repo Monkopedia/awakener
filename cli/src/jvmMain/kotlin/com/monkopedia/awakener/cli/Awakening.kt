@@ -11,6 +11,7 @@ import com.monkopedia.awakener.registry.AgentBus
 import com.monkopedia.awakener.registry.AgentId
 import com.monkopedia.awakener.registry.Binding
 import com.monkopedia.awakener.registry.BindingStore
+import com.monkopedia.awakener.registry.Forget
 import com.monkopedia.awakener.registry.SurfaceKey
 import com.monkopedia.awakener.registry.isAnimated
 import com.monkopedia.awakener.wm.DockHandle
@@ -112,6 +113,14 @@ sealed interface Awakened {
 }
 
 /**
+ * A binding already on disk for one of awakener's own windows, and what `list` did about it.
+ *
+ * @param forgotten what the forget did under [FurnitureBound.FORGET], or null under
+ * [FurnitureBound.REPORT], where the binding is still there.
+ */
+data class BoundFurniture(val key: SurfaceKey, val binding: Binding, val forgotten: Forget?)
+
+/**
  * The loop the whole project exists for: a window becomes a surface, a surface recalls or mints
  * its Lifeless, and the Lifeless comes up in a panel docked inside that window's tab.
  *
@@ -200,7 +209,7 @@ class Awakening(
      */
     suspend fun list(): List<Standing> {
         val cfg = config
-        val surfaces = wm.surfaces()
+        val surfaces = wm.surfaces().filterNot { cfg.isFurniture(it.appId) }
         val live = bus.liveAgents().map { it.agentId }.toSet()
         return surfaces.map { surface ->
             val key = SurfaceKey.of(surface.descriptor, cfg)
@@ -247,6 +256,20 @@ class Awakening(
         } else {
             surfaces.firstOrNull { it.id == target }
                 ?: return Awakened.NoSurface("no such surface: ${target.raw}")
+        }
+
+        // Ahead of everything durable, because a binding for a panel is a Lifeless whose surface
+        // is another Lifeless's window and it outlives the window that caused it (#170). Asked of
+        // the `app_id` rather than of `:wm`'s dock recognition, which cannot cover this: a
+        // one-shot process starts with an empty dock table and knows a panel only by its mark, so
+        // a panel another press is still standing up, or one #199's race left unclaimed, is an
+        // ordinary window to it. The `app_id` is the one fact such a window has from the moment
+        // it maps, and it is the configured one.
+        if (cfg.isFurniture(surface.appId)) {
+            return Awakened.NoSurface(
+                "the window is awakener's own (${surface.appId}), not a surface to bind an " +
+                    "agent to",
+            )
         }
 
         val key = SurfaceKey.of(surface.descriptor, cfg)
@@ -333,6 +356,43 @@ class Awakening(
             binding.agent,
         )
         return Awakened.Animated(surface.id, key, binding, dock, wasADrab, applied)
+    }
+
+    /**
+     * Bindings already written for awakener's own windows — before #170 refused them — reported,
+     * or forgotten under `invoke.furniture.bound=FORGET`.
+     *
+     * Nothing recalls such a binding any more, since [list] and [invoke] no longer offer the
+     * window it names, so leaving one in place costs nothing but the row and its residue. That is
+     * why the default only says so: what to do with the residue is the user's decision.
+     */
+    suspend fun boundFurniture(): List<BoundFurniture> {
+        val cfg = config
+        val forget = cfg[InvokeFlags.furnitureBound] == FurnitureBound.FORGET
+        return registry.bindings.value
+            .filterKeys { it is SurfaceKey.Window && cfg.isFurniture(it.appId) }
+            .map { (key, binding) ->
+                BoundFurniture(key, binding, if (forget) registry.unbind(key) else null)
+            }
+    }
+
+    /**
+     * Whether a window reporting [appId] is one awakener put on screen itself.
+     *
+     * The panel's name is read from [InvokeFlags.dockAppId] rather than listed, so the rule
+     * follows a rename instead of guarding the old name. It is matched both bare and as
+     * `<app_id>-<con_id>`, the name `:wm` gives it under `wm.dock.identity=PER_SURFACE_APP_ID` —
+     * under either identity, because flipping it leaves the panels named the other way standing.
+     */
+    private fun Config.isFurniture(appId: String?): Boolean {
+        if (appId.isNullOrBlank()) return false
+        val dock = this[InvokeFlags.dockAppId]
+        if (dock.isNotEmpty()) {
+            if (appId == dock) return true
+            val suffix = appId.removePrefix("$dock-")
+            if (suffix != appId && suffix.isNotEmpty() && suffix.all(Char::isDigit)) return true
+        }
+        return this[InvokeFlags.furnitureAppIds].split(',').any { it.trim() == appId }
     }
 
     /** Every connector definition on the search path, and the directories that nearly are one. */

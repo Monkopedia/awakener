@@ -53,6 +53,24 @@ enum class WhenAnimated {
     TOGGLE_HIDE,
 }
 
+/** What `list` does with a binding already written for one of awakener's own windows. */
+enum class FurnitureBound {
+    /**
+     * Say so, and leave it. The default because the binding is inert — nothing enumerates the
+     * window it names, so nothing recalls it — and what is under it is a residue directory, which
+     * `forget` may archive or delete. That is a decision about durable state, and the person who
+     * reads the warning is the one to take it.
+     */
+    REPORT,
+
+    /**
+     * Forget it, exactly as `awakener-registry forget` would, with the residue disposed of per
+     * `registry.binding.forget_residue`. For a desktop that has already decided furniture
+     * bindings are debris and would rather `list` cleaned them up than reported them each time.
+     */
+    FORGET,
+}
+
 /** How much a hotkey press prints when something on the bind path raises. */
 enum class FailureDetail {
     /**
@@ -125,6 +143,36 @@ object InvokeFlags {
         "The app_id a Lifeless's panel reports. It must be predictable before the window maps, " +
             "since that is when sway evaluates the focus rules :wm sets, and it must match " +
             "whatever {app_id} expands to in the dock command.",
+    )
+
+    /**
+     * Windows awakener puts on screen itself that are not surfaces, besides its panels.
+     *
+     * The panel's own `app_id` is deliberately **not** in this list. It is [dockAppId], read from
+     * there on every press, so changing what a panel is called cannot leave the refusal guarding
+     * the old name. This set is for everything else awakener spawns that a press could land on —
+     * the shipped `Super+o` binding runs the listing in `foot -a awakener-list`, which is the
+     * default here — and for anything a desktop adds of its own.
+     *
+     * See [Awakening.invoke] for why this is asked of the `app_id` rather than of the tree.
+     */
+    val furnitureAppIds = Flags.string(
+        "invoke.furniture.app_ids",
+        "awakener-list",
+        "Comma-separated app_ids of awakener's own windows, which a press refuses to bind and " +
+            "`list` does not offer as surfaces. invoke.dock.app_id is always refused besides " +
+            "these, both as itself and with a surface's con_id after it (wm.dock.identity=" +
+            "PER_SURFACE_APP_ID), so it does not belong here.",
+    )
+
+    /** What `list` does about bindings already written for awakener's own windows (#170). */
+    val furnitureBound = Flags.enum(
+        "invoke.furniture.bound",
+        FurnitureBound.REPORT,
+        "What `awakener-invoke list` does with a binding whose key is one of awakener's own " +
+            "windows — written before such windows were refused, and never recalled since. " +
+            "REPORT names it and the `awakener-registry forget` that removes it; FORGET runs " +
+            "that forget itself, disposing of the residue per registry.binding.forget_residue.",
     )
 
     val whenAnimated = Flags.enum(
