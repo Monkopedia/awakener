@@ -288,6 +288,8 @@ bindsym --no-repeat $mod+a exec $awk/awakener-invoke invoke
 bindsym $mod+Shift+a focus parent
 
 # What is bound, and which agents are live on the bus right now.
+# awakener-list is the default of invoke.furniture.app_ids, so a press while
+# this window has focus binds nothing. Rename it in both places or neither.
 bindsym --no-repeat $mod+o exec foot -a awakener-list -- sh -c '$awk/awakener-invoke list; echo; echo "[enter closes]"; read x'
 
 # Take down docks whose surface has gone.

@@ -542,7 +542,89 @@ class AwakeningSwayTest {
         assertTrue(awakening.list().single().animated, "and the bus is what decides that")
     }
 
+    /**
+     * #170, the dock case: a panel this process does not recognise is still awakener's own, and
+     * a press on it must write nothing durable.
+     *
+     * The window is opened by hand under the dock's `app_id`, with no mark and no table entry,
+     * because that is exactly what *every* other process's panel is to a one-shot
+     * `awakener-invoke`: its table starts empty, so it knows a dock only by the mark, and a dock
+     * whose mark has not landed yet, or one #199's race left unclaimed, has none. Recognition by
+     * mark and table cannot cover that window. Its `app_id` is the one fact present from the
+     * moment it maps, and the configured `invoke.dock.app_id` is what predicts it.
+     */
+    @Test
+    fun `a press on a panel nothing has claimed mints nothing`() = swayTest {
+        openSurface("aw-app1")
+        val stray = openSurface(DOCK_APP_ID)
+        command("[con_id=${stray.raw}] focus")
+
+        assertIs<Awakened.NoSurface>(awakening.invoke())
+        assertIs<Awakened.NoSurface>(awakening.invoke(stray), "nor when it is named by id")
+
+        assertNothingDurableFor(DOCK_APP_ID)
+        assertEquals(listOf(stray.raw), docks(), "and no panel was stood up beside the panel")
+    }
+
+    /**
+     * The same refusal under `wm.dock.identity=PER_SURFACE_APP_ID`, where each panel reports the
+     * configured `app_id` with its surface's `con_id` after it. Refused under either identity
+     * rather than only the current one, since a flip leaves panels standing that were named the
+     * other way.
+     */
+    @Test
+    fun `a per-surface panel name is refused too`() = swayTest {
+        val app1 = openSurface("aw-app1")
+        val stray = openSurface("$DOCK_APP_ID-${app1.raw}")
+        command("[con_id=${stray.raw}] focus")
+
+        assertIs<Awakened.NoSurface>(awakening.invoke())
+        assertNothingDurableFor(DOCK_APP_ID)
+    }
+
+    /**
+     * #170, the list case, which shares no mechanism with the dock case: the `Super+o` window is a
+     * plain `foot -a awakener-list`, never a dock, with no mark and no entry in any table. Only
+     * `invoke.furniture.app_ids` makes it something other than an ordinary window.
+     */
+    @Test
+    fun `a press on the list window mints nothing`() = swayTest {
+        openSurface("aw-app1")
+        val list = openSurface("awakener-list")
+        command("[con_id=${list.raw}] focus")
+
+        assertIs<Awakened.NoSurface>(awakening.invoke())
+        assertNothingDurableFor("awakener-list")
+        assertEquals(
+            listOf("aw-app1"),
+            awakening.list().map { it.surface.appId },
+            "and the listing offers neither piece of furniture as a Drab",
+        )
+
+        // The set is a flag, so a window awakener does not ship can be added to it, and taking
+        // the default out of it makes the list window an ordinary surface again.
+        store.put(InvokeFlags.furnitureAppIds, "")
+        assertIs<Awakened.Animated>(awakening.invoke())
+        assertEquals(1, minted)
+    }
+
     // -- helpers ------------------------------------------------------------------------
+
+    /**
+     * No binding, no mint and no residue for [appId], read back from the files themselves rather
+     * than from the store's view of them: the defect was a durable write, so the disk is what has
+     * to say it did not happen.
+     */
+    private fun assertNothingDurableFor(appId: String) {
+        assertEquals(0, minted, "nothing was minted")
+        val file = stateDir.resolve("bindings.json").toFile()
+        assertTrue(
+            !file.exists() || appId !in file.readText(),
+            "bindings.json names $appId: ${file.takeIf { it.exists() }?.readText()}",
+        )
+        val residue = stateDir.resolve("residue").toFile().walk().map { it.name }.toList()
+        assertTrue(residue.none { appId in it }, "residue was prepared for $appId: $residue")
+    }
 
     private fun swayTest(body: suspend () -> Unit) {
         SwayHarness.assumeAvailable()

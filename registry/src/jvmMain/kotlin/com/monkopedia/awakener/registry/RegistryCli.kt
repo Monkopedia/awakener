@@ -84,20 +84,6 @@ object RegistryCli {
         return code
     }
 
-    /**
-     * One line saying where the model now is.
-     *
-     * Every case names a path, so none of them can be read as any of the others at a glance —
-     * "left in place" and "archived" differ by the thing the user is about to go and look at.
-     */
-    private fun ResidueOutcome.describe(): String = when (this) {
-        is ResidueOutcome.Kept -> "left in place at $path"
-        is ResidueOutcome.Archived -> "archived to $archive (the fresh agent starts empty)"
-        is ResidueOutcome.Deleted -> "deleted from $path"
-        is ResidueOutcome.Absent -> "nothing had been written to $path"
-        is ResidueOutcome.Failed -> "STILL AT $path — could not be disposed of: $reason"
-    }
-
     private fun usage(out: (String) -> Unit, error: String): Int {
         out("error: $error")
         out("usage: awakener-registry [list | resolve <key> | residue <key> | forget <key>]")

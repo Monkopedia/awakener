@@ -6,7 +6,9 @@ import com.monkopedia.awakener.connector.ConnectorFlags
 import com.monkopedia.awakener.connector.ConnectorOutcome
 import com.monkopedia.awakener.connector.FileConnectorCatalog
 import com.monkopedia.awakener.registry.FileBindingStore
+import com.monkopedia.awakener.registry.ResidueOutcome
 import com.monkopedia.awakener.registry.SpanreedCli
+import com.monkopedia.awakener.registry.describe
 import com.monkopedia.awakener.wm.SurfaceId
 import com.monkopedia.awakener.wm.SwaySocket
 import com.monkopedia.awakener.wm.SwayWindowManager
@@ -53,7 +55,13 @@ object AwakenerInvokeCli {
                 val standing = awakening.list()
                 if (standing.isEmpty()) out("no surfaces")
                 standing.forEach { report(it, out) }
-                0
+                // After the listing, because it is about rows the listing no longer shows: the
+                // windows they name are not surfaces, so nothing above can be one of them.
+                val furniture = awakening.boundFurniture()
+                furniture.forEach { report(it, out) }
+                // A residue that a FORGET could not dispose of is a model still on disk that the
+                // flag asked to be rid of, which is the one outcome here worth an exit status.
+                if (furniture.any { it.forgotten?.residue is ResidueOutcome.Failed }) 3 else 0
             }
 
             "invoke" -> {
@@ -193,6 +201,27 @@ object AwakenerInvokeCli {
                     (if (standing.animated) "  [animated]" else "  [not animated]")
             },
         )
+    }
+
+    private fun report(furniture: BoundFurniture, out: (String) -> Unit) {
+        val key = oneLine(furniture.key.canonical)
+        when (val forget = furniture.forgotten) {
+            null -> {
+                out(
+                    "warning: $key is bound to ${furniture.binding.agentId}, but it is one of " +
+                        "awakener's own windows and nothing will recall it",
+                )
+                out(
+                    "  'awakener-registry forget $key' removes it, or " +
+                        "invoke.furniture.bound=FORGET makes this listing do so",
+                )
+            }
+
+            else -> {
+                out("forgot $key, one of awakener's own windows (invoke.furniture.bound=FORGET)")
+                out("  residue  ${forget.residue.describe()}")
+            }
+        }
     }
 
     private fun report(awakened: Awakened, out: (String) -> Unit): Int = when (awakened) {
