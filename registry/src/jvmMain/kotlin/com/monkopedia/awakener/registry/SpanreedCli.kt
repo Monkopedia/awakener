@@ -488,7 +488,11 @@ class SpanreedCli(
      */
     override suspend fun mint(key: SurfaceKey, residuePath: String): AgentIdentity {
         val cfg = config
-        val name = spanreedNameFor(key, cfg[RegistryFlags.agentNamePrefix])
+        val name = spanreedNameFor(
+            key,
+            cfg[RegistryFlags.agentNamePrefix],
+            cfg[RegistryFlags.agentNameLabel],
+        )
         val id = when (cfg[RegistryFlags.agentIdSource]) {
             AgentIdSource.DERIVED -> derivedId(name)
             AgentIdSource.SPANREED -> spanreedId(cfg, name)

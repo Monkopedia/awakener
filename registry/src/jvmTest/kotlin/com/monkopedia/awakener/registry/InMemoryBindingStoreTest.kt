@@ -22,7 +22,7 @@ class InMemoryBindingStoreTest {
 
         assertNull(store.resolve(key))
         val bound = store.bind(key)
-        assertEquals("agent-lifeless-${key.slug}", bound.agentId)
+        assertEquals("agent-lifeless-window-${key.digest}", bound.agentId)
         assertEquals(bound, store.resolve(key))
 
         assertTrue(store.unbind(key).wasBound)

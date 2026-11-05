@@ -52,8 +52,29 @@ fun interface AgentIdentities {
  *
  * Derived purely from the key, so it is reproducible from the bindings file alone and stable
  * for as long as the key is — which is precisely the property that makes a restart cheap.
+ *
+ * **This string is published.** spanreed lists it to every agent on the host, so what [label]
+ * lets through of the key's window-chosen text is a decision about a shared surface awakener
+ * does not own (#186). The kind is a literal from [SurfaceKey]'s sealed hierarchy rather than a
+ * substring of [SurfaceKey.canonical], so no `app_id` can reach that position. Uniqueness is the
+ * digest's under every label, exactly as it is for [SurfaceKey.slug].
  */
-fun spanreedNameFor(key: SurfaceKey, prefix: String): String = prefix + key.slug
+fun spanreedNameFor(key: SurfaceKey, prefix: String, label: AgentNameLabel): String {
+    if (label == AgentNameLabel.SLUG) return prefix + key.slug
+    val (kind, head) = when (key) {
+        is SurfaceKey.Window -> "window" to key.appId
+        is SurfaceKey.Titled -> "title" to key.title
+        is SurfaceKey.Unidentified -> "unidentified" to ""
+        is SurfaceKey.Origin -> "origin" to key.origin
+    }
+    val token = when (label) {
+        AgentNameLabel.BOUNDED -> head.lowercase()
+            .filter { it in 'a'..'z' || it in '0'..'9' }
+            .take(AGENT_NAME_TOKEN_MAX)
+        else -> ""
+    }
+    return listOf(prefix + kind, token, key.digest).filter { it.isNotEmpty() }.joinToString("-")
+}
 
 /**
  * Applies spanreed's documented `SPANREED_AGENT_NAME` override rule without a subprocess.
@@ -65,7 +86,12 @@ class DerivedAgentIdentities(private val config: () -> Config) : AgentIdentities
     constructor(store: ConfigStore) : this({ store.config.value })
 
     override suspend fun mint(key: SurfaceKey, residuePath: String): AgentIdentity {
-        val name = spanreedNameFor(key, config()[RegistryFlags.agentNamePrefix])
+        val cfg = config()
+        val name = spanreedNameFor(
+            key,
+            cfg[RegistryFlags.agentNamePrefix],
+            cfg[RegistryFlags.agentNameLabel],
+        )
         return AgentIdentity(AgentId("agent-$name"), name)
     }
 }

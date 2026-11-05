@@ -20,10 +20,12 @@ enum class Trust {
      * Minted by awakener or by the compositor, in a bounded alphabet.
      *
      * Verified rather than assumed for each one: [SurfaceFact.SURFACE_ID] and
-     * [SurfaceFact.PID] are integers; [SurfaceFact.RESIDUE], [SurfaceFact.AGENT_NAME] and
-     * [SurfaceFact.AGENT_ID] are built from `SurfaceKey.slug`, whose `slugOf` maps every
-     * character that is not a letter, a digit or `-` to `-` and appends a digest, so they are
-     * `[a-z0-9-]` plus operator-configured path and prefix; [SurfaceFact.CONNECTOR] is checked
+     * [SurfaceFact.PID] are integers; [SurfaceFact.RESIDUE] is built from `SurfaceKey.slug`,
+     * whose `slugOf` maps every character that is not a letter, a digit or `-` to `-` and
+     * appends a digest, and [SurfaceFact.AGENT_NAME] and [SurfaceFact.AGENT_ID] from
+     * `spanreedNameFor`, which under every `registry.agent.name_label` is a kind literal, a
+     * digest, and at most that same slug — so all three are `[a-z0-9-]` plus
+     * operator-configured path and prefix; [SurfaceFact.CONNECTOR] is checked
      * by [ConnectorFlags.isConnectorName]; [SurfaceFact.CONNECTOR_DIR] is a directory on the
      * operator's own search path.
      */
