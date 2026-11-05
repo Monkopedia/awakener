@@ -1,6 +1,7 @@
 package com.monkopedia.awakener.cli
 
 import com.monkopedia.awakener.config.Flags
+import com.monkopedia.awakener.wm.PLAIN_NAME
 
 /** What an invocation does when the surface's Lifeless is already animated. */
 enum class WhenAnimated {
@@ -142,7 +143,9 @@ object InvokeFlags {
         "awakener-dock",
         "The app_id a Lifeless's panel reports. It must be predictable before the window maps, " +
             "since that is when sway evaluates the focus rules :wm sets, and it must match " +
-            "whatever {app_id} expands to in the dock command.",
+            "whatever {app_id} expands to in the dock command — which it is written into as it " +
+            "stands, hence the restriction on what it may contain.",
+        PLAIN_NAME,
     )
 
     /**

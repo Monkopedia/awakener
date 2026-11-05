@@ -1,5 +1,6 @@
 package com.monkopedia.awakener.cli
 
+import com.monkopedia.awakener.config.Config
 import com.monkopedia.awakener.config.Flags
 import com.monkopedia.awakener.config.InMemoryConfigStore
 import com.monkopedia.awakener.registry.AgentBus
@@ -26,6 +27,7 @@ import kotlin.test.assertTrue
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.json.JsonPrimitive
 
 /**
  * The invoke loop, without a compositor.
@@ -508,6 +510,19 @@ class AwakeningTest {
         )
         wm.surfaces = listOf(Surface(SurfaceId(10), "my-panel-9", "x", pid = 105, focused = true))
         assertIs<Awakened.NoSurface>(awakening.invoke())
+    }
+
+    /** #184: the panel's name is written into the dock command as it stands, so it has to be plain. */
+    @Test
+    fun `a dock app_id that is not a plain name degrades to the default`() {
+        for (bad in listOf("x\"]; exec touch /tmp/f; [app_id=\"y", "a b", "")) {
+            val snapshot = Config.of(mapOf(InvokeFlags.dockAppId.key to JsonPrimitive(bad)))
+            assertTrue(
+                snapshot.problems.any { it.key == InvokeFlags.dockAppId.key },
+                "'$bad' accepted in silence: ${snapshot.problems}",
+            )
+            assertEquals(InvokeFlags.dockAppId.default, snapshot[InvokeFlags.dockAppId])
+        }
     }
 
     private class FakeBus : AgentBus {
