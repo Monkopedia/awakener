@@ -45,6 +45,49 @@ enum class SpanreedListForm {
     PLAIN,
 }
 
+/**
+ * How much of a surface's own text goes into the `SPANREED_AGENT_NAME` minted for it.
+ *
+ * That name is published in spanreed's shared roster, which every agent on the host reads, and
+ * a surface's key is made of text the window chose for itself — any Wayland client declares its
+ * own `app_id`. Flattening to `[a-z0-9-]` stops that text being *structure* but keeps its
+ * *words*, so under [SLUG] a window declaring a sentence became a peer named after that
+ * sentence (#186). Every value keeps the trailing digest, which is the same digest
+ * [SurfaceKey.slug] ends in and is all the uniqueness ever rested on; they differ only in what
+ * sits in front of it.
+ *
+ * Applies to what is **minted**. A stored binding keeps the name it was minted with — see
+ * [Binding] — so changing this re-names no existing agent.
+ */
+enum class AgentNameLabel {
+    /**
+     * Only awakener's own literal for the key's kind: `lifeless-window-<digest>`. No character
+     * of the name was chosen by the window. Which surface an agent belongs to is answered by the
+     * bindings file and `awakener-registry list`, neither of which is a roster other agents read,
+     * and the digest matches the one at the end of the surface's residue path.
+     */
+    NONE,
+
+    /**
+     * The kind plus one bounded token from the key's head: its ASCII letters and digits only,
+     * every separator dropped, at most [AGENT_NAME_TOKEN_MAX] characters —
+     * `lifeless-window-googlechrome-<digest>`. Readable enough to tell agents apart, and too
+     * short and too unseparated for a window to contribute a sentence, though it can still
+     * contribute a word.
+     */
+    BOUNDED,
+
+    /**
+     * The whole [SurfaceKey.slug], up to 48 readable characters of the window's text — the
+     * scheme every binding before #186 was minted under. Kept so that choice stays reachable as
+     * a decision rather than as the absence of one.
+     */
+    SLUG,
+}
+
+/** How many characters of a key's head [AgentNameLabel.BOUNDED] keeps. */
+const val AGENT_NAME_TOKEN_MAX = 12
+
 /** Where an agent id comes from when a surface is first bound. */
 enum class AgentIdSource {
     /**
@@ -414,6 +457,19 @@ object RegistryFlags {
         "Prefix for the SPANREED_AGENT_NAME minted for a surface. These names show up in " +
             "`spanreed list`, so the prefix is what keeps Lifelesses distinguishable from " +
             "human-driven sessions.",
+    )
+
+    val agentNameLabel = Flags.enum(
+        "registry.agent.name_label",
+        AgentNameLabel.NONE,
+        "How much of a window's own text appears in the SPANREED_AGENT_NAME minted for it, " +
+            "which spanreed publishes to every agent on the host. A window picks its own " +
+            "app_id, so the name can carry words it chose (#186). NONE, the default, is the " +
+            "prefix, the key's kind and a digest: lifeless-window-<digest>, nothing the window " +
+            "wrote. BOUNDED adds one token of at most 12 ASCII letters and digits from the " +
+            "app_id, separators dropped. SLUG is the pre-#186 scheme, up to 48 characters of " +
+            "the app_id with words intact. Applies to new bindings only: a stored binding keeps " +
+            "the name it was minted with, so flipping this renames no existing agent.",
     )
 
     val agentIdSource = Flags.enum(

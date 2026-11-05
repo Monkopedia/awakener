@@ -56,11 +56,11 @@ class SpanreedCliTest {
     }
 
     @Test
-    fun `the minted name carries the configured prefix and the surface slug`() = runTest {
+    fun `the minted name carries the configured prefix, the kind and the digest`() = runTest {
         config.put(RegistryFlags.agentNamePrefix, "surface-")
         val key = SurfaceKey.Origin("https://github.com")
 
-        assertEquals("surface-${key.slug}", cli.mint(key).spanreedName)
+        assertEquals("surface-origin-${key.digest}", cli.mint(key).spanreedName)
     }
 
     /** A name that is stable is the point; one that changes per launch is not an identity. */
