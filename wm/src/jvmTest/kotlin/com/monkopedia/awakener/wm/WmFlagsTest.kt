@@ -149,4 +149,21 @@ class WmFlagsTest {
             snapshot("wm.wait.poll_spin_ms" to 0L, "wm.wait.poll_interval_ms" to 0L).problems,
         )
     }
+
+    /** #184: a prefix sway would read as more than a mark is refused, not written. */
+    @Test
+    fun `a mark prefix that is not a plain name degrades to the default`() {
+        for (bad in listOf("x;exec touch /tmp/f;", "a b", "")) {
+            val config = Config.of(mapOf(WmFlags.dockMarkPrefix.key to JsonPrimitive(bad)))
+            assertTrue(
+                config.problems.any { it.key == WmFlags.dockMarkPrefix.key },
+                "'$bad' accepted in silence: ${config.problems}",
+            )
+            assertEquals(WmFlags.dockMarkPrefix.default, config[WmFlags.dockMarkPrefix])
+        }
+        assertEquals(
+            "my.dock-",
+            Config.of(mapOf(WmFlags.dockMarkPrefix.key to JsonPrimitive("my.dock-")))[WmFlags.dockMarkPrefix],
+        )
+    }
 }

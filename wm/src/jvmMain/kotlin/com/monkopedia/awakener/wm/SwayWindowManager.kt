@@ -850,7 +850,7 @@ class SwayWindowManager(
          */
         suspend fun suppressFocusFor(appId: String) {
             if (appId in docks.snapshot().focusRules) return
-            run("""no_focus [app_id="$appId"]""")
+            run("no_focus ${Criteria.appId(appId)}")
             docks.recordFocusRule(appId)
         }
 

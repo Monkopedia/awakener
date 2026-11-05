@@ -1,6 +1,25 @@
 package com.monkopedia.awakener.wm
 
 import com.monkopedia.awakener.config.Flags
+import com.monkopedia.awakener.config.Requirement
+
+/**
+ * What a configured name that is written into compositor commands as it stands has to be made
+ * of: ASCII letters, digits, `.`, `_` and `-`, at least one.
+ *
+ * For the dock's `app_id` and the dock-mark prefix (#184). Both reach sway unquoted somewhere —
+ * the mark prefix in `mark --add`, the `app_id` in the `{app_id}` of the dock command — and
+ * measured on sway 1.12 a prefix of `x;exec touch <f>;` ran the `exec`. Neither is window-supplied,
+ * so this is not a defence against the desktop: it makes a typo a reported problem that degrades to
+ * the default instead of a different command. The `no_focus` criteria are escaped by [Criteria]
+ * regardless, because `.` is in this set and is a regex wildcard there.
+ */
+val PLAIN_NAME: Requirement<String> =
+    Flags.requires("one or more ASCII letters, digits, '.', '_' or '-'") { name ->
+        name.isNotEmpty() && name.all {
+            it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' || it == '.' || it == '_' || it == '-'
+        }
+    }
 
 /** Which side of the surface the dock sits on. */
 enum class DockSide { LEFT, RIGHT }
@@ -445,6 +464,7 @@ object WmFlags {
             "sharp edge: a genuine window hidden by a prefix-shaped user mark under the old " +
             "value stays hidden under the new one, and removing the mark does not release it " +
             "either. Moving the prefix is a restart with no docks standing, not a flip.",
+        PLAIN_NAME,
     )
 
     val dockMarkScheme = Flags.enum(
