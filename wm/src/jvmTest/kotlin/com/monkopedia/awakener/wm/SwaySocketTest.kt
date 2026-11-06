@@ -72,6 +72,20 @@ class SwaySocketTest {
     }
 
     /**
+     * #191: a relative `XDG_RUNTIME_DIR` is invalid per the XDG spec and must be ignored. Read as a
+     * value it resolved against the working directory, so discovery would connect to whatever
+     * socket sat under wherever the process happened to start. The relative path here does name a
+     * directory holding a socket, so an empty answer is the guard and not a missing directory.
+     */
+    @Test
+    fun `a relative runtime directory is no candidates`() {
+        dead("sway-ipc.1000.11.sock", modified = 1_000)
+        val relative = Path.of("").toAbsolutePath().relativize(runtimeDir)
+        assertTrue(!relative.isAbsolute && relative.toString().isNotEmpty())
+        assertEquals(emptyList(), SwaySocket.successors(relative.toString()))
+    }
+
+    /**
      * The case the flag exists for: `SWAYSOCK` names the session that died, because a process
      * cannot re-read its own environment and the successor's path carries a pid nobody told it.
      */

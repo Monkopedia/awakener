@@ -1,5 +1,6 @@
 package com.monkopedia.awakener.wm
 
+import com.monkopedia.awakener.config.Xdg
 import java.nio.file.Path
 import kotlin.io.path.absolutePathString
 import kotlin.io.path.getLastModifiedTime
@@ -87,7 +88,7 @@ object SwaySocket {
      * `XDG_RUNTIME_DIR` somewhere of their own.
      */
     internal fun successors(runtimeDir: String?): List<Path> {
-        val dir = runtimeDir?.takeIf { it.isNotBlank() }?.let { Path.of(it) } ?: return emptyList()
+        val dir = Xdg.base(runtimeDir) ?: return emptyList()
         if (!dir.isDirectory()) return emptyList()
         return runCatching {
             dir.listDirectoryEntries()
