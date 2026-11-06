@@ -4,6 +4,7 @@ import com.monkopedia.awakener.config.Config
 import com.monkopedia.awakener.config.Xdg
 import java.nio.file.Path
 import kotlin.io.path.Path
+import kotlin.io.path.exists
 
 /**
  * Where the durable layer lives on disk.
@@ -48,11 +49,54 @@ object RegistryPaths {
      */
     private fun Path.holder(): Path = toAbsolutePath().let { it.parent ?: it }
 
-    fun residueLocation(config: Config, storePath: Path, key: SurfaceKey): Path =
-        containedResolve(
-            residueDir(config, storePath),
-            residueSegments(key, config[RegistryFlags.residueLayout]),
-        )
+    /**
+     * Where [key]'s residue is: the path [RegistryFlags.residueNaming] derives, unless residue
+     * for this surface already exists under the *other* naming, which is then the answer.
+     *
+     * That exception is the whole migration story for #208, and it runs in both directions.
+     * Every residue directory written before #208 is slug-named, and every one written or moved
+     * since is digest-named; a store that flipped to either without looking would hand an
+     * existing surface an empty directory beside its model — the empty-dock failure, reached by
+     * a flag flip. So every mix of names is tried, the configured name preferred at each
+     * component: for [ResidueLayout.PER_APP_SESSION_DIR] that is configured/configured,
+     * configured/other, other/configured, other/other, because an application directory can
+     * have been moved while a session inside it has not, and a model written during one naming
+     * can sit in the other's application directory when both exist. The first that exists wins.
+     *
+     * Only when none exists is a fresh path named, and then its application directory is
+     * whichever one already exists, the configured one first — so a new window joins its
+     * application's shared directory instead of splitting it in two. Whether residue found under
+     * the other naming is moved is [RegistryFlags.slugResidue]'s call and
+     * `FileBindingStore.prepareResidue`'s job; this only reads.
+     */
+    fun residueLocation(config: Config, storePath: Path, key: SurfaceKey): Path {
+        val dir = residueDir(config, storePath)
+        val layout = config[RegistryFlags.residueLayout]
+        val naming = config[RegistryFlags.residueNaming]
+        val preferred = residueSegments(key, layout, naming)
+        val other = residueSegments(key, layout, ResidueNaming.entries.single { it != naming })
+        // Lexicographic over (preferred, other) per component: the configured name wins
+        // wherever it can, earliest components first.
+        val mixes = preferred.indices.fold(listOf(emptyList<String>())) { prefixes, i ->
+            prefixes.flatMap { listOf(it + preferred[i], it + other[i]) }.distinct()
+        }
+        mixes.map { containedResolve(dir, it) }.firstOrNull { it.exists() }?.let { return it }
+        val parents = preferred.dropLast(1).indices.fold(emptyList<String>()) { parent, i ->
+            val keepOther = !containedResolve(dir, parent + preferred[i]).exists() &&
+                containedResolve(dir, parent + other[i]).exists()
+            parent + if (keepOther) other[i] else preferred[i]
+        }
+        return containedResolve(dir, parents + preferred.last())
+    }
+
+    /** Where [key]'s residue would be under [layout] and [naming], without reading the disk. */
+    fun residuePath(
+        config: Config,
+        storePath: Path,
+        key: SurfaceKey,
+        layout: ResidueLayout,
+        naming: ResidueNaming,
+    ): Path = containedResolve(residueDir(config, storePath), residueSegments(key, layout, naming))
 
     /**
      * Resolves [segments] under [base] one component at a time, refusing any that leaves it.

@@ -381,6 +381,68 @@ enum class ResidueLayout {
 }
 
 /**
+ * What a surface's residue path is named by, under any [ResidueLayout].
+ *
+ * The residue directory is a Lifeless's working directory, and spanreed publishes every agent's
+ * working directory to every other agent on the host — so the path is a published string in
+ * exactly the way the agent name is, and the same window-chosen text reached the roster through
+ * it after [AgentNameLabel] had kept it out of the name (#208).
+ */
+enum class ResidueNaming {
+    /**
+     * `<kind>-<digest>`, and `app-<kind>-<digest>` for [ResidueLayout.PER_APP_SESSION_DIR]'s
+     * application directory: a kind literal from [SurfaceKey]'s sealed hierarchy and the hex of
+     * [SurfaceKey.digest] / [SurfaceKey.appDigest]. The window chose none of these characters,
+     * and the session hex is the same hex the default agent name ends in.
+     */
+    DIGEST,
+
+    /**
+     * [SurfaceKey.slug] and [SurfaceKey.appSlug], up to 48 readable characters of the window's
+     * own text — the pre-#208 paths, byte for byte.
+     */
+    SLUG,
+}
+
+/**
+ * What happens to residue found at its [ResidueNaming.SLUG] path while
+ * [ResidueNaming.DIGEST] is in force and nothing exists at the digest path yet.
+ *
+ * Under either value that residue is still *found*: the store resolves to it rather than to an
+ * empty directory beside it, so no value of this flag orphans a model — and the same holds the
+ * other way round, for digest-named residue under [ResidueNaming.SLUG]. The question is only
+ * whether it stays where it is.
+ *
+ * **A move changes the Lifeless's working directory, and Claude Code keys its own state on
+ * that path**: `~/.claude/projects/<escaped cwd>/` (session transcripts *and* Claude's
+ * auto-memory directory) and the `~/.claude.json` project entry. awakener does not touch those
+ * — they are Claude's internals, as spanreed's files are spanreed's — so after a move Claude
+ * starts that surface with no transcripts and no auto-memory, and whatever it had written under
+ * the old path stays there, unread. Measured on adolin when this landed, the residue-keyed
+ * `memory/` directories were empty and the transcripts were about 1.2 MB, so nothing durable
+ * was lost then; auto-memory Claude writes later is orphaned by each move.
+ */
+enum class SlugResidue {
+    /**
+     * Rename it to the digest path on the next prepare — one `rename(2)` per path component, in
+     * the same directory, so the model is either wholly at the old name or wholly at the new one.
+     * Reported through `FileBindingStore.residueMigrated`.
+     */
+    MOVE,
+
+    /**
+     * Leave it at the slug path and keep using it there. That surface keeps publishing its
+     * `app_id` words as its working directory — and so does a *new* window of an application
+     * whose slug-named application directory exists under [ResidueLayout.PER_APP_SESSION_DIR],
+     * because it joins that directory (with a digest-named session inside it) rather than
+     * splitting the application's shared directory in two. Only a surface of an application with
+     * no residue at all gets a wholly digest path. For a desktop that would rather keep every
+     * existing path, and Claude's per-path state, stable.
+     */
+    IN_PLACE,
+}
+
+/**
  * Runtime switches for the durable binding layer.
  *
  * Each of these is a place where two behaviours are defensible and the answer depends on how
@@ -631,5 +693,35 @@ object RegistryFlags {
             "Flipping this moves where new residue is written and moves nothing that is " +
             "already there; residue left behind under another layout is reported on the next " +
             "prepare rather than silently orphaned.",
+    )
+
+    val residueNaming = Flags.enum(
+        "registry.residue.naming",
+        ResidueNaming.DIGEST,
+        "What each residue path component is named by. The residue directory is the " +
+            "Lifeless's working directory, which spanreed lists to every agent on the host. " +
+            "DIGEST names it <kind>-<32 hex> (and app-<kind>-<32 hex> for the " +
+            "PER_APP_SESSION_DIR application directory), so the window chooses no character " +
+            "of it. SLUG is the pre-#208 naming, which keeps up to 48 characters of the " +
+            "window's app_id, title or origin. Residue already written under the other naming " +
+            "is still found, in either direction, so flipping this never hands a surface an " +
+            "empty directory beside its model; registry.residue.slug_residue says whether " +
+            "slug-named residue is moved under DIGEST.",
+    )
+
+    val slugResidue = Flags.enum(
+        "registry.residue.slug_residue",
+        SlugResidue.MOVE,
+        "Under registry.residue.naming=DIGEST, what happens to a surface's residue found at " +
+            "its old slug-named path when nothing is at the digest path yet. Either way it is " +
+            "the residue the surface reads; nothing is orphaned. MOVE renames it to the digest " +
+            "path on the next prepare, in place and atomically, and reports the move. A move " +
+            "changes the dock's working directory, and Claude Code keys its transcripts, its " +
+            "auto-memory and its ~/.claude.json project entry on that path; awakener does not " +
+            "move those, so Claude starts the moved surface without them and anything it " +
+            "wrote under the old path is left there unread. IN_PLACE leaves the residue where " +
+            "it is, so that surface — and any new window of an application whose slug-named " +
+            "app directory exists — keeps publishing its app_id words as its working " +
+            "directory.",
     )
 }

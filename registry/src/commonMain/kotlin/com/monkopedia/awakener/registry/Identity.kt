@@ -61,11 +61,11 @@ fun interface AgentIdentities {
  */
 fun spanreedNameFor(key: SurfaceKey, prefix: String, label: AgentNameLabel): String {
     if (label == AgentNameLabel.SLUG) return prefix + key.slug
-    val (kind, head) = when (key) {
-        is SurfaceKey.Window -> "window" to key.appId
-        is SurfaceKey.Titled -> "title" to key.title
-        is SurfaceKey.Unidentified -> "unidentified" to ""
-        is SurfaceKey.Origin -> "origin" to key.origin
+    val head = when (key) {
+        is SurfaceKey.Window -> key.appId
+        is SurfaceKey.Titled -> key.title
+        is SurfaceKey.Unidentified -> ""
+        is SurfaceKey.Origin -> key.origin
     }
     val token = when (label) {
         AgentNameLabel.BOUNDED -> head.lowercase()
@@ -73,7 +73,7 @@ fun spanreedNameFor(key: SurfaceKey, prefix: String, label: AgentNameLabel): Str
             .take(AGENT_NAME_TOKEN_MAX)
         else -> ""
     }
-    return listOf(prefix + kind, token, key.digest).filter { it.isNotEmpty() }.joinToString("-")
+    return listOf(prefix + key.kind, token, key.digest).filter { it.isNotEmpty() }.joinToString("-")
 }
 
 /**

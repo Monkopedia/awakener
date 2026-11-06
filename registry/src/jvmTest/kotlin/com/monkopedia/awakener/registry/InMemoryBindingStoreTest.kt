@@ -46,9 +46,12 @@ class InMemoryBindingStoreTest {
     fun `it reports residue relative to wherever the durable layer would put it`() = runTest {
         val store = InMemoryBindingStore(config)
         val key = SurfaceKey.Window("firefox")
-        assertEquals("${key.slug}.md", store.residueLocation(key))
+        assertEquals("window-${key.digest}.md", store.residueLocation(key))
 
         config.put(RegistryFlags.residueLayout, ResidueLayout.PER_KEY_DIR)
+        assertEquals("window-${key.digest}", store.residueLocation(key))
+
+        config.put(RegistryFlags.residueNaming, ResidueNaming.SLUG)
         assertEquals(key.slug, store.residueLocation(key))
     }
 }

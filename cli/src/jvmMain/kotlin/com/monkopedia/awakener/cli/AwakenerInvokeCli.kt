@@ -423,6 +423,8 @@ private fun awaken(args: Array<String>, store: FileConfigStore): Int {
                 // has the same shape: a condition only the store can see, on the one call that
                 // was about to write the model somewhere.
                 bindings.residueStranded?.let { System.err.println("warning: $it") }
+                // And whether this press renamed the surface's model off its slug-named path.
+                bindings.residueMigrated?.let { System.err.println("note: $it") }
                 // The dock is sway's child, not this process's, so retiring the manager stops its
                 // collector and gives up its connection and leaves every panel standing.
                 //

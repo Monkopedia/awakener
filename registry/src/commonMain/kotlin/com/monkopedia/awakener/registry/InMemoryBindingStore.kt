@@ -57,7 +57,7 @@ class InMemoryBindingStore(
     }
 
     override fun residueLocation(key: SurfaceKey): String =
-        residueLeaf(key, config[RegistryFlags.residueLayout])
+        residueLeaf(key, config[RegistryFlags.residueLayout], config[RegistryFlags.residueNaming])
 }
 
 /**
@@ -88,8 +88,8 @@ internal suspend inline fun Binding?.merge(
 }
 
 /**
- * The residue path relative to the residue directory, per [RegistryFlags.residueLayout], as its
- * components.
+ * The residue path relative to the residue directory, per [RegistryFlags.residueLayout] and
+ * [RegistryFlags.residueNaming], as its components.
  *
  * A list rather than a joined string because [ResidueLayout.PER_APP_SESSION_DIR] has two
  * components and the guard that keeps them inside the residue directory has to see them
@@ -97,18 +97,39 @@ internal suspend inline fun Binding?.merge(
  * of `../..` is indistinguishable from nesting, which is precisely the confusion the guard
  * exists to refuse.
  *
- * Every component here is a slug — see [SurfaceKey.appSlug] — so none of them can contain a
- * separator, be `.` or `..`, or be absolute, whatever the window called itself.
+ * Every component is either a slug — see [SurfaceKey.appSlug] — or a kind literal and a hex
+ * digest, so none of them can contain a separator, be `.` or `..`, or be absolute, whatever the
+ * window called itself.
  */
-internal fun residueSegments(key: SurfaceKey, layout: ResidueLayout): List<String> = when (layout) {
-    ResidueLayout.PER_KEY_FILE -> listOf("${key.slug}.md")
-    ResidueLayout.PER_KEY_DIR -> listOf(key.slug)
-    ResidueLayout.PER_APP_SESSION_DIR -> listOf(key.appSlug, key.slug)
+internal fun residueSegments(
+    key: SurfaceKey,
+    layout: ResidueLayout,
+    naming: ResidueNaming,
+): List<String> {
+    val session = sessionName(key, naming)
+    return when (layout) {
+        ResidueLayout.PER_KEY_FILE -> listOf("$session.md")
+        ResidueLayout.PER_KEY_DIR -> listOf(session)
+        ResidueLayout.PER_APP_SESSION_DIR -> listOf(
+            when (naming) {
+                ResidueNaming.SLUG -> key.appSlug
+                // `app-` keeps an application directory disjoint from every session name, as
+                // [SurfaceKey.appScope]'s namespace does for the slug form.
+                ResidueNaming.DIGEST -> "app-${key.kind}-${key.appDigest}"
+            },
+            session,
+        )
+    }
+}
+
+private fun sessionName(key: SurfaceKey, naming: ResidueNaming): String = when (naming) {
+    ResidueNaming.SLUG -> key.slug
+    ResidueNaming.DIGEST -> "${key.kind}-${key.digest}"
 }
 
 /** [residueSegments] as one relative path, for a store with no filesystem under it. */
-internal fun residueLeaf(key: SurfaceKey, layout: ResidueLayout): String =
-    residueSegments(key, layout).joinToString("/")
+internal fun residueLeaf(key: SurfaceKey, layout: ResidueLayout, naming: ResidueNaming): String =
+    residueSegments(key, layout, naming).joinToString("/")
 
 /**
  * Where [ForgetResidue.ARCHIVE] moves that residue to.
@@ -119,12 +140,19 @@ internal fun residueLeaf(key: SurfaceKey, layout: ResidueLayout): String =
  * already holds that second, a counter — the name is what a human reads to tell two archives
  * of one surface apart, so it stays readable rather than becoming an opaque id.
  */
-internal fun archiveLeaf(key: SurfaceKey, layout: ResidueLayout, stamp: String): String =
-    when (layout) {
-        ResidueLayout.PER_KEY_FILE -> "${key.slug}.$stamp.md"
-        ResidueLayout.PER_KEY_DIR -> "${key.slug}.$stamp"
+internal fun archiveLeaf(
+    key: SurfaceKey,
+    layout: ResidueLayout,
+    naming: ResidueNaming,
+    stamp: String,
+): String {
+    val session = sessionName(key, naming)
+    return when (layout) {
+        ResidueLayout.PER_KEY_FILE -> "$session.$stamp.md"
+        ResidueLayout.PER_KEY_DIR -> "$session.$stamp"
         // A leaf, not a path: the caller resolves it as a *sibling* of the live residue, so
         // under this layout the archive stays inside the application's own directory rather
         // than being flattened back up beside every other app's.
-        ResidueLayout.PER_APP_SESSION_DIR -> "${key.slug}.$stamp"
+        ResidueLayout.PER_APP_SESSION_DIR -> "$session.$stamp"
     }
+}

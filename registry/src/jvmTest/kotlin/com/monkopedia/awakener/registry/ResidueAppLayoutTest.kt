@@ -89,17 +89,22 @@ class ResidueAppLayoutTest {
         assertNotEquals(one.parent, two.parent)
     }
 
-    /** The session component is the existing per-key slug, unchanged by the extra nesting. */
+    /** The session component is the per-key name the flat layouts use, unchanged by nesting. */
     @Test
-    fun `the session folder is named by the same key slug the flat layouts use`() = runTest {
+    fun `the session folder is named by the same key name the flat layouts use`() = runTest {
         val key = SurfaceKey.Window("firefox", "a")
         val flat = store().residueLocation(key)
-        assertEquals("${key.slug}.md", Path(flat).name)
+        assertEquals("window-${key.digest}.md", Path(flat).name)
 
         nested()
         val location = Path(store().residueLocation(key))
-        assertEquals(key.slug, location.name)
-        assertEquals(key.appSlug, location.parent.name)
+        assertEquals("window-${key.digest}", location.name)
+        assertEquals("app-window-${key.appDigest}", location.parent.name)
+
+        config.put(RegistryFlags.residueNaming, ResidueNaming.SLUG)
+        val slugged = Path(store().residueLocation(key))
+        assertEquals(key.slug, slugged.name)
+        assertEquals(key.appSlug, slugged.parent.name)
     }
 
     /** The default is untouched: an unconfigured system is laid out exactly as it was. */
@@ -108,7 +113,7 @@ class ResidueAppLayoutTest {
         val key = SurfaceKey.Window("firefox")
         val prepared = store().prepareResidue(key)
         assertEquals(residueDir, prepared.parent, "no new nesting level appears by default")
-        assertEquals("${key.slug}.md", prepared.name)
+        assertEquals("window-${key.digest}.md", prepared.name)
         assertFalse(prepared.isDirectory())
     }
 
@@ -482,19 +487,25 @@ class ResidueAppLayoutTest {
             )
             assertEquals(
                 listOf(key.slug),
-                residueSegments(key, ResidueLayout.PER_KEY_DIR),
+                residueSegments(key, ResidueLayout.PER_KEY_DIR, ResidueNaming.SLUG),
                 "sanity: PER_KEY_DIR is the surface's own slug",
             )
-            assertNotEquals(
-                residueSegments(key, ResidueLayout.PER_KEY_DIR),
-                listOf(key.appSlug),
-                "$key: the application directory IS the PER_KEY_DIR residue directory",
-            )
+            ResidueNaming.entries.forEach { naming ->
+                assertNotEquals(
+                    residueSegments(key, ResidueLayout.PER_KEY_DIR, naming),
+                    residueSegments(key, ResidueLayout.PER_APP_SESSION_DIR, naming).take(1),
+                    "$key: under $naming the application directory IS the PER_KEY_DIR one",
+                )
+            }
         }
         // And not merely for a key against itself: no application directory is any *other*
-        // surface's residue directory either.
-        val apps = defaults.map { it.appSlug }.toSet()
-        val surfaces = defaults.map { it.slug }.toSet()
+        // surface's residue directory either, under either naming or across the two.
+        val apps = ResidueNaming.entries.flatMap { naming ->
+            defaults.map { residueSegments(it, ResidueLayout.PER_APP_SESSION_DIR, naming)[0] }
+        }.toSet()
+        val surfaces = ResidueNaming.entries.flatMap { naming ->
+            defaults.map { residueSegments(it, ResidueLayout.PER_KEY_DIR, naming)[0] }
+        }.toSet()
         assertEquals(emptySet(), apps intersect surfaces, "the two namespaces overlap")
     }
 

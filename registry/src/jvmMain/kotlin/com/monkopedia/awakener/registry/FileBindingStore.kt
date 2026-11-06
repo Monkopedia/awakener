@@ -182,6 +182,19 @@ class FileBindingStore(
     /** The sentence to print when residue was left behind by a layout flip, else null. */
     val residueStranded: String? get() = strandedCheck.warning
 
+    @Volatile
+    private var migrated: String? = null
+
+    /**
+     * The sentence to print when the most recent prepare moved this surface's residue from its
+     * slug-named path to its digest-named one under [SlugResidue.MOVE], else null.
+     *
+     * Said out loud because it is the one time awakener renames a model of Jason on its own, and
+     * anything holding the old path — a shell `cd`'d into it, a note pointing at it — is about to
+     * be holding a path that is not there.
+     */
+    val residueMigrated: String? get() = migrated
+
     private val state = MutableStateFlow(snapshot.bindings)
 
     override val bindings: StateFlow<Map<SurfaceKey, Binding>> = state.asStateFlow()
@@ -272,6 +285,7 @@ class FileBindingStore(
         withContext(Dispatchers.IO) {
             val cfg = config
             val layout = cfg[RegistryFlags.residueLayout]
+            val naming = cfg[RegistryFlags.residueNaming]
             val location = RegistryPaths.residueLocation(cfg, path, key)
             val at = location.toString()
             when (cfg[RegistryFlags.forgetResidue]) {
@@ -279,7 +293,7 @@ class FileBindingStore(
                 ForgetResidue.ARCHIVE -> when {
                     !location.exists() -> ResidueOutcome.Absent(at)
                     else -> try {
-                        val archive = archivePath(key, layout, location)
+                        val archive = archivePath(key, layout, naming, location)
                         Files.move(location, archive)
                         ResidueOutcome.Archived(at, archive.toString())
                     } catch (e: IOException) {
@@ -312,16 +326,21 @@ class FileBindingStore(
      * as "your model could not be archived" for a reason that is nobody's fault. UTC, so the
      * ordering of two archives does not invert across a daylight-saving boundary.
      */
-    private fun archivePath(key: SurfaceKey, layout: ResidueLayout, location: Path): Path {
+    private fun archivePath(
+        key: SurfaceKey,
+        layout: ResidueLayout,
+        naming: ResidueNaming,
+        location: Path,
+    ): Path {
         val stamp = ARCHIVE_STAMP.format(Instant.ofEpochMilli(clock()))
         (0 until ARCHIVE_ATTEMPTS).forEach { attempt ->
             val suffix = if (attempt == 0) stamp else "$stamp-$attempt"
-            val candidate = location.resolveSibling(archiveLeaf(key, layout, suffix))
+            val candidate = location.resolveSibling(archiveLeaf(key, layout, naming, suffix))
             if (!candidate.exists()) return candidate
         }
         // Every name in the second is taken, which is not a filesystem this can archive into.
         // Reported as a failure by the caller rather than overwriting one of them.
-        throw IOException("no free archive name beside $location for ${key.slug} at $stamp")
+        throw IOException("no free archive name beside $location for ${key.canonical} at $stamp")
     }
 
     override fun residueLocation(key: SurfaceKey): String =
@@ -344,13 +363,15 @@ class FileBindingStore(
      */
     suspend fun prepareResidue(key: SurfaceKey): Path = withContext(Dispatchers.IO) {
         val cfg = config
-        val location = RegistryPaths.residueLocation(cfg, path, key)
         val permissions = cfg[RegistryFlags.filePermissions]
         checkExposure(
             RegistryPaths.residueDir(cfg, path),
             cfg[RegistryFlags.residueExposure],
             cfg[RegistryFlags.residueExposureScope],
         )
+        // Before the location is resolved, so it resolves to where the model now is.
+        migrateSlugResidue(cfg, key)
+        val location = RegistryPaths.residueLocation(cfg, path, key)
         checkStranded(cfg, key, location)
         when (cfg[RegistryFlags.residueLayout]) {
             // Both directory layouts create every missing ancestor at the same mode, which is
@@ -367,11 +388,78 @@ class FileBindingStore(
     }
 
     /**
-     * Records residue this surface has under a layout other than the one in force.
+     * Renames [key]'s slug-named residue to its digest name (#208).
      *
-     * Run before anything is created, so the active location existing cannot be mistaken for a
-     * stranded one. The layouts name three distinct paths for any given surface — `<slug>.md`,
-     * `<slug>`, `<appSlug>/<slug>` — so no arm of this can report the path it is standing on.
+     * Only under [ResidueNaming.DIGEST] with [SlugResidue.MOVE]. Two steps, each a `rename(2)`
+     * on one filesystem, so a crash leaves the model wholly at one name or wholly at the other
+     * and [RegistryPaths.residueLocation] finds it at either:
+     *
+     * 1. Under [ResidueLayout.PER_APP_SESSION_DIR], the slug-named application directory moves
+     *    whole to its digest name if that does not exist yet — taking anything the sessions share
+     *    and every sibling session with it, each found there under its slug name and moved on
+     *    its own surface's next prepare.
+     * 2. The surface's residue, wherever [RegistryPaths.residueLocation] finds it, moves to the
+     *    all-digest path if that does not exist. This is also what rescues a model that was
+     *    written into the slug application directory while a digest one already stood beside it.
+     *
+     * Nothing is ever merged or overwritten: a target that exists is left alone, and if residue
+     * also exists elsewhere [checkStranded] reports it. A running Lifeless whose working directory
+     * moves keeps its handle on it; only the path string changes.
+     *
+     * A rename that fails is reported rather than raised — the model is still where it was, which
+     * is where it will be read from — except when the target now exists, which means a
+     * concurrent press made the same move first; that is not a failure and is not reported.
+     */
+    private fun migrateSlugResidue(cfg: Config, key: SurfaceKey) {
+        migrated = null
+        if (cfg[RegistryFlags.residueNaming] != ResidueNaming.DIGEST) return
+        if (cfg[RegistryFlags.slugResidue] != SlugResidue.MOVE) return
+        val layout = cfg[RegistryFlags.residueLayout]
+        val notes = mutableListOf<String>()
+        if (layout == ResidueLayout.PER_APP_SESSION_DIR) {
+            val slugApp = RegistryPaths.residuePath(cfg, path, key, layout, ResidueNaming.SLUG).parent
+            val digestApp =
+                RegistryPaths.residuePath(cfg, path, key, layout, ResidueNaming.DIGEST).parent
+            if (!rename(slugApp, digestApp, notes)) return report(key, notes)
+        }
+        val target = RegistryPaths.residuePath(cfg, path, key, layout, ResidueNaming.DIGEST)
+        val source = RegistryPaths.residueLocation(cfg, path, key)
+        rename(source, target, notes)
+        report(key, notes)
+    }
+
+    /**
+     * Moves [from] to [to] when [from] exists and [to] does not, noting what happened. False only
+     * when a move was attempted, failed, and nobody else made it either.
+     */
+    private fun rename(from: Path, to: Path, notes: MutableList<String>): Boolean {
+        if (from == to || !from.exists() || to.exists()) return true
+        return try {
+            Files.move(from, to, StandardCopyOption.ATOMIC_MOVE)
+            notes += "moved $from to $to"
+            true
+        } catch (e: IOException) {
+            if (to.exists() && !from.exists()) return true
+            notes += "could not move $from to $to (${e.message ?: e}); it is read in place"
+            false
+        }
+    }
+
+    private fun report(key: SurfaceKey, notes: List<String>) {
+        if (notes.isEmpty()) return
+        migrated = "${key.canonical}: ${notes.joinToString("; ")} — slug-named residue carries " +
+            "the window's own text into the working directory spanreed publishes; set " +
+            "${RegistryFlags.slugResidue.key}=${SlugResidue.IN_PLACE} to leave it"
+    }
+
+    /**
+     * Records residue this surface has under a layout or a naming other than the one in force.
+     *
+     * Run after [migrateSlugResidue] and before anything is created, and [active] — the path
+     * actually in use, which under [SlugResidue.IN_PLACE] can be the slug-named one — is excluded
+     * by value, so the residue being read is never reported as left behind. Every other
+     * combination of layout and naming is a distinct path for any given surface, so what is
+     * reported is residue this run does not read.
      *
      * **The path it stands *in* has to be distinct too, and that is a second claim.** The
      * directory this layout creates above the session folder is `<residue>/<appSlug>`, and
@@ -385,19 +473,19 @@ class FileBindingStore(
      * the two disjoint, and it makes them disjoint for *every* pair of keys rather than for this
      * one.
      *
-     * Two `exists()` calls on the hotkey path, and it changes no behaviour: there is no
+     * Five `exists()` calls on the hotkey path, and it changes no behaviour: there is no
      * alternative to switch between here, only this and silence, and silence is what makes a
      * layout flip look like a surface that never wrote anything down.
      */
     private fun checkStranded(cfg: Config, key: SurfaceKey, active: Path) {
-        val layout = cfg[RegistryFlags.residueLayout]
-        val residueDir = RegistryPaths.residueDir(cfg, path)
-        val stranded = ResidueLayout.entries.filter { it != layout }.mapNotNull { other ->
-            runCatching { RegistryPaths.containedResolve(residueDir, residueSegments(key, other)) }
-                .getOrNull()
-                ?.takeIf { it.exists() }
-                ?.toString()
-        }
+        val stranded = ResidueLayout.entries.flatMap { layout ->
+            ResidueNaming.entries.mapNotNull { naming ->
+                runCatching { RegistryPaths.residuePath(cfg, path, key, layout, naming) }
+                    .getOrNull()
+                    ?.takeIf { it != active && it.exists() }
+                    ?.toString()
+            }
+        }.distinct()
         strandedCheck = if (stranded.isEmpty()) {
             ResidueStrandedCheck(ResidueStrandedFinding.NONE, active = active.toString())
         } else {
@@ -406,7 +494,8 @@ class FileBindingStore(
                 active = active.toString(),
                 stranded = stranded,
                 warning = "${key.canonical} has residue at ${stranded.joinToString(", ")} " +
-                    "written under a different ${RegistryFlags.residueLayout.key}; this run " +
+                    "written under a different ${RegistryFlags.residueLayout.key} or " +
+                    "${RegistryFlags.residueNaming.key}; this run " +
                     "reads and writes $active instead, and nothing moves the old model there",
             )
         }
