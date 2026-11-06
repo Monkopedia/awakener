@@ -235,6 +235,127 @@ class ResidueNamingTest {
         assertEquals(listOf(slug.toString()), store.residueStrandedCheck.stranded)
     }
 
+    // --- flipping the naming back and forth -----------------------------------------------
+
+    /**
+     * DIGEST moved the model; flipping to SLUG must find it there rather than hand the surface
+     * an empty directory at its slug path — the empty-dock failure, reached by a flag flip.
+     */
+    @Test
+    fun `flipping to SLUG after a migration still finds the model`() = runTest {
+        nested()
+        val chrome = SurfaceKey.Window("google-chrome")
+        slugResidue(chrome, "prefers dark mode")
+        val moved = store().prepareResidue(chrome)
+
+        config.put(RegistryFlags.residueNaming, ResidueNaming.SLUG)
+        val store = store()
+        val prepared = store.prepareResidue(chrome)
+
+        assertEquals(moved, prepared, "SLUG reads the digest-named residue it finds")
+        assertEquals("prefers dark mode", prepared.resolve("model.md").readText())
+        assertFalse(residueDir.resolve(chrome.appSlug).exists(), "no empty slug dir made")
+        assertNull(store.residueStranded)
+    }
+
+    /** The same under the flat default layout, the other direction of the round trip. */
+    @Test
+    fun `flipping to SLUG after a flat migration still finds the model`() = runTest {
+        val key = SurfaceKey.Window("foot")
+        residueDir.createDirectories()
+        residueDir.resolve("${key.slug}.md").writeText("model")
+        store().prepareResidue(key)
+
+        config.put(RegistryFlags.residueNaming, ResidueNaming.SLUG)
+        val prepared = store().prepareResidue(key)
+
+        assertEquals(residueDir.resolve("window-${key.digest}.md"), prepared)
+        assertEquals("model", prepared.readText())
+    }
+
+    /**
+     * DIGEST → SLUG → DIGEST: a model written during the SLUG period sits in the slug app
+     * directory while a digest app directory already exists beside it. It must not be shadowed.
+     */
+    @Test
+    fun `a model under the slug app dir is found when the digest app dir exists`() = runTest {
+        nested()
+        config.put(RegistryFlags.windowIdentity, WindowIdentity.APP_ID_AND_TITLE)
+        val a = SurfaceKey.Window("foot", "one")
+        val b = SurfaceKey.Window("foot", "two")
+        store().prepareResidue(a) // DIGEST: creates the digest app dir.
+        config.put(RegistryFlags.residueNaming, ResidueNaming.SLUG)
+        val written = store().prepareResidue(b)
+        written.resolve("model.md").writeText("model b")
+        // Make the slug period's shape explicit, whatever SLUG chose for a fresh sibling.
+        val slugSession = residueDir.resolve(b.appSlug).resolve(b.slug)
+        if (written != slugSession) {
+            slugSession.parent.createDirectories()
+            java.nio.file.Files.move(written, slugSession)
+        }
+
+        config.put(RegistryFlags.slugResidue, SlugResidue.IN_PLACE)
+        config.put(RegistryFlags.residueNaming, ResidueNaming.DIGEST)
+        assertEquals(slugSession, store().prepareResidue(b), "IN_PLACE finds it where it is")
+
+        config.put(RegistryFlags.slugResidue, SlugResidue.MOVE)
+        val store = store()
+        val moved = store.prepareResidue(b)
+        assertEquals(
+            residueDir.resolve("app-window-${b.appDigest}").resolve("window-${b.digest}"),
+            moved,
+        )
+        assertEquals("model b", moved.resolve("model.md").readText())
+        assertNotNull(store.residueMigrated)
+    }
+
+    /**
+     * Under IN_PLACE a new window of an application whose slug app directory exists joins that
+     * directory, so the app's shared workspace stays one place — and its path keeps the app
+     * words. Pinned so the flag's description cannot drift from it again.
+     */
+    @Test
+    fun `under IN_PLACE a new sibling joins the existing slug app dir`() = runTest {
+        nested()
+        config.put(RegistryFlags.windowIdentity, WindowIdentity.APP_ID_AND_TITLE)
+        config.put(RegistryFlags.slugResidue, SlugResidue.IN_PLACE)
+        val old = SurfaceKey.Window("foot", "one")
+        slugResidue(old, "model")
+        val fresh = SurfaceKey.Window("foot", "two")
+
+        val prepared = store().prepareResidue(fresh)
+
+        assertEquals(residueDir.resolve(fresh.appSlug).resolve("window-${fresh.digest}"), prepared)
+    }
+
+    /**
+     * Two presses on one surface at once: the one that loses the rename must not report a
+     * failure, since the model is exactly where it should be — the other press put it there.
+     */
+    @Test
+    fun `losing a concurrent migration is not reported as a failure`() {
+        nested()
+        repeat(60) { trial ->
+            val key = SurfaceKey.Window("race-$trial")
+            slugResidue(key, "model")
+            val stores = listOf(store(), store())
+            val barrier = java.util.concurrent.CyclicBarrier(2)
+            val threads = stores.map { store ->
+                Thread {
+                    barrier.await()
+                    kotlinx.coroutines.runBlocking { store.prepareResidue(key) }
+                }.apply { start() }
+            }
+            threads.forEach { it.join() }
+            stores.forEach { store ->
+                val note = store.residueMigrated.orEmpty()
+                assertFalse("could not move" in note, "trial $trial: $note")
+            }
+            val target = residueDir.resolve("app-window-${key.appDigest}").resolve("window-${key.digest}")
+            assertEquals("model", target.resolve("model.md").readText())
+        }
+    }
+
     /** The flat file layout migrates too: `PER_KEY_FILE` is the default and adolin has one. */
     @Test
     fun `a slug-named residue file is moved under the default layout`() = runTest {

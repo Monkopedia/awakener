@@ -388,55 +388,68 @@ class FileBindingStore(
     }
 
     /**
-     * Renames [key]'s slug-named residue to its digest name, one path component at a time (#208).
+     * Renames [key]'s slug-named residue to its digest name (#208).
      *
-     * Only under [ResidueNaming.DIGEST] with [SlugResidue.MOVE], and only a component whose slug
-     * name exists and whose digest name does not: residue that has already moved, or that was
-     * written under digest names to begin with, is never touched, and a component where both
-     * exist is left for [checkStranded] to report rather than merged.
+     * Only under [ResidueNaming.DIGEST] with [SlugResidue.MOVE]. Two steps, each a `rename(2)`
+     * on one filesystem, so a crash leaves the model wholly at one name or wholly at the other
+     * and [RegistryPaths.residueLocation] finds it at either:
      *
-     * Each move is a `rename(2)` between two names in one directory, so a crash leaves the model
-     * wholly at one name or wholly at the other, and [RegistryPaths.residueLocation] finds it at
-     * either. The application directory of [ResidueLayout.PER_APP_SESSION_DIR] moves whole, which
-     * takes every other session of that application with it — still under their slug names, each
-     * found there and moved in turn on its own surface's next prepare — along with anything the
-     * sessions share in it. A running Lifeless whose working directory moves keeps its handle on
-     * it; only the path string changes.
+     * 1. Under [ResidueLayout.PER_APP_SESSION_DIR], the slug-named application directory moves
+     *    whole to its digest name if that does not exist yet — taking anything the sessions share
+     *    and every sibling session with it, each found there under its slug name and moved on
+     *    its own surface's next prepare.
+     * 2. The surface's residue, wherever [RegistryPaths.residueLocation] finds it, moves to the
+     *    all-digest path if that does not exist. This is also what rescues a model that was
+     *    written into the slug application directory while a digest one already stood beside it.
      *
-     * A move that fails is reported rather than raised: the model is still at its slug path,
-     * which is where it will be read from, so the press can go on.
+     * Nothing is ever merged or overwritten: a target that exists is left alone, and if residue
+     * also exists elsewhere [checkStranded] reports it. A running Lifeless whose working directory
+     * moves keeps its handle on it; only the path string changes.
+     *
+     * A rename that fails is reported rather than raised — the model is still where it was, which
+     * is where it will be read from — except when the target now exists, which means a
+     * concurrent press made the same move first; that is not a failure and is not reported.
      */
     private fun migrateSlugResidue(cfg: Config, key: SurfaceKey) {
         migrated = null
         if (cfg[RegistryFlags.residueNaming] != ResidueNaming.DIGEST) return
         if (cfg[RegistryFlags.slugResidue] != SlugResidue.MOVE) return
-        val residueDir = RegistryPaths.residueDir(cfg, path)
         val layout = cfg[RegistryFlags.residueLayout]
-        val digest = residueSegments(key, layout, ResidueNaming.DIGEST)
-        val slug = residueSegments(key, layout, ResidueNaming.SLUG)
         val notes = mutableListOf<String>()
-        var parent = emptyList<String>()
-        for (i in digest.indices) {
-            val from = RegistryPaths.containedResolve(residueDir, parent + slug[i])
-            val to = RegistryPaths.containedResolve(residueDir, parent + digest[i])
-            if (from != to && from.exists() && !to.exists()) {
-                try {
-                    Files.move(from, to, StandardCopyOption.ATOMIC_MOVE)
-                    notes += "moved $from to $to"
-                } catch (e: IOException) {
-                    notes += "could not move $from to $to (${e.message ?: e}); it is read in place"
-                    // The digest-named parent does not exist, so nothing below it can be moved
-                    // into it; the slug-named residue is what gets read.
-                    break
-                }
-            }
-            parent = parent + digest[i]
+        if (layout == ResidueLayout.PER_APP_SESSION_DIR) {
+            val slugApp = RegistryPaths.residuePath(cfg, path, key, layout, ResidueNaming.SLUG).parent
+            val digestApp =
+                RegistryPaths.residuePath(cfg, path, key, layout, ResidueNaming.DIGEST).parent
+            if (!rename(slugApp, digestApp, notes)) return report(key, notes)
         }
-        if (notes.isNotEmpty()) {
-            migrated = "${key.canonical}: ${notes.joinToString("; ")} — slug-named residue " +
-                "carries the window's own text into the working directory spanreed publishes; " +
-                "set ${RegistryFlags.slugResidue.key}=${SlugResidue.IN_PLACE} to leave it"
+        val target = RegistryPaths.residuePath(cfg, path, key, layout, ResidueNaming.DIGEST)
+        val source = RegistryPaths.residueLocation(cfg, path, key)
+        rename(source, target, notes)
+        report(key, notes)
+    }
+
+    /**
+     * Moves [from] to [to] when [from] exists and [to] does not, noting what happened. False only
+     * when a move was attempted, failed, and nobody else made it either.
+     */
+    private fun rename(from: Path, to: Path, notes: MutableList<String>): Boolean {
+        if (from == to || !from.exists() || to.exists()) return true
+        return try {
+            Files.move(from, to, StandardCopyOption.ATOMIC_MOVE)
+            notes += "moved $from to $to"
+            true
+        } catch (e: IOException) {
+            if (to.exists() && !from.exists()) return true
+            notes += "could not move $from to $to (${e.message ?: e}); it is read in place"
+            false
         }
+    }
+
+    private fun report(key: SurfaceKey, notes: List<String>) {
+        if (notes.isEmpty()) return
+        migrated = "${key.canonical}: ${notes.joinToString("; ")} — slug-named residue carries " +
+            "the window's own text into the working directory spanreed publishes; set " +
+            "${RegistryFlags.slugResidue.key}=${SlugResidue.IN_PLACE} to leave it"
     }
 
     /**
@@ -481,7 +494,8 @@ class FileBindingStore(
                 active = active.toString(),
                 stranded = stranded,
                 warning = "${key.canonical} has residue at ${stranded.joinToString(", ")} " +
-                    "written under a different ${RegistryFlags.residueLayout.key}; this run " +
+                    "written under a different ${RegistryFlags.residueLayout.key} or " +
+                    "${RegistryFlags.residueNaming.key}; this run " +
                     "reads and writes $active instead, and nothing moves the old model there",
             )
         }

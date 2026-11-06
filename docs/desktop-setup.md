@@ -182,13 +182,26 @@ spanreed lists every agent's working directory to every other agent on the host.
 same hex the agent name ends in) and the window chooses none of it. `SLUG` is the older naming,
 which kept up to 48 characters of the window's `app_id` (`window-google-chrome-<32 hex>`).
 
-Residue written under slug names before this default changed is still found. Under the default
-`registry.residue.slug_residue=MOVE`, the next press on that surface renames it to its digest
-name in place — one atomic rename per path component, reported as a `note:` on stderr — and
-`IN_PLACE` leaves it at the slug name and keeps reading it there. The rename changes the
-directory's path, so `claude` starts its next session in a directory it has not seen: the
-launcher below re-accepts the trust prompt for it, and Claude's own per-directory session history
-starts fresh. The residue files themselves move with the directory.
+Residue written under the other naming is still found, in either direction, so flipping
+`registry.residue.naming` never hands a surface an empty directory beside its model. Under the
+default `registry.residue.slug_residue=MOVE`, the next press on a surface with slug-named residue
+renames it to its digest name in place — one atomic rename per step, reported as a `note:` on
+stderr. `IN_PLACE` leaves it at the slug name and keeps reading it there; under
+`PER_APP_SESSION_DIR` a new window of that application then joins the slug-named application
+directory too, so its path still carries the app's words.
+
+**What a move costs in Claude Code's own state.** The rename changes the dock's working
+directory, and Claude Code keys three things on that path: `~/.claude/projects/<escaped cwd>/`,
+which holds the session transcripts **and Claude's auto-memory directory**, and the
+`~/.claude.json` project entry (trust plus last-session metrics). awakener does not move any of
+them — they are Claude's internals, on the same principle that keeps awakener out of spanreed's
+files. So after a move the launcher below re-accepts trust for the new directory, Claude starts
+with no transcripts and no auto-memory for that surface, and whatever it wrote under the old path
+stays there unread. Measured on adolin when this default landed, the residue-keyed `memory/`
+directories were empty and the transcripts came to about 1.2 MB, so nothing durable was lost
+then; anything Claude's auto-memory writes there later is orphaned by each move. The residue
+files themselves — the durable layer in `docs/design.md`'s memory model — move with the
+directory.
 
 **Changing this moves nothing already written.** Residue left behind under a previous layout is
 reported on the next prepare rather than silently orphaned, so a switch is visible rather than a
