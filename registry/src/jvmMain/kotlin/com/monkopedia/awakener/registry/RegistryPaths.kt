@@ -4,6 +4,7 @@ import com.monkopedia.awakener.config.Config
 import com.monkopedia.awakener.config.Xdg
 import java.nio.file.Path
 import kotlin.io.path.Path
+import kotlin.io.path.exists
 
 /**
  * Where the durable layer lives on disk.
@@ -48,11 +49,43 @@ object RegistryPaths {
      */
     private fun Path.holder(): Path = toAbsolutePath().let { it.parent ?: it }
 
-    fun residueLocation(config: Config, storePath: Path, key: SurfaceKey): Path =
-        containedResolve(
-            residueDir(config, storePath),
-            residueSegments(key, config[RegistryFlags.residueLayout]),
-        )
+    /**
+     * Where [key]'s residue is: the path [RegistryFlags.residueNaming] derives, except where only
+     * the [ResidueNaming.SLUG] path exists, which is then the answer for that component.
+     *
+     * That exception is the whole migration story for #208. Every residue directory written
+     * before it is slug-named, and a store that switched to digest names without looking would
+     * hand each existing surface an empty directory beside its model. So the derivation reads
+     * the disk, one component at a time — a [ResidueLayout.PER_APP_SESSION_DIR] application
+     * directory can have been moved while a session inside it has not — and a component whose
+     * digest name exists always wins, so a surface whose residue has been moved never reads the
+     * old name again. Whether the slug-named residue is moved is [RegistryFlags.slugResidue]'s
+     * call and `FileBindingStore.prepareResidue`'s job; this only reads.
+     */
+    fun residueLocation(config: Config, storePath: Path, key: SurfaceKey): Path {
+        val dir = residueDir(config, storePath)
+        val layout = config[RegistryFlags.residueLayout]
+        val derived = residueSegments(key, layout, config[RegistryFlags.residueNaming])
+        if (config[RegistryFlags.residueNaming] == ResidueNaming.SLUG) {
+            return containedResolve(dir, derived)
+        }
+        val slug = residueSegments(key, layout, ResidueNaming.SLUG)
+        val chosen = derived.indices.fold(emptyList<String>()) { parent, i ->
+            val at = containedResolve(dir, parent)
+            val keepSlug = !at.resolve(derived[i]).exists() && at.resolve(slug[i]).exists()
+            parent + if (keepSlug) slug[i] else derived[i]
+        }
+        return containedResolve(dir, chosen)
+    }
+
+    /** Where [key]'s residue would be under [layout] and [naming], without reading the disk. */
+    fun residuePath(
+        config: Config,
+        storePath: Path,
+        key: SurfaceKey,
+        layout: ResidueLayout,
+        naming: ResidueNaming,
+    ): Path = containedResolve(residueDir(config, storePath), residueSegments(key, layout, naming))
 
     /**
      * Resolves [segments] under [base] one component at a time, refusing any that leaves it.

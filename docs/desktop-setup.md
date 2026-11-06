@@ -154,29 +154,41 @@ which layer fills each one in is load-bearing:
 - `{residue}` is where this surface's durable model lives.
 
 **`registry.residue.layout`** — the default `PER_KEY_FILE` gives each surface a single
-`<slug>.md` and no directory. A directory is what makes `cd {residue}` in the launcher
+`<name>.md` and no directory. A directory is what makes `cd {residue}` in the launcher
 meaningful: the agent gets a workspace it can write several files into, not one file it has to
 append to. Two layouts give it one.
 
 `PER_APP_SESSION_DIR` is the one to set. It writes `<residue>/<app>/<session>/`, so every
 surface belonging to one application sits under a directory of that application's own — a place
-two Lifelesses bound to two windows of the same app can both read and write. Measured on kaladin
-against headless sway, one real `awakener-invoke invoke` against a `foot` surface, with
-`registry.residue.dir` pointed at a scratch path:
+two Lifelesses bound to two windows of the same app can both read and write:
 
 ```
 residue/                                                            drwx------
-  app-window-fake-surface-54a0a7421bcf5d6b7b1c021861a6d2f9/          drwx------
-    window-fake-surface-32b1ee1a9793de3ecdf75459f7d9f47b/            drwx------
+  app-window-<32 hex>/                                              drwx------
+    window-<32 hex>/                                                drwx------
 ```
 
-Both levels created `0700`. The session directory is named exactly what the flat layout would
-have called that surface's residue, moved one level down; the application directory carries an
-`app-` prefix, which is what keeps it from ever colliding with some surface's own directory.
+Both levels are created `0700`. The session directory is named exactly what the flat layout would
+call that surface's residue, moved one level down; the application directory carries an `app-`
+prefix, which is what keeps it from ever colliding with some surface's own directory.
 
 `PER_KEY_DIR` is the flat version of the same thing — a directory per surface, all siblings, with
 nothing on disk saying which of them are three windows of one editor. It was the answer before
 the nested layout existed and is still fine if you do not want the extra level.
+
+**`registry.residue.naming`** — the residue directory is the dock's working directory, and
+spanreed lists every agent's working directory to every other agent on the host. So the default
+`DIGEST` names each component by a kind literal and a hex digest only (`window-<32 hex>`, the
+same hex the agent name ends in) and the window chooses none of it. `SLUG` is the older naming,
+which kept up to 48 characters of the window's `app_id` (`window-google-chrome-<32 hex>`).
+
+Residue written under slug names before this default changed is still found. Under the default
+`registry.residue.slug_residue=MOVE`, the next press on that surface renames it to its digest
+name in place — one atomic rename per path component, reported as a `note:` on stderr — and
+`IN_PLACE` leaves it at the slug name and keeps reading it there. The rename changes the
+directory's path, so `claude` starts its next session in a directory it has not seen: the
+launcher below re-accepts the trust prompt for it, and Claude's own per-directory session history
+starts fresh. The residue files themselves move with the directory.
 
 **Changing this moves nothing already written.** Residue left behind under a previous layout is
 reported on the next prepare rather than silently orphaned, so a switch is visible rather than a

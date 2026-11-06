@@ -462,7 +462,7 @@ class BindingStoreTest {
         assertEquals(residue.toString(), archived.path)
         assertEquals("prefers dark mode", Path(archived.archive).readText())
         assertTrue(
-            Path(archived.archive).name.startsWith("${key.slug}."),
+            Path(archived.archive).name.startsWith("window-${key.digest}."),
             "an archive is findable from the surface it belonged to: ${archived.archive}",
         )
         assertTrue(archived.archive.endsWith(".md"), archived.archive)

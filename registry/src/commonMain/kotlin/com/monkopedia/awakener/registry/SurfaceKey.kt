@@ -156,8 +156,8 @@ sealed interface SurfaceKey {
     /**
      * A short, readable, filesystem- and spanreed-safe name for this key.
      *
-     * This string becomes the residue filename and, under [AgentNameLabel.SLUG], the
-     * `SPANREED_AGENT_NAME` and through that the `agent_id` spanreed routes on — so two keys
+     * Under [ResidueNaming.SLUG] this string becomes the residue filename, and under
+     * [AgentNameLabel.SLUG] the `SPANREED_AGENT_NAME` and through that the `agent_id` spanreed routes on — so two keys
      * sharing a slug is two surfaces sharing a model of Jason, and under that label an inbox too.
      * The other labels keep only [digest], so the same argument holds for them through it. The readable half cannot
      * carry any of that uniqueness — it is truncated, and every character that is not a letter
@@ -200,6 +200,22 @@ sealed interface SurfaceKey {
      * half, so an agent's name and its surface's residue path carry the same hex.
      */
     val digest: String get() = canonical.stableDigest()
+
+    /** The digest [appSlug] ends in, alone: the hex of a [ResidueNaming.DIGEST] app directory. */
+    val appDigest: String get() = appScope.stableDigest()
+
+    /**
+     * The kind literal for this key, from the sealed hierarchy rather than from a substring of
+     * [canonical], so no window-supplied text can land in it. What the published names and paths
+     * keep of a key besides its digest (#186, #208).
+     */
+    val kind: String
+        get() = when (this) {
+            is Window -> "window"
+            is Titled -> "title"
+            is Unidentified -> "unidentified"
+            is Origin -> "origin"
+        }
 
     companion object {
         /**
