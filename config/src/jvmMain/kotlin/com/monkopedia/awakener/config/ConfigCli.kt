@@ -23,11 +23,9 @@ import kotlinx.coroutines.runBlocking
  * empty registry and report that none of them exist.
  */
 object ConfigCli {
-    fun defaultPath() = Path(
-        System.getenv("AWAKENER_CONFIG")
-            ?: "${System.getenv("XDG_CONFIG_HOME") ?: "${System.getProperty("user.home")}/.config"}" +
-            "/awakener/config.json",
-    )
+    fun defaultPath(environment: Map<String, String> = System.getenv()): Path =
+        environment["AWAKENER_CONFIG"]?.takeIf { it.isNotBlank() }?.let(::Path)
+            ?: Xdg.configHome(environment).resolve("awakener/config.json")
 
     /**
      * Opens the config store with every flag on the classpath registered.

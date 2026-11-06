@@ -30,6 +30,29 @@ class RegistryPathsTest {
         )
     }
 
+    /**
+     * #191: the XDG spec treats an exported-empty variable as unset and a relative one as invalid.
+     * A bare `?:` read `XDG_STATE_HOME=""` as a value and put the bindings file at the relative
+     * `awakener/bindings.json`, so the store followed whatever working directory the compositor
+     * happened to exec the hotkey from.
+     */
+    @Test
+    fun `an empty or relative XDG_STATE_HOME falls back to the home directory`() {
+        val fallback = Path(System.getProperty("user.home"), ".local/state/awakener/bindings.json")
+        listOf(emptyMap(), mapOf("XDG_STATE_HOME" to ""), mapOf("XDG_STATE_HOME" to "state"))
+            .forEach { environment ->
+                assertEquals(
+                    fallback,
+                    RegistryPaths.storePath(Config.EMPTY, environment),
+                    "$environment",
+                )
+            }
+        assertEquals(
+            Path("/srv/state/awakener/bindings.json"),
+            RegistryPaths.storePath(Config.EMPTY, mapOf("XDG_STATE_HOME" to "/srv/state")),
+        )
+    }
+
     @Test
     fun `an absolute store path is unaffected`() {
         assertEquals(

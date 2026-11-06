@@ -1,6 +1,7 @@
 package com.monkopedia.awakener.registry
 
 import com.monkopedia.awakener.config.Config
+import com.monkopedia.awakener.config.Xdg
 import java.nio.file.Path
 import kotlin.io.path.Path
 
@@ -12,10 +13,8 @@ import kotlin.io.path.Path
  * they default under `XDG_STATE_HOME` while `:config` defaults under `XDG_CONFIG_HOME`.
  */
 object RegistryPaths {
-    fun stateHome(environment: Map<String, String> = System.getenv()): Path = Path(
-        environment["XDG_STATE_HOME"]
-            ?: "${System.getProperty("user.home")}/.local/state",
-    ).resolve("awakener")
+    fun stateHome(environment: Map<String, String> = System.getenv()): Path =
+        Xdg.stateHome(environment).resolve("awakener")
 
     fun storePath(config: Config, environment: Map<String, String> = System.getenv()): Path =
         config[RegistryFlags.storePath].takeIf { it.isNotBlank() }?.let(::Path)

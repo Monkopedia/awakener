@@ -209,6 +209,20 @@ class FileConnectorCatalogTest {
         )
     }
 
+    /**
+     * #191: an exported-empty `XDG_CONFIG_HOME` is unset per the XDG spec, and a relative one is
+     * invalid. Read as a value, `""` made the user's directory `awakener/connectors` under
+     * whatever the working directory was.
+     */
+    @Test
+    fun `an empty or relative XDG_CONFIG_HOME falls back to the home directory`() {
+        val user = "${System.getProperty("user.home")}/.config/awakener/connectors"
+        listOf("", "cfg").forEach { value ->
+            val catalog = FileConnectorCatalog(Config.EMPTY, mapOf("XDG_CONFIG_HOME" to value))
+            assertEquals(listOf(user), catalog.searchPath.map { it.toString() }, "'$value'")
+        }
+    }
+
     @Test
     fun `a configured search path is the whole answer`() {
         val catalog = FileConnectorCatalog(

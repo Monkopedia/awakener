@@ -111,13 +111,13 @@ class SwayConnection private constructor(private val channel: SocketChannel) : A
 
     companion object {
         /**
-         * @param socketPath sway's IPC socket; defaults to `SWAYSOCK`, which sway sets for
-         * processes it spawns and honours when creating the socket.
+         * Opens [socketPath] and nothing else. Where the path comes from — `wm.ipc.socket_path`,
+         * `SWAYSOCK`, discovery — is [SwaySocket]'s question; a default here read `SWAYSOCK`
+         * unguarded and was reachable from no caller (#191).
          */
-        fun open(socketPath: String? = null): SwayConnection {
-            val path = socketPath ?: System.getenv("SWAYSOCK") ?: throw noSocket()
+        fun open(socketPath: String): SwayConnection {
             val channel = SocketChannel.open(StandardProtocolFamily.UNIX)
-            channel.connect(UnixDomainSocketAddress.of(path))
+            channel.connect(UnixDomainSocketAddress.of(socketPath))
             return SwayConnection(channel)
         }
 

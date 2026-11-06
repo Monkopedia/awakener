@@ -3,6 +3,7 @@ package com.monkopedia.awakener.connector
 import com.monkopedia.awakener.config.Config
 import com.monkopedia.awakener.config.FilePermissions
 import com.monkopedia.awakener.config.PrivateFiles
+import com.monkopedia.awakener.config.Xdg
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
@@ -63,10 +64,7 @@ class FileConnectorCatalog(
             configured.split(':').filter { it.isNotBlank() }.map { Path(it) }
         } else {
             listOfNotNull(
-                Path(
-                    environment["XDG_CONFIG_HOME"]
-                        ?: "${System.getProperty("user.home")}/.config",
-                ).resolve("awakener/connectors"),
+                Xdg.configHome(environment).resolve("awakener/connectors"),
                 environment["AWAKENER_CONNECTORS"]?.takeIf { it.isNotBlank() }?.let(::Path),
             )
         }
