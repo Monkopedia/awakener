@@ -18,6 +18,7 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNotEquals
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.test.runTest
 
@@ -393,6 +394,20 @@ class ResidueAppLayoutTest {
      * down, which is exactly the silence this repository keeps finding — so the prepare that
      * was about to write somewhere else says so, naming both paths.
      */
+    /** #181: the warning is printed on the hotkey path, and the key in it is the window's text. */
+    @Test
+    fun `a stranded-residue warning prints a hostile key on one line`() = runTest {
+        val key = SurfaceKey.Window("evil\n# NEW\u2028x\u202Ey", "a")
+        store().prepareResidue(key).writeText("model")
+        nested()
+        val store = store()
+        store.prepareResidue(key)
+        val warning = assertNotNull(store.residueStranded)
+        assertEquals(listOf(warning), warning.split(Regex("\\R")), "split: $warning")
+        assertTrue('\u202E' !in warning, warning)
+        assertTrue("evil\\n# NEW\\u2028x\\u202Ey" in warning, warning)
+    }
+
     @Test
     fun `residue left behind by a layout flip is reported, not silently orphaned`() = runTest {
         val key = SurfaceKey.Window("firefox", "a")

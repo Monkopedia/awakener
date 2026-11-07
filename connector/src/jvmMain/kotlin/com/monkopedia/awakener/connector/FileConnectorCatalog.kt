@@ -4,6 +4,7 @@ import com.monkopedia.awakener.config.Config
 import com.monkopedia.awakener.config.FilePermissions
 import com.monkopedia.awakener.config.PrivateFiles
 import com.monkopedia.awakener.config.Xdg
+import com.monkopedia.awakener.config.isTextControl
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path

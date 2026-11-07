@@ -1,6 +1,7 @@
 package com.monkopedia.awakener.registry
 
 import com.monkopedia.awakener.config.ConfigCli
+import com.monkopedia.awakener.config.oneLine
 import kotlin.system.exitProcess
 import kotlinx.coroutines.runBlocking
 
@@ -27,14 +28,18 @@ object RegistryCli {
             out("refusing to write until this is resolved; move the file aside to start over")
             return 1
         }
-        store.unreadableKeys.forEach { out("warning: unreadable key '$it' (kept, not resolved)") }
+        // Every key below is printed through `oneLine`: `canonical` is the window's own text with
+        // `%` and `:` escaped, so raw it could split or reorder a line of this listing (#181).
+        store.unreadableKeys.forEach {
+            out("warning: unreadable key '${oneLine(it)}' (kept, not resolved)")
+        }
 
         val code = when (args.firstOrNull() ?: "list") {
             "list" -> {
                 val bindings = store.bindings.value
                 if (bindings.isEmpty()) out("no surfaces bound (${store.path})")
                 bindings.forEach { (key, binding) ->
-                    out(key.canonical)
+                    out(oneLine(key.canonical))
                     out("  agent    ${binding.agentId}  (SPANREED_AGENT_NAME=${binding.spanreedName})")
                     out("  residue  ${store.residueLocation(key)}")
                 }
@@ -45,7 +50,7 @@ object RegistryCli {
                 val key = args.getOrNull(1)?.let(SurfaceKey::parse)
                     ?: return usage(out, "resolve needs a canonical key, e.g. window:firefox")
                 val binding = runBlocking { store.resolve(key) }
-                    ?: return usage(out, "no binding for ${key.canonical}")
+                    ?: return usage(out, "no binding for ${oneLine(key.canonical)}")
                 out(binding.agentId)
                 0
             }
@@ -65,7 +70,7 @@ object RegistryCli {
                     out("not bound")
                     1
                 } else {
-                    out("forgot ${key.canonical}")
+                    out("forgot ${oneLine(key.canonical)}")
                     // Named rather than implied. The user reaching for this command has just
                     // decided an agent has the wrong idea about them, and the next thing they
                     // need to know is whether the written-down version of that idea is still

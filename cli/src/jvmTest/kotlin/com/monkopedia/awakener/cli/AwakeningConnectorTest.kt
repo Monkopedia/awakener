@@ -416,27 +416,6 @@ class AwakeningConnectorTest {
         )
     }
 
-    @Test
-    fun `oneLine escapes control characters reversibly and leaves ordinary text alone`() {
-        assertEquals("plain app_id", AwakenerInvokeCli.oneLine("plain app_id"))
-        assertEquals("a\\nb", AwakenerInvokeCli.oneLine("a\nb"))
-        assertEquals("a\\rb", AwakenerInvokeCli.oneLine("a\rb"))
-        assertEquals("a\\tb", AwakenerInvokeCli.oneLine("a\tb"))
-        assertEquals("a\\x1B[31m", AwakenerInvokeCli.oneLine("a\u001B[31m"))
-        assertEquals("a\\x7F", AwakenerInvokeCli.oneLine("a\u007F"))
-        // The backslash itself, or the escaping would not be reversible and two different
-        // app_ids could print the same line — this is a listing people match windows against.
-        assertEquals("a\\\\nb", AwakenerInvokeCli.oneLine("a\\nb"))
-        // Everything else that is invisible or acts on layout, in the escape that fits its width.
-        assertEquals("a\\x85b", AwakenerInvokeCli.oneLine("a\u0085b"))
-        assertEquals("a\\x9B31m", AwakenerInvokeCli.oneLine("a\u009B31m"))
-        assertEquals("a\\u2028b\\u2029c", AwakenerInvokeCli.oneLine("a\u2028b\u2029c"))
-        assertEquals("\\u202Eevil\\u2069", AwakenerInvokeCli.oneLine("\u202Eevil\u2069"))
-        assertEquals("a\\u200Bb", AwakenerInvokeCli.oneLine("a\u200Bb"))
-        // And text that merely is not ASCII is left alone: this is not an ASCII filter.
-        assertEquals("café — 日本語 עברית", AwakenerInvokeCli.oneLine("café — 日本語 עברית"))
-    }
-
     // ------------------------------------------------------------------ fakes
 
     /**

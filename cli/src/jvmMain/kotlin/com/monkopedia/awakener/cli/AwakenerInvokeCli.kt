@@ -2,10 +2,10 @@ package com.monkopedia.awakener.cli
 
 import com.monkopedia.awakener.config.ConfigCli
 import com.monkopedia.awakener.config.FileConfigStore
+import com.monkopedia.awakener.config.oneLine
 import com.monkopedia.awakener.connector.ConnectorFlags
 import com.monkopedia.awakener.connector.ConnectorOutcome
 import com.monkopedia.awakener.connector.FileConnectorCatalog
-import com.monkopedia.awakener.connector.isTextControl
 import com.monkopedia.awakener.registry.FileBindingStore
 import com.monkopedia.awakener.registry.ResidueOutcome
 import com.monkopedia.awakener.registry.SpanreedCli
@@ -150,51 +150,6 @@ object AwakenerInvokeCli {
     /** A `--connector` value, or null when it is not a name a connector directory could have. */
     private fun named(name: String): ConnectorChoice? =
         if (ConnectorFlags.isConnectorName(name)) ConnectorChoice.Named(name) else null
-
-    /**
-     * One line, safe to print, for a string whose bytes the window chose.
-     *
-     * `awakener-invoke list` prints an `app_id` and a `SurfaceKey`, and both carry whatever the
-     * program owning the window declared — `SurfaceKey.escapeSegment` escapes `%` and `:` and
-     * passes newlines through, because its job is injectivity rather than safety. A window whose
-     * `app_id` is four lines of Markdown therefore rendered as four lines of this command's
-     * output, one of them beginning `# NEW INSTRUCTIONS FOR THE AGENT`.
-     *
-     * That is the same class `connector.window_facts` closes for rendered files, one layer over:
-     * a hotkey press writes to a terminal, but `awakener-invoke list` is exactly the command an
-     * agent runs to find out what is on the desktop, and its stdout is then something an agent
-     * reads. Found by re-running the reviewer's own payload against the fixed build rather than
-     * by being told, which is the argument for fixing a class rather than a case.
-     *
-     * Not a flag. A one-line-per-surface listing that a window can turn into four lines is wrong
-     * for a human reader too, so there is no second behaviour to offer — this is the report being
-     * correct rather than a choice about it.
-     *
-     * "One line" means one line to every reader, not to a terminal: what is escaped is
-     * [isTextControl]'s set, which is decided by Unicode category so that U+2028 and the bidi
-     * overrides are covered by the rule rather than by being remembered (#181).
-     */
-    internal fun oneLine(value: String): String = buildString(value.length) {
-        value.codePoints().forEach { c ->
-            when {
-                c == '\\'.code -> append("\\\\")
-                c == '\n'.code -> append("\\n")
-                c == '\r'.code -> append("\\r")
-                c == '\t'.code -> append("\\t")
-                // Escaped rather than dropped: the value stays reversible, so two surfaces
-                // differing only in an invisible character still print differently. This is a
-                // listing people match windows against. The width is the narrowest that fits.
-                isTextControl(c) -> append(
-                    when {
-                        c < 0x100 -> "\\x%02X"
-                        c < 0x10000 -> "\\u%04X"
-                        else -> "\\U%08X"
-                    }.format(c),
-                )
-                else -> appendCodePoint(c)
-            }
-        }
-    }
 
     private fun report(standing: Standing, out: (String) -> Unit) {
         val focus = if (standing.surface.focused) "* " else "  "

@@ -313,4 +313,20 @@ class WindowFactContainmentTest {
             "STRIP still produced an executable",
         )
     }
+
+    /**
+     * The positive control the test above needs to mean anything: the same source under
+     * [ExecutableFiles.PRESERVE] does produce an executable, so "not executable" under STRIP is
+     * the flag's doing and not a copy path that never carried the bit at all.
+     */
+    @Test
+    fun `PRESERVE carries the execute bit, which is what STRIP is declining`() {
+        define("x", "run.sh" to "#!/bin/sh\n")
+        definitions.resolve("x/run.sh").toFile().setExecutable(true)
+        catalog { put(ConnectorFlags.executable, ExecutableFiles.PRESERVE) }.apply("x", facts)
+        assertTrue(
+            residue.resolve("run.sh").toFile().canExecute(),
+            "PRESERVE did not produce an executable, so the STRIP test cannot fail",
+        )
+    }
 }
