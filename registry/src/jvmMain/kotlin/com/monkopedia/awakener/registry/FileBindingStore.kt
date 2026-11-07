@@ -705,20 +705,16 @@ class FileBindingStore(
         val file = BindingsFile(
             bindings = bindings.mapKeys { (key, _) -> key.canonical } + snapshot.unreadable,
         )
-        val permissions = config[RegistryFlags.filePermissions]
-        PrivateFiles.createParentDirectories(path, permissions)
-        val tmp = tmpPath
-        // The permissions go on the *staging* file, and the rename carries them to the bindings
-        // file along with the contents — which is also what upgrades a bindings file an earlier
-        // build left at 0644, with no migration step anywhere. `sync` is the fsync that used to
-        // be a second `FileChannel.open` here: without it the rename can land while the contents
-        // it points at are still in page cache, and a power loss then leaves an empty file where
-        // the bindings were, which reads as "nothing is bound" and re-mints every agent on the
-        // desktop.
-        PrivateFiles.writeString(tmp, json.encodeToString(file), permissions, sync = true)
-        // Atomic rename, same discipline as the config file: a concurrent reader sees the old
-        // bindings or the new ones, never a truncated file.
-        Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        // Fsync, atomic rename, directory fsync — the same write the config file gets
+        // (#192). Without the first, the rename can land while the contents it points at are
+        // still in page cache, and a power loss then leaves an empty file where the bindings
+        // were, which reads as "nothing is bound" and re-mints every agent on the desktop.
+        PrivateFiles.replace(
+            target = path,
+            staging = tmpPath,
+            text = json.encodeToString(file),
+            permissions = config[RegistryFlags.filePermissions],
+        )
     }
 
     private data class Loaded(

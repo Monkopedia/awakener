@@ -7,6 +7,7 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.OpenOption
 import java.nio.file.Path
+import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.FileAttribute
 import java.nio.file.attribute.PosixFilePermission
@@ -84,27 +85,86 @@ object PrivateFiles {
     }
 
     /** Writes [text] as UTF-8, creating or truncating [file]. */
-    fun writeString(
-        file: Path,
+    fun writeString(file: Path, text: String, permissions: FilePermissions) {
+        openTruncating(file, permissions).use { it.writeFully(text) }
+    }
+
+    /**
+     * Replaces [target] with [text] so that a crash at any point leaves either the old contents
+     * or the new ones — never an empty or truncated file. Both stores in this build that hold
+     * something worth keeping write through here: the config file, which is hand-authored and
+     * has no source to rebuild it from, and the bindings file (#192).
+     *
+     * The order is the whole of it:
+     *
+     * 1. **Write [staging] and fsync it.** Without this the rename can land while the contents
+     *    it points at are still in page cache, and on ext4 with delayed allocation a power loss
+     *    then leaves a zero-length file under the target's name.
+     * 2. **Rename it over [target]**, atomically, so a concurrent reader sees the old file or
+     *    the new one and never a partial write.
+     * 3. **Fsync the directory**, which is what makes the rename itself durable rather than a
+     *    directory entry still in page cache that a crash can roll back.
+     *
+     * The permissions go on the staging file and the rename carries them to [target] with the
+     * contents, which is also what tightens a file an earlier build created 0644 — no migration
+     * step, and no window in which a file exists at one mode and is about to be another (#102).
+     *
+     * [steps] is the seam that lets a test assert that order; production passes nothing.
+     */
+    fun replace(
+        target: Path,
+        staging: Path,
         text: String,
         permissions: FilePermissions,
-        sync: Boolean = false,
+        steps: ReplaceSteps = ReplaceSteps,
     ) {
-        open(
-            file,
-            permissions,
-            setOf(
-                StandardOpenOption.CREATE,
-                StandardOpenOption.WRITE,
-                StandardOpenOption.TRUNCATE_EXISTING,
-            ),
-        ).use { channel ->
-            val bytes = ByteBuffer.wrap(text.toByteArray(StandardCharsets.UTF_8))
-            while (bytes.hasRemaining()) channel.write(bytes)
-            // Before the caller renames it, or the rename can land while the contents it points
-            // at are still in page cache.
-            if (sync) channel.force(true)
+        createParentDirectories(target, permissions)
+        openTruncating(staging, permissions).use { channel ->
+            channel.writeFully(text)
+            steps.syncFile(staging, channel)
         }
+        steps.move(staging, target)
+        steps.syncDirectory(target.toAbsolutePath().parent)
+    }
+
+    /**
+     * The three filesystem steps [replace] takes, one method each so a test can record their
+     * order. The companion is the real implementation and the only one production uses.
+     */
+    interface ReplaceSteps {
+        fun syncFile(file: Path, channel: FileChannel) = channel.force(true)
+
+        fun move(from: Path, to: Path) {
+            Files.move(from, to, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        }
+
+        /**
+         * Best effort, deliberately: by the time this runs the rename has landed and the new
+         * contents are what every reader sees, so failing the write here would report a change
+         * that took effect as one that did not. Linux opens and fsyncs a directory without
+         * complaint; a platform that will not open one for reading is a platform this cannot
+         * help on.
+         */
+        fun syncDirectory(dir: Path) {
+            try {
+                FileChannel.open(dir, StandardOpenOption.READ).use { it.force(true) }
+            } catch (_: IOException) {
+                // Deliberate: see above.
+            }
+        }
+
+        companion object : ReplaceSteps
+    }
+
+    private fun openTruncating(file: Path, permissions: FilePermissions): FileChannel = open(
+        file,
+        permissions,
+        setOf(StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING),
+    )
+
+    private fun FileChannel.writeFully(text: String) {
+        val bytes = ByteBuffer.wrap(text.toByteArray(StandardCharsets.UTF_8))
+        while (bytes.hasRemaining()) write(bytes)
     }
 
     /**

@@ -3,9 +3,7 @@ package com.monkopedia.awakener.config
 import java.io.IOException
 import java.nio.channels.FileChannel
 import java.nio.file.ClosedWatchServiceException
-import java.nio.file.Files
 import java.nio.file.Path
-import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 import java.nio.file.StandardWatchEventKinds.ENTRY_CREATE
 import java.nio.file.StandardWatchEventKinds.ENTRY_DELETE
@@ -70,6 +68,8 @@ class FileConfigStore(
      */
     val path: Path,
     private val environment: Map<String, String> = System.getenv(),
+    /** How a write reaches the disk; a seam for tests, see [PrivateFiles.replace]. */
+    private val replaceSteps: PrivateFiles.ReplaceSteps = PrivateFiles.ReplaceSteps,
 ) : ConfigStore {
     private val json = Json { prettyPrint = true; ignoreUnknownKeys = true }
 
@@ -303,25 +303,19 @@ class FileConfigStore(
             lock.withLock {
                 withFileLock {
                     val next = transform(currentForWrite())
-                    val permissions = config.value[ConfigFlags.filePermissions]
-                    PrivateFiles.createParentDirectories(path, permissions)
-                    val tmp = tmpPath
-                    // The permissions go on the staging file and the rename carries them to the
-                    // config file with the contents, which is also what tightens a file an
-                    // earlier build created 0644 — no migration step, and no window in which a
-                    // file exists at one mode and is about to be another (#102).
-                    PrivateFiles.writeString(tmp, json.encodeToString(JsonObject(next)), permissions)
-                    // Atomic rename: a reader either sees the old file or the new one, never a
-                    // partial write. This is also why [watch] is registered on the directory —
-                    // the target's inode does not survive this, so the store's own writes are
-                    // the first thing a watch bound to the file rather than the name would
-                    // miss. The reload below is this process's own; a watch elsewhere sees the
-                    // rename.
-                    Files.move(
-                        tmp,
-                        path,
-                        StandardCopyOption.REPLACE_EXISTING,
-                        StandardCopyOption.ATOMIC_MOVE,
+                    // Durable as well as atomic: fsync the staging file, rename it over the
+                    // config, fsync the directory (#192). The rename is also why [watch] is
+                    // registered on the directory — the target's inode does not survive it, so
+                    // the store's own writes are the first thing a watch bound to the file
+                    // rather than the name would miss — and why the watch filters on the name:
+                    // the staging file it is renamed from never provokes a re-read. The reload
+                    // below is this process's own; a watch elsewhere sees the rename.
+                    PrivateFiles.replace(
+                        target = path,
+                        staging = tmpPath,
+                        text = json.encodeToString(JsonObject(next)),
+                        permissions = config.value[ConfigFlags.filePermissions],
+                        steps = replaceSteps,
                     )
                     state.value = load()
                 }
