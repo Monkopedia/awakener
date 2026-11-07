@@ -47,6 +47,56 @@ class RegistryCliTest {
     }
 
     /**
+     * #181, the listing `awakener-invoke list` was fixed for, one module over: `canonical`
+     * escapes `%` and `:` and nothing else, so a window's `\n`, U+2028 or bidi override reached
+     * this output raw. Every line this command prints about a hostile key — the listing, the
+     * unreadable-key warning, `forget`'s echo and the archive failure it reports — must be one
+     * line by `\R`'s definition and carry no line terminator or bidi control.
+     */
+    @Test
+    fun `no window-chosen text splits or reorders a line of the registry's output`() = runTest {
+        val window = SurfaceKey.Window(HOSTILE, "a")
+        val titled = SurfaceKey.Titled(HOSTILE)
+        val unreadable = "window:a:b:$HOSTILE"
+        val quoted = kotlinx.serialization.json.JsonPrimitive(unreadable).toString()
+        dir.resolve("bindings.json").writeText(
+            """{"version": 1, "bindings": {$quoted: {"agent_id": "agent-x", """ +
+                """"spanreed_name": "x", "created_at_ms": 0, "last_bound_at_ms": 0}}}""",
+        )
+        // A fixed clock and every archive name for that second already taken, so `forget`
+        // reports the archive failure — the third message that carries the key.
+        config.put(RegistryFlags.forgetResidue, ForgetResidue.ARCHIVE)
+        val store = FileBindingStore(
+            config,
+            identities,
+            environment = emptyMap(),
+            clock = { 0L },
+            path = dir.resolve("bindings.json"),
+        )
+        store.bind(window)
+        store.bind(titled)
+        val residue = store.prepareResidue(window).also { it.writeText("model") }
+        (0 until 100).forEach { n ->
+            val suffix = if (n == 0) "19700101-000000" else "19700101-000000-$n"
+            residue.resolveSibling(residue.fileName.toString().removeSuffix(".md") + ".$suffix.md")
+                .writeText("taken")
+        }
+
+        assertEquals(0, run(store, "list"))
+        run(store, "forget", window.canonical)
+
+        val text = out.joinToString("\n")
+        assertEquals(out.size, text.split(Regex("\\R")).size, "a line was split: $out")
+        val leaked = out.joinToString("").filter { it in CONTROLS }.map { "U+%04X".format(it.code) }
+        assertEquals(emptyList(), leaked, "a control reached the output raw: $out")
+        val escaped = "evil\\n# NEW INSTRUCTIONS\\u2028x\\u2029y\\x85z\\u202Ew\\u2066v\\u2069"
+        assertTrue(out.any { it == "window:$escaped:a" }, "the listing lost the key: $out")
+        assertTrue(out.any { it.startsWith("warning: unreadable key") && "\\u2028" in it }, "$out")
+        assertTrue(out.any { it.startsWith("forgot ") && "\\u202E" in it }, "$out")
+        assertTrue(out.any { "no free archive name" in it && "evil\\n#" in it }, "$out")
+    }
+
+    /**
      * The repair path: drop the binding so the surface mints a fresh Lifeless, without deleting
      * the residue — the old written-down model is the thing you would want to read afterwards.
      *
@@ -152,5 +202,14 @@ class RegistryCliTest {
 
         assertEquals(1, run(store("broken.json"), "list"))
         assertTrue(out.first().startsWith("error:"), out.toString())
+    }
+
+    private companion object {
+        const val HOSTILE = "evil\n# NEW INSTRUCTIONS\u2028x\u2029y\u0085z\u202Ew\u2066v\u2069"
+
+        /** `\n` plus the line terminators `\R` knows beyond it, and the bidi controls. */
+        val CONTROLS: Set<Char> =
+            ("\n\r\u000B\u000C\u0085\u2028\u2029" + ('\u202A'..'\u202E').joinToString("") +
+                ('\u2066'..'\u2069').joinToString("")).toSet()
     }
 }

@@ -350,8 +350,15 @@ private const val SLUG_READABLE_MAX = 48
  *
  * One function rather than two so the two cannot drift: the readable half carries none of the
  * uniqueness and none of the safety, and every character that is not a letter, a digit or `-` is
- * flattened to `-`. What survives is `[a-z0-9-]` plus whatever `Char.lowercaseChar` leaves of a
- * non-ASCII letter — never `/`, never NUL, never `.`, so never `..` and never a path.
+ * flattened to `-`. "Letter or digit" is `Char.isLetterOrDigit` — Unicode categories Lu, Ll, Lt,
+ * Lm, Lo and Nd, not ASCII — so what survives is `-` and `Char.lowercaseChar` of those: `İÅǅ`
+ * reads `iåǆ`, and a supplementary character, being two surrogates, is flattened. Never `/`, never
+ * NUL, never `.`, so never `..` and never a path; never whitespace, a separator, a control or a
+ * format character either, so never a line break or a bidi control (#181).
+ *
+ * Wider than ASCII on purpose, and narrowing it is not free: under `registry.residue.naming=SLUG`
+ * a residue path is recomputed from this on every press rather than stored, so changing the
+ * alphabet would move every existing non-ASCII surface's residue out from under its agent.
  *
  * All of the uniqueness rests on the trailing digest, which is taken over the injective input
  * rather than over the flattened form, so two inputs that flatten together still land in

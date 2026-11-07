@@ -3,6 +3,7 @@ package com.monkopedia.awakener.registry
 import com.monkopedia.awakener.config.Config
 import com.monkopedia.awakener.config.ConfigStore
 import com.monkopedia.awakener.config.PrivateFiles
+import com.monkopedia.awakener.config.oneLine
 import java.io.IOException
 import java.nio.channels.FileChannel
 import java.nio.file.Files
@@ -340,7 +341,9 @@ class FileBindingStore(
         }
         // Every name in the second is taken, which is not a filesystem this can archive into.
         // Reported as a failure by the caller rather than overwriting one of them.
-        throw IOException("no free archive name beside $location for ${key.canonical} at $stamp")
+        throw IOException(
+            "no free archive name beside $location for ${oneLine(key.canonical)} at $stamp",
+        )
     }
 
     override fun residueLocation(key: SurfaceKey): String =
@@ -447,8 +450,11 @@ class FileBindingStore(
 
     private fun report(key: SurfaceKey, notes: List<String>) {
         if (notes.isEmpty()) return
-        migrated = "${key.canonical}: ${notes.joinToString("; ")} — slug-named residue carries " +
-            "the window's own text into the working directory spanreed publishes; set " +
+        // `oneLine`, as on every message here naming a key: it is printed on the hotkey path,
+        // and `canonical` is the window's own text (#181).
+        migrated = "${oneLine(key.canonical)}: ${notes.joinToString("; ")} — slug-named " +
+            "residue carries the window's own text into the working directory spanreed " +
+            "publishes; set " +
             "${RegistryFlags.slugResidue.key}=${SlugResidue.IN_PLACE} to leave it"
     }
 
@@ -493,7 +499,8 @@ class FileBindingStore(
                 ResidueStrandedFinding.STRANDED,
                 active = active.toString(),
                 stranded = stranded,
-                warning = "${key.canonical} has residue at ${stranded.joinToString(", ")} " +
+                warning = "${oneLine(key.canonical)} has residue at " +
+                    "${stranded.joinToString(", ")} " +
                     "written under a different ${RegistryFlags.residueLayout.key} or " +
                     "${RegistryFlags.residueNaming.key}; this run " +
                     "reads and writes $active instead, and nothing moves the old model there",

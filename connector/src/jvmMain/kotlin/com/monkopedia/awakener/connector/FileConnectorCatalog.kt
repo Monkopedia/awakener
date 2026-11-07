@@ -4,6 +4,7 @@ import com.monkopedia.awakener.config.Config
 import com.monkopedia.awakener.config.FilePermissions
 import com.monkopedia.awakener.config.PrivateFiles
 import com.monkopedia.awakener.config.Xdg
+import com.monkopedia.awakener.config.isTextControl
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
@@ -453,7 +454,7 @@ class FileConnectorCatalog(
         val staging = out.resolveSibling("${out.name}.tmp")
         PrivateFiles.writeString(
             staging,
-            PRETTY.encodeToString(JsonObject.serializer(), json),
+            escapeTextControls(PRETTY.encodeToString(JsonObject.serializer(), json)),
             permissions,
         )
         // Through a staging file and a rename, so an agent reading this while a second press is
@@ -480,5 +481,25 @@ class FileConnectorCatalog(
 
         private val JSON = Json { ignoreUnknownKeys = false }
         private val PRETTY = Json { prettyPrint = true }
+
+        /**
+         * [encoded] with every [isTextControl] code point outside C0 written as `\uXXXX` —
+         * a surrogate pair of them for a supplementary one, which is how JSON spells it.
+         *
+         * JSON permits these raw inside a string and kotlinx emits them raw, so a title made of
+         * U+2028 or a bidi override put a line break or a reordering into a file an agent reads
+         * as text (#181). Rewriting the encoded text is sound because everything outside a
+         * string literal is ASCII; C0 is left alone because inside a string the encoder has
+         * already escaped it, so any C0 still present is the pretty-printer's own newline.
+         */
+        private fun escapeTextControls(encoded: String): String = buildString(encoded.length) {
+            encoded.codePoints().forEach { c ->
+                if (c >= 0x20 && isTextControl(c)) {
+                    Character.toChars(c).forEach { append("\\u%04X".format(it.code)) }
+                } else {
+                    appendCodePoint(c)
+                }
+            }
+        }
     }
 }

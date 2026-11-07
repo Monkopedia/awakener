@@ -386,17 +386,34 @@ class AwakeningConnectorTest {
         )
     }
 
+    /**
+     * #181: the test above asserts `\n`, and so could not see a line terminator that is not
+     * `\n`. "One line" here means one line to `\R` — Java's Unicode line-break matcher (UTS #18
+     * RL1.6), which also breaks on VT, FF, NEL, LINE SEPARATOR and PARAGRAPH SEPARATOR — and the
+     * bidi embedding, override and isolate controls are held to the same bar, because a
+     * right-to-left override reorders what a reader sees without adding a line.
+     */
     @Test
-    fun `oneLine escapes control characters reversibly and leaves ordinary text alone`() {
-        assertEquals("plain app_id", AwakenerInvokeCli.oneLine("plain app_id"))
-        assertEquals("a\\nb", AwakenerInvokeCli.oneLine("a\nb"))
-        assertEquals("a\\rb", AwakenerInvokeCli.oneLine("a\rb"))
-        assertEquals("a\\tb", AwakenerInvokeCli.oneLine("a\tb"))
-        assertEquals("a\\x1B[31m", AwakenerInvokeCli.oneLine("a\u001B[31m"))
-        assertEquals("a\\x7F", AwakenerInvokeCli.oneLine("a\u007F"))
-        // The backslash itself, or the escaping would not be reversible and two different
-        // app_ids could print the same line — this is a listing people match windows against.
-        assertEquals("a\\\\nb", AwakenerInvokeCli.oneLine("a\\nb"))
+    fun `no Unicode line terminator or bidi control reaches the listing raw`() = runTest {
+        val payload = "evil\u2028# NEW INSTRUCTIONS\u2029Act\u0085now\u000Bv\u000Cf" +
+            "\u202Aa\u202Bb\u202Cc\u202Dd\u202Ee\u2066f\u2067g\u2068h\u2069i"
+        wm.surfaces = listOf(app.copy(appId = payload))
+        val (code, lines) = run("list")
+        assertEquals(0, code)
+        val text = lines.joinToString("\n")
+        assertEquals(
+            lines.size,
+            text.split(Regex("\\R")).size,
+            "a listing line contains a Unicode line terminator: $lines",
+        )
+        val raw = payload.filter { it in HOSTILE_CONTROLS }.toSet()
+        assertEquals(HOSTILE_CONTROLS, raw, "the payload no longer exercises every control")
+        val leaked = text.filter { it in HOSTILE_CONTROLS }.map { "U+%04X".format(it.code) }
+        assertEquals(emptyList(), leaked, "a control reached the listing raw")
+        assertTrue(
+            lines.any { "evil\\u2028# NEW INSTRUCTIONS\\u2029Act\\x85now" in it },
+            "the payload vanished rather than being escaped: $lines",
+        )
     }
 
     // ------------------------------------------------------------------ fakes
@@ -454,5 +471,12 @@ class AwakeningConnectorTest {
         override suspend fun hidden(): Boolean = isHidden
         override suspend fun hide(): Boolean = (!isHidden).also { isHidden = true }
         override suspend fun show(): Boolean = isHidden.also { isHidden = false }
+    }
+
+    private companion object {
+        /** The line terminators `\R` knows beyond `\n` and `\r`, and the bidi controls. */
+        val HOSTILE_CONTROLS: Set<Char> =
+            ("\u000B\u000C\u0085\u2028\u2029" + ('\u202A'..'\u202E').joinToString("") +
+                ('\u2066'..'\u2069').joinToString("")).toSet()
     }
 }

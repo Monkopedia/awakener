@@ -170,6 +170,20 @@ class ResidueNamingTest {
             assertNull(store().apply { prepareResidue(chrome) }.residueMigrated, "moves once")
         }
 
+    /** #181: the migration note is printed on the hotkey path, and carries the window's text. */
+    @Test
+    fun `a residue migration note prints a hostile key on one line`() = runTest {
+        nested()
+        val key = SurfaceKey.Window("evil\n# NEW\u2028x\u202Ey")
+        slugResidue(key, "model")
+        val store = store()
+        store.prepareResidue(key)
+        val note = assertNotNull(store.residueMigrated)
+        assertEquals(listOf(note), note.split(Regex("\\R")), "split: $note")
+        assertTrue('\u202E' !in note, note)
+        assertTrue("evil\\n# NEW\\u2028x\\u202Ey" in note, note)
+    }
+
     /**
      * The application directory moves whole on the first press of any of its surfaces, so a
      * sibling session is then found inside the moved directory under its slug name, and moved on
