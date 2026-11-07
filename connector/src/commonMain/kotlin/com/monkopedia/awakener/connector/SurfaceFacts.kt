@@ -22,12 +22,24 @@ enum class Trust {
      * Verified rather than assumed for each one: [SurfaceFact.SURFACE_ID] and
      * [SurfaceFact.PID] are integers; [SurfaceFact.RESIDUE] is built from a kind literal and a
      * digest, or under `registry.residue.naming=SLUG` from `SurfaceKey.slug`, whose `slugOf`
-     * maps every character that is not a letter, a digit or `-` to `-` and appends a digest, and [SurfaceFact.AGENT_NAME] and [SurfaceFact.AGENT_ID] from
-     * `spanreedNameFor`, which under every `registry.agent.name_label` is a kind literal, a
-     * digest, and at most that same slug — so all three are `[a-z0-9-]` plus
-     * operator-configured path and prefix; [SurfaceFact.CONNECTOR] is checked
-     * by [ConnectorFlags.isConnectorName]; [SurfaceFact.CONNECTOR_DIR] is a directory on the
+     * maps every character that is not a letter, a digit or `-` to `-` and appends a digest, and
+     * [SurfaceFact.AGENT_NAME] and [SurfaceFact.AGENT_ID] from `spanreedNameFor`, which under
+     * every `registry.agent.name_label` is a kind literal, a digest, and at most that same slug
+     * — so all three are operator-configured path and prefix plus `-` and Unicode letters and
+     * decimal digits, lowercased; [SurfaceFact.CONNECTOR] is checked by
+     * [ConnectorFlags.isConnectorName]; [SurfaceFact.CONNECTOR_DIR] is a directory on the
      * operator's own search path.
+     *
+     * **Not ASCII, and that is what to check a new fact against (#181).** "Letter" is
+     * `Char.isLetterOrDigit`, the categories Lu, Ll, Lt, Lm, Lo and Nd, so `İÅǅ` survives as
+     * `iåǆ`; a supplementary character is two surrogates, neither a letter, and is flattened.
+     * What the bound excludes is every category that *acts* — whitespace, line and paragraph
+     * separators, controls, format characters (all the bidi controls among them), punctuation
+     * and symbols — so an `AWAKENER` value cannot break a line, reorder one, or open markup.
+     * It can still spell words, in any script, including look-alikes of Latin ones: the bound
+     * is on structure, not on meaning, and a fact classified here on an ASCII-only assumption
+     * has been classified on a rule the code does not enforce. `SurfaceKeyTest` checks the
+     * alphabet over every UTF-16 code unit.
      */
     AWAKENER,
 

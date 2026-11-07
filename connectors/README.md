@@ -78,7 +78,8 @@ what each of your files is. **The safe carrier already exists**: read them from
 `.awakener/surface.json` at runtime, where the writer escapes them as JSON strings — that is one
 of the two reasons that file exists, and its escaping is held under hostile input by its own
 tests. `{pid}` and `{surface_id}` are integers and are safe anywhere; `{residue}`, `{agent_id}`
-and `{agent_name}` are built from a slug in `[a-z0-9-]`.
+and `{agent_name}` are built from a slug of `-` and lowercased Unicode letters and digits — not
+only ASCII, but never whitespace, punctuation, a control or a line break.
 
 ### Awakener will not write outside the residue directory
 

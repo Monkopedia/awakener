@@ -93,6 +93,33 @@ class SurfaceKeyTest {
     }
 
     /**
+     * #181: the slug is what `Trust.AWAKENER` rests on for `residue`, `agent_name` and
+     * `agent_id`, so its alphabet is checked against what `slugOf`'s KDoc says, over every
+     * UTF-16 code unit rather than over the ASCII a reader might assume. It is **not** ASCII —
+     * `İÅǅ` reads `iåǆ` — but it is never whitespace, a line or paragraph separator, a control,
+     * a format character (which is where every bidi control lives), punctuation or a symbol.
+     */
+    @Test
+    fun `the readable half of a slug is letters, digits and hyphens, and nothing that acts`() {
+        val admitted = setOf(
+            CharCategory.UPPERCASE_LETTER, CharCategory.LOWERCASE_LETTER,
+            CharCategory.TITLECASE_LETTER, CharCategory.MODIFIER_LETTER,
+            CharCategory.OTHER_LETTER, CharCategory.DECIMAL_DIGIT_NUMBER,
+        )
+        (0 until 0x10000).chunked(32).forEach { chunk ->
+            val text = chunk.joinToString("") { it.toChar().toString() }
+            val slug = SurfaceKey.Window(text).slug
+            slug.forEach { c ->
+                assertTrue(
+                    c == '-' || c.category in admitted,
+                    "U+%04X (%s) survived into '%s'".format(c.code, c.category, slug),
+                )
+            }
+        }
+        assertEquals("window-iåǆ", SurfaceKey.Window("İÅǅ").slug.substringBeforeLast('-'))
+    }
+
+    /**
      * The `app_id` half of #13. Both strings are things an ordinary desktop program can ask the
      * compositor for — `foot -a <anything>`, or a Chrome `--app=URL` toplevel — and they are a
      * real collision under the 32-bit FNV-1a this replaced: sanitised prefixes equal past the

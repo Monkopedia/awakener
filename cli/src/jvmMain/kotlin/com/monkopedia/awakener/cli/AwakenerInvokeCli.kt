@@ -5,6 +5,7 @@ import com.monkopedia.awakener.config.FileConfigStore
 import com.monkopedia.awakener.connector.ConnectorFlags
 import com.monkopedia.awakener.connector.ConnectorOutcome
 import com.monkopedia.awakener.connector.FileConnectorCatalog
+import com.monkopedia.awakener.connector.isTextControl
 import com.monkopedia.awakener.registry.FileBindingStore
 import com.monkopedia.awakener.registry.ResidueOutcome
 import com.monkopedia.awakener.registry.SpanreedCli
@@ -168,19 +169,29 @@ object AwakenerInvokeCli {
      * Not a flag. A one-line-per-surface listing that a window can turn into four lines is wrong
      * for a human reader too, so there is no second behaviour to offer — this is the report being
      * correct rather than a choice about it.
+     *
+     * "One line" means one line to every reader, not to a terminal: what is escaped is
+     * [isTextControl]'s set, which is decided by Unicode category so that U+2028 and the bidi
+     * overrides are covered by the rule rather than by being remembered (#181).
      */
     internal fun oneLine(value: String): String = buildString(value.length) {
-        value.forEach { c ->
+        value.codePoints().forEach { c ->
             when {
-                c == '\\' -> append("\\\\")
-                c == '\n' -> append("\\n")
-                c == '\r' -> append("\\r")
-                c == '\t' -> append("\\t")
-                // C0 and DEL, escaped as `\xNN` rather than dropped: the value stays reversible,
-                // so two surfaces differing only in a control character still print differently.
-                // This is a listing people match windows against.
-                c.code < 0x20 || c.code == 0x7F -> append("\\x%02X".format(c.code))
-                else -> append(c)
+                c == '\\'.code -> append("\\\\")
+                c == '\n'.code -> append("\\n")
+                c == '\r'.code -> append("\\r")
+                c == '\t'.code -> append("\\t")
+                // Escaped rather than dropped: the value stays reversible, so two surfaces
+                // differing only in an invisible character still print differently. This is a
+                // listing people match windows against. The width is the narrowest that fits.
+                isTextControl(c) -> append(
+                    when {
+                        c < 0x100 -> "\\x%02X"
+                        c < 0x10000 -> "\\u%04X"
+                        else -> "\\U%08X"
+                    }.format(c),
+                )
+                else -> appendCodePoint(c)
             }
         }
     }

@@ -50,8 +50,8 @@ enum class SpanreedListForm {
  *
  * That name is published in spanreed's shared roster, which every agent on the host reads, and
  * a surface's key is made of text the window chose for itself — any Wayland client declares its
- * own `app_id`. Flattening to `[a-z0-9-]` stops that text being *structure* but keeps its
- * *words*, so under [SLUG] a window declaring a sentence became a peer named after that
+ * own `app_id`. Flattening to letters, digits and `-` stops that text being *structure* but
+ * keeps its *words*, so under [SLUG] a window declaring a sentence became a peer named after that
  * sentence (#186). Every value keeps the trailing digest, which is the same digest
  * [SurfaceKey.slug] ends in and is all the uniqueness ever rested on; they differ only in what
  * sits in front of it.
