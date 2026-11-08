@@ -25,7 +25,7 @@ On the desktop host:
 | `sway` | 1.12 | The compositor awakener drives. `:wm` speaks i3 IPC. |
 | `foot` | 1.27.0 | The terminal the dock runs in. Anything that takes `-a <app_id>` works; `foot` is what the default `invoke.dock.command` names. |
 | JDK 21 | `/usr/lib/jvm/java-21-openjdk` | Build and runtime. |
-| `jq` | 1.8.2 | Used by the dock launcher below, not by awakener itself. |
+| `jq` | 1.8.2 | Used by the tree-inspection commands in §6, not by awakener itself. |
 | `claude` | in `~/.local/bin` | The agent. |
 | `spanreed` | in `~/.local/bin` | The bus. awakener talks to it through its **CLI** only. |
 
@@ -195,8 +195,8 @@ directory, and Claude Code keys three things on that path: `~/.claude/projects/<
 which holds the session transcripts **and Claude's auto-memory directory**, and the
 `~/.claude.json` project entry (trust plus last-session metrics). awakener does not move any of
 them — they are Claude's internals, on the same principle that keeps awakener out of spanreed's
-files. So after a move the launcher below re-accepts trust for the new directory, Claude starts
-with no transcripts and no auto-memory for that surface, and whatever it wrote under the old path
+files. So after a move Claude starts with no transcripts and no auto-memory for that surface (trust
+carries over, because it comes from the residue root — §5), and whatever it wrote under the old path
 stays there unread. Measured on adolin when this default landed, the residue-keyed `memory/`
 directories were empty and the transcripts came to about 1.2 MB, so nothing durable was lost
 then; anything Claude's auto-memory writes there later is orphaned by each move. The residue
@@ -211,35 +211,22 @@ quiet loss of the model.
 
 ## 5. The dock launcher
 
-`invoke.dock.command` above points at a wrapper script rather than at `claude` directly. Three
+`invoke.dock.command` above points at a wrapper script rather than at `claude` directly, for two
 reasons, each measured. Save this as `~/awakener/dock-launch.sh` and `chmod +x` it:
 
 ```sh
 #!/bin/sh
 # awakener dock launcher.
 # Called as: dock-launch.sh <residue-dir> [claude args...]
+#
+# Workspace trust is not handled here: it is inherited from the residue root,
+# which you trust once (desktop-setup.md section 5). This script never writes
+# ~/.claude.json -- that file is Claude Code's, and every running claude
+# rewrites it without any lock we could take.
 set -eu
 dir=${1:?residue directory required}
 shift || true
 mkdir -p "$dir"
-
-# ~/.claude.json is one file shared by every dock, and several can stand up at
-# once, so the read-modify-write is taken under a lock. Without it, two docks
-# racing lose one of the two trust entries -- and the loser prompts.
-CJ="$HOME/.claude.json"
-if [ -f "$CJ" ] && command -v jq >/dev/null 2>&1; then
-    exec 9>"$CJ.awakener.lock"
-    if flock -w 5 9; then
-        if jq --arg d "$dir" '.projects[$d].hasTrustDialogAccepted = true' "$CJ" > "$CJ.awakener.tmp" \
-           && jq -e . "$CJ.awakener.tmp" >/dev/null 2>&1; then
-            mv "$CJ.awakener.tmp" "$CJ"
-        else
-            rm -f "$CJ.awakener.tmp"
-        fi
-        flock -u 9
-    fi
-    exec 9>&-
-fi
 
 # A GDM-launched session has no ~/.local/bin on PATH, and that is where both
 # `claude` and `spanreed` live. See gotcha 1.
@@ -252,36 +239,64 @@ cd "$dir"
 exec "$HOME/.local/bin/claude" "$@"
 ```
 
+Then trust the residue root, **once**, by running Claude there and answering its own prompt:
+
+```sh
+root="${XDG_STATE_HOME:-$HOME/.local/state}/awakener/residue"   # or registry.residue.dir
+mkdir -p "$root" && cd "$root" && claude    # choose "Yes, I trust this folder", then /exit
+```
+
 ### Why each part is there
 
 **`cd "$dir"`** gives the agent its own workspace. With `PER_APP_SESSION_DIR` (§4) that is a real
 directory per surface.
 
-**Pre-accepting the workspace-trust prompt.** A fresh directory makes Claude Code ask whether
-you trust it. That question is fine once; it is useless on a hotkey, once per surface, in a
-384px-wide panel. **There is no CLI flag for this in an interactive session** — `claude --help`
-says the trust dialog is skipped only in non-interactive mode:
+**Trusting the residue root instead of each dock's directory.** A fresh directory makes Claude
+Code ask whether you trust it. That question is fine once; it is useless on a hotkey, once per
+surface, in a 384px-wide panel. **There is no CLI flag for this in an interactive session** —
+`claude --help` says the trust dialog is skipped only in non-interactive mode:
 
 > The workspace trust dialog is skipped when Claude is run in non-interactive mode (via `-p`,
 > or when stdout is not a TTY, e.g. piped or redirected output).
 
-A dock is interactive by construction, so the only mechanism left is the state Claude Code
-would have written itself: `projects["<dir>"].hasTrustDialogAccepted` in `~/.claude.json`.
-awakener created that directory a moment earlier, so there is nothing in it to decide about.
+But Claude Code does not only look up the working directory itself: it walks **up** from it and
+treats the directory as trusted if any ancestor has `projects["<dir>"].hasTrustDialogAccepted`
+in `~/.claude.json`. Every dock's directory sits under the residue root, so one acceptance there
+covers every surface, present and future, including one whose directory a residue move (§4)
+just renamed. And it is Claude that writes the entry, through its own writer, when you answer
+its prompt.
 
-**Why the `flock`.** `~/.claude.json` is one file shared by every dock, and the update is a
-read-modify-write. Two docks standing up at once both read the old file, both write their own
-entry, and the second write drops the first — so one of the two surfaces prompts anyway, which
-looks like an intermittent bug rather than a race. Measured on kaladin, 12 concurrent launches
-into an empty `.claude.json`, three runs each:
+Measured against a real interactive `claude` in a pty, scratch `HOME`, a dock directory
+`<root>/app-x/win-y`, on Claude Code 2.1.283 (kaladin); the same parent walk is present in
+2.1.247's code (adolin):
 
-| | run 1 | run 2 | run 3 |
-| --- | --- | --- | --- |
-| lock removed (`flock -w 5 9` → `true`) | file unreadable | file unreadable | 1 of 12 entries |
-| lock in place | 12 of 12 | 12 of 12 | 12 of 12 |
+| `hasTrustDialogAccepted` set on | trust prompt in `<root>/app-x/win-y`? |
+| --- | --- |
+| nothing | **yes** |
+| a sibling, `<root>/app-z` | **yes** |
+| `<root>/app-x/win-y` itself | no |
+| `<root>` | no |
+| `$HOME` | no |
 
-The unlocked variant does not merely lose entries — mid-run it leaves the file in a state `jq`
-will not parse, because two `mv`s and two readers interleave. The lock is not a nicety.
+Two consequences:
+
+- **If you have ever accepted trust in `$HOME`, the docks are already covered**, because the
+  residue root is under it. adolin's `~/.claude.json` has exactly that entry. Trusting the
+  residue root is still the narrower statement, and the one to make on a fresh machine.
+- **The walk stops at a git repository's root.** If `registry.residue.dir` points inside a git
+  checkout, an entry above the repository does not count — measured: trusting the parent of a
+  fresh `git init` still prompts inside it, trusting the repository root does not. The default
+  location is not in a repository.
+
+**Why the launcher no longer writes `~/.claude.json`.** It used to pre-accept trust per directory
+with `jq … ~/.claude.json > tmp && mv tmp ~/.claude.json` under an awakener-only `flock`. Every
+running `claude` writes that file too and takes no part in that lock, so a Claude write landing
+between `jq`'s read and the `mv` was silently discarded — and the temp file came up under the
+shell's umask, so the `mv` loosened the file from `0600` to `0644`. Claude Code creates the file
+`0600` but afterwards keeps whatever mode it finds, so a loosened mode stays loose; if your
+launcher ever did this, `chmod 600 ~/.claude.json`. Measured against a scratch `HOME`, issue
+#213. There is no correct way to read-modify-write a file whose owner takes no lock you can
+share, so the launcher does not do it at all.
 
 **Prepending `~/.local/bin` to `PATH`.** Gotcha 1. This is the one that costs the most time.
 
@@ -764,9 +779,12 @@ Everything in this guide that is stated as a measurement was run. Where and how:
   at any level.
 - The `unbindsym` measurement: two headless sway sessions, 2 `Overwriting binding` lines and 1
   `namespace swaynag` layer surface without it, 0 and 0 with it.
-- The dock launcher's `cd`, `PATH` prepend and trust write, against a scratch `HOME` and a fake
-  `claude` — including the control run with the `flock` removed, which loses 11 or 12 of 12
-  entries. A guard that cannot be made to fail is not evidence that it fired.
+- The dock launcher's `cd` and `PATH` prepend against a scratch `HOME` and a fake `claude`, and
+  that it leaves `~/.claude.json` byte-identical and at its mode — with the previous launcher as
+  the control, which lost a concurrent writer's update and turned `0600` into `0644`.
+- Workspace trust inherited from an ancestor (the table in §5), against a real interactive
+  `claude` 2.1.283 in a pty with a scratch `HOME`, including the one-time acceptance in the
+  residue root, which Claude persisted itself at `0600`.
 - sway 1.12's proprietary-GPU strings, and `claude --help`'s trust-dialog wording.
 - The `--app=` `app_id` table of
   [the Chromium probe](findings/2026-08-23-chromium-app-mode-app-id.md), against Chromium
