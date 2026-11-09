@@ -197,6 +197,14 @@ class Awakening(
      * reports; under that default `TOGGLE_HIDE` degrades to standing a panel up every press.
      */
     private val dockFor: suspend (SurfaceId) -> DockHandle? = { null },
+    /**
+     * The surface the focused panel is docked beside, if focus is in a panel that names one.
+     *
+     * [dockFor]'s question the other way round, a lambda for the same reasons, and the piece
+     * that lets a press made from inside a panel act on its surface (#196). Defaults to "not in
+     * a panel", which leaves every such press refused, as it was before.
+     */
+    private val focusedDockOwner: suspend () -> SurfaceId? = { null },
 ) {
     private val config: Config get() = store.config.value
 
@@ -243,6 +251,7 @@ class Awakening(
         val surfaces = wm.surfaces()
         val surface = if (target == null) {
             surfaces.firstOrNull { it.focused }
+                ?: owningSurface(cfg, surfaces)
                 ?: return Awakened.NoSurface(
                     if (surfaces.isEmpty()) {
                         "no bindable surfaces"
@@ -356,6 +365,22 @@ class Awakening(
             binding.agent,
         )
         return Awakened.Animated(surface.id, key, binding, dock, wasADrab, applied)
+    }
+
+    /**
+     * The surface a press made from inside a panel is aimed at, under
+     * `invoke.from_panel=OWNING_SURFACE` (#196).
+     *
+     * Only ever reached with focus on something [WindowManager.surfaces] left out, so this does
+     * not undo #170: a panel nothing has claimed is still listed, still focused, and refused by
+     * the `app_id` check below. What reaches here is a panel `:wm` recognised, and the surface it
+     * answers is looked up in this press's own enumeration, so one whose surface has gone is
+     * refused rather than acted on.
+     */
+    private suspend fun owningSurface(cfg: Config, surfaces: List<Surface>): Surface? {
+        if (cfg[InvokeFlags.fromPanel] != FromPanel.OWNING_SURFACE) return null
+        val owner = focusedDockOwner() ?: return null
+        return surfaces.firstOrNull { it.id == owner }
     }
 
     /**

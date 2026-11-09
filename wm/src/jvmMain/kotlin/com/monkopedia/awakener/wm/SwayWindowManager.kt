@@ -2135,6 +2135,25 @@ class SwayWindowManager(
         return SwayDockHandle(surface, agent, SurfaceId(node.id), key, session)
     }
 
+    /**
+     * The surface the focused window is docked beside, or null if the focused window is no dock
+     * this can name a surface for.
+     *
+     * [dockFor]'s question asked the other way round, so a press made from inside a panel can
+     * act on the panel's own surface (#196). Recognition is the same [dockedTo] union, which is
+     * what makes it work from a one-shot process: the table is empty there, and the mark names
+     * the surface. A window that only *looks* like a dock — the configured `app_id` with no mark,
+     * which is a dock still being stood up or one #199 left unclaimed — names nothing, and gets
+     * null rather than a guess from its `app_id`.
+     *
+     * A concrete method passed down as a lambda, for [dockFor]'s reasons; see #94.
+     */
+    suspend fun focusedDockOwner(): SurfaceId? {
+        val cfg = config
+        val focused = tree().windows.firstOrNull { it.focused } ?: return null
+        return dockedTo(focused, docks.snapshot(), cfg)
+    }
+
     private inner class SwayDockHandle(
         override val surface: SurfaceId,
         override val agent: AgentId,

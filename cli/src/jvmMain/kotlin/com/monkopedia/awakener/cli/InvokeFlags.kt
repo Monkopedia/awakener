@@ -54,6 +54,28 @@ enum class WhenAnimated {
     TOGGLE_HIDE,
 }
 
+/** What a press does when focus is in an agent panel rather than in a surface (#196). */
+enum class FromPanel {
+    /**
+     * Act on the surface the panel is docked beside, exactly as a press from that surface would.
+     *
+     * The default because it is what makes `invoke.when_animated=TOGGLE_HIDE` a toggle at all
+     * under `wm.focus.resting=DOCK`: the press that stands a panel up leaves focus in it, so the
+     * next press always comes from inside the panel. Only a panel whose mark names its surface is
+     * mapped; one that carries no mark is still refused, since its surface would be a guess.
+     */
+    OWNING_SURFACE,
+
+    /**
+     * Refuse, saying the focused window is not a bindable surface — the behaviour before #196.
+     *
+     * Kept reachable because under `REUSE` and `SECOND_DOCK` it is less clear that a press from
+     * the panel means its surface: under `SECOND_DOCK` it stands a second panel beside the same
+     * window, which a press typed into the agent may not have meant.
+     */
+    REFUSE,
+}
+
 /** What `list` does with a binding already written for one of awakener's own windows. */
 enum class FurnitureBound {
     /**
@@ -188,6 +210,16 @@ object InvokeFlags {
             "with the panel standing hides it, leaving the agent running, and the next press " +
             "brings it back where it was. TOGGLE_HIDE asks the tree rather than the bus, because " +
             "hiding is a question about a panel and only the tree knows whether there is one.",
+    )
+
+    val fromPanel = Flags.enum(
+        "invoke.from_panel",
+        FromPanel.OWNING_SURFACE,
+        "What a press with no window id does when focus is in an agent panel. OWNING_SURFACE " +
+            "acts on the surface the panel's mark names, as a press from that surface would — so " +
+            "under invoke.when_animated=TOGGLE_HIDE the press hides the panel it was made from. " +
+            "A panel with no mark names no surface and is refused either way. REFUSE declines " +
+            "every press made from a panel.",
     )
 
     /**
