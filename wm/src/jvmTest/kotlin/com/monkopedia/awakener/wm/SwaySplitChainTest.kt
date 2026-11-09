@@ -12,7 +12,11 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -35,11 +39,13 @@ import kotlinx.coroutines.yield
  * wm.dock.flatten_on_hide, an unwound attach — also clears a chain it did not make, which is the
  * last group of tests.
  *
- * Not covered, because they are not sequential paths: two `awakener-invoke` processes attaching at
- * once nest a second split inside the first, since each `split horizontal` lands on a surface the
- * other's dock already shares a split with (#199). A dock closed by hand while visible leaves its
- * surface in one single-child split until the next press, because nothing runs between presses;
- * that one does not compound, and the last test here holds it to that.
+ * Concurrent attaches are covered too, by separate managers — separate in-process locks, which is
+ * what separate `awakener-invoke` processes are. Before the cross-process attach lock (#199) they
+ * claimed one dock between them, nested the surface a split deeper every round, and had detach's
+ * `split none` refused. `ConcurrentInvokeTest` in `:cli` is the same question asked of real
+ * processes. A dock closed by hand while visible leaves its surface in one single-child split
+ * until the next press, because nothing runs between presses; that one does not compound, and a
+ * test here holds it to that.
  *
  * Exercised against **sway 1.12** on the headless wlroots backend, `workspace_layout tabbed` as on
  * adolin.
@@ -50,6 +56,7 @@ class SwaySplitChainTest {
     private lateinit var wm: SwayWindowManager
     private lateinit var store: InMemoryConfigStore
     private lateinit var stateDir: Path
+    private lateinit var registry: FileBindingStore
 
     @BeforeTest
     fun setUp() {
@@ -58,7 +65,7 @@ class SwaySplitChainTest {
         scope = CoroutineScope(SupervisorJob())
         store = InMemoryConfigStore()
         stateDir = createTempDirectory("awakener-wm-split-chain")
-        val registry = FileBindingStore(
+        registry = FileBindingStore(
             configStore = store,
             identities = { key, residuePath -> DerivedAgentIdentities(store).mint(key, residuePath) },
             path = stateDir.resolve("bindings.json"),
@@ -208,11 +215,80 @@ class SwaySplitChainTest {
         assertEquals(0, singleChildSplits(), "the next detach clears it: ${describe()}")
     }
 
+    /**
+     * The control for the concurrent case below: [CONCURRENT] docks on one surface, attached one
+     * after another, then all detached in the order they were attached. Several docks on one
+     * surface is a shape the interface permits (`invoke.when_animated=SECOND_DOCK` asks for it), so
+     * a serialised attach has to leave a tree this can take back.
+     */
+    @Test
+    fun `several docks attached one at a time on one surface tear down cleanly`() =
+        rounds { app, managers ->
+            managers.map { it.attach(app, dockSpec(), AGENT) }
+        }
+
+    /**
+     * #199's second consequence. Separate managers have separate in-process locks, which is what
+     * separate `awakener-invoke` processes are, so this releases [CONCURRENT] of them off one gate
+     * against one surface. Before the cross-process attach lock the docks were cross-adopted, each
+     * round nested the surface one split deeper, and detach's `split none` was refused with "Can
+     * only flatten a child container with no siblings".
+     */
+    @Test
+    fun `concurrent attaches on one surface tear down with no nesting across rounds`() =
+        rounds { app, managers ->
+            val gate = CompletableDeferred<Unit>()
+            val attaches = managers.map { manager ->
+                async(Dispatchers.Default) {
+                    gate.await()
+                    manager.attach(app, dockSpec(), AGENT)
+                }
+            }
+            gate.complete(Unit)
+            attaches.awaitAll()
+        }
+
     // -- helpers ------------------------------------------------------------------------
 
-    private fun swayTest(body: suspend () -> Unit) {
+    private fun swayTest(body: suspend CoroutineScope.() -> Unit) {
         SwayHarness.assumeAvailable()
         runBlocking { body() }
+    }
+
+    /**
+     * [ROUNDS] rounds of: [CONCURRENT] fresh managers stand docks up beside one surface via
+     * [attachAll], every handle is detached, and the workspace must be back to its baseline with
+     * no single-child split and no nesting. Checked every round, because the defect this guards
+     * grows by one level per round.
+     */
+    private fun rounds(
+        attachAll: suspend CoroutineScope.(SurfaceId, List<SwayWindowManager>) -> List<DockHandle>,
+    ) = swayTest {
+        openSurface("aw-other")
+        val app = openSurface("aw-app0")
+        val baseline = describe()
+        for (round in 1..ROUNDS) {
+            val managers = List(CONCURRENT) {
+                SwayWindowManager({ sway.connection() }, store, registry, scope)
+            }
+            try {
+                val docks = attachAll(app, managers)
+                val ids = docks.map { it.dockId }
+                assertEquals(CONCURRENT, ids.toSet().size, "round $round: distinct docks $ids")
+                val tree = wm.tree()
+                ids.forEach { id ->
+                    val node = assertNotNull(tree.find(id.raw), "round $round: dock ${id.raw}")
+                    assertEquals(1, node.marks.size, "round $round: dock ${id.raw} marks ${node.marks}")
+                }
+                val unclaimed = tree.windows.filter { it.appId == "aw-dock" && SurfaceId(it.id) !in ids }
+                assertEquals(emptyList(), unclaimed.map { it.id }, "round $round: unclaimed docks; ${describe()}")
+                docks.forEach { it.detach() }
+                assertEquals(0, singleChildSplits(), "after round $round: ${describe()}")
+                assertEquals(baseline, describe(), "after round $round")
+            } finally {
+                managers.forEach { runCatching { it.close() } }
+            }
+        }
     }
 
     /**
@@ -310,6 +386,8 @@ class SwaySplitChainTest {
         const val POLL_MS = 20L
         const val CYCLES = 5
         const val CHAIN = 5
+        const val ROUNDS = 4
+        const val CONCURRENT = 4
 
         /** Long enough for an exec to be accepted, short enough that five failures stay cheap. */
         const val NEVER_MAPS_WAIT_MS = 600L

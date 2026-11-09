@@ -1,5 +1,7 @@
 // Explicit: inside a build script `java` names the Java plugin extension, not the package.
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.attribute.PosixFilePermissions
 
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
@@ -257,6 +259,23 @@ val launcherTest by tasks.registering(Exec::class) {
 tasks.named("check") { dependsOn(launcherTest) }
 
 tasks.withType<Test>().configureEach {
+    // A runtime directory of the suite's own (#199). The attach lock lives under
+    // $XDG_RUNTIME_DIR/awakener, one file per compositor socket, and every harness sway has a
+    // fresh socket — so a suite run against the developer's real runtime directory left hundreds
+    // of lock files there (335 after one review). The harness hands this same directory to the
+    // sways it starts, so their Wayland sockets land here too and the grim tests still find them.
+    // Short on purpose: a Wayland socket path has to fit in sun_path's 108 bytes.
+    val testRuntime = layout.buildDirectory.dir("xdg-run").get().asFile
+    environment("XDG_RUNTIME_DIR", testRuntime.absolutePath)
+    doFirst {
+        testRuntime.deleteRecursively()
+        testRuntime.mkdirs()
+        // 0700, as the spec requires of a runtime directory.
+        Files.setPosixFilePermissions(
+            testRuntime.toPath(),
+            PosixFilePermissions.fromString("rwx------"),
+        )
+    }
     // So the suite can assert the wiring above actually happened, for whatever the current set
     // of modules is rather than for a set frozen into a test.
     systemProperty("awakener.modules", siblingModules.joinToString(","))

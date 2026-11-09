@@ -21,7 +21,14 @@ import kotlinx.serialization.json.Json
  * A connection that has been subscribed to events must not be used for requests, because
  * events arrive interleaved with replies; use a dedicated connection for [subscribe].
  */
-class SwayConnection private constructor(private val channel: SocketChannel) : AutoCloseable {
+class SwayConnection private constructor(
+    private val channel: SocketChannel,
+    /**
+     * The socket this connection was opened on. Read by [CompositorLock], which keys the
+     * cross-process attach lock on it so that the lock is per compositor (#199).
+     */
+    val path: String,
+) : AutoCloseable {
     private val lock = Mutex()
 
     /**
@@ -118,7 +125,7 @@ class SwayConnection private constructor(private val channel: SocketChannel) : A
         fun open(socketPath: String): SwayConnection {
             val channel = SocketChannel.open(StandardProtocolFamily.UNIX)
             channel.connect(UnixDomainSocketAddress.of(socketPath))
-            return SwayConnection(channel)
+            return SwayConnection(channel, socketPath)
         }
 
         /**

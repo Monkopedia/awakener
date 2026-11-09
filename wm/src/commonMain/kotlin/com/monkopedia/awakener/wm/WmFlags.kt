@@ -2,6 +2,8 @@ package com.monkopedia.awakener.wm
 
 import com.monkopedia.awakener.config.Flags
 import com.monkopedia.awakener.config.Requirement
+import com.monkopedia.awakener.config.Config
+import com.monkopedia.awakener.registry.RegistryFlags
 
 /**
  * What a configured name that is written into compositor commands as it stands has to be made
@@ -21,6 +23,26 @@ val PLAIN_NAME: Requirement<String> =
         }
     }
 
+/** What serialises tree edits — and with them `attach`'s dock claim — against each other. */
+enum class AttachLockScope {
+    /**
+     * This process's mutex, then an exclusive lock on a file per compositor socket, under
+     * `$XDG_RUNTIME_DIR/awakener` (the state directory when that is unset). Every hotkey press is
+     * its own `awakener-invoke` process, so this is the only scope that serialises two presses.
+     * The kernel drops the file lock when its holder dies, so a press that crashed cannot wedge
+     * the next one.
+     */
+    CROSS_PROCESS,
+
+    /**
+     * This process's mutex only — the behaviour before #199. Two presses that overlap each
+     * snapshot the docks standing before either dock maps, so the first dock to map answers
+     * both waits: one surface gets no panel, the other gets two (one sometimes running the other
+     * surface's agent), and every concurrent round nests the surface one split deeper.
+     */
+    PROCESS,
+}
+
 /** Which side of the surface the dock sits on. */
 enum class DockSide { LEFT, RIGHT }
 
@@ -39,8 +61,9 @@ enum class DockIdentity {
      * window reporting that name which maps before the real dock does gets adopted in its
      * place, marked as this surface's dock, and killed by the eventual `detach`, while the dock
      * that actually spawned is left unmanaged. awakener's own attaches are serialised so they
-     * cannot do this to each other, but a panel started by hand under the same name is outside
-     * that guarantee.
+     * cannot do this to each other — across processes only under the default
+     * [WmFlags.attachLockScope] (#199) — but a panel started by hand under the same name is
+     * outside that guarantee.
      */
     NEW_NODE,
 
@@ -1122,6 +1145,93 @@ object WmFlags {
         },
     )
 
+    val attachLockScope = Flags.enum(
+        "wm.attach.lock_scope",
+        AttachLockScope.CROSS_PROCESS,
+        "What serialises tree edits against each other. attach identifies its dock as the new " +
+            "window that maps after its exec, which only works if no other exec lands in " +
+            "between, and every hotkey press is a separate process. CROSS_PROCESS takes an " +
+            "exclusive lock on a per-compositor file under \$XDG_RUNTIME_DIR/awakener for each " +
+            "tree edit, and awakener-invoke holds it across a whole press (resolve, toggle, bind, " +
+            "attach), so a second press on the same surface sees the first one's dock and " +
+            "applies invoke.when_animated to it. PROCESS is the behaviour before #199: two " +
+            "overlapping presses claim the same dock and nest splits.",
+    )
+
+    /**
+     * The longest [attachLockWaitMs] may be set to: ten minutes. A bound and not "forever"
+     * because the value is converted to a deadline, and an unbounded one (`Long.MAX_VALUE`, the
+     * natural spelling of "wait forever") overflowed that conversion and refused after 233ms
+     * while claiming to have waited 9.2e18ms. A press queued for ten minutes is a wedged press
+     * either way.
+     */
+    const val MAX_ATTACH_LOCK_WAIT_MS = 600_000L
+
+    /**
+     * Sixty seconds, which is the whole span a queued press can legitimately wait behind, under
+     * defaults, rounded up. `awakener-invoke` holds the lock across a *whole* press, not just its
+     * tree edit, so the bound is the worst a first press can take before it either finishes or
+     * fails:
+     *
+     * - `spanreed list` for `invoke.when_animated=REUSE`, at most twice under
+     *   `registry.agent.spanreed_list_form=AUTO` — each run is
+     *   `registry.agent.command_timeout_ms` (10s) plus `registry.agent.drain_grace_ms` (1s) per
+     *   pipe, so 2 × 12s = 24s;
+     * - the mint under `registry.agent.id_source=SPANREED`, one run: 12s;
+     * - the attach's map wait, `wm.wait.map_ms`: 5s;
+     * - the unwind's kill of a dock that mapped too late, `wm.wait.unmap_ms`: 5s.
+     *
+     * That is 46s. The rest is IPC and JVM start-up headroom. [attachLockOutlastsPress] reports
+     * when the flags it sums are raised past whatever this is set to.
+     */
+    val attachLockWaitMs = Flags.long(
+        "wm.attach.lock_wait_ms",
+        60_000,
+        "How long a press or tree edit waits for another process's attach lock before failing " +
+            "with nothing changed. awakener-invoke holds the lock across a whole press, so the " +
+            "default has to outlast the slowest legitimate first press under defaults: up to two " +
+            "spanreed list runs (REUSE) and one spanreed mint, each " +
+            "registry.agent.command_timeout_ms plus two registry.agent.drain_grace_ms (12s), " +
+            "then wm.wait.map_ms and an unwind's wm.wait.unmap_ms (5s each) — 46s, rounded up " +
+            "to 60s. A second press behind a first that is merely slow then waits rather than " +
+            "failing. Zero makes a second press give up at once rather than queue behind the " +
+            "first, which suits a key that auto-repeats.",
+        requires = Flags.within(0L..MAX_ATTACH_LOCK_WAIT_MS),
+    )
+
+    /**
+     * Reports a [attachLockWaitMs] shorter than the press it waits behind can legitimately take.
+     * Zero is exempt: it is the deliberate "never queue" setting. Reports rather than degrades,
+     * like [reservationOutlastsMap], because neither number is wrong alone.
+     */
+    val attachLockOutlastsPress = Flags.constraint(
+        attachLockWaitMs.key,
+        "zero, or at least the longest a press can hold the lock",
+    ) { config ->
+        val wait = config[attachLockWaitMs]
+        val press = attachLockPressBoundMs(config)
+        if (wait == 0L || wait >= press) {
+            null
+        } else {
+            "wm.attach.lock_wait_ms ($wait) is below the ${press}ms a press can legitimately " +
+                "hold the attach lock under the current flags (two spanreed list runs and a mint " +
+                "at registry.agent.command_timeout_ms + 2 × registry.agent.drain_grace_ms each, " +
+                "plus wm.wait.map_ms and wm.wait.unmap_ms), so a second press can be refused " +
+                "behind a first that is merely slow"
+        }
+    }
+
+    val attachLockRequired = Flags.boolean(
+        "wm.attach.lock_required",
+        false,
+        "What happens when the attach lock file cannot be created or the filesystem will not " +
+            "lock it (as opposed to another process holding it, which is wm.attach.lock_wait_ms). " +
+            "Off, the edit goes ahead with only this process's mutex, as it did before #199, and " +
+            "the manager reports that through lockDegraded so awakener-invoke can warn. On, it " +
+            "fails instead. Off by default for the reason registry.store.lock_required is: " +
+            "refusing takes the hotkey down on a live desktop.",
+    )
+
     val eventsEnabled = Flags.boolean(
         "wm.events.enabled",
         true,
@@ -1140,4 +1250,29 @@ object WmFlags {
             "a fourth cost: wm.session.reconnect acquires a successor connection when the " +
             "boundary is *observed*, and with events off it never is.",
     )
+}
+
+/**
+ * The longest one press can hold the attach lock without anything being wrong: the arithmetic
+ * [WmFlags.attachLockWaitMs] documents, read from [config]. Saturating, so flags at their upper
+ * bounds report a large number rather than a negative one.
+ */
+internal fun attachLockPressBoundMs(config: Config): Long {
+    val grace = config[RegistryFlags.drainGraceMs]
+    val spanreedRun = saturatingAdd(
+        config[RegistryFlags.commandTimeoutMs],
+        saturatingAdd(grace, grace),
+    )
+    return listOf(
+        spanreedRun,
+        spanreedRun,
+        spanreedRun,
+        config[WmFlags.mapWaitMs],
+        config[WmFlags.unmapWaitMs],
+    ).fold(0L, ::saturatingAdd)
+}
+
+private fun saturatingAdd(a: Long, b: Long): Long {
+    val sum = a + b
+    return if (((a xor sum) and (b xor sum)) < 0) Long.MAX_VALUE else sum
 }
