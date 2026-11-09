@@ -1700,10 +1700,16 @@ class SwayWindowManager(
                 }
             }
 
-            // Outside the section on purpose: this is not a tree edit, and in the hotkey case it
-            // mints, which reaches a spanreed subprocess. Holding the compositor across a process
-            // spawn would stall every other attach and detach behind it — the same call
+            // Outside the tree edit on purpose: this is not one, and with a null agent it mints,
+            // which reaches a spanreed subprocess. Holding the in-process tree mutex across a
+            // process spawn would stall this manager's other edits behind it — the same call
             // `FileBindingStore.bind` makes one module down, for the same reason.
+            //
+            // That is the mutex, not the compositor. A caller inside [exclusively] still holds the
+            // cross-process attach lock here, and `awakener-invoke` is one on purpose: it holds
+            // that lock across the whole press, including its own mint before this attach, so a
+            // second press queued behind it sees this dock rather than racing it (#199). Every
+            // other press waits through the spawn; wm.attach.lock_wait_ms is sized for that.
             //
             // Still recorded only once the dock is standing, so a failed attach leaves no durable
             // binding to an agent that has no panel. A null agent is the hotkey case: the registry

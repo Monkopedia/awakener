@@ -3,6 +3,7 @@ package com.monkopedia.awakener.wm
 import com.monkopedia.awakener.config.Config
 import com.monkopedia.awakener.config.ConfigFlags
 import com.monkopedia.awakener.config.Flags
+import com.monkopedia.awakener.registry.RegistryFlags
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -21,7 +22,7 @@ class WmFlagsTest {
         // ConfigFlags too: the invalid-value mode is itself a flag, so a snapshot that does not
         // declare it reads `config.invalid_value` as a key nothing owns and reports a problem
         // that has nothing to do with what is under test.
-        Flags.requireLoaded(WmFlags, ConfigFlags)
+        Flags.requireLoaded(WmFlags, ConfigFlags, RegistryFlags)
     }
 
     private fun snapshot(vararg values: Pair<String, Long>): Config =
@@ -110,7 +111,12 @@ class WmFlagsTest {
     @Test
     fun `raising only the map deadline past the default grace is reported`() {
         val config = snapshot("wm.wait.map_ms" to 30_000L)
-        assertEquals(WmFlags.reservationGraceMs.key, config.problems.single().key)
+        // Two rules trip, both correctly: a 30s map wait also outgrows the default attach-lock
+        // wait (36s of spanreed + 30s + 5s > 60s), which `wm.attach.lock_wait_ms` reports.
+        assertEquals(
+            setOf(WmFlags.reservationGraceMs.key, WmFlags.attachLockWaitMs.key),
+            config.problems.map { it.key }.toSet(),
+        )
     }
 
     @Test
@@ -164,6 +170,71 @@ class WmFlagsTest {
         assertEquals(
             "my.dock-",
             Config.of(mapOf(WmFlags.dockMarkPrefix.key to JsonPrimitive("my.dock-")))[WmFlags.dockMarkPrefix],
+        )
+    }
+
+    // -- wm.attach.lock_wait_ms (#199) --------------------------------------------------
+
+    /**
+     * Long.MAX_VALUE is how somebody types "wait forever", and it overflowed the deadline
+     * conversion into a refusal after 233ms. It is now out of the declared range, so it is
+     * reported and degraded to the default instead of reaching the conversion.
+     */
+    @Test
+    fun `a lock wait above the ceiling is reported and degraded`() {
+        for (value in listOf(Long.MAX_VALUE, WmFlags.MAX_ATTACH_LOCK_WAIT_MS + 1)) {
+            val config = snapshot("wm.attach.lock_wait_ms" to value)
+            val problem = config.problems.singleOrNull { it.key == WmFlags.attachLockWaitMs.key }
+            assertTrue(problem != null, "$value was not reported: ${config.problems}")
+            assertEquals(
+                WmFlags.attachLockWaitMs.default,
+                config[WmFlags.attachLockWaitMs],
+                "$value has to degrade to the default, not be coerced or used",
+            )
+        }
+    }
+
+    @Test
+    fun `a negative lock wait is reported and degraded`() {
+        val config = snapshot("wm.attach.lock_wait_ms" to -5L)
+        assertTrue(config.problems.any { it.key == WmFlags.attachLockWaitMs.key }, "${config.problems}")
+        assertEquals(WmFlags.attachLockWaitMs.default, config[WmFlags.attachLockWaitMs])
+    }
+
+    /** Both ends of the range are legal values: zero yields at once, the ceiling waits ten minutes. */
+    @Test
+    fun `the lock wait's boundaries are accepted`() {
+        for (value in listOf(0L, WmFlags.MAX_ATTACH_LOCK_WAIT_MS)) {
+            val config = snapshot("wm.attach.lock_wait_ms" to value)
+            assertEquals(emptyList(), config.problems, "$value")
+            assertEquals(value, config[WmFlags.attachLockWaitMs])
+        }
+    }
+
+    /**
+     * The default has to outlast the press it waits behind, and the bound is stated against the
+     * whole press: two spanreed list runs and a mint at 10s + 2 x 1s each, plus the map and
+     * unmap waits — 46s.
+     */
+    @Test
+    fun `the default lock wait outlasts a whole press`() {
+        assertEquals(46_000L, attachLockPressBoundMs(snapshot()))
+        assertTrue(WmFlags.attachLockWaitMs.default >= attachLockPressBoundMs(snapshot()))
+    }
+
+    @Test
+    fun `a lock wait shorter than a press is reported, and zero is not`() {
+        val short = snapshot("wm.attach.lock_wait_ms" to 15_000L)
+        val problem = short.problems.single()
+        assertEquals(WmFlags.attachLockWaitMs.key, problem.key)
+        assertTrue("15000" in problem.reason && "46000" in problem.reason, problem.reason)
+        assertEquals(15_000L, short[WmFlags.attachLockWaitMs], "a pair rule reports, it does not degrade")
+
+        assertEquals(emptyList(), snapshot("wm.attach.lock_wait_ms" to 0L).problems)
+        val raised = snapshot("registry.agent.command_timeout_ms" to 30_000L)
+        assertTrue(
+            raised.problems.any { it.key == WmFlags.attachLockWaitMs.key },
+            "raising the spanreed timeout past what the default covers has to say so: ${raised.problems}",
         )
     }
 }

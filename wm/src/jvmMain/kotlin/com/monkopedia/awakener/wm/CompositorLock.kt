@@ -16,6 +16,9 @@ import kotlin.coroutines.AbstractCoroutineContextElement
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.coroutineContext
 import kotlin.io.path.Path
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.TimeMark
+import kotlin.time.TimeSource
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -74,9 +77,13 @@ internal object CompositorLock {
     ): T {
         if (coroutineContext[Held]?.file == file) return block()
         val mutex = mutexes.computeIfAbsent(file) { Mutex() }
-        val deadline = System.nanoTime() + waitMs * 1_000_000
+        // A Duration and a monotonic mark rather than `nanoTime() + waitMs * 1_000_000`: that
+        // product wraps above ~9.2e12ms, and Long.MAX_VALUE then refused after 233ms. Duration
+        // arithmetic saturates to INFINITE, whatever the flag's declared range lets through.
+        val wait = waitMs.coerceAtLeast(0L).milliseconds
+        val deadline = TimeSource.Monotonic.markNow() + wait
         if (!mutex.tryLock()) {
-            val got = waitMs > 0 && withTimeoutOrNull(waitMs) { mutex.lock() } != null
+            val got = waitMs > 0 && withTimeoutOrNull(wait) { mutex.lock() } != null
             if (!got) throw contended(file, waitMs, "another awakener in this process")
         }
         try {
@@ -120,12 +127,12 @@ internal object CompositorLock {
      * read it as a filesystem that will not lock and run the edit unlocked. That is exactly what
      * the first version of this did, and the bounded-wait test is what caught it.
      */
-    private suspend fun acquire(channel: FileChannel, deadline: Long): FileLock? {
+    private suspend fun acquire(channel: FileChannel, deadline: TimeMark): FileLock? {
         channel.tryLock()?.let { return it }
-        val remainingMs = (deadline - System.nanoTime()) / 1_000_000
-        if (remainingMs <= 0) return null
+        val remaining = -deadline.elapsedNow()
+        if (!remaining.isPositive()) return null
         return try {
-            withTimeoutOrNull(remainingMs) {
+            withTimeoutOrNull(remaining) {
                 runInterruptible(Dispatchers.IO) { channel.lock() }
             }
         } catch (interrupted: FileLockInterruptionException) {
@@ -149,7 +156,14 @@ internal object CompositorLock {
         degraded: (String) -> Unit,
         block: suspend () -> T,
     ): T {
-        if (required) throw cause
+        if (required) {
+            throw IOException(
+                "$file: $why (${cause::class.simpleName}: ${cause.message}), and " +
+                    "${WmFlags.attachLockRequired.key}=true refuses to edit the tree without the " +
+                    "cross-process attach lock",
+                cause,
+            )
+        }
         degraded(
             "$file: $why (${cause::class.simpleName}: ${cause.message}); editing the tree " +
                 "without cross-process exclusion, so two overlapping presses can claim the " +
