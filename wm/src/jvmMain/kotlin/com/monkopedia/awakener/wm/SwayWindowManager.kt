@@ -622,7 +622,42 @@ class SwayWindowManager(
      * section needs — `settleFocus`, called from the end of `attach`, in particular.
      */
     private suspend fun <T> treeEdit(edit: suspend TreeEdit.() -> T): T =
-        treeEditLock.withLock { TreeEdit(session()).edit() }
+        exclusively { treeEditLock.withLock { TreeEdit(session()).edit() } }
+
+    /**
+     * Why the last cross-process exclusion this manager took fell back to the in-process mutex,
+     * or null if it did not. Set only under [WmFlags.attachLockRequired]`=false`, where the edit
+     * went ahead anyway; `awakener-invoke` prints it, because #199's race is silent otherwise.
+     */
+    @Volatile
+    var lockDegraded: String? = null
+        private set
+
+    /**
+     * Runs [block] holding this compositor's attach lock, across processes (#199).
+     *
+     * Every [treeEdit] takes it, which is what makes [attach]'s claim sound against another
+     * process's attach. A caller holds it across more than one call when the calls have to be
+     * atomic together: `awakener-invoke` holds it for a whole press, so that a second press
+     * queued behind the first sees the first one's dock and applies `invoke.when_animated` to it
+     * instead of attaching a second. Reentrant for the coroutine holding it and its children.
+     *
+     * Not on [WindowManager]: how presses are serialised is a fact about this implementation,
+     * and the interface stays at three calls. [WmFlags.attachLockScope]`=PROCESS` makes this run
+     * [block] directly. Raises [CompositorLock.Contended] with nothing changed when another holder
+     * keeps the lock past [WmFlags.attachLockWaitMs].
+     */
+    suspend fun <T> exclusively(block: suspend () -> T): T {
+        val cfg = config
+        if (cfg[WmFlags.attachLockScope] == AttachLockScope.PROCESS) return block()
+        return CompositorLock.withLock(
+            file = CompositorLock.fileFor(session().connection.path),
+            waitMs = cfg[WmFlags.attachLockWaitMs],
+            required = cfg[WmFlags.attachLockRequired],
+            degraded = { lockDegraded = it },
+            block = block,
+        )
+    }
 
     /**
      * What identifies the dock an `attach` has `exec`'d but has not found yet: the `app_id` it
@@ -957,8 +992,9 @@ class SwayWindowManager(
          * a dock of its own in there and nowhere else; and a window elsewhere reporting the same
          * `app_id` is not this attach's to kill — under [DockIdentity.NEW_NODE] that name is
          * shared with every other dock and with anything the user launched by hand. Nothing else
-         * may `exec` while the lock is held, which is the same exclusion [awaitWindow]'s
-         * [PendingDock.standing] set rests on.
+         * may `exec` while the lock is held — the in-process mutex and, under the default
+         * [WmFlags.attachLockScope], the cross-process lock with it (#199) — which is the same
+         * exclusion [awaitWindow]'s [PendingDock.standing] set rests on.
          *
          * What the scoping does not remove is [DockIdentity.NEW_NODE]'s disclosed trust in the
          * shared name, which this is a second route to: a window a user launches *into this
@@ -1547,7 +1583,8 @@ class SwayWindowManager(
                     // alone would resolve to whichever of them sway happens to list first, since
                     // in production every dock is the same panel program and they all report the
                     // same name. The snapshot only identifies anything because nothing else can
-                    // exec before the claim.
+                    // exec before the claim — in this process or any other, which is why
+                    // treeEdit holds the cross-process lock and not only the mutex (#199).
                     val standing =
                         tree().windows.filter { it.appId == appId }.map { it.id }.toSet()
 

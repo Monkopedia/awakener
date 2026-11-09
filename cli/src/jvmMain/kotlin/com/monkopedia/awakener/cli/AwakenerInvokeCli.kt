@@ -50,7 +50,19 @@ import kotlinx.coroutines.runBlocking
  * window.
  */
 object AwakenerInvokeCli {
-    suspend fun run(args: Array<String>, awakening: Awakening, out: (String) -> Unit): Int =
+    /**
+     * @param exclusive holds the compositor's attach lock around a whole `invoke` or `reap`
+     * (#199). Each press is its own process, so without it two presses that overlap both attach,
+     * and a second press on the same surface cannot see the first one's dock. Holding it from
+     * the surface lookup through the attach is what makes a queued second press observe the first
+     * one's panel and apply `invoke.when_animated` to it — under `TOGGLE_HIDE`, hiding it.
+     */
+    suspend fun run(
+        args: Array<String>,
+        awakening: Awakening,
+        out: (String) -> Unit,
+        exclusive: suspend (suspend () -> Int) -> Int = { it() },
+    ): Int =
         when (args.firstOrNull() ?: "list") {
             "list" -> {
                 val standing = awakening.list()
@@ -108,7 +120,7 @@ object AwakenerInvokeCli {
                     }
                     index++
                 }
-                report(awakening.invoke(target, connector), out)
+                exclusive { report(awakening.invoke(target, connector), out) }
             }
 
             "connectors" -> {
@@ -138,7 +150,7 @@ object AwakenerInvokeCli {
                 if (listing.broken.isEmpty()) 0 else 1
             }
 
-            "reap" -> {
+            "reap" -> exclusive {
                 awakening.reap()
                 out("swept")
                 0
@@ -377,6 +389,7 @@ private fun awaken(args: Array<String>, store: FileConfigStore): Int {
                         connectors = FileConnectorCatalog(store.config.value),
                     ),
                     ::println,
+                    exclusive = { press -> wm.exclusively(press) },
                 )
             } finally {
                 // Where the model was written, when that is somewhere another local user could
@@ -391,6 +404,9 @@ private fun awaken(args: Array<String>, store: FileConfigStore): Int {
                 bindings.residueStranded?.let { System.err.println("warning: $it") }
                 // And whether this press renamed the surface's model off its slug-named path.
                 bindings.residueMigrated?.let { System.err.println("note: $it") }
+                // And whether this press ran without the cross-process attach lock, which is the
+                // one condition under which #199's double-claimed dock can come back.
+                wm.lockDegraded?.let { System.err.println("warning: $it") }
                 // The dock is sway's child, not this process's, so retiring the manager stops its
                 // collector and gives up its connection and leaves every panel standing.
                 //

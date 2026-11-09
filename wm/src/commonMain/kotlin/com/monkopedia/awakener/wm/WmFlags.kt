@@ -21,6 +21,26 @@ val PLAIN_NAME: Requirement<String> =
         }
     }
 
+/** What serialises tree edits — and with them `attach`'s dock claim — against each other. */
+enum class AttachLockScope {
+    /**
+     * This process's mutex, then an exclusive lock on a file per compositor socket, under
+     * `$XDG_RUNTIME_DIR/awakener` (the state directory when that is unset). Every hotkey press is
+     * its own `awakener-invoke` process, so this is the only scope that serialises two presses.
+     * The kernel drops the file lock when its holder dies, so a press that crashed cannot wedge
+     * the next one.
+     */
+    CROSS_PROCESS,
+
+    /**
+     * This process's mutex only — the behaviour before #199. Two presses that overlap each
+     * snapshot the docks standing before either dock maps, so the first dock to map answers
+     * both waits: one surface gets no panel, the other gets two (one sometimes running the other
+     * surface's agent), and every concurrent round nests the surface one split deeper.
+     */
+    PROCESS,
+}
+
 /** Which side of the surface the dock sits on. */
 enum class DockSide { LEFT, RIGHT }
 
@@ -39,8 +59,9 @@ enum class DockIdentity {
      * window reporting that name which maps before the real dock does gets adopted in its
      * place, marked as this surface's dock, and killed by the eventual `detach`, while the dock
      * that actually spawned is left unmanaged. awakener's own attaches are serialised so they
-     * cannot do this to each other, but a panel started by hand under the same name is outside
-     * that guarantee.
+     * cannot do this to each other — across processes only under the default
+     * [WmFlags.attachLockScope] (#199) — but a panel started by hand under the same name is
+     * outside that guarantee.
      */
     NEW_NODE,
 
@@ -1120,6 +1141,40 @@ object WmFlags {
         Flags.requires("a format containing ${TabTitle.TITLE_PLACEHOLDER}") {
             it.contains(TabTitle.TITLE_PLACEHOLDER)
         },
+    )
+
+    val attachLockScope = Flags.enum(
+        "wm.attach.lock_scope",
+        AttachLockScope.CROSS_PROCESS,
+        "What serialises tree edits against each other. attach identifies its dock as the new " +
+            "window that maps after its exec, which only works if no other exec lands in " +
+            "between, and every hotkey press is a separate process. CROSS_PROCESS takes an " +
+            "exclusive lock on a per-compositor file under \$XDG_RUNTIME_DIR/awakener for each " +
+            "tree edit, and awakener-invoke holds it across a whole press (resolve, toggle, bind, " +
+            "attach), so a second press on the same surface sees the first one's dock and " +
+            "applies invoke.when_animated to it. PROCESS is the behaviour before #199: two " +
+            "overlapping presses claim the same dock and nest splits.",
+    )
+
+    val attachLockWaitMs = Flags.long(
+        "wm.attach.lock_wait_ms",
+        15_000,
+        "How long a press or tree edit waits for another process's attach lock before failing " +
+            "with nothing changed. Long enough by default to outlast one attach that waits out " +
+            "wm.wait.map_ms plus an unwind. Zero makes a second press give up at once rather " +
+            "than queue behind the first, which suits a key that auto-repeats.",
+        requires = Flags.atLeast(0L),
+    )
+
+    val attachLockRequired = Flags.boolean(
+        "wm.attach.lock_required",
+        false,
+        "What happens when the attach lock file cannot be created or the filesystem will not " +
+            "lock it (as opposed to another process holding it, which is wm.attach.lock_wait_ms). " +
+            "Off, the edit goes ahead with only this process's mutex, as it did before #199, and " +
+            "the manager reports that through lockDegraded so awakener-invoke can warn. On, it " +
+            "fails instead. Off by default for the reason registry.store.lock_required is: " +
+            "refusing takes the hotkey down on a live desktop.",
     )
 
     val eventsEnabled = Flags.boolean(
