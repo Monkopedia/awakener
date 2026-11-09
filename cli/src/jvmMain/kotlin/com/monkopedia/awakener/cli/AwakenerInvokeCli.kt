@@ -370,6 +370,7 @@ private fun awaken(args: Array<String>, store: FileConfigStore): Int {
                         prepareResidue = { bindings.prepareResidue(it) },
                         reapOrphans = wm::reapOrphans,
                         dockFor = wm::dockFor,
+                        focusedDockOwner = wm::focusedDockOwner,
                         // The snapshot, not the store. One press is one operation, and the
                         // catalog reads `connector.*` — a reload landing between "which
                         // connector" and "where does it write" would materialise half of one

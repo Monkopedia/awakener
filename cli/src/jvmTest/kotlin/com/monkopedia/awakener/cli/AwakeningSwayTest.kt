@@ -18,6 +18,7 @@ import com.monkopedia.awakener.registry.UnreachableIdSource
 import com.monkopedia.awakener.wm.CommandResult
 import com.monkopedia.awakener.wm.I3Ipc
 import com.monkopedia.awakener.wm.Node
+import com.monkopedia.awakener.wm.RestingFocus
 import com.monkopedia.awakener.wm.SurfaceId
 import com.monkopedia.awakener.wm.SwayHarness
 import com.monkopedia.awakener.wm.SwayWindowManager
@@ -140,15 +141,7 @@ class AwakeningSwayTest {
             path = stateDir.resolve("bindings.json"),
         )
         wm = SwayWindowManager({ sway.connection() }, store, registry, scope)
-        awakening = Awakening(
-            wm = wm,
-            registry = registry,
-            bus = bus,
-            store = store,
-            prepareResidue = { registry.prepareResidue(it) },
-            reapOrphans = wm::reapOrphans,
-            dockFor = wm::dockFor,
-        )
+        awakening = awakeningOver(wm)
     }
 
     @AfterTest
@@ -608,6 +601,91 @@ class AwakeningSwayTest {
         assertEquals(1, minted)
     }
 
+    /**
+     * #196: with focus resting in the panel, the toggle hides the panel it is pressed from.
+     *
+     * `wm.focus.resting=DOCK` is the combination that made this unreachable: the press that
+     * stands a panel up leaves focus in it, so every later press came from a window enumeration
+     * leaves out, and was refused. Each press after the first is made by a **fresh**
+     * `SwayWindowManager`, because that is what a hotkey is — a new process with an empty dock
+     * table, which knows the panel only by the mark on it.
+     */
+    @Test
+    fun `a press from inside the panel hides it`() = swayTest {
+        store.put(InvokeFlags.whenAnimated, WhenAnimated.TOGGLE_HIDE)
+        store.put(WmFlags.restingFocus, RestingFocus.DOCK)
+        val app1 = openSurface("aw-app1")
+
+        val stood = assertIs<Awakened.Animated>(awakening.invoke())
+        assertEquals(stood.dock.dockId.raw, focusedWindow(), "focus rests in the panel")
+
+        val hidden = assertIs<Awakened.Hidden>(freshAwakening().invoke())
+        assertEquals(app1, hidden.surface, "the press was taken as the panel's own surface's")
+        assertEquals(stood.dock.dockId, hidden.dock.dockId)
+        assertEquals(
+            emptyList(),
+            assertNotNull(tabHolding(app1)).windows.map { it.id }.filter { it != app1.raw },
+            "and the panel is out of the tab",
+        )
+
+        assertIs<Awakened.Restored>(freshAwakening().invoke())
+        assertEquals(stood.dock.dockId.raw, focusedWindow(), "the restore rests in the panel too")
+        assertIs<Awakened.Hidden>(freshAwakening().invoke(), "so the toggle keeps toggling")
+        assertEquals(1, minted, "and no press after the first minted anything")
+    }
+
+    /**
+     * `invoke.from_panel=REFUSE` is the behaviour before #196, kept reachable.
+     */
+    @Test
+    fun `a press from inside the panel is refused under REFUSE`() = swayTest {
+        store.put(InvokeFlags.whenAnimated, WhenAnimated.TOGGLE_HIDE)
+        store.put(WmFlags.restingFocus, RestingFocus.DOCK)
+        store.put(InvokeFlags.fromPanel, FromPanel.REFUSE)
+        openSurface("aw-app1")
+        val stood = assertIs<Awakened.Animated>(awakening.invoke())
+
+        assertIs<Awakened.NoSurface>(freshAwakening().invoke())
+        assertEquals(stood.dock.dockId.raw, focusedWindow(), "and the panel is where it was")
+    }
+
+    /**
+     * A panel with no mark — the shape #199's race leaves, and what any panel is in the moment
+     * before its mark lands — names no surface. With a real, marked panel standing beside a
+     * surface too, a press from the unmarked one must neither guess its way to that surface nor
+     * bind the panel itself.
+     */
+    @Test
+    fun `a press from a panel nothing has claimed is still refused`() = swayTest {
+        store.put(InvokeFlags.whenAnimated, WhenAnimated.TOGGLE_HIDE)
+        val app1 = openSurface("aw-app1")
+        val stood = assertIs<Awakened.Animated>(awakening.invoke())
+        minted = 0
+        val stray = openSurface("$DOCK_APP_ID-${app1.raw}")
+        command("[con_id=${stray.raw}] focus")
+
+        assertIs<Awakened.NoSurface>(freshAwakening().invoke())
+        assertNothingDurableFor("$DOCK_APP_ID-${app1.raw}")
+        assertNotNull(
+            assertNotNull(tabHolding(app1)).find(stood.dock.dockId.raw),
+            "and the marked panel was not hidden on the stray's behalf",
+        )
+    }
+
+    /** A marked panel whose surface has gone names a surface this press cannot act on. */
+    @Test
+    fun `a press from a panel whose surface has gone is refused`() = swayTest {
+        val app1 = openSurface("aw-app1")
+        openSurface("aw-app2")
+        val stood = assertIs<Awakened.Animated>(awakening.invoke(app1))
+        command("[con_id=${app1.raw}] kill")
+        awaitGone(app1)
+        command("[con_id=${stood.dock.dockId.raw}] focus")
+
+        assertIs<Awakened.NoSurface>(freshAwakening().invoke())
+        assertEquals(1, minted, "nothing beyond the first panel's own mint")
+    }
+
     // -- helpers ------------------------------------------------------------------------
 
     /**
@@ -625,6 +703,23 @@ class AwakeningSwayTest {
         val residue = stateDir.resolve("residue").toFile().walk().map { it.name }.toList()
         assertTrue(residue.none { appId in it }, "residue was prepared for $appId: $residue")
     }
+
+    private fun awakeningOver(wm: SwayWindowManager) = Awakening(
+        wm = wm,
+        registry = registry,
+        bus = bus,
+        store = store,
+        prepareResidue = { registry.prepareResidue(it) },
+        reapOrphans = wm::reapOrphans,
+        dockFor = wm::dockFor,
+        focusedDockOwner = wm::focusedDockOwner,
+    )
+
+    /** What the next hotkey press is: a new process, holding no dock table. */
+    private fun freshAwakening() =
+        awakeningOver(SwayWindowManager({ sway.connection() }, store, registry, scope))
+
+    private suspend fun focusedWindow(): Long? = wm.tree().windows.firstOrNull { it.focused }?.id
 
     private fun swayTest(body: suspend () -> Unit) {
         SwayHarness.assumeAvailable()
