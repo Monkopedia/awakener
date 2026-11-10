@@ -198,13 +198,14 @@ class Awakening(
      */
     private val dockFor: suspend (SurfaceId) -> DockHandle? = { null },
     /**
-     * The surface the focused panel is docked beside, if focus is in a panel that names one.
+     * The focused panel, if focus is in one that names its surface — [DockHandle.surface].
      *
      * [dockFor]'s question the other way round, a lambda for the same reasons, and the piece
-     * that lets a press made from inside a panel act on its surface (#196). Defaults to "not in
-     * a panel", which leaves every such press refused, as it was before.
+     * that lets a press made from inside a panel act on its surface (#196) and on that panel
+     * rather than a sibling (#220). Defaults to "not in a panel", which leaves every such press
+     * refused, as it was before.
      */
-    private val focusedDockOwner: suspend () -> SurfaceId? = { null },
+    private val focusedDock: suspend () -> DockHandle? = { null },
 ) {
     private val config: Config get() = store.config.value
 
@@ -249,9 +250,14 @@ class Awakening(
     ): Awakened {
         val cfg = config
         val surfaces = wm.surfaces()
+        // The panel the press came from, when it came from one. Kept, not just mapped to its
+        // surface: with two panels beside one surface, re-deriving "the" dock from the surface
+        // answers whichever the tree lists first, which need not be this one (#220).
+        val pressedFrom =
+            if (target == null && surfaces.none { it.focused }) pressedPanel(cfg) else null
         val surface = if (target == null) {
             surfaces.firstOrNull { it.focused }
-                ?: owningSurface(cfg, surfaces)
+                ?: pressedFrom?.let { panel -> surfaces.firstOrNull { it.id == panel.surface } }
                 ?: return Awakened.NoSurface(
                     if (surfaces.isEmpty()) {
                         "no bindable surfaces"
@@ -290,7 +296,7 @@ class Awakening(
         // panel standing beside it was bound by the attach that stood it up, so there is no
         // identity here left to recall.
         if (cfg[InvokeFlags.whenAnimated] == WhenAnimated.TOGGLE_HIDE) {
-            val dock = dockFor(surface.id)
+            val dock = pressedFrom ?: dockFor(surface.id)
             if (dock != null) {
                 // Asked of the compositor rather than remembered, so a dock the user pulled out
                 // of the scratchpad by hand toggles from where it actually is. Nothing here holds
@@ -368,20 +374,16 @@ class Awakening(
     }
 
     /**
-     * The surface a press made from inside a panel is aimed at, under
-     * `invoke.from_panel=OWNING_SURFACE` (#196).
+     * The panel a press was made from, under `invoke.from_panel=OWNING_SURFACE` (#196).
      *
      * Only ever reached with focus on something [WindowManager.surfaces] left out, so this does
      * not undo #170: a panel nothing has claimed is still listed, still focused, and refused by
-     * the `app_id` check below. What reaches here is a panel `:wm` recognised, and the surface it
-     * answers is looked up in this press's own enumeration, so one whose surface has gone is
-     * refused rather than acted on.
+     * the `app_id` check below. What reaches here is a panel `:wm` recognised; the caller looks
+     * its surface up in this press's own enumeration, so one whose surface has gone is refused
+     * rather than acted on.
      */
-    private suspend fun owningSurface(cfg: Config, surfaces: List<Surface>): Surface? {
-        if (cfg[InvokeFlags.fromPanel] != FromPanel.OWNING_SURFACE) return null
-        val owner = focusedDockOwner() ?: return null
-        return surfaces.firstOrNull { it.id == owner }
-    }
+    private suspend fun pressedPanel(cfg: Config): DockHandle? =
+        if (cfg[InvokeFlags.fromPanel] == FromPanel.OWNING_SURFACE) focusedDock() else null
 
     /**
      * Bindings already written for awakener's own windows — before #170 refused them — reported,

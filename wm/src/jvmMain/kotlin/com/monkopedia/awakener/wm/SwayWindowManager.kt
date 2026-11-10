@@ -2128,30 +2128,42 @@ class SwayWindowManager(
         val root = tree(session)
         val table = docks.snapshot()
         val node = root.windows.firstOrNull { dockedTo(it, table, cfg) == surface } ?: return null
-        // Derived here rather than carried, because this handle was not made by an attach: the
-        // key is what `detach` needs to forget the binding, and the agent is what a caller prints.
+        return adoptedHandle(surface, node, session)
+    }
+
+    /**
+     * A handle on a dock this process did not attach, recovered from the tree.
+     *
+     * The key and agent are derived here rather than carried, because no attach made this
+     * handle: the key is what `detach` needs to forget the binding, and the agent is what a caller
+     * prints.
+     */
+    private suspend fun adoptedHandle(surface: SurfaceId, node: Node, session: Session): DockHandle {
         val key = keyFor(surface)
         val agent = key?.let { registry.resolve(it)?.agent } ?: AgentId("")
         return SwayDockHandle(surface, agent, SurfaceId(node.id), key, session)
     }
 
     /**
-     * The surface the focused window is docked beside, or null if the focused window is no dock
-     * this can name a surface for.
+     * A handle on the focused window if it is a dock, or null if it is no dock this can name a
+     * surface for. The handle's [DockHandle.surface] is the surface it is docked beside.
      *
      * [dockFor]'s question asked the other way round, so a press made from inside a panel can
-     * act on the panel's own surface (#196). Recognition is the same [dockedTo] union, which is
-     * what makes it work from a one-shot process: the table is empty there, and the mark names
-     * the surface. A window that only *looks* like a dock — the configured `app_id` with no mark,
-     * which is a dock still being stood up or one #199 left unclaimed — names nothing, and gets
-     * null rather than a guess from its `app_id`.
+     * act on the panel's own surface (#196) — and on **that** panel, not on whichever of the
+     * surface's panels [dockFor] would list first (#220). Recognition is the same [dockedTo]
+     * union, which is what makes it work from a one-shot process: the table is empty there, and
+     * the mark names the surface. A window that only *looks* like a dock — the configured
+     * `app_id` with no mark, which is a dock still being stood up or one #199 left unclaimed —
+     * names nothing, and gets null rather than a guess from its `app_id`.
      *
      * A concrete method passed down as a lambda, for [dockFor]'s reasons; see #94.
      */
-    suspend fun focusedDockOwner(): SurfaceId? {
+    suspend fun focusedDock(): DockHandle? {
         val cfg = config
-        val focused = tree().windows.firstOrNull { it.focused } ?: return null
-        return dockedTo(focused, docks.snapshot(), cfg)
+        val session = session()
+        val focused = tree(session).windows.firstOrNull { it.focused } ?: return null
+        val surface = dockedTo(focused, docks.snapshot(), cfg) ?: return null
+        return adoptedHandle(surface, focused, session)
     }
 
     private inner class SwayDockHandle(
