@@ -753,7 +753,9 @@ recycled.
 **`$mod+a` is not a toggle.** `invoke.when_animated` is either `REUSE` (decline a second panel
 when this surface's agent is already live on the bus) or `SECOND_DOCK` (stand another anyway,
 as a deliberate second view onto one agent). Neither hides or closes a dock. Close a dock the
-way you close its terminal, or use `awakener-invoke reap` for docks whose surface has gone.
+way you close its terminal. A dock whose surface has gone stays standing until the next
+`$mod+a` press anywhere, which sweeps for such docks before it acts (`invoke.sweep_first`), or
+until `awakener-invoke reap` (`$mod+p`).
 
 **There is no daemon.** A press cannot raise a panel that is already standing.
 

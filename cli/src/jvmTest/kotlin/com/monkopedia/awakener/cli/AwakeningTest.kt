@@ -44,6 +44,7 @@ class AwakeningTest {
     private val bus = FakeBus()
     private val prepared = mutableListOf<SurfaceKey>()
     private var sweeps = 0
+    private var sweepFails = false
 
     private val app = Surface(SurfaceId(5), "editor", "notes.md", pid = 100, focused = true)
     private val other = Surface(SurfaceId(6), "browser", "a page", pid = 101, focused = false)
@@ -56,7 +57,10 @@ class AwakeningTest {
         bus = bus,
         store = config,
         prepareResidue = { prepared += it },
-        reapOrphans = { sweeps++ },
+        reapOrphans = {
+            sweeps++
+            if (sweepFails) error("dock 9 would not come down")
+        },
         dockFor = { wm.standing[it] },
     )
 
@@ -463,6 +467,42 @@ class AwakeningTest {
     fun `reap delegates to the sweep the composition root supplied`() = runTest {
         awakening.reap()
         assertEquals(1, sweeps)
+    }
+
+    /** #197: every press sweeps first, under the default. */
+    @Test
+    fun `a press sweeps before it acts`() = runTest {
+        assertIs<Awakened.Animated>(awakening.invoke())
+        assertEquals(1, sweeps)
+        assertNull(awakening.sweepFailure)
+    }
+
+    @Test
+    fun `a press sweeps nothing with invoke sweep_first off`() = runTest {
+        config.put(InvokeFlags.sweepFirst, false)
+        assertIs<Awakened.Animated>(awakening.invoke())
+        assertEquals(0, sweeps)
+    }
+
+    /**
+     * A panel that will not come down must not break the hotkey: the press goes ahead and the
+     * failure is kept for the composition root to report. `reap` is the other way round, because
+     * there the sweep is the whole of what was asked for.
+     */
+    @Test
+    fun `a failed sweep is kept and the press still stands its panel`() = runTest {
+        sweepFails = true
+
+        assertIs<Awakened.Animated>(awakening.invoke())
+
+        assertEquals("dock 9 would not come down", awakening.sweepFailure?.message)
+    }
+
+    @Test
+    fun `a failed sweep fails reap`() = runTest {
+        sweepFails = true
+
+        assertFailsWith<IllegalStateException> { awakening.reap() }
     }
 
     /**

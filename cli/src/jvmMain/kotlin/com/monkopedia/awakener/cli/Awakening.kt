@@ -19,6 +19,7 @@ import com.monkopedia.awakener.wm.DockSpec
 import com.monkopedia.awakener.wm.Surface
 import com.monkopedia.awakener.wm.SurfaceId
 import com.monkopedia.awakener.wm.WindowManager
+import kotlinx.coroutines.CancellationException
 
 /** One window, and what awakener currently knows about it. */
 data class Standing(
@@ -255,23 +256,31 @@ class Awakening(
         // answers whichever the tree lists first, which need not be this one (#220).
         val pressedFrom =
             if (target == null && surfaces.none { it.focused }) pressedPanel(cfg) else null
-        val surface = if (target == null) {
+        val aimed = if (target == null) {
             surfaces.firstOrNull { it.focused }
                 ?: pressedFrom?.let { panel -> surfaces.firstOrNull { it.id == panel.surface } }
-                ?: return Awakened.NoSurface(
-                    if (surfaces.isEmpty()) {
-                        "no bindable surfaces"
-                    } else {
-                        // Focus is on something surfaces() excludes, and the likeliest such thing
-                        // is a dock — pressing the hotkey inside an agent panel. Saying so beats
-                        // "nothing is focused", which is not true and sends the reader to sway.
-                        "the focused window is not a bindable surface (an agent panel, perhaps)"
-                    },
-                )
         } else {
             surfaces.firstOrNull { it.id == target }
-                ?: return Awakened.NoSurface("no such surface: ${target.raw}")
         }
+        // After the press is aimed — `pressedFrom` included — and before anything acts on it
+        // (#197). Before, because this
+        // process is the only thing that runs, so the press is the only moment a panel whose
+        // window has closed can be noticed at all. After the aim, because the orphan is the
+        // likeliest thing to have focus — it fills the tab — and sweeping it moves focus to
+        // whatever sway picks next: a press aimed after the sweep would act on a window the user
+        // never pressed in. The sweep only takes down panels whose surface is gone, so it cannot
+        // take down the one this press is aimed at.
+        if (cfg[InvokeFlags.sweepFirst]) sweep()
+        val surface = aimed ?: return Awakened.NoSurface(
+            when {
+                target != null -> "no such surface: ${target.raw}"
+                surfaces.isEmpty() -> "no bindable surfaces"
+                // Focus is on something surfaces() excludes, and the likeliest such thing is a
+                // dock — pressing the hotkey inside an agent panel. Saying so beats "nothing is
+                // focused", which is not true and sends the reader to sway.
+                else -> "the focused window is not a bindable surface (an agent panel, perhaps)"
+            },
+        )
 
         // Ahead of everything durable, because a binding for a panel is a Lifeless whose surface
         // is another Lifeless's window and it outlives the window that caused it (#170). Asked of
@@ -427,6 +436,27 @@ class Awakening(
 
     /** Takes down docks whose surface has gone. See [reapOrphans]. */
     suspend fun reap() = reapOrphans()
+
+    /**
+     * Why the sweep [invoke] ran under [InvokeFlags.sweepFirst] failed, if it did.
+     *
+     * Kept rather than raised: a panel that will not come down is a reason to say so, not to
+     * refuse every press until it does — the hotkey would then be broken by the one thing the
+     * user cannot fix by pressing it. The composition root reports it on stderr. `reap` raises
+     * instead, because there the sweep is the whole of what was asked for.
+     */
+    var sweepFailure: Exception? = null
+        private set
+
+    private suspend fun sweep() {
+        try {
+            reapOrphans()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            sweepFailure = failure
+        }
+    }
 
     companion object {
         /** `:wm` substitutes `{app_id}`; see [InvokeFlags.dockCommand] for why it is not here. */

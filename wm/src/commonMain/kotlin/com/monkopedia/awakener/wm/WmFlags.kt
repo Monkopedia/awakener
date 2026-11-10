@@ -657,8 +657,12 @@ object WmFlags {
     val orphanPolicy = Flags.enum(
         "wm.dock.orphan_policy",
         OrphanPolicy.CLOSE,
-        "What to do with a dock whose surface has closed. sway leaves the dock standing in " +
-            "the split container, so without action it becomes an orphaned panel.",
+        "What the orphan sweep does with a dock whose surface has closed. sway leaves the " +
+            "dock standing in the split container, so without action it becomes an orphaned " +
+            "panel. This decides what a sweep does, not when one runs: under awakener-invoke, " +
+            "which is one-shot, a sweep runs at the start of each press " +
+            "(invoke.sweep_first) and on `awakener-invoke reap`, so a dock stands from its " +
+            "surface's close until the next of those. LEAVE makes every sweep a no-op.",
     )
 
     val normalizeContainerOnDetach = Flags.boolean(
@@ -806,15 +810,18 @@ object WmFlags {
     val sweepOnClose = Flags.boolean(
         "wm.repair.sweep_on_close",
         true,
-        "Sweep for orphaned docks when the compositor reports a window closing. sway leaves a " +
-            "dock standing when the surface it shares a tab with dies, and the close event is " +
-            "the exact moment that happens, so this is what turns wm.dock.orphan_policy from a " +
-            "setting into a behaviour. Off is the previous behaviour, in which the sweep existed " +
-            "and nothing ran it: orphaned panels then accumulate until something calls the sweep " +
-            "itself, and nothing in awakener does. Turn it off to drive repair by hand, or to " +
-            "leave the tree damage visible while diagnosing without also giving up the session " +
-            "boundary — the collector still watches for the compositor going away either way. " +
-            "Nothing is swept on a timer: this reacts to an event or it does not run.",
+        "Sweep for orphaned docks when the compositor reports a window closing, for as long " +
+            "as the process that owns the window manager is running. sway leaves a dock standing " +
+            "when the surface it shares a tab with dies, and the close event is the moment that " +
+            "happens — but only a process alive at that moment hears it. awakener-invoke is " +
+            "one-shot and holds the attach lock for its whole press, so in the shipped " +
+            "deployment this collector is never listening when a user closes a window; what " +
+            "repairs those docks there is invoke.sweep_first on the next press, or " +
+            "`awakener-invoke reap`. Off stops a long-lived process sweeping on close, to drive " +
+            "repair by hand or to leave the tree damage visible while diagnosing without also " +
+            "giving up the session boundary — the collector still watches for the compositor " +
+            "going away either way. Nothing is swept on a timer: this reacts to an event or it " +
+            "does not run.",
     )
 
     val sweepFailure = Flags.enum(
