@@ -635,6 +635,36 @@ class AwakeningSwayTest {
     }
 
     /**
+     * #220: with two panels beside one surface, a press from a panel acts on **that** panel.
+     *
+     * The shape `SECOND_DOCK` leaves, and `invoke.when_animated` is a flag flipped on a live
+     * system. Panel 1 is hidden first, so the scratchpad — which the tree lists ahead of every
+     * workspace — holds it, and re-deriving "the" dock from the surface finds panel 1. The press
+     * comes from panel 2 and must hide panel 2; restoring panel 1 instead is the defect.
+     */
+    @Test
+    fun `a press from the second of two panels acts on that panel`() = swayTest {
+        store.put(InvokeFlags.whenAnimated, WhenAnimated.TOGGLE_HIDE)
+        val app1 = openSurface("aw-app1")
+        val first = assertIs<Awakened.Animated>(awakening.invoke(app1))
+        assertIs<Awakened.Hidden>(freshAwakening().invoke(app1))
+
+        store.put(InvokeFlags.whenAnimated, WhenAnimated.SECOND_DOCK)
+        val second = assertIs<Awakened.Animated>(freshAwakening().invoke(app1))
+        command("[con_id=${second.dock.dockId.raw}] focus")
+
+        store.put(InvokeFlags.whenAnimated, WhenAnimated.TOGGLE_HIDE)
+        val hidden = assertIs<Awakened.Hidden>(freshAwakening().invoke())
+        assertEquals(second.dock.dockId, hidden.dock.dockId, "the pressed panel is the one hidden")
+        assertEquals(app1, hidden.surface)
+        assertEquals(
+            listOf(app1.raw),
+            assertNotNull(tabHolding(app1)).windows.map { it.id },
+            "and neither panel is in the tab: ${first.dock.dockId.raw} stayed hidden",
+        )
+    }
+
+    /**
      * `invoke.from_panel=REFUSE` is the behaviour before #196, kept reachable.
      */
     @Test
@@ -712,7 +742,7 @@ class AwakeningSwayTest {
         prepareResidue = { registry.prepareResidue(it) },
         reapOrphans = wm::reapOrphans,
         dockFor = wm::dockFor,
-        focusedDockOwner = wm::focusedDockOwner,
+        focusedDock = wm::focusedDock,
     )
 
     /** What the next hotkey press is: a new process, holding no dock table. */
