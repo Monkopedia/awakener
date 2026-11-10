@@ -32,6 +32,7 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -1554,6 +1555,44 @@ class SwayBindingTest {
     }
 
     /**
+     * #197: the surface closes while `attach` is waiting for its dock to map.
+     *
+     * Nothing before the success return looked at the surface again — the mark, the move and the
+     * resize are all addressed to the dock, and the tab title and focus steps are silent about a
+     * surface that has gone — so the attach reported a dock "beside" a window that no longer
+     * existed, and the panel stood as a tab of its own, marked for a dead surface, until somebody
+     * reaped it. The surface is killed from this test's own connection, which is not queued
+     * behind the attach lock, exactly as a user's close is not.
+     */
+    @Test
+    fun `a surface that closes while its dock is mapping fails the attach`() = swayTest {
+        // So the only thing that can take the dock down is the attach's own unwind: a collector
+        // sweep landing after the mark would make the assertion below pass against the defect.
+        store.put(WmFlags.sweepOnClose, false)
+        val app = openSurface("aw-app1")
+        openSurface("aw-app2")
+
+        coroutineScope {
+            launch {
+                delay(SURFACE_CLOSES_AFTER_MS)
+                command("[con_id=${app.raw}] kill")
+            }
+            assertFailsWith<IllegalStateException>(
+                "an attach whose surface closed under it must not report a dock beside it",
+            ) {
+                wm.attach(app, slowDock("aw-dock"), AgentId("agent-1"))
+            }
+        }
+
+        assertNull(wm.tree().find(app.raw), "the surface really did close")
+        assertEquals(
+            emptyList(),
+            wm.tree().windows.filter { it.appId == "aw-dock" }.map { it.id },
+            "and the dock it spawned went with the unwind rather than standing as an orphan",
+        )
+    }
+
+    /**
      * The other half of #6: a failure *after* the dock has mapped owes the window as well as the
      * container. The binding is what fails here, and it is the realistic case rather than a
      * contrived one — it is recorded outside the tree section because the minter shells out to
@@ -2421,6 +2460,13 @@ class SwayBindingTest {
          * dock is certainly still absent when the deadline expires.
          */
         const val SLOW_DOCK_SLEEP_S = 2
+
+        /**
+         * When the #197 test closes the surface: after the attach has certainly exec'd its dock —
+         * a handful of round trips — and a whole second before [SLOW_DOCK_SLEEP_S] maps it, so the
+         * close lands inside the map wait on every run.
+         */
+        const val SURFACE_CLOSES_AFTER_MS = 1_000L
 
         /**
          * How long the #96 interloper waits before mapping: after the attach has certainly taken

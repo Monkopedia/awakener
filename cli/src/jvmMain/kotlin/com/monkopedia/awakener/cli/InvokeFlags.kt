@@ -223,6 +223,31 @@ object InvokeFlags {
     )
 
     /**
+     * Whether a press sweeps for orphaned panels before it does anything else (#197).
+     *
+     * The press is the only moment `awakener-invoke` runs, so it is the only moment a panel
+     * whose window has closed can be noticed. That is what keeps this inside "no unattended
+     * autonomous action": the sweep is part of something the user just did.
+     */
+    val sweepFirst = Flags.boolean(
+        "invoke.sweep_first",
+        true,
+        "Sweep for panels whose window has closed at the start of every `awakener-invoke " +
+            "invoke`, before the press resolves its surface. awakener-invoke is one-shot, so " +
+            "nothing is running when a window closes and its panel stays standing until " +
+            "something sweeps; with this on, that something is the next press anywhere, at the " +
+            "cost of one tree read when nothing is orphaned. A press made from inside such a " +
+            "panel takes it down and stops, rather than acting on whatever window focus falls " +
+            "to. A sweep that fails is reported on stderr and the press carries on — so an " +
+            "orphan whose client will not close (a frozen panel) costs every press the detach " +
+            "wait, about 5.5s measured, until it is killed by hand; turn this off to stop " +
+            "paying it. What is " +
+            "swept, and whether anything is, follows wm.dock.orphan_policy and " +
+            "wm.dock.reap_evidence exactly as `awakener-invoke reap` does. Off leaves orphans " +
+            "for `reap` alone.",
+    )
+
+    /**
      * How much a press that raised prints, and where.
      *
      * See [FailureDetail] for why both answers are wanted by the same person at different

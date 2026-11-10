@@ -45,9 +45,11 @@ import kotlinx.coroutines.runBlocking
  *
  * That shape is also what keeps this on the right side of the design brief's "no unattended
  * autonomous action". This process does nothing until a key is pressed, and then it exits. There
- * is no timer, no loop and no schedule — the only thing that runs between presses is the repair
- * collector `:wm` starts, which is parked on a socket read and reacts to the user closing a
- * window.
+ * is no timer, no loop and no schedule, and **nothing runs between presses** — including the
+ * repair collector `:wm` starts, which lives only as long as the press that started it and holds
+ * no lock the press is not already holding (#197). So a window closed between presses leaves its
+ * panel standing until the next one: `invoke` sweeps for such panels before it acts, under
+ * `invoke.sweep_first`, and `reap` does nothing else.
  */
 object AwakenerInvokeCli {
     /**
@@ -371,28 +373,36 @@ private fun awaken(args: Array<String>, store: FileConfigStore): Int {
 
     return try {
         runBlocking {
+            // Named, rather than built inline, so the `finally` below can report what its
+            // sweep-first left undone.
+            val awakening = Awakening(
+                wm = wm,
+                registry = bindings,
+                bus = spanreed,
+                store = store,
+                prepareResidue = { bindings.prepareResidue(it) },
+                reapOrphans = wm::reapOrphans,
+                dockFor = wm::dockFor,
+                focusedDock = wm::focusedDock,
+                // The snapshot, not the store. One press is one operation, and the
+                // catalog reads `connector.*` — a reload landing between "which
+                // connector" and "where does it write" would materialise half of one
+                // deployment's answer and half of another's.
+                connectors = FileConnectorCatalog(store.config.value),
+            )
             try {
                 AwakenerInvokeCli.run(
                     args,
-                    Awakening(
-                        wm = wm,
-                        registry = bindings,
-                        bus = spanreed,
-                        store = store,
-                        prepareResidue = { bindings.prepareResidue(it) },
-                        reapOrphans = wm::reapOrphans,
-                        dockFor = wm::dockFor,
-                        focusedDock = wm::focusedDock,
-                        // The snapshot, not the store. One press is one operation, and the
-                        // catalog reads `connector.*` — a reload landing between "which
-                        // connector" and "where does it write" would materialise half of one
-                        // deployment's answer and half of another's.
-                        connectors = FileConnectorCatalog(store.config.value),
-                    ),
+                    awakening,
                     ::println,
                     exclusive = { press -> wm.exclusively(press) },
                 )
             } finally {
+                // A panel `invoke.sweep_first` could not take down. The press went ahead without
+                // it, so this is a warning and not the exit status.
+                awakening.sweepFailure?.let {
+                    System.err.println("warning: sweeping for orphaned panels: ${it.message}")
+                }
                 // Where the model was written, when that is somewhere another local user could
                 // have got to first. In the `finally` because a press that then failed for some
                 // other reason has still created the directory, and on stderr for the reason

@@ -426,6 +426,57 @@ class AwakeningSwayTest {
     }
 
     /**
+     * #197: the next press anywhere takes down a panel whose surface has gone.
+     *
+     * The collector that sweeps on a close only lives as long as one press, so on the shipped
+     * desktop nothing is listening when the user closes a window and its panel stays standing.
+     * The press is the one moment awakener runs; [freshAwakening] is what makes it the shipped
+     * shape — a new process, with no dock table and no collector that saw the close.
+     */
+    @Test
+    fun `a press takes down a panel whose surface has gone`() = swayTest {
+        val app1 = openSurface("aw-app1")
+        val app2 = openSurface("aw-app2")
+        command("[con_id=${app1.raw}] focus")
+        val first = assertIs<Awakened.Animated>(awakening.invoke())
+
+        command("[con_id=${app1.raw}] kill")
+        awaitGone(app1)
+        assertEquals(listOf(first.dock.dockId.raw), docks(), "the orphan really is standing")
+
+        command("[con_id=${app2.raw}] focus")
+        val second = assertIs<Awakened.Animated>(freshAwakening().invoke())
+
+        assertEquals(app2, second.surface, "the press still acts on the window it was made in")
+        assertEquals(
+            listOf(second.dock.dockId.raw),
+            docks(),
+            "and the orphan went first, so the only panel left is the one this press stood up",
+        )
+    }
+
+    /** Off is the previous behaviour: a press leaves the orphan for `reap`. */
+    @Test
+    fun `sweeping on every press is switchable off`() = swayTest {
+        store.put(InvokeFlags.sweepFirst, false)
+        val app1 = openSurface("aw-app1")
+        val app2 = openSurface("aw-app2")
+        command("[con_id=${app1.raw}] focus")
+        val first = assertIs<Awakened.Animated>(awakening.invoke())
+        command("[con_id=${app1.raw}] kill")
+        awaitGone(app1)
+
+        command("[con_id=${app2.raw}] focus")
+        val second = assertIs<Awakened.Animated>(freshAwakening().invoke())
+
+        assertEquals(
+            listOf(first.dock.dockId.raw, second.dock.dockId.raw).sorted(),
+            docks(),
+            "with the flag off the orphan stands beside the new panel",
+        )
+    }
+
+    /**
      * **The product loop for Jason's toggle, end to end**: press, press, press.
      *
      * The assertion that carries it is that the *same process* is behind the panel all three
@@ -665,6 +716,43 @@ class AwakeningSwayTest {
     }
 
     /**
+     * #197 against #220: a press from a live panel still acts on that panel when the same press
+     * sweeps an orphan in another tab.
+     *
+     * Composition, not ordering. Sweeping this orphan does not move focus off the pressed panel,
+     * so this passes with the sweep moved above the aim as well — measured. The ordering is held
+     * by `a press from a panel whose surface has gone is refused`, where the swept panel *is* the
+     * focused one and a press aimed after the sweep acts on the wrong window.
+     */
+    @Test
+    fun `a press from a panel acts on that panel while its sweep takes an orphan down`() =
+        swayTest {
+            store.put(InvokeFlags.whenAnimated, WhenAnimated.TOGGLE_HIDE)
+            // Off while the orphan is made, so the press that stands the live panel up does not
+            // sweep it before the press under test can.
+            store.put(InvokeFlags.sweepFirst, false)
+            val app1 = openSurface("aw-app1")
+            val app2 = openSurface("aw-app2")
+            val orphan = assertIs<Awakened.Animated>(awakening.invoke(app2))
+            val live = assertIs<Awakened.Animated>(freshAwakening().invoke(app1))
+            command("[con_id=${app2.raw}] kill")
+            awaitGone(app2)
+            command("[con_id=${live.dock.dockId.raw}] focus")
+            assertEquals(
+                listOf(orphan.dock.dockId.raw, live.dock.dockId.raw).sorted(),
+                docks(),
+                "both panels stand before the press",
+            )
+
+            store.put(InvokeFlags.sweepFirst, true)
+            val hidden = assertIs<Awakened.Hidden>(freshAwakening().invoke())
+
+            assertEquals(live.dock.dockId, hidden.dock.dockId, "the pressed panel is hidden")
+            assertEquals(app1, hidden.surface)
+            assertEquals(listOf(live.dock.dockId.raw), docks(), "and the orphan was swept")
+        }
+
+    /**
      * `invoke.from_panel=REFUSE` is the behaviour before #196, kept reachable.
      */
     @Test
@@ -702,7 +790,14 @@ class AwakeningSwayTest {
         )
     }
 
-    /** A marked panel whose surface has gone names a surface this press cannot act on. */
+    /**
+     * A marked panel whose surface has gone names a surface this press cannot act on.
+     *
+     * It is also the likeliest press of all to be made from an orphan, since the panel fills the
+     * tab. Under `invoke.sweep_first` the press takes it down (#197) — and must still be refused:
+     * the sweep moves focus to whatever sway picks next, and a press aimed after it would stand a
+     * panel up on a window the user never pressed in.
+     */
     @Test
     fun `a press from a panel whose surface has gone is refused`() = swayTest {
         val app1 = openSurface("aw-app1")
@@ -714,6 +809,7 @@ class AwakeningSwayTest {
 
         assertIs<Awakened.NoSurface>(freshAwakening().invoke())
         assertEquals(1, minted, "nothing beyond the first panel's own mint")
+        assertEquals(emptyList(), docks(), "the orphan is gone, and no panel replaced it")
     }
 
     // -- helpers ------------------------------------------------------------------------

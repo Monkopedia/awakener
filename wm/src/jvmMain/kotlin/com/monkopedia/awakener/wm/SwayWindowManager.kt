@@ -1693,6 +1693,14 @@ class SwayWindowManager(
                         focus(surface)
                     }
                     if (cfg[WmFlags.restoreFocusAfterAttach]) settleFocus(surface, dockId)
+                    // Last, because nothing above it would notice (#197). The mark, move and
+                    // resize address the dock, and the title and focus steps are silent about a
+                    // surface that has gone — so a surface closed during the map wait used to come
+                    // back as a dock "beside" it, standing as a tab of its own until a reap. A
+                    // close landing after this read is the orphan the next sweep exists for.
+                    check(tree().find(surface.raw) != null) {
+                        "surface ${surface.raw} closed while its dock was being stood up"
+                    }
                     dockId to session
                 } catch (failure: Throwable) {
                     unwindAttach(surface, spawned, pending, container, failure)
