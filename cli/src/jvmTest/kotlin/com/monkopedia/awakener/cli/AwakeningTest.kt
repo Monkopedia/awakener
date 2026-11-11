@@ -126,7 +126,9 @@ class AwakeningTest {
     @Test
     fun `a second invocation recalls the same agent rather than minting`() = runTest {
         val first = assertIs<Awakened.Animated>(awakening.invoke())
-        bus.live = emptyList() // the panel died; the surface is a Drab to the bus, not to us
+        // The panel died: gone from the tree, and the surface is a Drab to the bus, not to us.
+        wm.standing.clear()
+        bus.live = emptyList()
 
         val second = assertIs<Awakened.Animated>(awakening.invoke())
         assertEquals(first.binding.agentId, second.binding.agentId)
@@ -263,6 +265,85 @@ class AwakeningTest {
         val second = assertIs<Awakened.AlreadyAnimated>(awakening.invoke())
         assertEquals(first.binding.agentId, second.binding.agentId)
         assertTrue(wm.attaches.isEmpty(), "no second attach")
+    }
+
+    /**
+     * #198. The panel's agent reaches the bus only once its `claude` has started, so a second
+     * press in between — a double tap, key repeat — was told "not animated" and stood a second
+     * session under one identity. The bus here never hears of the agent at all, which is the
+     * limit of that window and also the panel whose program never registers.
+     */
+    @Test
+    fun `REUSE declines a second panel before the agent has registered`() = runTest {
+        val first = assertIs<Awakened.Animated>(awakening.invoke())
+        bus.live = emptyList()
+
+        val second = assertIs<Awakened.AlreadyAnimated>(awakening.invoke())
+        assertEquals(first.binding.agentId, second.binding.agentId)
+        assertEquals(1, wm.attaches.size, "one panel, one session")
+    }
+
+    /** A hidden panel's `claude` is still running behind it, so it is the same evidence. */
+    @Test
+    fun `a hidden panel is evidence too`() = runTest {
+        assertIs<Awakened.Animated>(awakening.invoke())
+        wm.standing.getValue(app.id).hide()
+
+        assertIs<Awakened.AlreadyAnimated>(awakening.invoke())
+        assertEquals(1, wm.attaches.size)
+    }
+
+    /**
+     * Under app-level keying two windows of one application share a Lifeless, so a panel beside
+     * the other window is the second session the bus would report once it registered.
+     */
+    @Test
+    fun `a panel beside another window of the same Lifeless is evidence too`() = runTest {
+        val sibling = Surface(SurfaceId(7), "editor", "other.md", pid = 102, focused = false)
+        wm.surfaces = listOf(app, other, sibling)
+        val first = assertIs<Awakened.Animated>(awakening.invoke())
+        assertEquals(key(app), key(sibling), "the premise: both windows key to one Lifeless")
+
+        val second = assertIs<Awakened.AlreadyAnimated>(awakening.invoke(sibling.id))
+        assertEquals(first.binding.agentId, second.binding.agentId)
+        assertEquals(1, wm.attaches.size)
+
+        // A panel for a different Lifeless is not evidence about this one.
+        assertIs<Awakened.Animated>(awakening.invoke(other.id))
+    }
+
+    /**
+     * What REUSE asked the bus for in the first place, unchanged: an agent animated with no panel
+     * here — the Chrome manager's case, or a panel closed by hand whose `claude` lives on — is
+     * still declined, and with neither a panel nor a live session the press stands one up.
+     */
+    @Test
+    fun `REUSE still asks the bus when no panel stands`() = runTest {
+        val first = assertIs<Awakened.Animated>(awakening.invoke())
+        wm.standing.clear()
+        bus.live = listOf(LiveAgent(first.binding.agentId, first.binding.spanreedName))
+        assertIs<Awakened.AlreadyAnimated>(awakening.invoke())
+
+        bus.live = emptyList()
+        assertIs<Awakened.Animated>(awakening.invoke())
+        assertEquals(2, wm.attaches.size)
+    }
+
+    /** The behaviour before #198, kept reachable: the bus alone. */
+    @Test
+    fun `reuse_evidence=BUS stands a second panel before the agent registers`() = runTest {
+        config.put(InvokeFlags.reuseEvidence, ReuseEvidence.BUS)
+        assertIs<Awakened.Animated>(awakening.invoke())
+        bus.live = emptyList()
+
+        assertIs<Awakened.Animated>(awakening.invoke())
+        assertEquals(2, wm.attaches.size)
+    }
+
+    @Test
+    fun `BUS_OR_PANEL is the default`() = runTest {
+        assertEquals(ReuseEvidence.BUS_OR_PANEL, InvokeFlags.reuseEvidence.default)
+        assertEquals(ReuseEvidence.BUS_OR_PANEL, config.config.value[InvokeFlags.reuseEvidence])
     }
 
     /**

@@ -281,6 +281,8 @@ class AwakeningConnectorTest {
         assertTrue(residue.resolve("NOTES.md").toFile().exists())
         residue.toFile().deleteRecursively()
         residue.createDirectories()
+        // Closed, so the second press stands a panel rather than finding this one (#198).
+        wm.standing.clear()
         assertEquals(0, run("invoke", "--connector=chromium").first)
         assertTrue(residue.resolve("NOTES.md").toFile().exists())
     }

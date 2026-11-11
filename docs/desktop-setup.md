@@ -605,6 +605,12 @@ list` returned `[]`. `REUSE` then asks the bus "is this surface's agent animated
 every single time, and correctly concludes it should stand a dock. **The reuse logic was right
 throughout; the bus had nothing in it.**
 
+Since #198 the symptom is quieter. Under the default `invoke.reuse_evidence=BUS_OR_PANEL`,
+`REUSE` also counts a panel already standing for the agent, so a second press beside a dock
+whose `claude` never registered now declines instead of stacking another. The broken `PATH`
+is still there, and the agent is still missing from the bus. Only the doubled dock that used
+to point at it is gone, so the confirmation below is now the only way to see it.
+
 **Fix:** the `PATH` prepend in the dock launcher (§5), plus the absolute
 `registry.agent.spanreed_command` (§4). They fix two different processes and you need both.
 
