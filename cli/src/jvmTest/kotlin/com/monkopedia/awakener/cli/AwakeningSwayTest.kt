@@ -345,6 +345,10 @@ class AwakeningSwayTest {
      */
     @Test
     fun `a second window of one app recalls its agent without minting`() = swayTest {
+        // Two panels for one Lifeless is SECOND_DOCK's by name. Under REUSE the first window's
+        // panel is now evidence the agent is up (#198), so the second press would decline —
+        // correctly, and not the property this test is about.
+        store.put(InvokeFlags.whenAnimated, WhenAnimated.SECOND_DOCK)
         openSurface("aw-app1")
         val first = assertIs<Awakened.Animated>(awakening.invoke())
         assertEquals(1, minted)

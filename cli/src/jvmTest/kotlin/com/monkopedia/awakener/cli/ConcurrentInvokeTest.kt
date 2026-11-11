@@ -48,8 +48,9 @@ import kotlinx.serialization.json.JsonPrimitive
  * The docks carry their agent's name as their title (`foot -T`), which is what makes "running the
  * wrong agent" assertable without an agent.
  *
- * Nothing here touches the real bus: ids are derived, the spanreed command names nothing, and
- * neither `when_animated` value used asks spanreed who is animated.
+ * Nothing here touches the real bus: ids are derived, and the spanreed command either names
+ * nothing or — for the REUSE cases, the one value that asks who is animated — is a stand-in
+ * script in the test's own directory that lists an agent once its dock has "registered".
  *
  * Exercised against **sway 1.12**, headless wlroots backend, `workspace_layout tabbed`.
  */
@@ -209,7 +210,136 @@ class ConcurrentInvokeTest {
         }
     }
 
+    /**
+     * #198 through the shipped entry point: two presses in quick succession under the default
+     * REUSE, beside a dock whose agent registers [REGISTER_DELAY_S] after it starts — longer than
+     * the 0.5–0.8s a real `claude` took on kaladin, so the second press lands in the gap rather
+     * than near its edge.
+     *
+     * Each round closes the dock by hand afterwards, because that is #171's remaining leak: two
+     * docks on one surface closed by hand compounded single-child splits 2 → 6 over five rounds.
+     * With one dock per round the count must stay at the one a hand-closed visible dock leaves.
+     */
+    @Test
+    fun `two quick presses under REUSE stand one panel before the agent registers`() = runBlocking {
+        val config = lateRegisteringConfig()
+        val app = openSurface("aw-app")
+        for (round in 1..ROUNDS) {
+            val first = finish(start(config, app))
+            val second = finish(start(config, app))
+            listOf(first, second).forEach {
+                assertEquals(0, it.exitCode, "round $round: ${it.stdout}${it.stderr}")
+            }
+            assertTrue(DOCK_LINE.containsMatchIn(first.stdout), "round $round: ${first.stdout}")
+            assertTrue(!live.exists(), "round $round: the second press beat registration")
+            assertTrue(
+                "already animated" in second.stdout,
+                "round $round: the second press declined: ${second.stdout}",
+            )
+            assertEquals(1, docks(wm.tree()).size, "round $round: one panel; ${describe()}")
+
+            closeDocksByHand()
+            assertTrue(singleChildSplits() <= 1, "after round $round: ${describe()}")
+        }
+    }
+
+    /**
+     * The same two presses released together. The attach lock serialises them, and the one that
+     * waited is past the lock with the panel already marked but its agent not yet registered.
+     */
+    @Test
+    fun `two presses released together under REUSE stand one panel`() = runBlocking {
+        val config = lateRegisteringConfig()
+        val app = openSurface("aw-app")
+        val runs = pressTogether(config, List(2) { app })
+        runs.forEach { assertEquals(0, it.exitCode, it.stdout + it.stderr) }
+        assertTrue(!live.exists(), "both presses beat registration")
+        assertEquals(1, runs.count { DOCK_LINE.containsMatchIn(it.stdout) }, runs.map { it.stdout }.toString())
+        assertEquals(1, runs.count { "already animated" in it.stdout }, runs.map { it.stdout }.toString())
+        assertEquals(1, docks(wm.tree()).size, describe())
+        closeDocksByHand()
+    }
+
+    /**
+     * The control the test above needs: the same presses under `invoke.reuse_evidence=BUS` stand
+     * two panels. Without it, "one panel" could be a dock that never came up a second time for
+     * some other reason.
+     */
+    @Test
+    fun `under reuse_evidence=BUS the second quick press stands a second panel`() = runBlocking {
+        val config = lateRegisteringConfig(mapOf("invoke.reuse_evidence" to "BUS"))
+        val app = openSurface("aw-app")
+        val first = finish(start(config, app))
+        val second = finish(start(config, app))
+        assertTrue(!live.exists(), "the second press beat registration")
+        listOf(first, second).forEach {
+            assertTrue(DOCK_LINE.containsMatchIn(it.stdout), it.stdout + it.stderr)
+        }
+        assertEquals(2, docks(wm.tree()).size, describe())
+        closeDocksByHand()
+    }
+
+    /** Once the agent has registered, the bus answers as it always did. */
+    @Test
+    fun `a press after registration is declined by the bus as before`() = runBlocking {
+        val config = lateRegisteringConfig(mapOf("invoke.reuse_evidence" to "BUS"))
+        val app = openSurface("aw-app")
+        assertTrue(DOCK_LINE.containsMatchIn(finish(start(config, app)).stdout))
+        assertNotNull(
+            withTimeoutOrNull(STARTUP_MS) { while (!live.exists()) delay(POLL_MS) },
+            "the dock never registered",
+        )
+        val again = finish(start(config, app))
+        assertTrue("already animated" in again.stdout, again.stdout + again.stderr)
+        assertEquals(1, docks(wm.tree()).size, describe())
+        closeDocksByHand()
+    }
+
     // -- helpers ------------------------------------------------------------------------
+
+    /** Where the stand-in bus reads its listing from; the dock writes it once "registered". */
+    private val live: Path get() = home.resolve("live.json")
+
+    /**
+     * A REUSE config whose bus is a stand-in: `list` prints `[]` until the dock's program has
+     * written [live], [REGISTER_DELAY_S] after it starts — the shape of a `claude` whose
+     * `SessionStart` hook has not run yet.
+     */
+    private fun lateRegisteringConfig(extra: Map<String, String> = emptyMap()): Path {
+        val bus = home.resolve("spanreed-standin")
+        bus.writeText(
+            """
+            #!/bin/sh
+            [ "${'$'}1" = list ] || exit 64
+            if [ -f '$live' ]; then cat '$live'; else echo '[]'; fi
+            """.trimIndent() + "\n",
+        )
+        val dock = home.resolve("late-register")
+        dock.writeText(
+            """
+            #!/bin/sh
+            sleep $REGISTER_DELAY_S
+            printf '[{"agent_id":"%s"}]\n' "${'$'}1" > '$live'
+            exec sleep 3600
+            """.trimIndent() + "\n",
+        )
+        listOf(bus, dock).forEach { it.toFile().setExecutable(true) }
+        return config(
+            whenAnimated = "REUSE",
+            dockCommand = "foot -a {app_id} -T {agent_name} -- $dock {agent_id}",
+            extra = mapOf("registry.agent.spanreed_command" to bus.absolutePathString()) + extra,
+        )
+    }
+
+    /** Closes every dock the way a user does — `kill` on the window, not a detach. */
+    private suspend fun closeDocksByHand() {
+        command("[app_id=\"$DOCK_APP_ID\"] kill")
+        withTimeoutOrNull(STARTUP_MS) { while (docks(wm.tree()).isNotEmpty()) delay(POLL_MS) }
+        assertEquals(0, docks(wm.tree()).size, "docks closed by hand: ${describe()}")
+        // spanreed drops an agent whose process has gone; the stand-in has to be told.
+        live.toFile().delete()
+    }
+
 
     private class Run(val exitCode: Int, val stdout: String, val stderr: String)
 
@@ -350,6 +480,8 @@ class ConcurrentInvokeTest {
         const val DOCK_APP_ID = "aw-dock"
         const val ROUNDS = 3
         const val BURST = 4
+        /** Longer than the 0.5–0.8s measured for a real `claude` on kaladin; see the #198 test. */
+        const val REGISTER_DELAY_S = 4
         const val POLL_MS = 20L
         const val STARTUP_MS = 20_000L
         const val PRESS_MS = 60_000L

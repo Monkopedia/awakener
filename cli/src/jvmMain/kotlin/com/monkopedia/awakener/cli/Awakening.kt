@@ -147,13 +147,20 @@ data class BoundFurniture(val key: SurfaceKey, val binding: Binding, val forgott
  * identity is cheap and stable, and re-minting on every failed attempt is what would actually
  * hurt, since it strands the residue path the previous identity was going to write to.
  *
- * ### Why "already animated" is asked of the bus and not of the tree
+ * ### Why "already animated" is asked of the bus, and of the tree first
  *
- * The tree could answer "is there a panel beside this window", and that is a worse question. It
- * is compositor-specific, it needs a fourth call, and it stops being the same question the
- * moment a panel and an agent are not one-to-one — which is exactly what the design brief's
- * Chrome manager does, mirroring several origins behind one window. "Is this Lifeless animated"
- * is the question that survives that, and `spanreed list` already answers it.
+ * "Is there a panel beside this window" alone is the worse question. It stops being the same
+ * question the moment a panel and an agent are not one-to-one — which is exactly what the design
+ * brief's Chrome manager does, mirroring several origins behind one window. "Is this Lifeless
+ * animated" is the question that survives that, and `spanreed list` answers it.
+ *
+ * But the bus answers it late (#198). A panel's agent registers only once its `claude` has
+ * started — measured on kaladin at 0.5–0.8s after the panel maps, and not at all while `claude`
+ * waits at a folder-trust prompt — so a press in between was told "no" and stood a second panel
+ * under the same identity. A standing panel is therefore taken as proof *as well*, under
+ * `invoke.reuse_evidence=BUS_OR_PANEL`: it is the one fact that is true from the instant
+ * `attach` returns. It is asked through [dockFor], the lambda `TOGGLE_HIDE` already needed, so
+ * this still holds a [WindowManager] and no compositor, and still puts no fourth call on it.
  */
 class Awakening(
     private val wm: WindowManager,
@@ -331,8 +338,17 @@ class Awakening(
         // window creation as a trigger would mint hundreds a day for tabs glanced at and closed.
         val binding = registry.bind(key)
 
-        if (cfg[InvokeFlags.whenAnimated] == WhenAnimated.REUSE && bus.isAnimated(binding.agent)) {
-            return Awakened.AlreadyAnimated(surface.id, key, binding)
+        if (cfg[InvokeFlags.whenAnimated] == WhenAnimated.REUSE) {
+            // The tree first, because it is the evidence that cannot lag (#198): a panel is
+            // marked before `attach` returns, while its agent reaches the bus only once its
+            // `claude` has started — and a press between the two would otherwise be told "not
+            // animated" and stand a second session under this identity. The bus is still asked
+            // when no panel stands, which is the case it exists for.
+            val panel = cfg[InvokeFlags.reuseEvidence] == ReuseEvidence.BUS_OR_PANEL &&
+                (pressedFrom != null || panelStandsFor(binding, surfaces, cfg))
+            if (panel || bus.isAnimated(binding.agent)) {
+                return Awakened.AlreadyAnimated(surface.id, key, binding)
+            }
         }
 
         val residue = registry.residueLocation(key)
@@ -380,6 +396,26 @@ class Awakening(
             binding.agent,
         )
         return Awakened.Animated(surface.id, key, binding, dock, wasADrab, applied)
+    }
+
+    /**
+     * Whether a panel — visible or hidden — already stands for [binding]'s agent beside any of
+     * [surfaces], under `invoke.reuse_evidence=BUS_OR_PANEL` (#198).
+     *
+     * Every surface that resolves to the same agent, not only the one pressed: under app-level
+     * keying two windows of one application share a Lifeless, and a panel beside the other window
+     * is the same second-session hazard the bus would report once that panel's agent registered.
+     * Asked through [dockFor], so this learns nothing about the compositor; under its default of
+     * "no dock" this finds nothing and REUSE asks the bus alone, as it did before.
+     */
+    private suspend fun panelStandsFor(
+        binding: Binding,
+        surfaces: List<Surface>,
+        cfg: Config,
+    ): Boolean = surfaces.any { other ->
+        !cfg.isFurniture(other.appId) &&
+            registry.resolve(SurfaceKey.of(other.descriptor, cfg))?.agentId == binding.agentId &&
+            dockFor(other.id) != null
     }
 
     /**

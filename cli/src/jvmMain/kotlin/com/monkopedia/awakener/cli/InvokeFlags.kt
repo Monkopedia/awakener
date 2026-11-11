@@ -14,6 +14,9 @@ enum class WhenAnimated {
      * fresh process holds no [com.monkopedia.awakener.wm.DockHandle], and the handle is what
      * knows which node the dock is. Raising is what a daemon adds. Declining to duplicate is the
      * whole of what this value promises.
+     *
+     * "Already up" is a panel standing for this Lifeless or the bus listing it, by default — see
+     * [ReuseEvidence] for why the bus alone answers too late to keep that promise.
      */
     REUSE,
 
@@ -39,8 +42,8 @@ enum class WhenAnimated {
      * destroys a live session and everything the agent has accumulated about that surface, which
      * is the one thing this project exists to keep.
      *
-     * **It asks the tree, where [REUSE] asks the bus, and that is a real difference rather than an
-     * inconsistency.** `Awakening`'s note gives the reason [REUSE] is right to ask the bus: "is
+     * **It asks only the tree, where [REUSE] also asks the bus, and that is a real difference
+     * rather than an inconsistency.** `Awakening`'s note gives the reason [REUSE] is right to ask the bus: "is
      * this Lifeless animated" survives a Chrome manager mirroring several origins behind one
      * window, where "is there a panel beside this window" does not. But the question *this* value
      * has to answer is literally about a panel — there is nothing to hide or restore otherwise —
@@ -52,6 +55,39 @@ enum class WhenAnimated {
      * existed.
      */
     TOGGLE_HIDE,
+}
+
+/**
+ * What [WhenAnimated.REUSE] takes as proof that a Lifeless is already animated (#198).
+ *
+ * The bus is the question that survives a panel and an agent stopping being one-to-one — see
+ * `Awakening`'s note — but it is not an immediate one. A dock's `claude` registers on spanreed
+ * only once its `SessionStart` hook has run: measured on kaladin at 0.5–0.8s after the panel
+ * maps in a trusted folder, and **never** in a folder `claude` has not been told to trust, where
+ * it sits at the trust prompt until somebody answers it. A press in that window is told "not
+ * animated" and stands a second panel under the same identity, which is the outcome [REUSE]
+ * exists to prevent and the shape that leaves #171's two docks to be closed by hand.
+ */
+enum class ReuseEvidence {
+    /**
+     * Declined if a panel for this Lifeless already stands beside any surface — visible or hidden
+     * — **or** the bus says it is animated.
+     *
+     * The tree knows the instant `attach` returns, because the panel's mark is what `attach`
+     * finishes by writing, so a second press cannot overtake it. The bus is still asked when no
+     * panel stands, so an agent animated with no panel here (the Chrome manager's mirrored
+     * origins, a panel the user closed whose `claude` lives on) is still declined exactly as
+     * before. What changes is only the case the bus cannot see yet: a panel standing whose agent
+     * has not registered — or never will.
+     */
+    BUS_OR_PANEL,
+
+    /**
+     * The bus alone — the behaviour before #198. A press before the panel's agent registers stands
+     * a second panel under the same identity, and so does every press beside a panel whose
+     * program never registers at all.
+     */
+    BUS,
 }
 
 /** What a press does when focus is in an agent panel rather than in a surface (#196). */
@@ -203,13 +239,26 @@ object InvokeFlags {
     val whenAnimated = Flags.enum(
         "invoke.when_animated",
         WhenAnimated.REUSE,
-        "What a hotkey does when this surface's Lifeless already has a live session on the bus. " +
+        "What a hotkey does when this surface's Lifeless is already up — a panel standing for " +
+            "it, or a live session on the bus (see invoke.reuse_evidence). " +
             "Reusing declines to stand a second panel, since two sessions under one identity " +
             "accumulate two divergent residues; SECOND_DOCK stands another anyway, which is the " +
             "deliberate second view onto one agent; TOGGLE_HIDE makes the key a toggle — a press " +
             "with the panel standing hides it, leaving the agent running, and the next press " +
-            "brings it back where it was. TOGGLE_HIDE asks the tree rather than the bus, because " +
-            "hiding is a question about a panel and only the tree knows whether there is one.",
+            "brings it back where it was. TOGGLE_HIDE asks only the tree, because hiding is a " +
+            "question about a panel and only the tree knows whether there is one.",
+    )
+
+    val reuseEvidence = Flags.enum(
+        "invoke.reuse_evidence",
+        ReuseEvidence.BUS_OR_PANEL,
+        "What invoke.when_animated=REUSE takes as proof the Lifeless is already up. " +
+            "BUS_OR_PANEL declines if a panel for this agent already stands beside any surface, " +
+            "visible or hidden, or else if the bus lists it — so a press before the panel's " +
+            "claude has registered on spanreed (0.5-0.8s measured in a trusted folder, never in " +
+            "an untrusted one until its trust prompt is answered) cannot stand a second panel " +
+            "under the same identity. BUS asks spanreed alone, the behaviour before #198. " +
+            "Read only under REUSE.",
     )
 
     val fromPanel = Flags.enum(
