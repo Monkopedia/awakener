@@ -116,7 +116,8 @@ claude plugin list
 
 Three flags. Everything else is left at its default, which is deliberate — a default is the
 behaviour that would otherwise have been hard-coded, so an unconfigured awakener is already
-correct. Set and read back:
+correct. (Whether `$mod+a` toggles is a fourth, optional choice — see the end of this section.)
+Set and read back:
 
 ```sh
 awakener-config set registry.agent.spanreed_command "$HOME/.local/bin/spanreed"
@@ -206,6 +207,70 @@ directory.
 **Changing this moves nothing already written.** Residue left behind under a previous layout is
 reported on the next prepare rather than silently orphaned, so a switch is visible rather than a
 quiet loss of the model.
+
+### What `$mod+a` does when the surface already has a panel
+
+This is `invoke.when_animated`, and **the default is not a toggle**. `awakener-config list` on an
+unconfigured install, with each flag's description line trimmed to `…`:
+
+```
+  invoke.when_animated                   REUSE
+                                         …
+                                         one of: REUSE, SECOND_DOCK, TOGGLE_HIDE
+  invoke.reuse_evidence                  BUS_OR_PANEL
+                                         …
+                                         one of: BUS_OR_PANEL, BUS
+```
+
+- **`REUSE`** (the default) stands no second panel when this surface's agent is already up. What
+  counts as "up" is `invoke.reuse_evidence`. Under its default, `BUS_OR_PANEL`, a panel already
+  standing for the agent counts, visible or hidden. So does a press made from inside that panel.
+  Only when there is no panel does the press ask the bus whether the agent has a live session. `BUS`
+  asks the bus alone, which is how it worked before #198: a panel whose `claude` has not
+  registered yet, or never will, does not count, and the press stands another. Either way `REUSE`
+  hides nothing and closes nothing; the panel stays where it is.
+- **`SECOND_DOCK`** stands another panel anyway, bound to the same agent — a deliberate second
+  view onto one Lifeless.
+- **`TOGGLE_HIDE`** makes the key a toggle. A press with the panel standing hides it, and the next
+  press brings it back where it was. **`claude` keeps running throughout** — hiding moves the
+  panel to sway's scratchpad, it does not close the terminal. This value asks the *tree* whether
+  there is a panel rather than asking the bus, so a panel you closed by hand is simply stood up
+  again on the next press.
+
+To get the toggle:
+
+```sh
+awakener-config set invoke.when_animated TOGGLE_HIDE
+```
+
+**A press from inside the panel acts on that panel.** `invoke.from_panel` defaults to
+`OWNING_SURFACE`: with focus in a panel, a press acts on the surface the panel is docked beside,
+exactly as a press from that surface would — so under `TOGGLE_HIDE` it hides the panel you are
+typing in. `REFUSE` declines every press made from a panel instead (*"nothing to awaken: the
+focused window is not a bindable surface"*).
+
+**Presses queue rather than collide.** Each press is its own process, and it holds a
+cross-process lock on the compositor for the whole press, so a second press that arrives while
+the first is still running waits for it and then sees the first one's panel. It waits up to
+`wm.attach.lock_wait_ms`, default `60000`, and then fails having changed nothing. `0` makes a
+second press give up at once instead of queueing.
+
+**What a hide does to the tab.** `wm.dock.flatten_on_hide`, default `true`, collapses the split
+`attach` made once the panel is hidden. When the surface shares its workspace with other tabs, a
+window you open in that tab while the panel is hidden gets a tab of its own instead of landing
+beside the surface, and the show splits the surface again. **When the surface is the only window on
+its workspace, the hide also removes the workspace's `tabbed` container** (Refs #226, a known
+defect, not the intended behaviour). A window opened while the panel is hidden then lands beside
+the surface rather than in a new tab, and the restored panel and surface no longer sit inside a
+tab. `wm.dock.flatten_on_hide=false` keeps the tab in that case. The cost is that the split stays
+standing while the panel is hidden, so a window opened then lands inside it. A window opened
+while the panel was *visible* is a different case — sway puts it inside the split, beside the
+surface or the panel. `wm.dock.evict_on_hide`, default `false`, moves such windows out of the split
+on the next hide; it is off because it moves windows you may have put there on purpose.
+
+**A hidden panel is in sway's scratchpad**, so stock sway's `$mod+minus` (`scratchpad show`)
+brings it up as a floating window. That is harmless: the next `$mod+a` on its surface counts it as
+standing and hides it again.
 
 ---
 
@@ -365,8 +430,11 @@ with `namespace swaynag`, and the one with it did not.
 ### `--no-repeat` on `$mod+a`
 
 **Load-bearing.** Without it, *holding* the key repeats at the keyboard repeat rate, and every
-repeat stands another dock and another `claude`. This is not theoretical; it happened during
-bring-up. Every awakener binding above uses it.
+repeat is a separate press. During bring-up, every repeat stood another dock and another `claude`
+(that was gotcha 1 as well as the repeat). Presses now queue behind one another on the attach lock
+(§4) rather than colliding, but each one still acts: under `TOGGLE_HIDE` a held key flickers the
+panel hidden and back, under `SECOND_DOCK` it stands a dock per repeat. Every awakener binding
+above uses it.
 
 ### `workspace_layout tabbed`
 
@@ -582,8 +650,10 @@ a GDM fact, not a Wayland one.
 This is the single most confusing failure in the whole setup, because the symptom names the
 wrong subsystem.
 
-**Symptom:** every press of `$mod+a` stands *another* dock on the same surface, even though
-`invoke.when_animated` is `REUSE` and should decline the second one.
+**Symptom, as it was during bring-up:** every press of `$mod+a` stood *another* dock on the
+same surface, even though `invoke.when_animated` was `REUSE` and should have declined the second
+one. Under today's defaults that symptom is gone and only a quieter one is left (see below); you
+still get the doubled dock with `invoke.reuse_evidence=BUS`.
 
 **Chain:** GDM starts sway with a `PATH` of roughly `/usr/local/bin:/usr/bin:...` — no
 `~/.local/bin`. Read it from the running process, not from a shell you opened yourself, which
@@ -609,7 +679,9 @@ Since #198 the symptom is quieter. Under the default `invoke.reuse_evidence=BUS_
 `REUSE` also counts a panel already standing for the agent, so a second press beside a dock
 whose `claude` never registered now declines instead of stacking another. The broken `PATH`
 is still there, and the agent is still missing from the bus. Only the doubled dock that used
-to point at it is gone, so the confirmation below is now the only way to see it.
+to point at it is gone, so the confirmation below is now the only way to see it. The same holds
+under `invoke.when_animated=TOGGLE_HIDE`, which asks the tree and never the bus (§4): the toggle
+works and the agent is silently absent from `spanreed list`.
 
 **Fix:** the `PATH` prepend in the dock launcher (§5), plus the absolute
 `registry.agent.spanreed_command` (§4). They fix two different processes and you need both.
@@ -756,14 +828,17 @@ is unbuilt. `registry.key.window_identity` offers `APP_ID_AND_TITLE` and `APP_ID
 want windows separated today, with the trade-offs those names imply: titles churn, pids are
 recycled.
 
-**`$mod+a` is not a toggle.** `invoke.when_animated` is either `REUSE` (decline a second panel
-when this surface's agent is already live on the bus) or `SECOND_DOCK` (stand another anyway,
-as a deliberate second view onto one agent). Neither hides or closes a dock. Close a dock the
-way you close its terminal. A dock whose surface has gone stays standing until the next
-`$mod+a` press anywhere, which sweeps for such docks before it acts (`invoke.sweep_first`), or
-until `awakener-invoke reap` (`$mod+p`).
+**`$mod+a` is a toggle only if you ask for one.** The default `invoke.when_animated=REUSE`
+declines a second panel and leaves the first as it is; `TOGGLE_HIDE` hides and restores it with
+the agent still running (§4). No value *closes* a dock: close one the way you close its terminal.
+A dock whose surface has gone stays standing until the next `$mod+a` press anywhere, which sweeps
+for such docks before it acts (`invoke.sweep_first`, default `true`), or until
+`awakener-invoke reap` (`$mod+p`).
 
-**There is no daemon.** A press cannot raise a panel that is already standing.
+**There is no daemon.** Nothing runs between presses, so nothing reacts to a window closing until
+the next press. Each press finds the panel it needs by the panel's mark in sway's tree. That is
+how `TOGGLE_HIDE` restores a panel and how `REUSE` sees one standing. Under `REUSE` the press
+declines and leaves the standing panel as it is: it does not raise or focus it.
 
 ---
 
@@ -798,6 +873,34 @@ Everything in this guide that is stated as a measurement was run. Where and how:
   [the Chromium probe](findings/2026-08-23-chromium-app-mode-app-id.md), against Chromium
   151.0.7922.173 under `--ozone-platform=wayland` on a headless sway 1.12.
 - `./gradlew build` with `AWAKENER_REQUIRE_SWAY=1 AWAKENER_REQUIRE_SPANREED=1`.
+- The `$mod+a` behaviour of §4 and §10, at `4869c14` (2026-11-10): the shipped
+  `awakener-invoke` from `:cli:installDist` against a headless sway 1.12 started with this guide's
+  `workspace_layout tabbed` and `default_border none`, a `foot` surface, and a dock command running
+  `foot` with no `claude` in it, so nothing was on the bus. The defaults quoted are
+  `awakener-config list` against an empty config. Under `TOGGLE_HIDE`: three presses from the
+  surface stood, hid (panel in `__i3_scratch`) and restored the same dock `con_id` with the same
+  dock pid alive throughout; a press with focus in the panel hid it, under the default
+  `invoke.from_panel`, and the same press under `REFUSE` was refused with exit 1; two presses
+  started together each acted in turn, one hiding and one restoring; `scratchpad show` floated a
+  hidden panel and the next press hid it again; closing the surface left its dock standing until
+  the next press, made from an `awakener-list` window, took it down — and that press was itself
+  refused as awakener's own window. Re-run at `4c69008` (2026-11-12), same setup:
+  - Under the default `REUSE` / `BUS_OR_PANEL`, with the bus empty, a second press from the
+    surface, a press from inside the panel, and a press with the panel hidden each printed
+    `… is already animated; standing no second panel` and left one dock. Under
+    `invoke.reuse_evidence=BUS`, presses with the panel hidden and then visible each stood another
+    dock (three in all).
+  - Under `TOGGLE_HIDE`, with a surface alone on its workspace, the shape went
+    `{tabbed:[surface]}` → stood `{tabbed:[{splith:[surface, dock]}]}` → hid `[surface]` (no
+    `tabbed`). A window opened then went side by side with it, and the show left it outside any tab.
+  - With a second tab beside the surface, the window opened while hidden became a third tab and
+    the show re-split only the surface's tab.
+  - With `wm.dock.flatten_on_hide=false`, the single-window case kept its `tabbed` container, and a
+    window opened while hidden landed inside the split.
+
+  **Read from the flag descriptions, not exercised here:** `wm.dock.evict_on_hide`, a queued
+  press timing out at `wm.attach.lock_wait_ms`, and `REUSE` declining against an agent that is on
+  the bus with no panel standing.
 
 **On adolin (read-only inspection of a live, in-use desktop):**
 
