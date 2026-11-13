@@ -50,10 +50,13 @@ class InMemoryBindingStore(
      * was disposed of; a store that claimed `Archived` here would be describing a file it
      * never wrote.
      */
-    override suspend fun unbind(key: SurfaceKey): Forget = lock.withLock {
-        val had = key in state.value
-        state.value = state.value - key
-        Forget(had, ResidueOutcome.Kept(residueLocation(key)))
+    override suspend fun unbind(key: SurfaceKey, sessionEnding: Boolean): Forget {
+        val had = lock.withLock {
+            state.value[key].also { state.value = state.value - key }
+        }
+        val residue = ResidueOutcome.Kept(residueLocation(key))
+        if (had == null) return Forget(false, residue)
+        return Forget(true, residue, identities.retire(had.identity, sessionEnding))
     }
 
     override fun residueLocation(key: SurfaceKey): String =

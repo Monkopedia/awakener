@@ -45,6 +45,18 @@ fun interface AgentIdentities {
      * path does not agree with what the flags alone would say.
      */
     suspend fun mint(key: SurfaceKey, residuePath: String): AgentIdentity
+
+    /**
+     * Takes down whatever [mint] put anywhere other than the bindings file, once the binding
+     * that [identity] belongs to has been forgotten (#188).
+     *
+     * A default rather than an abstract member because only a minter that publishes anything has
+     * anything to retire: [DerivedAgentIdentities] writes nowhere, and neither does a test's.
+     *
+     * @param sessionEnding see [BindingStore.unbind].
+     */
+    suspend fun retire(identity: AgentIdentity, sessionEnding: Boolean = false): BusOutcome =
+        BusOutcome.NotAsked
 }
 
 /**

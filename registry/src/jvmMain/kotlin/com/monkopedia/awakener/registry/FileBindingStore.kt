@@ -254,17 +254,18 @@ class FileBindingStore(
      * filesystem work on a different directory, and holding the bindings lock across it would
      * serialise every other surface behind one rename.
      */
-    override suspend fun unbind(key: SurfaceKey): Forget {
-        val wasBound = mutate {
-            val had = key in state.value
-            if (had) write(state.value - key)
-            had
+    override suspend fun unbind(key: SurfaceKey, sessionEnding: Boolean): Forget {
+        val forgotten = mutate {
+            state.value[key]?.also { write(state.value - key) }
         }
         // A surface that was not bound has had nothing forgotten, so there is nothing for the
         // flag to act on. Disposing anyway would make `forget` a residue command that also
         // happens to unbind, and would let a mistyped key delete a model under DELETE.
-        if (!wasBound) return Forget(false, ResidueOutcome.Kept(residueLocation(key)))
-        return Forget(true, disposeResidue(key))
+        if (forgotten == null) return Forget(false, ResidueOutcome.Kept(residueLocation(key)))
+        // Last, after the residue, and outside the lock for the reason the disposal is: it is a
+        // subprocess against state this store does not own.
+        val residue = disposeResidue(key)
+        return Forget(true, residue, identities.retire(forgotten.identity, sessionEnding))
     }
 
     /**

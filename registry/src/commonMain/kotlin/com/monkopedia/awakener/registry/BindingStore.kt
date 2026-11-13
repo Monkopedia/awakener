@@ -48,7 +48,53 @@ internal data class BindingsFile(
  * nothing is disposed of either: `forget` is about the binding, so a surface that has none has
  * had nothing taken away and its residue is not the command's to touch.
  */
-data class Forget(val wasBound: Boolean, val residue: ResidueOutcome)
+data class Forget(
+    val wasBound: Boolean,
+    val residue: ResidueOutcome,
+    /** What became of the forgotten agent's entry on the bus; see [AgentIdentities.retire]. */
+    val bus: BusOutcome = BusOutcome.NotAsked,
+)
+
+/**
+ * What became of a forgotten Lifeless's entry in spanreed's registry.
+ *
+ * Its own type rather than a boolean for the reason [ResidueOutcome] is one: "nothing was there",
+ * "it was removed" and "it was left because a session is running under it" are three different
+ * states of a shared roster every agent on the host reads, and a forget has to say which.
+ */
+sealed interface BusOutcome {
+    /**
+     * The bus was not consulted: [RegistryFlags.deregisterOnForget] is off, there is no bus, or
+     * the spanreed command could not be run at all — on a host with none, nothing can have been
+     * registered, and a warning on every forget would be one nobody can act on.
+     */
+    data object NotAsked : BusOutcome
+
+    /** Nothing was listed under [agent], stale or live. */
+    data class Absent(val agent: AgentId) : BusOutcome
+
+    /** [agent]'s entry was deregistered, and a read of the roster afterwards no longer has it. */
+    data class Deregistered(val agent: AgentId) : BusOutcome
+
+    /**
+     * A live session is running under [agent], so its entry was left alone: removing it would
+     * take a running agent off the roster its peers address it through. The session's own
+     * lifecycle owns that entry, not awakener.
+     */
+    data class StillLive(val agent: AgentId) : BusOutcome
+
+    /** The deregistration was asked for and the entry may still be there. */
+    data class Failed(val agent: AgentId, val reason: String) : BusOutcome
+}
+
+/** One line saying what the roster now holds for the forgotten agent, or null if not asked. */
+fun BusOutcome.describe(): String? = when (this) {
+    BusOutcome.NotAsked -> null
+    is BusOutcome.Absent -> "nothing registered under ${agent.raw}"
+    is BusOutcome.Deregistered -> "deregistered ${agent.raw}"
+    is BusOutcome.StillLive -> "left ${agent.raw} registered: a live session is running under it"
+    is BusOutcome.Failed -> "${agent.raw} MAY STILL BE REGISTERED — $reason"
+}
 
 /**
  * What became of a forgotten surface's residue.
@@ -234,8 +280,13 @@ interface BindingStore {
      * different pieces of state, and the second can fail — a read-only state directory — with
      * the first already durable. A caller told only "forgotten" would then believe a model had
      * been archived, or deleted, that is still sitting on disk.
+     *
+     * @param sessionEnding the caller has just ended the session running under this binding's
+     * agent — a dock teardown — so a bus entry that still reads live is given
+     * [RegistryFlags.endingSessionWaitMs] to stop being live before it is judged to be a running
+     * session's. See [AgentIdentities.retire].
      */
-    suspend fun unbind(key: SurfaceKey): Forget
+    suspend fun unbind(key: SurfaceKey, sessionEnding: Boolean = false): Forget
 
     /**
      * Where this surface's distilled residue lives.

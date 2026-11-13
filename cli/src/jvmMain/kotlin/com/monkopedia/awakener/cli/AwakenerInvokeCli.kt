@@ -200,6 +200,7 @@ object AwakenerInvokeCli {
             else -> {
                 out("forgot $key, one of awakener's own windows (invoke.furniture.bound=FORGET)")
                 out("  residue  ${forget.residue.describe()}")
+                forget.bus.describe()?.let { out("  spanreed $it") }
             }
         }
     }
