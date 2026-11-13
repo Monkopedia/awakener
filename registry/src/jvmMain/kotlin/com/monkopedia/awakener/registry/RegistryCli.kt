@@ -76,6 +76,9 @@ object RegistryCli {
                     // need to know is whether the written-down version of that idea is still
                     // there — which under RegistryFlags.forgetResidue it may or may not be.
                     out("  residue  ${forget.residue.describe()}")
+                    // Not part of the exit code: a stale entry left on the bus is a leak worth
+                    // saying out loud, not a model the user asked to be rid of still on disk.
+                    forget.bus.describe()?.let { out("  spanreed $it") }
                     if (forget.residue is ResidueOutcome.Failed) 3 else 0
                 }
             }

@@ -610,9 +610,27 @@ object RegistryFlags {
     val registerOnMint = Flags.boolean(
         "registry.agent.register_on_mint",
         false,
-        "Mirror a freshly minted Lifeless into spanreed's registry at bind time. Off by " +
-            "default because spanreed keys liveness on pid + pid_start, so an entry registered " +
-            "under awakener's own pid would claim a liveness the Lifeless does not yet have.",
+        "Mirror a freshly minted Lifeless into spanreed's registry at bind time, under " +
+            "awakener's own pid. Off by default because spanreed keys liveness on pid + " +
+            "pid_start, so the entry is stale the moment the minting process exits and never " +
+            "says whether the Lifeless is running. Its lifetime is the binding's, not the " +
+            "panel's: registry.agent.deregister_on_forget removes it when the binding is " +
+            "forgotten (awakener-registry forget, invoke.furniture.bound=FORGET, " +
+            "wm.dock.forget_binding_on_detach). Reaping an orphaned panel keeps the binding, and " +
+            "so keeps the entry — the next press recalls the binding and does not mint again, so " +
+            "an entry removed then would never come back.",
+    )
+
+    val deregisterOnForget = Flags.boolean(
+        "registry.agent.deregister_on_forget",
+        true,
+        "When a binding is forgotten, deregister its agent id from spanreed and read the " +
+            "roster back to confirm it is gone — the teardown for " +
+            "registry.agent.register_on_mint (#188). Applies whatever register_on_mint says now, since the entry outlives a flip " +
+            "of it. An entry spanreed reports live is left alone: that is a running session's, " +
+            "and its peers address it through that entry. Costs one `spanreed list` per forget " +
+            "when nothing is registered. Off is the behaviour before #188: forget never touches " +
+            "the bus.",
     )
 
     val rebindPolicy = Flags.enum(

@@ -5,6 +5,7 @@ import com.monkopedia.awakener.config.ConfigStore
 import java.io.IOException
 import java.io.InputStream
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -362,11 +363,12 @@ class ProcessCommandRunner(
  * The published set is whatever `spanreed --help` prints; as of 2026-08-07 that is `agent-id`,
  * `inbox-path`, `register`, `deregister`, `list`, `send`, `recv`, `inbox-watch`,
  * `session-start`, `name`, `focus`, `status`, `status-tracking`, `activity-log`, `log`,
- * `conjoin`. **awakener calls two of them**: `agent-id`, from [spanreedId], which is the primary
- * mint path, and `list`, from [liveAgents]; [register] adds a third under
- * [RegistryFlags.registerOnMint], which is off by default. Naming what awakener uses rather than
- * an abridged copy of the contract is the point — the abridged copy this replaces omitted
- * `agent-id`, so an audit of "does awakener stay inside the published contract?" read the list
+ * `conjoin`. **awakener calls two of them on the hotkey path**: `agent-id`, from [spanreedId],
+ * which is the primary mint path, and `list`, from [liveAgents]; [register] adds a third under
+ * [RegistryFlags.registerOnMint], which is off by default, and [retire] calls `list` and
+ * `deregister` when a binding is forgotten. Naming what awakener uses rather than an abridged
+ * copy of the contract is the point — the abridged copy this replaces omitted `agent-id`, so an
+ * audit of "does awakener stay inside the published contract?" read the list
  * beside the code and found this class's main call unaccounted for (#109).
  */
 class SpanreedCli(
@@ -566,8 +568,8 @@ class SpanreedCli(
      * authority on where its own residue lives — a store opened over an explicit path would
      * otherwise be registered against a location nothing ever writes to. Note the known gap:
      * spanreed keys liveness on `pid` + `pid_start`, so an entry registered under awakener's pid
-     * outlives the Lifeless it describes — which is why [RegistryFlags.registerOnMint] defaults
-     * off.
+     * says nothing about whether the Lifeless is running — which is why
+     * [RegistryFlags.registerOnMint] defaults off. [retire] is its teardown.
      */
     suspend fun register(identity: AgentIdentity, residuePath: String): ProcessResult = exec(
         config,
@@ -580,6 +582,67 @@ class SpanreedCli(
         ),
         identity.spanreedName,
     )
+
+    /**
+     * Deregisters [identity] from spanreed once its binding has been forgotten, and confirms by
+     * reading the roster back (#188).
+     *
+     * The readback is the outcome, not the exit code: `spanreed deregister` exits 0 and prints
+     * nothing whether or not the id was listed (measured against spanreed-bus 0.3.2 on
+     * 2026-11-12, against a scratch `SPANREED_STATE_ROOT`). So the roster is read with
+     * `--include-stale` before and after — before, so an id that was never registered costs one
+     * read and reports [BusOutcome.Absent]; after, so [BusOutcome.Deregistered] means the entry
+     * is not there.
+     *
+     * A live entry is left alone. Liveness is spanreed's to judge — [liveAgents] asks it — and a
+     * live entry under this id is a panel's session that registered itself, which its peers are
+     * addressing right now. The narrow race, a session starting between that read and the
+     * deregister, costs that session its entry until it next registers.
+     *
+     * Never raises: by now the binding is durably gone, and a forget that half happened must not
+     * read as one that did not happen at all — the rule [ResidueOutcome.Failed] follows.
+     */
+    override suspend fun retire(identity: AgentIdentity): BusOutcome {
+        val cfg = config
+        if (!cfg[RegistryFlags.deregisterOnForget]) return BusOutcome.NotAsked
+        val agent = identity.id
+        return try {
+            if (agent.raw !in roster(cfg)) return BusOutcome.Absent(agent)
+            if (isAnimated(agent)) return BusOutcome.StillLive(agent)
+            val result = exec(cfg, listOf("deregister", agent.raw), identity.spanreedName)
+            when {
+                !result.succeeded ->
+                    BusOutcome.Failed(agent, "spanreed deregister failed — ${result.problem}")
+                agent.raw in roster(cfg) ->
+                    BusOutcome.Failed(agent, "still listed after deregister")
+                else -> BusOutcome.Deregistered(agent)
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            BusOutcome.Failed(agent, failure.message ?: failure.toString())
+        }
+    }
+
+    /**
+     * Every id in spanreed's registry, stale entries included — what [retire] must find gone.
+     *
+     * JSON only, unlike [liveAgents]: `--include-stale` reports the entries a 0.0.8 `list` would
+     * also omit, and a spanreed that refuses `--json` fails here and is reported as such.
+     */
+    private suspend fun roster(cfg: Config): Set<String> {
+        val result = withContext(Dispatchers.IO) {
+            runner.run(
+                listOf(cfg[RegistryFlags.spanreedCommand], "list", "--include-stale", "--json"),
+                mapOf("SPANREED_AGENT_NAME" to null),
+            )
+        }
+        check(result.succeeded) { "spanreed list --include-stale failed — ${result.problem}" }
+        val listing = result.stdout.ifBlank {
+            error("spanreed list --include-stale printed nothing")
+        }
+        return busJson.decodeFromString<List<LiveAgent>>(listing).map { it.agentId }.toSet()
+    }
 
     private suspend fun exec(
         config: Config,
