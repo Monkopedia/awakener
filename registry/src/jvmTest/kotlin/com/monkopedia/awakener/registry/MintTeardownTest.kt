@@ -7,7 +7,6 @@ import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
-import kotlin.test.assertIs
 import kotlin.test.assertTrue
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.Json
@@ -51,14 +50,18 @@ class MintTeardownTest {
             .jsonArray.map { it.jsonObject.getValue("agent_id").jsonPrimitive.content }.toSet()
 
     /**
-     * The pid of a process that has exited — what the one-shot `awakener-invoke` that minted an
-     * entry is by the time anybody forgets it.
+     * A process standing in for the one-shot `awakener-invoke` that mints: alive while it
+     * registers, so spanreed records its `pid_start`, and ended with [exited] before the forget.
+     * Ending it after the register rather than registering a pid that is already dead is what
+     * keeps a reused pid from reading live — spanreed matches the start time, and a dead pid has
+     * none recorded.
      */
-    private fun deadPid(): Long {
-        val child = ProcessBuilder("true").start()
-        child.waitFor()
-        return child.pid()
-    }
+    private val minter = mutableListOf<Process>()
+
+    private fun minterPid(): Long =
+        ProcessBuilder("sleep", "60").start().also { minter += it }.pid()
+
+    private fun exited() = minter.forEach { it.destroy(); it.waitFor() }
 
     private fun cli(pid: Long) = SpanreedCli(
         configStore = config,
@@ -76,6 +79,7 @@ class MintTeardownTest {
 
     @AfterTest
     fun cleanUp() {
+        exited()
         try {
             if (SpanreedHarness.available()) {
                 minted.forEach { spanreed("deregister", it) }
@@ -93,11 +97,12 @@ class MintTeardownTest {
     @Test
     fun `forgetting a binding removes the entry its mint registered`() = runTest {
         SpanreedHarness.assumeAvailable()
-        val store = store(cli(deadPid()))
+        val store = store(cli(minterPid()))
         val key = SurfaceKey.Window("awakener-test-188")
         val binding = store.bind(key)
         minted += binding.agentId
         assertTrue(binding.agentId in roster(), "the mint registered nothing to tear down")
+        exited()
 
         val forget = store.unbind(key)
 
@@ -106,15 +111,76 @@ class MintTeardownTest {
         assertEquals(BusOutcome.Deregistered(binding.agent), forget.bus)
     }
 
+    /**
+     * A forget made by a dock teardown: the panel's session registered over the mint's entry
+     * with its own pid, and is still exiting when the forget reads the roster — its window left
+     * the tree first. Measured: a real `claude` exits 283-529ms after its foot window is gone.
+     */
+    @Test
+    fun `an ending session is waited out, then deregistered`() = runTest {
+        SpanreedHarness.assumeAvailable()
+        val store = store(cli(minterPid()))
+        val key = SurfaceKey.Window("awakener-test-188", "ending")
+        val binding = store.bind(key)
+        minted += binding.agentId
+        exited()
+        val session = ProcessBuilder("sleep", "60").start()
+        try {
+            spanreed(
+                "register", "--agent-id", binding.agentId, "--name", binding.spanreedName,
+                "--working-dir", "/tmp", "--pid", session.pid().toString(),
+            )
+            Thread {
+                Thread.sleep(700)
+                session.destroy()
+            }.start()
+
+            val forget = store.unbind(key, sessionEnding = true)
+
+            assertEquals(BusOutcome.Deregistered(binding.agent), forget.bus)
+            assertFalse(binding.agentId in roster(), "the ended session's entry outlived it")
+        } finally {
+            session.destroy()
+        }
+    }
+
+    /** The same moment with no wait: the leak the flag exists to close, pinned at its 0. */
+    @Test
+    fun `with no wait an ending session's entry is left`() = runTest {
+        SpanreedHarness.assumeAvailable()
+        config.put(RegistryFlags.endingSessionWaitMs, 0L)
+        val store = store(cli(minterPid()))
+        val key = SurfaceKey.Window("awakener-test-188", "nowait")
+        val binding = store.bind(key)
+        minted += binding.agentId
+        exited()
+        val session = ProcessBuilder("sleep", "60").start()
+        try {
+            spanreed(
+                "register", "--agent-id", binding.agentId, "--name", binding.spanreedName,
+                "--working-dir", "/tmp", "--pid", session.pid().toString(),
+            )
+
+            assertEquals(
+                BusOutcome.StillLive(binding.agent),
+                store.unbind(key, sessionEnding = true).bus,
+            )
+            assertTrue(binding.agentId in roster())
+        } finally {
+            session.destroy()
+        }
+    }
+
     /** The command a user actually runs, and what it tells them about the roster. */
     @Test
     fun `awakener-registry forget deregisters and says so`() = runTest {
         SpanreedHarness.assumeAvailable()
-        val store = store(cli(deadPid()))
+        val store = store(cli(minterPid()))
         val key = SurfaceKey.Window("awakener-test-188", "cli")
         val binding = store.bind(key)
         minted += binding.agentId
         val out = mutableListOf<String>()
+        exited()
 
         assertEquals(0, RegistryCli.run(arrayOf("forget", key.canonical), store, out::add))
 
@@ -143,10 +209,11 @@ class MintTeardownTest {
     fun `with the teardown off a forget leaves the bus alone`() = runTest {
         SpanreedHarness.assumeAvailable()
         config.put(RegistryFlags.deregisterOnForget, false)
-        val store = store(cli(deadPid()))
+        val store = store(cli(minterPid()))
         val key = SurfaceKey.Window("awakener-test-188", "off")
         val binding = store.bind(key)
         minted += binding.agentId
+        exited()
 
         assertEquals(BusOutcome.NotAsked, store.unbind(key).bus)
         assertTrue(binding.agentId in roster(), "the pre-#188 behaviour: the entry outlives it")
@@ -157,7 +224,7 @@ class MintTeardownTest {
     fun `forgetting an agent that was never registered reports it absent`() = runTest {
         SpanreedHarness.assumeAvailable()
         config.put(RegistryFlags.registerOnMint, false)
-        val store = store(cli(deadPid()))
+        val store = store(cli(minterPid()))
         val key = SurfaceKey.Window("awakener-test-188", "never")
         val binding = store.bind(key)
         minted += binding.agentId
@@ -165,19 +232,22 @@ class MintTeardownTest {
         assertEquals(BusOutcome.Absent(binding.agent), store.unbind(key).bus)
     }
 
-    /** The binding is durably gone by then, so a bus that cannot be reached must not undo that. */
+    /**
+     * A host with no spanreed: nothing can have been registered there, so the forget says
+     * nothing about the bus rather than warning on every run — and the binding still goes.
+     */
     @Test
-    fun `a spanreed that cannot run fails the teardown, not the forget`() = runTest {
+    fun `a spanreed that cannot run is not asked, and the forget still happens`() = runTest {
         val identity = AgentIdentity(AgentId("agent-awakener-test-188-unrunnable"), "x")
         val store = FileBindingStore(
             config,
             object : AgentIdentities {
                 override suspend fun mint(key: SurfaceKey, residuePath: String) = identity
-                override suspend fun retire(identity: AgentIdentity) =
+                override suspend fun retire(identity: AgentIdentity, sessionEnding: Boolean) =
                     SpanreedCli(
                         InMemoryConfigStore()
                             .put(RegistryFlags.spanreedCommand, "awakener-no-such-spanreed"),
-                    ).retire(identity)
+                    ).retire(identity, sessionEnding)
             },
             environment = emptyMap(),
             path = dir.resolve("bindings.json"),
@@ -188,7 +258,7 @@ class MintTeardownTest {
         val forget = store.unbind(key)
 
         assertTrue(forget.wasBound)
-        assertEquals(identity.id, assertIs<BusOutcome.Failed>(forget.bus).agent)
+        assertEquals(BusOutcome.NotAsked, forget.bus)
         assertEquals(null, store.resolve(key))
     }
 }

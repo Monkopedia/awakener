@@ -7,11 +7,15 @@ import java.io.InputStream
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 
 /** spanreed's registry is its shape to grow, so an unknown field must never fail a hotkey. */
 private val busJson = Json { ignoreUnknownKeys = true }
+
+/** How often [SpanreedCli.retire] re-asks whether an ending session has left the bus. */
+private const val LIVE_POLL_MS = 100L
 
 /**
  * The outcome of running a subprocess.
@@ -599,21 +603,32 @@ class SpanreedCli(
      * addressing right now. The narrow race, a session starting between that read and the
      * deregister, costs that session its entry until it next registers.
      *
+     * Under [sessionEnding] the caller has just killed that session, and a killed session is
+     * still live for a moment: its window leaves the tree before its process exits. So liveness
+     * is re-asked for up to [RegistryFlags.endingSessionWaitMs] before the entry is called a
+     * running session's — without it the detach path read live, left the entry, and the entry
+     * went stale with the binding already gone (#188's leak, on the one automatic path).
+     *
+     * A spanreed that cannot be run at all is [BusOutcome.NotAsked]: nothing on such a host can
+     * have been registered.
+     *
      * Never raises: by now the binding is durably gone, and a forget that half happened must not
      * read as one that did not happen at all — the rule [ResidueOutcome.Failed] follows.
      */
-    override suspend fun retire(identity: AgentIdentity): BusOutcome {
+    override suspend fun retire(identity: AgentIdentity, sessionEnding: Boolean): BusOutcome {
         val cfg = config
         if (!cfg[RegistryFlags.deregisterOnForget]) return BusOutcome.NotAsked
         val agent = identity.id
         return try {
-            if (agent.raw !in roster(cfg)) return BusOutcome.Absent(agent)
-            if (isAnimated(agent)) return BusOutcome.StillLive(agent)
+            val listed = roster(cfg) ?: return BusOutcome.NotAsked
+            if (agent.raw !in listed) return BusOutcome.Absent(agent)
+            val wait = if (sessionEnding) cfg[RegistryFlags.endingSessionWaitMs] else 0L
+            if (stillLiveAfter(agent, wait)) return BusOutcome.StillLive(agent)
             val result = exec(cfg, listOf("deregister", agent.raw), identity.spanreedName)
             when {
                 !result.succeeded ->
                     BusOutcome.Failed(agent, "spanreed deregister failed — ${result.problem}")
-                agent.raw in roster(cfg) ->
+                agent.raw in roster(cfg).orEmpty() ->
                     BusOutcome.Failed(agent, "still listed after deregister")
                 else -> BusOutcome.Deregistered(agent)
             }
@@ -625,18 +640,35 @@ class SpanreedCli(
     }
 
     /**
-     * Every id in spanreed's registry, stale entries included — what [retire] must find gone.
+     * Whether [agent] still reads live after waiting up to [waitMs] for it not to.
+     *
+     * Asked at once, and then again every [LIVE_POLL_MS] until the deadline. Bounded by the
+     * caller's budget alone: the operation it sits in is one teardown, not a watch.
+     */
+    private suspend fun stillLiveAfter(agent: AgentId, waitMs: Long): Boolean {
+        val deadline = System.nanoTime() + waitMs * 1_000_000
+        while (isAnimated(agent)) {
+            if (System.nanoTime() >= deadline) return true
+            delay(LIVE_POLL_MS)
+        }
+        return false
+    }
+
+    /**
+     * Every id in spanreed's registry, stale entries included — what [retire] must find gone —
+     * or null when the spanreed command could not be run at all.
      *
      * JSON only, unlike [liveAgents]: `--include-stale` reports the entries a 0.0.8 `list` would
      * also omit, and a spanreed that refuses `--json` fails here and is reported as such.
      */
-    private suspend fun roster(cfg: Config): Set<String> {
+    private suspend fun roster(cfg: Config): Set<String>? {
         val result = withContext(Dispatchers.IO) {
             runner.run(
                 listOf(cfg[RegistryFlags.spanreedCommand], "list", "--include-stale", "--json"),
                 mapOf("SPANREED_AGENT_NAME" to null),
             )
         }
+        if (result.notRunnable) return null
         check(result.succeeded) { "spanreed list --include-stale failed — ${result.problem}" }
         val listing = result.stdout.ifBlank {
             error("spanreed list --include-stale printed nothing")

@@ -4,6 +4,7 @@ import com.monkopedia.awakener.config.Config
 import com.monkopedia.awakener.config.ConfigStore
 import com.monkopedia.awakener.registry.AgentId
 import com.monkopedia.awakener.registry.BindingStore
+import com.monkopedia.awakener.registry.BusOutcome
 import com.monkopedia.awakener.registry.ResidueOutcome
 import com.monkopedia.awakener.registry.SurfaceKey
 import com.monkopedia.awakener.registry.asIdentity
@@ -238,6 +239,16 @@ class SwayWindowManager(
 
     val residueDisposalFailures: StateFlow<List<ResidueDisposalFailure>> =
         residueFailures.asStateFlow()
+
+    private val busLeft = MutableStateFlow<List<BusEntryLeft>>(emptyList())
+
+    /**
+     * Bus entries a detach's forget left on spanreed's roster, oldest first — the bus half of
+     * the `Forget` that [residueDisposalFailures] is the residue half of, kept as a list for the
+     * same reasons. Reported, never raised: unlike a residue the user asked to have deleted, an
+     * entry left behind is a leak to see, not a failed key press.
+     */
+    val busEntriesLeft: StateFlow<List<BusEntryLeft>> = busLeft.asStateFlow()
 
     /**
      * The session every command in this manager rides on, acquiring one if there is none.
@@ -2359,12 +2370,19 @@ class SwayWindowManager(
             // Outside the section for the same reason as attach's bind: the registry is not the
             // tree, and the dock is already down by here.
             if (cfg[WmFlags.forgetBindingOnDetach] && key != null) {
-                // The `Forget` is read rather than discarded. Its residue half exists so that a
-                // disposal which failed with the binding already durably gone can be told from one
-                // that worked; dropping it made that failure loud through
+                // The `Forget` is read rather than discarded, both halves. Its residue half exists
+                // so that a disposal which failed with the binding already durably gone can be told
+                // from one that worked; dropping it made that failure loud through
                 // `awakener-registry forget`, which exits 3 for it, and silent here — on the path
                 // nobody invokes deliberately, since a dock closing takes it automatically (#115).
-                val forget = registry.unbind(key)
+                // Its bus half is the same shape: an entry left on the roster here has no binding
+                // left to be forgotten by (#188). `sessionEnding`, because the kill above ended the
+                // panel's session and its process outlives its window by a few hundred ms.
+                val forget = registry.unbind(key, sessionEnding = true)
+                val bus = forget.bus
+                if (bus is BusOutcome.StillLive || bus is BusOutcome.Failed) {
+                    busLeft.update { it + BusEntryLeft(surface, dockId, key.canonical, bus) }
+                }
                 (forget.residue as? ResidueOutcome.Failed)?.let { failed ->
                     reportResidueFailure(key, failed, cfg)
                 }

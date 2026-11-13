@@ -1,6 +1,7 @@
 package com.monkopedia.awakener.wm
 
 import com.monkopedia.awakener.registry.AgentId
+import com.monkopedia.awakener.registry.BusOutcome
 import com.monkopedia.awakener.registry.SurfaceDescriptor
 import kotlinx.coroutines.flow.Flow
 
@@ -229,6 +230,27 @@ data class ResidueDisposalFailure(
     override fun toString(): String =
         "the binding for $key was forgotten when dock ${dock.raw} beside surface ${surface.raw} " +
             "came down, but its residue is STILL AT $path — disposal failed: $reason"
+}
+
+/**
+ * A bus entry a detach's forget left on spanreed's roster — [BusOutcome.StillLive] or
+ * [BusOutcome.Failed] — recorded beside [ResidueDisposalFailure] for the same reason (#188): the
+ * binding is gone, so no later forget can reach the entry, and this path is the one nobody runs
+ * deliberately.
+ */
+data class BusEntryLeft(
+    /** The surface whose binding was forgotten. */
+    val surface: SurfaceId,
+    /** The dock whose teardown asked for the forget. */
+    val dock: SurfaceId,
+    /** The durable key the binding was under, in its canonical form. */
+    val key: String,
+    /** What the store reported about the entry. */
+    val outcome: BusOutcome,
+) {
+    override fun toString(): String =
+        "the binding for $key was forgotten when dock ${dock.raw} beside surface ${surface.raw} " +
+            "came down, but its bus entry was left: $outcome"
 }
 
 /**

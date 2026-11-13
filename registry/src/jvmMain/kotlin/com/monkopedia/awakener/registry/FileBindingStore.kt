@@ -254,7 +254,7 @@ class FileBindingStore(
      * filesystem work on a different directory, and holding the bindings lock across it would
      * serialise every other surface behind one rename.
      */
-    override suspend fun unbind(key: SurfaceKey): Forget {
+    override suspend fun unbind(key: SurfaceKey, sessionEnding: Boolean): Forget {
         val forgotten = mutate {
             state.value[key]?.also { write(state.value - key) }
         }
@@ -265,7 +265,7 @@ class FileBindingStore(
         // Last, after the residue, and outside the lock for the reason the disposal is: it is a
         // subprocess against state this store does not own.
         val residue = disposeResidue(key)
-        return Forget(true, residue, identities.retire(forgotten.identity))
+        return Forget(true, residue, identities.retire(forgotten.identity, sessionEnding))
     }
 
     /**

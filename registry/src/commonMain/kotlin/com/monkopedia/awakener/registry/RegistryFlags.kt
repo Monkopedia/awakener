@@ -616,9 +616,11 @@ object RegistryFlags {
             "says whether the Lifeless is running. Its lifetime is the binding's, not the " +
             "panel's: registry.agent.deregister_on_forget removes it when the binding is " +
             "forgotten (awakener-registry forget, invoke.furniture.bound=FORGET, " +
-            "wm.dock.forget_binding_on_detach). Reaping an orphaned panel keeps the binding, and " +
-            "so keeps the entry — the next press recalls the binding and does not mint again, so " +
-            "an entry removed then would never come back.",
+            "wm.dock.forget_binding_on_detach — where the panel's session can outlive its " +
+            "window, which registry.agent.deregister_ending_session_wait_ms covers). Reaping " +
+            "an orphaned panel keeps the binding, and so keeps the entry — the next press " +
+            "recalls the binding and does not mint again, so an entry removed then would never " +
+            "come back.",
     )
 
     val deregisterOnForget = Flags.boolean(
@@ -626,11 +628,29 @@ object RegistryFlags {
         true,
         "When a binding is forgotten, deregister its agent id from spanreed and read the " +
             "roster back to confirm it is gone — the teardown for " +
-            "registry.agent.register_on_mint (#188). Applies whatever register_on_mint says now, since the entry outlives a flip " +
-            "of it. An entry spanreed reports live is left alone: that is a running session's, " +
-            "and its peers address it through that entry. Costs one `spanreed list` per forget " +
-            "when nothing is registered. Off is the behaviour before #188: forget never touches " +
+            "registry.agent.register_on_mint (#188). Applies whatever register_on_mint says " +
+            "now, since the entry outlives a flip of it, and so also removes the stale entry a " +
+            "panel's own session left under that id: it belongs to the agent being forgotten. " +
+            "An entry spanreed reports live is left alone — that is a running session's, and " +
+            "its peers address it through that entry — and the forget says so. Costs one " +
+            "`spanreed list` per forget when nothing is registered, and nothing on a host where " +
+            "spanreed cannot be run. Off is the behaviour before #188: forget never touches " +
             "the bus.",
+    )
+
+    val endingSessionWaitMs = Flags.long(
+        "registry.agent.deregister_ending_session_wait_ms",
+        3_000,
+        "How long a forget made by a dock teardown (wm.dock.forget_binding_on_detach) waits " +
+            "for the panel's session to leave the bus before treating its entry as a running " +
+            "session's and leaving it. The window leaves the tree before the process in it " +
+            "exits — measured on kaladin with foot 1.27.0 on headless sway 1.12: the node went " +
+            "in 2-3ms and a real `claude` exited 283-529ms after it — so without a wait the " +
+            "entry reads live, is left, and goes stale with no binding left to forget it by. " +
+            "Spent only while the entry still reads live, polled every 100ms. 0 judges at " +
+            "once, which is that leak. A user's `awakener-registry forget` never waits: it ends " +
+            "no session.",
+        Flags.atLeast(0L),
     )
 
     val rebindPolicy = Flags.enum(

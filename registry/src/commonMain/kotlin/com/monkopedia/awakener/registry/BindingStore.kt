@@ -63,7 +63,11 @@ data class Forget(
  * states of a shared roster every agent on the host reads, and a forget has to say which.
  */
 sealed interface BusOutcome {
-    /** The bus was not consulted: [RegistryFlags.deregisterOnForget] is off, or no bus exists. */
+    /**
+     * The bus was not consulted: [RegistryFlags.deregisterOnForget] is off, there is no bus, or
+     * the spanreed command could not be run at all — on a host with none, nothing can have been
+     * registered, and a warning on every forget would be one nobody can act on.
+     */
     data object NotAsked : BusOutcome
 
     /** Nothing was listed under [agent], stale or live. */
@@ -276,8 +280,13 @@ interface BindingStore {
      * different pieces of state, and the second can fail — a read-only state directory — with
      * the first already durable. A caller told only "forgotten" would then believe a model had
      * been archived, or deleted, that is still sitting on disk.
+     *
+     * @param sessionEnding the caller has just ended the session running under this binding's
+     * agent — a dock teardown — so a bus entry that still reads live is given
+     * [RegistryFlags.endingSessionWaitMs] to stop being live before it is judged to be a running
+     * session's. See [AgentIdentities.retire].
      */
-    suspend fun unbind(key: SurfaceKey): Forget
+    suspend fun unbind(key: SurfaceKey, sessionEnding: Boolean = false): Forget
 
     /**
      * Where this surface's distilled residue lives.

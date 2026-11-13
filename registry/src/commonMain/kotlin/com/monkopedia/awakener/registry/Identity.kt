@@ -52,8 +52,11 @@ fun interface AgentIdentities {
      *
      * A default rather than an abstract member because only a minter that publishes anything has
      * anything to retire: [DerivedAgentIdentities] writes nowhere, and neither does a test's.
+     *
+     * @param sessionEnding see [BindingStore.unbind].
      */
-    suspend fun retire(identity: AgentIdentity): BusOutcome = BusOutcome.NotAsked
+    suspend fun retire(identity: AgentIdentity, sessionEnding: Boolean = false): BusOutcome =
+        BusOutcome.NotAsked
 }
 
 /**
