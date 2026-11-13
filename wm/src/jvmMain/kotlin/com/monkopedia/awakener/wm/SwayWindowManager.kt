@@ -10,6 +10,7 @@ import com.monkopedia.awakener.registry.asIdentity
 import java.io.File
 import java.security.SecureRandom
 import kotlin.math.abs
+import kotlin.random.Random
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.TimeSource
 import kotlinx.coroutines.CancellationException
@@ -745,24 +746,6 @@ class SwayWindowManager(
         suspend fun focus(id: SurfaceId) = run("[con_id=${id.raw}] focus")
 
         /**
-         * Flattens the split container [survivor] is the last window in.
-         *
-         * One routine for both paths on purpose: #6 is the failure path of a job the success path
-         * already does correctly, and two copies of it would drift. sway does not collapse a
-         * split container when it drops to one child, and the leftover silently adopts the next
-         * window opened in that tab.
-         *
-         * **It reports; the caller decides.** sway refuses `split none` on a node that still has
-         * siblings — "Can only flatten a child container with no siblings" — which is a genuine
-         * failure rather than a target-already-gone, so it is raised. `detach` lets it out, since
-         * the orphan sweep's aggregate exists to collect exactly that; an unwind suppresses it
-         * rather than replacing the diagnosis of why the attach failed. Swallowing it here would
-         * take that choice away from both.
-         *
-         * A [survivor] that has left the tree is not a failure: the container it was alone in
-         * went with it.
-         */
-        /**
          * Names the tab of the container [surface] is docked in after [surface]'s own title.
          *
          * **The container, not the window.** Attaching a dock puts the surface inside a split, and
@@ -855,8 +838,33 @@ class SwayWindowManager(
             nameTab(container, TabTitle.resetCommand(container))
         }
 
+        /**
+         * Flattens the split container [survivor] is the last window in.
+         *
+         * One routine for both paths on purpose: #6 is the failure path of a job the success path
+         * already does correctly, and two copies of it would drift. sway does not collapse a
+         * split container when it drops to one child, and the leftover silently adopts the next
+         * window opened in that tab.
+         *
+         * **It reports; the caller decides.** sway refuses `split none` on a node that still has
+         * siblings — "Can only flatten a child container with no siblings" — which is a genuine
+         * failure rather than a target-already-gone, so it is raised. `detach` lets it out, since
+         * the orphan sweep's aggregate exists to collect exactly that; an unwind suppresses it
+         * rather than replacing the diagnosis of why the attach failed. Swallowing it here would
+         * take that choice away from both.
+         *
+         * A [survivor] that has left the tree is not a failure: the container it was alone in
+         * went with it.
+         *
+         * **Only splits are flattened.** Where `split none` would also take a tab strip awakener
+         * did not make — see [tabAbove] — the survivor is lifted into that tab strip instead,
+         * which empties the splits below it and leaves the strip standing (#226).
+         */
         suspend fun normalizeContainer(survivor: SurfaceId) {
-            if (tree().find(survivor.raw) == null) return
+            val tree = tree()
+            if (tree.find(survivor.raw) == null) return
+            val tab = tabAbove(tree, survivor)
+            if (tab != null) return run(liftInto(tab, survivor))
             focus(survivor)
             run("split none")
         }
@@ -1108,9 +1116,13 @@ class SwayWindowManager(
             // else's window that a hide makes only under wm.dock.evict_on_hide — which, when on,
             // has already moved it out above, so the split is down to the surface by now unless
             // no side of it could take the window. Targeted by criteria rather than by focus, so
-            // the hide leaves focus exactly where sway put it.
-            if (cfg[WmFlags.flattenOnHide] && dockSplitOf(tree(), surface)?.nodes?.size == 1) {
-                run("[con_id=${surface.raw}] split none")
+            // the hide leaves focus exactly where sway put it. And only the split: with the
+            // surface alone on a `workspace_layout tabbed` workspace, `split none` would take the
+            // tab strip too (#226), so there the surface is lifted into the strip instead.
+            val tree = tree()
+            if (cfg[WmFlags.flattenOnHide] && dockSplitOf(tree, surface)?.nodes?.size == 1) {
+                val tab = tabAbove(tree, surface)
+                run(if (tab != null) liftInto(tab, surface) else "[con_id=${surface.raw}] split none")
             }
             return true
         }
@@ -2090,8 +2102,27 @@ class SwayWindowManager(
                 // `split none` refusal arrives anonymous. The sweep's usual caller is the repair
                 // collector, which nobody is watching, so this message is the whole of what
                 // reaches `repairs` for a human to work from.
+                //
+                // And it says whether the dock is still there (#224). A detach kills first and
+                // tidies after, so a refusal from the tidying arrives with the dock already gone,
+                // and "reaping failed" would then send the reader after a panel that is not on
+                // screen. Asked of the tree rather than of where the throw came from, because the
+                // tree is what the user sees; a read that itself fails says nothing either way,
+                // and the message falls back to the reap failing.
+                val reaped = try {
+                    tree(session).find(node.id) == null
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    false
+                }
                 failures += IllegalStateException(
-                    "reaping dock ${node.id}, bound to the gone surface $boundTo, failed",
+                    if (reaped) {
+                        "dock ${node.id}, bound to the gone surface $boundTo, was reaped, but " +
+                            "tidying the tree after it failed"
+                    } else {
+                        "reaping dock ${node.id}, bound to the gone surface $boundTo, failed"
+                    },
                     failure,
                 )
             }
@@ -2260,10 +2291,15 @@ class SwayWindowManager(
                 // a split: under wm.dock.flatten_on_hide the hide already collapsed it, and the
                 // surface's parent is then the tab strip, whose title is not awakener's to reset
                 // and whose "survivor" is some other tab that `split none` would be refused on.
+                //
+                // The dock's own side is held to the same test (#224). A dock standing directly on
+                // the workspace — a tab the user flattened by hand — or in a tab strip it was
+                // dragged into has no split of awakener's above it, and the window that happens to
+                // be beside it is no survivor of one: flattening it is refused, after the kill.
                 val parent = if (inScratchpad(dockId)) {
                     dockSplitOf(tree(), surface)
                 } else {
-                    tree().parentOf(dockId.raw)
+                    tree().parentOf(dockId.raw)?.takeIf { it.isSplit() }
                 }
                 // Ungated, and **before** the kill, which is where it has to be rather than
                 // where it reads most naturally. A dock whose surface has already gone is the
@@ -2283,7 +2319,7 @@ class SwayWindowManager(
                 // die leaves a still-standing panel in a container sway has gone back to naming
                 // itself. That is a wedged dock either way, and `wm.dock.wedged_dock_fails_detach`
                 // is what reports it.
-                parent?.takeIf { it.type == CON }?.let { resetTabTitle(SurfaceId(it.id)) }
+                parent?.let { resetTabTitle(SurfaceId(it.id)) }
 
                 // `kill` waits, and holding the tree across that wait is the point: the critical
                 // section must not end over a dock that is still standing, or the next teardown
@@ -2388,8 +2424,50 @@ class SwayWindowManager(
          * neither is awakener's to name, flatten, or treat as holding a survivor.
          */
         private fun dockSplitOf(tree: Node, surface: SurfaceId): Node? =
-            tree.parentOf(surface.raw)
-                ?.takeIf { it.type == CON && (it.layout == "splith" || it.layout == "splitv") }
+            tree.parentOf(surface.raw)?.takeIf { it.isSplit() }
+
+        /** A split container — the shape `attach` makes — as opposed to a tab strip or workspace. */
+        private fun Node.isSplit(): Boolean =
+            type == CON && (layout == "splith" || layout == "splitv")
+
+        /**
+         * The tab strip a `split none` on [survivor] would destroy along with the split it is
+         * meant for, or null when the flatten would stop at splits.
+         *
+         * **sway's flatten does not stop at one level.** It replaces the survivor's parent with
+         * the survivor, then does the same to each ancestor above for as long as that one too has
+         * a single child, whatever its layout — measured on headless sway 1.12. Across a run of
+         * splits that is the chain collapse `SwaySplitChainTest` relies on. But with the surface
+         * the only window on a `workspace_layout tabbed` workspace, the strip sway made for it
+         * holds nothing but attach's split, and the walk takes the strip as well: the next window
+         * then opens beside the surface instead of as a tab, and every dock after stands directly
+         * on the workspace (#226). A second tab stops the walk at the strip, which is why only a
+         * lone window ever showed it.
+         *
+         * So this walks the same run sway will — the survivor's parent and each single-child
+         * container above it — and answers with the lowest that is not a split.
+         */
+        private fun tabAbove(tree: Node, survivor: SurfaceId): Node? =
+            generateSequence(tree.parentOf(survivor.raw)) { tree.parentOf(it.id) }
+                .takeWhile { it.type == CON && it.nodes.size == 1 }
+                .firstOrNull { !it.isSplit() }
+
+        /**
+         * One message that moves [survivor] into [tab] as a direct child, which leaves the splits
+         * it sat in empty for sway to reap and [tab] standing — the flatten, stopped at the strip.
+         *
+         * sway names a destination only by mark, and a `move … to mark` onto a container puts the
+         * window *inside* it (measured on 1.12, as [evictionCommands] records), so [tab] is marked
+         * for the length of the message. The mark is random so it is never one a user already
+         * placed — `mark --add` would move theirs and the `unmark` would then delete it — and the
+         * `unmark` runs even when the move is refused, since sway carries on through a message
+         * past a failed command (measured).
+         */
+        private fun liftInto(tab: Node, survivor: SurfaceId): String {
+            val mark = "_awakener_flatten_${Random.nextLong().toULong().toString(16)}"
+            return "[con_id=${tab.id}] mark --add $mark; " +
+                "[con_id=${survivor.raw}] move container to mark $mark; unmark $mark"
+        }
 
         /**
          * The commands that move every window sharing [dock]'s split, other than [surface] and
@@ -2428,9 +2506,7 @@ class SwayWindowManager(
          * focus where it was — measured on 1.12 with the surface focused and an intruder moved.
          */
         private fun evictionCommands(tree: Node, surface: SurfaceId, dock: SurfaceId): List<String> {
-            val split = tree.parentOf(dock.raw)
-                ?.takeIf { it.type == CON && (it.layout == "splith" || it.layout == "splitv") }
-                ?: return emptyList()
+            val split = tree.parentOf(dock.raw)?.takeIf { it.isSplit() } ?: return emptyList()
             if (split.nodes.none { it.id == surface.raw }) return emptyList()
             val parent = tree.parentOf(split.id) ?: return emptyList()
             val horizontal = when (parent.layout) {
