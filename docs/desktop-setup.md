@@ -256,14 +256,11 @@ the first is still running waits for it and then sees the first one's panel. It 
 second press give up at once instead of queueing.
 
 **What a hide does to the tab.** `wm.dock.flatten_on_hide`, default `true`, collapses the split
-`attach` made once the panel is hidden. When the surface shares its workspace with other tabs, a
-window you open in that tab while the panel is hidden gets a tab of its own instead of landing
-beside the surface, and the show splits the surface again. **When the surface is the only window on
-its workspace, the hide also removes the workspace's `tabbed` container** (Refs #226, a known
-defect, not the intended behaviour). A window opened while the panel is hidden then lands beside
-the surface rather than in a new tab, and the restored panel and surface no longer sit inside a
-tab. `wm.dock.flatten_on_hide=false` keeps the tab in that case. The cost is that the split stays
-standing while the panel is hidden, so a window opened then lands inside it. A window opened
+`attach` made once the panel is hidden — that split only, so the workspace's own `tabbed`
+container stays even when the surface is the only window on the workspace. A window you open in
+that tab while the panel is hidden gets a tab of its own instead of landing beside the surface,
+and the show splits the surface again inside its tab. `wm.dock.flatten_on_hide=false` leaves the
+split standing while the panel is hidden, so a window opened then lands inside it. A window opened
 while the panel was *visible* is a different case — sway puts it inside the split, beside the
 surface or the panel. `wm.dock.evict_on_hide`, default `false`, moves such windows out of the split
 on the next hide; it is off because it moves windows you may have put there on purpose.
@@ -897,6 +894,10 @@ Everything in this guide that is stated as a measurement was run. Where and how:
     the show re-split only the surface's tab.
   - With `wm.dock.flatten_on_hide=false`, the single-window case kept its `tabbed` container, and a
     window opened while hidden landed inside the split.
+  - Re-run on the change for #226 (2026-11-12, same setup): the single-window case went
+    `{tabbed:[surface]}` → stood `{tabbed:[{splith:[surface, dock]}]}` → hid `{tabbed:[surface]}`;
+    a window opened then became a second tab, and the show re-split the surface inside its tab.
+    Three hide/restore cycles kept the `tabbed` container throughout.
 
   **Read from the flag descriptions, not exercised here:** `wm.dock.evict_on_hide`, a queued
   press timing out at `wm.attach.lock_wait_ms`, and `REUSE` declining against an agent that is on

@@ -248,6 +248,128 @@ class SwaySplitChainTest {
             attaches.awaitAll()
         }
 
+    /**
+     * #226. With `workspace_layout tabbed` and the surface the only window on its workspace, the
+     * tab strip is a `tabbed` container holding nothing but attach's split — so a `split none`
+     * that walks the whole single-child run, which is what sway's does, takes the tab strip too.
+     * The hide has to stop at the split: a window opened while the panel is hidden becomes a tab
+     * of its own, and the restore splits the surface again inside its tab.
+     */
+    @Test
+    fun `a hide on a surface alone in its tab keeps the tab, and the next window joins it`() =
+        swayTest {
+            val app = openSurface("aw-app")
+            assertEquals("splith[tabbed[aw-app]]", describe(), "baseline")
+            val dock = wm.attach(app, dockSpec(), AGENT)
+            assertEquals("splith[tabbed[splith[aw-app aw-dock]]]", describe(), "docked")
+
+            dock.hide()
+            assertEquals("splith[tabbed[aw-app]]", describe(), "the hide takes attach's split only")
+
+            openSurface("aw-new")
+            assertEquals("splith[tabbed[aw-app aw-new]]", describe(), "a window opened is a tab")
+
+            dock.show()
+            assertEquals(
+                "splith[tabbed[splith[aw-app aw-dock] aw-new]]",
+                describe(),
+                "the restore splits the surface inside its own tab",
+            )
+        }
+
+    /** The same lifecycles as above with no second tab, so attach's split is the tab's only child. */
+    @Test
+    fun `attach, hide, show and detach cycles alone in a tab keep the tab`() =
+        cycles(alone = true) { app ->
+            val dock = wm.attach(app, dockSpec(), AGENT)
+            dock.hide()
+            dock.show()
+            dock.detach()
+        }
+
+    /** A visible detach's normalisation is the same `split none`, so it has the same reach. */
+    @Test
+    fun `attach and detach cycles alone in a tab keep the tab`() = cycles(alone = true) { app ->
+        wm.attach(app, dockSpec(), AGENT).detach()
+    }
+
+    /** And an unwound attach's, which flattens the split it made around the surface. */
+    @Test
+    fun `an attach whose dock never maps, alone in a tab, keeps the tab`() {
+        store.put(WmFlags.mapWaitMs, NEVER_MAPS_WAIT_MS)
+        cycles(alone = true) { app ->
+            assertFailsWith<IllegalStateException> {
+                wm.attach(app, DockSpec("aw-never", "sleep 3600"), AGENT)
+            }
+        }
+    }
+
+    /** A chain of splits inside a lone tab still goes, and the tab still stays. */
+    @Test
+    fun `hide collapses a chain inside a lone tab and keeps the tab`() = swayTest {
+        val app = openSurface("aw-app")
+        command("[con_id=${app.raw}] focus")
+        repeat(CHAIN) { command("split horizontal; focus parent") }
+        val dock = wm.attach(app, dockSpec(), AGENT)
+
+        dock.hide()
+
+        assertEquals("splith[tabbed[aw-app]]", describe())
+    }
+
+    /**
+     * #224. A dock standing directly on the workspace — the shape #226's collapsed tab left
+     * behind, and one a user flattening the tab by hand still produces. Its parent is no split
+     * attach made, so a window beside it is no survivor of one: flattening it is refused, and
+     * that refusal used to come back as the reap failing after the dock had already gone.
+     */
+    @Test
+    fun `a dock standing on the workspace itself is reaped cleanly`() = swayTest {
+        // The sweep is called below, rather than left to the collector, so its outcome is seen.
+        store.put(WmFlags.sweepOnClose, false)
+        val app = openSurface("aw-app")
+        // The user's own flatten of the lone tab, so attach finds the surface on the workspace.
+        command("[con_id=${app.raw}] split none")
+        val dock = wm.attach(app, dockSpec(), AGENT)
+        openSurface("aw-other")
+        assertEquals(
+            "workspace",
+            wm.tree().parentOf(dock.dockId.raw)?.type,
+            "the collapsed shape: ${describe()}",
+        )
+
+        close(app)
+        wm.reapOrphans()
+
+        assertEquals("splith[aw-other]", describe())
+    }
+
+    /**
+     * The general half of #224: a cleanup sway refuses *after* the dock has gone is still
+     * reported, but as what it is. The surface closes out of a split that two other windows have
+     * joined, so the split outlives the dock holding two of them and sway refuses to flatten it.
+     */
+    @Test
+    fun `a reap whose cleanup is refused says the dock was reaped`() = swayTest {
+        store.put(WmFlags.sweepOnClose, false)
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        val dock = wm.attach(app, dockSpec(), AGENT)
+        command("[con_id=${app.raw}] focus")
+        openSurface("aw-in1")
+        openSurface("aw-in2")
+        close(app)
+
+        val failure = assertFailsWith<IllegalStateException> { wm.reapOrphans() }
+
+        assertEquals(null, wm.tree().find(dock.dockId.raw), "the dock is gone: ${describe()}")
+        assertEquals(
+            "dock ${dock.dockId.raw}, bound to the gone surface ${app.raw}, was reaped, but " +
+                "tidying the tree after it failed",
+            failure.message,
+        )
+    }
+
     // -- helpers ------------------------------------------------------------------------
 
     private fun swayTest(body: suspend CoroutineScope.() -> Unit) {
@@ -292,14 +414,19 @@ class SwaySplitChainTest {
     }
 
     /**
-     * Runs [cycle] [CYCLES] times beside a second tab, asserting after each one that no
+     * Runs [cycle] [CYCLES] times beside a second tab — or, [alone], with the surface the only
+     * window on the workspace — asserting after each one that no
      * single-child split is left and — where the surface outlives the cycle — that the workspace
      * is back to exactly the shape it started in. The count alone would pass a cycle that put the
      * dock somewhere wrong without leaving an only child behind.
      */
-    private fun cycles(freshSurface: Boolean = false, cycle: suspend (SurfaceId) -> Unit) =
+    private fun cycles(
+        freshSurface: Boolean = false,
+        alone: Boolean = false,
+        cycle: suspend (SurfaceId) -> Unit,
+    ) =
         swayTest {
-            openSurface("aw-other")
+            if (!alone) openSurface("aw-other")
             var app = openSurface("aw-app0")
             val baseline = describe()
             assertEquals(0, singleChildSplits(), "baseline: $baseline")
