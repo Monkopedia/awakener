@@ -22,6 +22,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
@@ -437,7 +438,183 @@ class SwayHideTest {
         assertNull(wm.dockFor(app2))
     }
 
+    /**
+     * **#229.** A floating surface's dock shares a *floating* split with it, and sway's
+     * `move scratchpad` on any child of a floating container moves the whole container — measured
+     * on headless sway 1.12 — so the hide used to take the user's window into the scratchpad with
+     * the panel.
+     *
+     * Asserted on what the user sees: the surface is still on the workspace, still floating, and
+     * occupies exactly the rectangle it held before the panel was ever attached — the panel's
+     * share of the floating window goes back to the surface, as it does for a tiled one.
+     */
+    @Test
+    fun `hiding the panel of a floating surface leaves the surface where it was`() = swayTest {
+        val app = openFloatingSurface("aw-app1")
+        val before = geometryOf(app)
+        val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+
+        assertTrue(dock.hide(), "the hide is what changed things")
+
+        assertTrue(dock.hidden(), "the panel is in the scratchpad")
+        assertFalse(inScratchpad(app), "and the surface it was hidden from is not")
+        assertEquals(FLOATING, floatingAncestorOf(app)?.type, "the surface is still floating")
+        assertEquals(before, geometryOf(app), "on the rectangle it held before the attach")
+    }
+
+    /**
+     * The other half of #229: the panel comes back *into* the floating window, beside the surface,
+     * rather than tiled into the workspace behind it or floating over it.
+     */
+    @Test
+    fun `showing the panel of a floating surface puts it back beside the surface`() = swayTest {
+        val app = openFloatingSurface("aw-app1")
+        val before = geometryOf(app)
+        val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+        val docked = geometryOf(dock.dockId)
+        val attached = geometryOf(app)
+        dock.hide()
+        // Elsewhere, so the restore cannot be relying on focus to find the surface.
+        val other = openSurface("aw-other")
+        awaitFocused(other)
+
+        assertTrue(dock.show(), "the show is what changed things")
+
+        val container = assertNotNull(floatingAncestorOf(app), "the surface is still floating")
+        assertEquals(
+            container.id,
+            floatingAncestorOf(dock.dockId)?.id,
+            "and the panel is back in the same floating window as it",
+        )
+        assertEquals(before, geometryOf(SurfaceId(container.id)), "which has not moved or resized")
+        assertEquals(docked, geometryOf(dock.dockId), "the panel is where the attach put it")
+        assertEquals(attached, geometryOf(app), "and the surface has given its share back")
+    }
+
+    /**
+     * With `wm.dock.flatten_on_hide` off the floating split is kept across the hide rather than
+     * collapsed, and the restore reuses it — the same two shapes the tiled case has, and the
+     * surface stays put in both.
+     */
+    @Test
+    fun `a floating surface keeps its place across a hide with flatten_on_hide off`() = swayTest {
+        store.put(WmFlags.flattenOnHide, false)
+        val app = openFloatingSurface("aw-app1")
+        val before = geometryOf(app)
+        val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+        val docked = geometryOf(dock.dockId)
+        val split = assertNotNull(floatingAncestorOf(app)).id
+
+        assertTrue(dock.hide())
+        assertFalse(inScratchpad(app), "the surface was not hidden with the panel")
+        assertEquals(split, floatingAncestorOf(app)?.id, "the floating split was kept")
+        assertEquals(before, geometryOf(SurfaceId(split)), "where it was")
+
+        assertTrue(dock.show())
+        assertEquals(split, floatingAncestorOf(dock.dockId)?.id, "and the panel went back into it")
+        assertEquals(docked, geometryOf(dock.dockId))
+    }
+
+    /** `wm.dock.side=LEFT` survives the floating restore, which places the panel by a different
+     * route from the tiled one. */
+    @Test
+    fun `a floating surface's left-hand panel comes back on the left`() = swayTest {
+        store.put(WmFlags.dockSide, DockSide.LEFT)
+        val app = openFloatingSurface("aw-app1")
+        val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+        val docked = geometryOf(dock.dockId)
+
+        dock.hide()
+        assertTrue(dock.show())
+
+        assertEquals(docked, geometryOf(dock.dockId))
+        assertEquals(
+            geometryOf(SurfaceId(assertNotNull(floatingAncestorOf(app)).id)).substringBefore(" "),
+            geometryOf(dock.dockId).substringBefore(" "),
+            "it starts at the floating window's left edge",
+        )
+    }
+
+    /**
+     * The guard that #229's branch is chosen by the dock's container and not by the workspace: a
+     * tiled surface with a floating window beside it hides and restores exactly as before, and the
+     * floating window is not touched.
+     */
+    @Test
+    fun `a tiled surface's hide is unchanged by a floating window on its workspace`() = swayTest {
+        val floater = openFloatingSurface("aw-floater")
+        val floating = geometryOf(floater)
+        val app = openSurface("aw-app1")
+        val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+        val docked = geometryOf(dock.dockId)
+        val surfaced = geometryOf(app)
+
+        assertTrue(dock.hide())
+        assertFalse(inTab(app, dock.dockId))
+        assertTrue(dock.show())
+
+        assertTrue(inTab(app, dock.dockId), "the panel is back in the surface's tab")
+        assertEquals(docked, geometryOf(dock.dockId))
+        assertEquals(surfaced, geometryOf(app))
+        assertEquals(FLOATING, wm.tree().find(floater.raw)?.type, "the floater is still floating")
+        assertEquals(floating, geometryOf(floater), "and has not moved")
+    }
+
     // -- helpers ------------------------------------------------------------------------
+
+    /**
+     * A surface that is floating before anything is attached to it, at a size of the test's
+     * choosing, read back until the client has taken that size and kept it.
+     *
+     * Neither the type nor a rectangle that holds still for a moment is enough. sway sizes a
+     * floating view from whatever the client last committed, and foot commits the tiled size it
+     * was first configured with whenever it gets round to it: seen in this suite as a floater
+     * read at `698x496` that was `1280x691` a few hundred milliseconds later with nothing having
+     * touched it. So the size is set explicitly, which sway then holds whatever foot commits, and
+     * the window counts as settled once it is floating on the same rectangle for [SETTLE_READS]
+     * reads running.
+     */
+    private suspend fun openFloatingSurface(appId: String): SurfaceId {
+        val id = openSurface(appId)
+        command(
+            "[con_id=${id.raw}] floating enable; [con_id=${id.raw}] resize set 640 px 400 px; " +
+                "[con_id=${id.raw}] move absolute position 200 px 100 px",
+        )
+        assertNotNull(
+            withTimeoutOrNull(WAIT_MS) {
+                var last: String? = null
+                var settled = 0
+                while (settled < SETTLE_READS) {
+                    delay(SETTLE_MS)
+                    val now = geometryOf(id).takeIf { wm.tree().find(id.raw)?.type == FLOATING }
+                    settled = if (now != null && now == last) settled + 1 else 0
+                    last = now
+                }
+                true
+            },
+            "window ${id.raw} never settled floating",
+        )
+        return id
+    }
+
+    /** The node with [id] in a raw `GET_TREE` payload, found by walking `nodes` and `floating_nodes`. */
+    private fun nodeOf(node: JsonObject, id: Long): JsonObject? {
+        if (node["id"]?.jsonPrimitive?.longOrNull == id) return node
+        return listOf("nodes", "floating_nodes")
+            .mapNotNull { node[it]?.jsonArray }
+            .flatten()
+            .firstNotNullOfOrNull { nodeOf(it.jsonObject, id) }
+    }
+
+    private suspend fun inScratchpad(id: SurfaceId): Boolean =
+        wm.tree().workspace(SCRATCH)?.find(id.raw) != null
+
+    /** The floating container [id] is in — itself, when it floats alone — or null when tiled. */
+    private suspend fun floatingAncestorOf(id: SurfaceId): Node? {
+        val tree = wm.tree()
+        return generateSequence(tree.find(id.raw)) { tree.parentOf(it.id) }
+            .firstOrNull { it.type == FLOATING }
+    }
 
     private fun swayTest(body: suspend () -> Unit) {
         SwayHarness.assumeAvailable()
@@ -586,14 +763,8 @@ class SwayHideTest {
             .sortedByDescending { it.value }
             .joinToString("\n") { "  ${it.key}  ${it.value} samples" }
 
-    /** The `rect` of the node with [id], found by walking `nodes` and `floating_nodes`. */
-    private fun rectOf(node: JsonObject, id: Long): JsonObject? {
-        if (node["id"]?.jsonPrimitive?.longOrNull == id) return node["rect"]?.jsonObject
-        return listOf("nodes", "floating_nodes")
-            .mapNotNull { node[it]?.jsonArray }
-            .flatten()
-            .firstNotNullOfOrNull { rectOf(it.jsonObject, id) }
-    }
+    /** The `rect` of the node with [id]. */
+    private fun rectOf(node: JsonObject, id: Long): JsonObject? = nodeOf(node, id)?.get("rect")?.jsonObject
 
     private suspend fun awaitWindow(appId: String): Long? = withTimeoutOrNull(WAIT_MS) {
         while (true) {
@@ -639,6 +810,12 @@ class SwayHideTest {
 
     private companion object {
         const val WAIT_MS = 5_000L
+
+        /** How often a floating window is re-read while waiting for its client to settle. */
+        const val SETTLE_MS = 20L
+
+        /** How many reads in a row a floating window has to agree with its client to count as settled. */
+        const val SETTLE_READS = 5
 
         /**
          * The reading for a dock that is not on screen — in the scratchpad, or not in the tree.

@@ -684,7 +684,9 @@ object WmFlags {
             "and moving that window out is not this flag's call. Off restores the old shape, " +
             "where the split stands for as long as the dock is hidden. It does not cover a " +
             "window opened while the dock is visible: sway places a new window beside the " +
-            "focused one, which is the surface or the dock, and both are inside the split.",
+            "focused one, which is the surface or the dock, and both are inside the split. A " +
+            "floating surface is collapsed the same way: it is left floating alone on the " +
+            "rectangle its floating split held, rather than in a floating split of one (#229).",
     )
 
     val evictOnHide = Flags.boolean(
