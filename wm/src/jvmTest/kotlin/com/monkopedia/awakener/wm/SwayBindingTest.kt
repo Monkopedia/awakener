@@ -2186,6 +2186,19 @@ class SwayBindingTest {
         assertMarkedFor(app2, dock2.dockId, "one per dock")
     }
 
+    /**
+     * The control for `awaitGone`, which nine sweep tests use as the precondition of "this window
+     * was not killed": if it can return while its window still stands, those pass with nothing
+     * swept. Before #190 it did, and this call returned normally.
+     */
+    @Test
+    fun `waiting for a window that never closes fails the test`() = swayTest {
+        val app = openSurface("aw-app1")
+
+        assertFailsWith<AssertionError> { awaitGone(app) }
+        assertNotNull(wm.tree().find(app.raw), "the window really was standing the whole time")
+    }
+
     // -- helpers ------------------------------------------------------------------------
 
     private fun swayTest(body: suspend () -> Unit) {
@@ -2389,10 +2402,19 @@ class SwayBindingTest {
         null
     }
 
+    /**
+     * Fails unless [id] leaves the tree within [WAIT_MS]: it is the precondition of every sweep
+     * test, and a sweep skips a dock whose surface is still live, so a wait that returned on
+     * timeout would let "this window was not killed" pass because nothing was ever swept (#190).
+     */
     private suspend fun awaitGone(id: SurfaceId) {
-        withTimeoutOrNull(WAIT_MS) {
-            while (wm.tree().find(id.raw) != null) yield()
-        }
+        assertNotNull(
+            withTimeoutOrNull(WAIT_MS) {
+                while (wm.tree().find(id.raw) != null) yield()
+                true
+            },
+            "window ${id.raw} was still in the tree ${WAIT_MS}ms after it was closed",
+        )
     }
 
     /** Waits for the repair collector to have completed a sweep of its own. */
