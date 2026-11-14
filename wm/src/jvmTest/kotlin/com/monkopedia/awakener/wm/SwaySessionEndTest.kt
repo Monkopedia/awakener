@@ -245,9 +245,14 @@ class SwaySessionEndTest {
     /** Leaves the desktop genuinely idle — and takes the terminal down while sway can still ask. */
     private suspend fun closeSurface(surface: SurfaceId) {
         command("[con_id=${surface.raw}] kill")
-        withTimeoutOrNull(WAIT_MS) {
-            while (wm.tree().find(surface.raw) != null) yield()
-        }
+        assertNotNull(
+            withTimeoutOrNull(WAIT_MS) {
+                while (wm.tree().find(surface.raw) != null) yield()
+                true
+            },
+            "window ${surface.raw} was still in the tree ${WAIT_MS}ms after it was closed, so " +
+                "the desktop below is not idle",
+        )
     }
 
     private companion object {

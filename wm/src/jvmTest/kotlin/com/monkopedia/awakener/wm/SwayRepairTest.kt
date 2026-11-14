@@ -83,11 +83,11 @@ class SwayRepairTest {
 
         command("[con_id=${app.raw}] kill")
 
-        assertNotNull(
-            awaitGone(dock),
-            "the dock is still standing ${WAIT_MS}ms after its surface closed, and nothing in " +
-                "this test ever called the sweep — which is the point: a repair nothing drives " +
-                "is not a repair",
+        awaitGone(
+            dock,
+            message = "the dock is still standing ${WAIT_MS}ms after its surface closed, and " +
+                "nothing in this test ever called the sweep — which is the point: a repair " +
+                "nothing drives is not a repair",
         )
         // Waited for rather than read: the dock leaves the tree from inside the sweep, which
         // counts itself only once it returns, so reading the counter here is a coin flip.
@@ -173,10 +173,11 @@ class SwayRepairTest {
         val cleanDock = wm.attach(clean, dockFor("aw-dock"), AgentId("agent-2")).dockId
         command("[con_id=${clean.raw}] kill")
 
-        assertNotNull(
+        awaitGone(
+            cleanDock,
             // Generous, and not slack: every later sweep pays the wedged dock's full window wait
             // before it reaches this one, which is a cost of the wedge rather than of the fix.
-            awaitGone(cleanDock, WEDGED_SWEEP_WAIT_MS),
+            WEDGED_SWEEP_WAIT_MS,
             "the orphan after the failure was never reaped: one wedged panel took the whole " +
                 "desktop's repair with it",
         )
@@ -340,12 +341,24 @@ class SwayRepairTest {
         )
     }
 
-    /** Null if [id] was still in the tree after [timeoutMs]. */
-    private suspend fun awaitGone(id: SurfaceId, timeoutMs: Long = WAIT_MS): Boolean? =
-        withTimeoutOrNull(timeoutMs) {
-            while (wm.tree().find(id.raw) != null) yield()
-            true
-        }
+    /**
+     * Fails unless [id] leaves the tree within [timeoutMs]. Asserting here rather than returning
+     * a nullable is what stops a caller dropping the timeout: three did, each the precondition of
+     * an "the orphan stands" assertion that a surface still live would satisfy on its own (#190).
+     */
+    private suspend fun awaitGone(
+        id: SurfaceId,
+        timeoutMs: Long = WAIT_MS,
+        message: String = "window ${id.raw} was still in the tree ${timeoutMs}ms after it closed",
+    ) {
+        assertNotNull(
+            withTimeoutOrNull(timeoutMs) {
+                while (wm.tree().find(id.raw) != null) yield()
+                true
+            },
+            message,
+        )
+    }
 
     /** Null if no sweep has raised within the window wait plus the sweep's own. */
     private suspend fun awaitFailure(): Boolean? = withTimeoutOrNull(WAIT_MS + WAIT_MS) {

@@ -244,8 +244,8 @@ class SwayLifecycleTest {
 
         val dock2 = wm.attach(app2, dockFor("aw-dock"), AgentId("agent-2")).dockId
         command("[con_id=${app2.raw}] kill")
-        assertNotNull(
-            awaitGone(dock2),
+        awaitGone(
+            dock2,
             "the orphan in the new session was never reaped, so the reconnect brought back a " +
                 "command connection and not a manager: nothing restarted the repair collector",
         )
@@ -413,10 +413,15 @@ class SwayLifecycleTest {
         )
     }
 
-    /** Null if [id] was still in the tree after [WAIT_MS]. */
-    private suspend fun awaitGone(id: SurfaceId): Boolean? = withTimeoutOrNull(WAIT_MS) {
-        while (treeNow().find(id.raw) != null) delay(POLL_MS)
-        true
+    /** Fails unless [id] leaves the tree within [WAIT_MS], so no caller can drop the timeout. */
+    private suspend fun awaitGone(id: SurfaceId, message: String) {
+        assertNotNull(
+            withTimeoutOrNull(WAIT_MS) {
+                while (treeNow().find(id.raw) != null) delay(POLL_MS)
+                true
+            },
+            message,
+        )
     }
 
     /** Null if the collector never reported the session ending. */
