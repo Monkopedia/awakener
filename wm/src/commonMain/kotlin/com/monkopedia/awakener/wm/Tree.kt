@@ -31,15 +31,6 @@ data class Node(
      * [SwayWindowManager] `restoreFault`, which asks about the scratchpad and about [type] first.
      */
     val percent: Double? = null,
-    /**
-     * Where the node sits on the layout, in output pixels.
-     *
-     * Read for one purpose: a floating window that is tiled for the length of a hide has to be
-     * put back on exactly the rectangle it left, because sway's `floating enable` does not
-     * remember one — it centres the window at a default size, measured on headless sway 1.12
-     * (#229).
-     */
-    val rect: Rect? = null,
     val marks: List<String> = emptyList(),
     val nodes: List<Node> = emptyList(),
     @SerialName("floating_nodes") val floatingNodes: List<Node> = emptyList(),
@@ -72,10 +63,6 @@ data class Node(
         else -> children.firstNotNullOfOrNull { it.workspace(name) }
     }
 }
-
-/** A node's `rect` as sway reports it. */
-@Serializable
-data class Rect(val x: Int, val y: Int, val width: Int, val height: Int)
 
 @Serializable
 data class WindowEvent(val change: String, val container: Node? = null)
