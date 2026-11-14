@@ -684,7 +684,24 @@ object WmFlags {
             "and moving that window out is not this flag's call. Off restores the old shape, " +
             "where the split stands for as long as the dock is hidden. It does not cover a " +
             "window opened while the dock is visible: sway places a new window beside the " +
-            "focused one, which is the surface or the dock, and both are inside the split.",
+            "focused one, which is the surface or the dock, and both are inside the split. A " +
+            "floating surface's split is wm.dock.flatten_floating_on_hide's, not this flag's.",
+    )
+
+    val flattenFloatingOnHide = Flags.boolean(
+        "wm.dock.flatten_floating_on_hide",
+        false,
+        "wm.dock.flatten_on_hide for a floating surface (#229): collapse the floating split " +
+            "attach made around it when its dock is hidden, so it floats alone on the split's " +
+            "rectangle. Off by default because the collapse makes the surface a floating window " +
+            "of its own, and sway resizes a floating window to whatever its client next " +
+            "commits: a client that has not yet committed the narrower size the split gave it " +
+            "commits it after the collapse, and the window keeps the dock's share of its width " +
+            "lost for good. Measured on headless sway 1.12 with foot at scale 1.5, a hide " +
+            "following straight on from an attach lost it in 4 runs of 5. Off keeps the split " +
+            "for as long as the dock is hidden, and the surface stays a tiled child of it whose " +
+            "size no commit can change; the cost is #187's, a window opened while the surface " +
+            "is focused maps inside the floating split beside it.",
     )
 
     val evictOnHide = Flags.boolean(

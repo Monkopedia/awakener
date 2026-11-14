@@ -22,6 +22,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
@@ -53,9 +54,13 @@ import kotlinx.serialization.json.longOrNull
  * is what holds the second half: **the process must still be running while the window is gone**,
  * and that is asserted directly against the process table rather than inferred from the tree.
  *
- * Exercised against **sway 1.12** on the headless wlroots backend.
+ * Exercised against **sway 1.12** on the headless wlroots backend, at scale 1 here and at
+ * scale 1.5 by [SwayHideScaledTest], which is [outputConfig]'s only use.
  */
-class SwayHideTest {
+open class SwayHideTest {
+    /** Extra sway configuration for the session, which is how a subclass sets the output scale. */
+    protected open val outputConfig: String = ""
+
     private lateinit var sway: SwayHarness
     private lateinit var scope: CoroutineScope
     private lateinit var wmScope: CoroutineScope
@@ -69,7 +74,7 @@ class SwayHideTest {
     @BeforeTest
     fun setUp() {
         SwayHarness.assumeAvailable()
-        sway = SwayHarness.start()
+        sway = SwayHarness.start(outputConfig)
         scope = CoroutineScope(SupervisorJob())
         store = InMemoryConfigStore()
         stateDir = createTempDirectory("awakener-wm-hide")
@@ -437,7 +442,339 @@ class SwayHideTest {
         assertNull(wm.dockFor(app2))
     }
 
+    /**
+     * **#229.** A floating surface's dock shares a *floating* split with it, and sway's
+     * `move scratchpad` on any child of a floating container moves the whole container — measured
+     * on headless sway 1.12 — so the hide used to take the user's window into the scratchpad with
+     * the panel.
+     *
+     * Asserted on what the user sees, once the client has settled: the surface is still on the
+     * workspace, still floating, and occupies exactly the rectangle it held before the panel was
+     * ever attached — the panel's share of the floating window goes back to the surface, as it
+     * does for a tiled one.
+     *
+     * The hide follows straight on from the attach on purpose. That is the case where the
+     * surface's client has not yet committed the narrower size the split gave it, and the first
+     * fix lost the panel's share of the window to that late commit in most runs at scale 1.5.
+     */
+    @Test
+    fun `hiding the panel of a floating surface leaves the surface where it was`() = swayTest {
+        val app = openFloatingSurface("aw-float1")
+        val before = settledGeometryOf(app)
+        val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+        val split = assertNotNull(floatingAncestorOf(app)).id
+
+        assertTrue(dock.hide(), "the hide is what changed things")
+
+        assertTrue(dock.hidden(), "the panel is in the scratchpad")
+        assertFalse(inScratchpad(app), "and the surface it was hidden from is not")
+        assertEquals(split, floatingAncestorOf(app)?.id, "it is still in its floating split")
+        assertEquals(before, settledGeometryOf(app), "on the rectangle it held before the attach")
+        assertEquals(listOf("1"), workspaceNames(), "and the hide left no workspace behind")
+    }
+
+    /**
+     * The hide passes the dock through the workspace as a tiled window on its way out of the
+     * floating split, and that must not disturb anything tiled there: the same containers, in the
+     * same layouts, at the same sizes, before the hide, after it and after the restore.
+     */
+    @Test
+    fun `a floating hide leaves the tiled windows on its workspace as they were`() = swayTest {
+        val left = openSurface("aw-tiled1")
+        openSurface("aw-tiled2")
+        command("[con_id=${left.raw}] focus; split vertical")
+        openSurface("aw-tiled3")
+        val app = openFloatingSurface("aw-float1")
+        val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+        settledGeometryOf(dock.dockId)
+        val shape = tiledShape()
+
+        assertTrue(dock.hide())
+        assertEquals(shape, tiledShape(), "after the hide")
+        assertTrue(dock.show())
+        assertEquals(shape, tiledShape(), "after the restore")
+    }
+
+    /**
+     * The other half of #229: the panel comes back *into* the floating window, beside the surface,
+     * rather than tiled into the workspace behind it or floating over it.
+     */
+    @Test
+    fun `showing the panel of a floating surface puts it back beside the surface`() = swayTest {
+        // Opened first: one opened while the floating surface is focused maps inside its split.
+        val other = openSurface("aw-other")
+        val app = openFloatingSurface("aw-float1")
+        val before = settledGeometryOf(app)
+        val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+        val docked = settledGeometryOf(dock.dockId)
+        val attached = settledGeometryOf(app)
+        dock.hide()
+        // Elsewhere, so the restore cannot be relying on focus to find the surface.
+        command("[con_id=${other.raw}] focus")
+        awaitFocused(other)
+
+        assertTrue(dock.show(), "the show is what changed things")
+
+        val container = assertNotNull(floatingAncestorOf(app), "the surface is still floating")
+        assertEquals(
+            container.id,
+            floatingAncestorOf(dock.dockId)?.id,
+            "and the panel is back in the same floating window as it",
+        )
+        assertEquals(
+            before,
+            settledGeometryOf(SurfaceId(container.id)),
+            "which has not moved or resized",
+        )
+        assertEquals(docked, settledGeometryOf(dock.dockId), "the panel is where the attach put it")
+        assertEquals(attached, settledGeometryOf(app), "and the surface has given its share back")
+    }
+
+    /**
+     * **The review of #232's first fix.** That hide tiled the floating window for the length of
+     * one message and floated the surface again, and the client then committed the size it had
+     * held *inside* the split after sway had already laid the window out — which sway keeps for a
+     * floating window — so every hide cost the window the panel's share of its width, compounding
+     * across cycles. At `scale 1.5` it was nearly every run: `1275 → 893 → 622`.
+     *
+     * Read only after the client has settled, which is what a one-read assertion straight after
+     * the call cannot see, and over several cycles, which is what makes a loss compound.
+     */
+    @Test
+    fun `a floating surface keeps its size across repeated hides and restores`() = swayTest {
+        cycleFloating("aw-float1")
+    }
+
+    /**
+     * The same cycle on a second output, where the reviewer saw the loss at scale 1 too, and where
+     * the workspace the hide passes the dock back through is not workspace `1` — named with a
+     * space and a double quote, which is the spelling the hide has to get right to name it.
+     */
+    @Test
+    fun `a floating surface on a second output keeps its size across hides`() = swayTest {
+        command("create_output")
+        assertNotNull(
+            withTimeoutOrNull(WAIT_MS) {
+                while (outputs() < 2) yield()
+                true
+            },
+            "the second output never appeared",
+        )
+        command("output HEADLESS-2 position 1280 0 scale 1; focus output HEADLESS-2")
+        command("workspace 'second \"one\"'; layout tabbed")
+        cycleFloating("aw-float2")
+    }
+
+    /**
+     * `wm.dock.flatten_floating_on_hide` on: the floating split is collapsed, the surface floats
+     * alone on its rectangle, and the restore splits it again.
+     *
+     * The surface is let settle inside the split before the hide, because the flag's documented
+     * cost is exactly the case where it has not: a collapse makes the surface a floating window,
+     * which sway resizes to whatever its client commits next.
+     */
+    @Test
+    fun `with flatten_floating_on_hide the surface floats alone and keeps its place`() =
+        swayTest {
+            store.put(WmFlags.flattenFloatingOnHide, true)
+            val app = openFloatingSurface("aw-float1")
+            val before = settledGeometryOf(app)
+            val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+            val docked = settledGeometryOf(dock.dockId)
+            val attached = settledGeometryOf(app)
+
+            assertTrue(dock.hide())
+            assertFalse(inScratchpad(app), "the surface was not hidden with the panel")
+            assertEquals(app.raw, floatingAncestorOf(app)?.id, "it floats alone")
+            assertEquals(before, settledGeometryOf(app), "where it was")
+
+            assertTrue(dock.show())
+            val container = assertNotNull(floatingAncestorOf(app))
+            assertEquals(container.id, floatingAncestorOf(dock.dockId)?.id, "split again")
+            assertEquals(before, settledGeometryOf(SurfaceId(container.id)))
+            assertEquals(docked, settledGeometryOf(dock.dockId))
+            assertEquals(attached, settledGeometryOf(app))
+        }
+
+    /** `wm.dock.side=LEFT` survives the floating restore, which places the panel by a different
+     * route from the tiled one. */
+    @Test
+    fun `a floating surface's left-hand panel comes back on the left`() = swayTest {
+        store.put(WmFlags.dockSide, DockSide.LEFT)
+        val app = openFloatingSurface("aw-float1")
+        val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+        val docked = settledGeometryOf(dock.dockId)
+
+        dock.hide()
+        assertTrue(dock.show())
+
+        assertEquals(docked, settledGeometryOf(dock.dockId))
+        assertEquals(
+            settledGeometryOf(SurfaceId(assertNotNull(floatingAncestorOf(app)).id))
+                .substringBefore(" "),
+            settledGeometryOf(dock.dockId).substringBefore(" "),
+            "it starts at the floating window's left edge",
+        )
+    }
+
+    /**
+     * The guard that #229's branch is chosen by the dock's container and not by the workspace: a
+     * tiled surface with a floating window beside it hides and restores exactly as before, and the
+     * floating window is not touched.
+     */
+    @Test
+    fun `a tiled surface's hide is unchanged by a floating window on its workspace`() = swayTest {
+        val floater = openFloatingSurface("aw-float-other")
+        val floating = settledGeometryOf(floater)
+        val app = openSurface("aw-app1")
+        val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+        val docked = settledGeometryOf(dock.dockId)
+        val surfaced = settledGeometryOf(app)
+
+        assertTrue(dock.hide())
+        assertFalse(inTab(app, dock.dockId))
+        assertTrue(dock.show())
+
+        assertTrue(inTab(app, dock.dockId), "the panel is back in the surface's tab")
+        assertEquals(docked, settledGeometryOf(dock.dockId))
+        assertEquals(surfaced, settledGeometryOf(app))
+        assertEquals(FLOATING, wm.tree().find(floater.raw)?.type, "the floater is still floating")
+        assertEquals(floating, settledGeometryOf(floater), "and has not moved")
+    }
+
     // -- helpers ------------------------------------------------------------------------
+
+    /** [FLOATING_CYCLES] hides and restores of a floating surface's panel, each read settled. */
+    private suspend fun cycleFloating(appId: String) {
+        val app = openFloatingSurface(appId)
+        val before = settledGeometryOf(app)
+        val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+        val docked = settledGeometryOf(dock.dockId)
+        val attached = settledGeometryOf(app)
+        val workspaces = workspaceNames()
+        repeat(FLOATING_CYCLES) { cycle ->
+            assertTrue(dock.hide(), "cycle $cycle: the hide is what changed things")
+            assertEquals(workspaces, workspaceNames(), "cycle $cycle: no workspace left behind")
+            assertEquals(before, settledGeometryOf(app), "cycle $cycle: the surface, hidden")
+            assertTrue(dock.show(), "cycle $cycle: the show is what changed things")
+            val container = assertNotNull(floatingAncestorOf(app), "cycle $cycle: floating")
+            assertEquals(before, settledGeometryOf(SurfaceId(container.id)), "cycle $cycle: window")
+            assertEquals(attached, settledGeometryOf(app), "cycle $cycle: the surface, docked")
+            assertEquals(docked, settledGeometryOf(dock.dockId), "cycle $cycle: the panel")
+        }
+    }
+
+    /**
+     * A surface that floats from the moment it maps, at a size of the test's choosing, read back
+     * once the client has settled on it.
+     *
+     * **Floated by a `for_window` rule rather than after mapping**, because the other way is not a
+     * fixture of the test's choosing. A foot that maps tiled is configured at the tiled size, and
+     * commits that size whenever it gets round to it — after a `floating enable` and a `resize
+     * set` have already gone out, and sway keeps whatever a floating client commits. Measured on
+     * this suite: a window asked for at 640x400 settled at 1280x691, hanging off the output. A
+     * window that has only ever been floating has no stale size to commit.
+     *
+     * The size is then asserted rather than assumed, to within the terminal's cell, since foot
+     * rounds to whole cells: a fixture that silently landed somewhere else is what let the
+     * off-screen window above go unnoticed.
+     */
+    private suspend fun openFloatingSurface(appId: String): SurfaceId {
+        command("for_window [app_id=\"^$appId\$\"] floating enable")
+        val id = openSurface(appId)
+        assertNotNull(
+            withTimeoutOrNull(WAIT_MS) {
+                while (wm.tree().find(id.raw)?.type != FLOATING) yield()
+                true
+            },
+            "window ${id.raw} never floated",
+        )
+        settledGeometryOf(id)
+        val output = assertNotNull(rectOfOutputHolding(id), "window ${id.raw} is on no output")
+        val x = output.first + FLOAT_X
+        command(
+            "[con_id=${id.raw}] resize set $FLOAT_W px $FLOAT_H px; " +
+                "[con_id=${id.raw}] move absolute position $x px $FLOAT_Y px",
+        )
+        val settled = settledGeometryOf(id)
+        val (w, h) = settled.split(" ").drop(2).map { it.substringAfter("=").toInt() }
+        assertTrue(
+            w in (FLOAT_W - CELL_SLACK)..FLOAT_W && h in (FLOAT_H - CELL_SLACK)..FLOAT_H,
+            "the floating fixture landed at the size it asked for, within one cell: $settled",
+        )
+        return id
+    }
+
+    /**
+     * [id]'s geometry once it has held still for [SETTLE_READS] reads running, [SETTLE_MS] apart.
+     *
+     * A client commits on its own schedule, and sway keeps whatever a floating one commits — so a
+     * single read straight after a call answers about the layout sway asked for, not the one the
+     * user ends up with. The window here is long enough to span the late commit the review of
+     * #232 caught at 700ms only because each settle restarts on any change.
+     */
+    private suspend fun settledGeometryOf(id: SurfaceId): String = assertNotNull(
+        withTimeoutOrNull(WAIT_MS) {
+            var last = geometryOf(id)
+            var settled = 0
+            while (settled < SETTLE_READS) {
+                delay(SETTLE_MS)
+                val now = geometryOf(id)
+                settled = if (now == last) settled + 1 else 0
+                last = now
+            }
+            last
+        },
+        "window ${id.raw} never held still for ${SETTLE_READS * SETTLE_MS}ms",
+    )
+
+    /** The x of the output [id] is on, and its width, in logical pixels. */
+    private suspend fun rectOfOutputHolding(id: SurfaceId): Pair<Int, Int>? {
+        val raw = sway.connection().use { it.request(I3Ipc.Request.GET_TREE, "") }
+        val outputs = Json.parseToJsonElement(raw).jsonObject.getValue("nodes").jsonArray
+        return outputs.map { it.jsonObject }
+            .firstOrNull { nodeOf(it, id.raw) != null }
+            ?.getValue("rect")?.jsonObject
+            ?.let { it.getValue("x").jsonPrimitive.int to it.getValue("width").jsonPrimitive.int }
+    }
+
+    /** The workspaces on real outputs, by name. */
+    private suspend fun workspaceNames(): List<String> =
+        wm.tree().nodes.filter { it.name != "__i3" }.flatMap { output -> output.nodes.mapNotNull { it.name } }
+
+    /**
+     * The tiled part of workspace `1` as one string — every container's id, layout and geometry,
+     * nested — so that two readings are equal exactly when nothing tiled has changed.
+     */
+    private suspend fun tiledShape(): String {
+        val workspace = assertNotNull(wm.tree().workspace("1"))
+        suspend fun shape(node: Node): String =
+            "${node.id}:${node.layout}:${geometryOf(SurfaceId(node.id))}" +
+                node.nodes.map { shape(it) }.joinToString(",", "[", "]")
+        return workspace.nodes.map { shape(it) }.joinToString(",")
+    }
+
+    /** Real outputs, which is every child of the root but sway's `__i3` scratchpad output. */
+    private suspend fun outputs(): Int = wm.tree().nodes.count { it.name != "__i3" }
+
+    /** The node with [id] in a raw `GET_TREE` payload, found by walking `nodes` and `floating_nodes`. */
+    private fun nodeOf(node: JsonObject, id: Long): JsonObject? {
+        if (node["id"]?.jsonPrimitive?.longOrNull == id) return node
+        return listOf("nodes", "floating_nodes")
+            .mapNotNull { node[it]?.jsonArray }
+            .flatten()
+            .firstNotNullOfOrNull { nodeOf(it.jsonObject, id) }
+    }
+
+    private suspend fun inScratchpad(id: SurfaceId): Boolean =
+        wm.tree().workspace(SCRATCH)?.find(id.raw) != null
+
+    /** The floating container [id] is in — itself, when it floats alone — or null when tiled. */
+    private suspend fun floatingAncestorOf(id: SurfaceId): Node? {
+        val tree = wm.tree()
+        return generateSequence(tree.find(id.raw)) { tree.parentOf(it.id) }
+            .firstOrNull { it.type == FLOATING }
+    }
 
     private fun swayTest(body: suspend () -> Unit) {
         SwayHarness.assumeAvailable()
@@ -586,14 +923,8 @@ class SwayHideTest {
             .sortedByDescending { it.value }
             .joinToString("\n") { "  ${it.key}  ${it.value} samples" }
 
-    /** The `rect` of the node with [id], found by walking `nodes` and `floating_nodes`. */
-    private fun rectOf(node: JsonObject, id: Long): JsonObject? {
-        if (node["id"]?.jsonPrimitive?.longOrNull == id) return node["rect"]?.jsonObject
-        return listOf("nodes", "floating_nodes")
-            .mapNotNull { node[it]?.jsonArray }
-            .flatten()
-            .firstNotNullOfOrNull { rectOf(it.jsonObject, id) }
-    }
+    /** The `rect` of the node with [id]. */
+    private fun rectOf(node: JsonObject, id: Long): JsonObject? = nodeOf(node, id)?.get("rect")?.jsonObject
 
     private suspend fun awaitWindow(appId: String): Long? = withTimeoutOrNull(WAIT_MS) {
         while (true) {
@@ -639,6 +970,24 @@ class SwayHideTest {
 
     private companion object {
         const val WAIT_MS = 5_000L
+
+        /** How often a window is re-read while waiting for its client to settle. */
+        const val SETTLE_MS = 50L
+
+        /** How many reads in a row a window has to hold still for to count as settled. */
+        const val SETTLE_READS = 10
+
+        /** Hide/restore cycles one floating census covers; the first fix's loss compounded. */
+        const val FLOATING_CYCLES = 5
+
+        /** The floating fixture's rectangle, on-screen on a 1280x720 logical output. */
+        const val FLOAT_X = 100
+        const val FLOAT_Y = 60
+        const val FLOAT_W = 1000
+        const val FLOAT_H = 600
+
+        /** How far foot may round the fixture's size down to a whole cell. */
+        const val CELL_SLACK = 30
 
         /**
          * The reading for a dock that is not on screen — in the scratchpad, or not in the tree.

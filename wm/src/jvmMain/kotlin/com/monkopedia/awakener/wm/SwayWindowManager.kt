@@ -1102,19 +1102,30 @@ class SwayWindowManager(
         suspend fun hideDock(surface: SurfaceId, dock: SurfaceId): Boolean {
             if (inScratchpad(dock)) return false
             val cfg = config
-            // #187, the visible-dock half. Planned from one read and sent in the same message as
-            // the move, for #172's reason: one message, one present, so the user never sees the
-            // windows leaving the tab as a separate frame from the panel going away.
-            val evict = if (cfg[WmFlags.evictOnHide]) {
-                evictionCommands(tree(), surface, dock)
-            } else {
-                emptyList()
+            val before = tree()
+            val floating = floatingAncestorOf(before, dock)
+            val hide = when {
+                floating != null -> floatingHideCommands(
+                    before,
+                    floating,
+                    surface,
+                    dock,
+                    cfg[WmFlags.flattenFloatingOnHide],
+                )
+                // #187, the visible-dock half. Planned from one read and sent in the same message
+                // as the move, for #172's reason: one message, one present, so the user never
+                // sees the windows leaving the tab as a separate frame from the panel going away.
+                cfg[WmFlags.evictOnHide] ->
+                    evictionCommands(before, surface, dock) + "[con_id=${dock.raw}] move scratchpad"
+                else -> listOf("[con_id=${dock.raw}] move scratchpad")
             }
-            run((evict + "[con_id=${dock.raw}] move scratchpad").joinToString("; "))
+            run(hide.joinToString("; "))
             check(pollTree(cfg[WmFlags.unmapWaitMs]) { if (inScratchpad(dock)) true else null } == true) {
                 "dock ${dock.raw} was still outside the scratchpad " +
                     "${cfg[WmFlags.unmapWaitMs]}ms after being moved into it"
             }
+            // The floating hide has already flattened, or kept, the split as the flag says.
+            if (floating != null) return true
             // #187. With the dock gone the surface is alone in the split attach made, and sway
             // places a new window beside the focused one *inside its parent* — so the next window
             // opened in this tab would land in that split, sharing the tab with the surface,
@@ -1191,15 +1202,29 @@ class SwayWindowManager(
             // tab of its own*, measured on headless sway 1.12, rather than beside it. Decided by
             // the tree rather than by the flag, because the flag can have been flipped between
             // the hide and this show and the tree is what the batch will actually meet.
-            val resplit = dockSplitOf(tree(), surface) == null
+            val before = tree()
+            val floating = floatingAncestorOf(before, surface)
+            val resplit = dockSplitOf(before, surface) == null
             val restore = buildList {
                 add("[con_id=${dock.raw}] scratchpad show")
                 // Before `floating disable`, because that re-tiles beside the focused node.
                 add("[con_id=${surface.raw}] focus")
-                // After the focus, because `split` applies to the focused node — the same order
-                // attach uses, and inside the batch for #172's reason: one message, one present.
-                if (resplit) add("split horizontal")
-                add("[con_id=${dock.raw}] floating disable")
+                if (floating == null) {
+                    // After the focus, because `split` applies to the focused node — the same
+                    // order attach uses, and inside the batch for #172's reason: one message,
+                    // one present.
+                    if (resplit) add("split horizontal")
+                    add("[con_id=${dock.raw}] floating disable")
+                } else {
+                    // #229. `floating disable` tiles beside the focused *tiled* node, and a
+                    // floating surface is not one, so the dock is tiled wherever that puts it and
+                    // then moved beside the surface by mark — into the floating split, which a
+                    // surface the hide left floating alone gets back first. A `split` on a
+                    // floating window makes a floating split on its rectangle, measured on 1.12.
+                    if (floating.id == surface.raw) add("[con_id=${surface.raw}] split horizontal")
+                    add("[con_id=${dock.raw}] floating disable")
+                    add(moveToMarkOn(surface.raw, dock.raw))
+                }
                 // The same two commands attach ends with, because a restore owes the caller the
                 // dock's configured geometry back: the scratchpad keeps neither side nor width.
                 if (cfg[WmFlags.dockSide] == DockSide.LEFT) add("[con_id=${dock.raw}] move left")
@@ -2481,10 +2506,108 @@ class SwayWindowManager(
          * `unmark` runs even when the move is refused, since sway carries on through a message
          * past a failed command (measured).
          */
-        private fun liftInto(tab: Node, survivor: SurfaceId): String {
-            val mark = "_awakener_flatten_${Random.nextLong().toULong().toString(16)}"
-            return "[con_id=${tab.id}] mark --add $mark; " +
-                "[con_id=${survivor.raw}] move container to mark $mark; unmark $mark"
+        private fun liftInto(tab: Node, survivor: SurfaceId): String =
+            moveToMarkOn(tab.id, survivor.raw)
+
+        /**
+         * One message moving [mover] to [target] by a mark held for the length of that message:
+         * *into* [target] when it is a container, beside it when it is a window (measured on 1.12).
+         */
+        private fun moveToMarkOn(target: Long, mover: Long): String {
+            val mark = "_awakener_move_${Random.nextLong().toULong().toString(16)}"
+            return "[con_id=$target] mark --add $mark; " +
+                "[con_id=$mover] move container to mark $mark; unmark $mark"
+        }
+
+        /**
+         * The floating container [id] is in — [id] itself when it floats alone — or null when it
+         * is tiled. Only the outermost container of a floating subtree is a `floating_con`, so the
+         * first one up the parents is the whole floating window.
+         */
+        private fun floatingAncestorOf(tree: Node, id: SurfaceId): Node? =
+            generateSequence(tree.find(id.raw)) { tree.parentOf(it.id) }
+                .firstOrNull { it.type == FLOATING_CON }
+
+        /**
+         * #229: the hide for a dock inside [floating], a floating window — which is where attach
+         * puts it beside a floating surface, since a split of a floating window floats.
+         *
+         * **`move scratchpad` cannot be aimed at the dock there.** On any child of a floating
+         * container sway moves the whole container, so the plain hide took the surface into the
+         * scratchpad with its panel. `floating enable` and `move right` on that child do nothing
+         * for the same reason, and a move to a mark on the window puts it back inside — all
+         * measured on headless sway 1.12.
+         *
+         * **A move to another workspace does take the dock out alone, and is the only command
+         * found that does.** So the dock goes to a workspace of its own and straight back to the
+         * floating window's workspace, where it arrives as an ordinary tiled window — beside the
+         * workspace's last-focused *tiled* node, never inside the floating split — that
+         * `move scratchpad` then takes by itself. The return is what disposes of the passage: a
+         * workspace the dock merely *leaves for the scratchpad* is left standing, empty, while one
+         * it leaves by a move to another workspace is destroyed. A `move … to output` will not do
+         * for the return: it lands the dock beside the output's focused node, which is the surface,
+         * and so back inside the split. All measured on 1.12, and all one message, so nothing in
+         * between is presented (#172).
+         *
+         * **Nothing here changes the surface's floating state**, and that is the point of the
+         * shape (the review of #232). The first fix tiled the floating window for the length of
+         * the message and floated it again on its old rectangle, and the surface's client then
+         * committed the size it had held inside the split *after* sway had laid the window out —
+         * which sway keeps for a floating window — so a hide cost the window the panel's share of
+         * its width, compounding across cycles; at `scale 1.5` on nearly every run. The floating
+         * window here never leaves the float, its rectangle is never re-asserted, and the surface
+         * is resized within it by layout, which a tiled client's commits do not override.
+         *
+         * Under [flatten] — [WmFlags.flattenFloatingOnHide], off by default for the reason its
+         * description gives — and when nothing but the surface and dock were in the window, the
+         * window is then collapsed onto the surface: the collapse #187 makes for a tiled split,
+         * since a new window maps inside a focused floating split as well, which is how attach's
+         * own dock gets there. `split none` on the only child of a floating split leaves it
+         * floating alone on the split's rectangle, measured on 1.12. That collapse is the one
+         * step here that does make the surface a floating window, which is why it is not the
+         * default.
+         */
+        private fun floatingHideCommands(
+            tree: Node,
+            floating: Node,
+            surface: SurfaceId,
+            dock: SurfaceId,
+            flatten: Boolean,
+        ): List<String> {
+            val name = checkNotNull(workspaceOf(tree, floating)?.name) {
+                "floating window ${floating.id} holding dock ${dock.raw} is on no workspace"
+            }
+            // Refused rather than hidden the old way, which would take the surface with it.
+            val workspace = checkNotNull(quotedWorkspace(name)) {
+                "cannot hide dock ${dock.raw}: its workspace '$name' holds both kinds of quote, " +
+                    "so no sway command can name it"
+            }
+            val passage = "__awakener_hide_${Random.nextLong().toULong().toString(16)}"
+            val alone = floating.nodes.map { it.id }.toSet() == setOf(surface.raw, dock.raw)
+            return buildList {
+                add("[con_id=${dock.raw}] move container to workspace $passage")
+                add("[con_id=${dock.raw}] move container to workspace $workspace")
+                add("[con_id=${dock.raw}] move scratchpad")
+                if (flatten && alone) add("[con_id=${surface.raw}] split none")
+            }
+        }
+
+        /** The workspace [node] is on, or null when it is on none. */
+        private fun workspaceOf(tree: Node, node: Node): Node? =
+            generateSequence(tree.parentOf(node.id)) { tree.parentOf(it.id) }
+                .firstOrNull { it.type == WORKSPACE }
+
+        /**
+         * [name] as a single sway argument, or null when it cannot be written as one.
+         *
+         * sway does not unescape inside quotes — `"a \"q\" b"` names the workspace `a \"q\" b`,
+         * backslashes and all, measured on 1.12 — so a quote can only appear inside the *other*
+         * kind of quote, and a name holding both kinds has no spelling at all.
+         */
+        private fun quotedWorkspace(name: String): String? = when {
+            '"' !in name -> "\"$name\""
+            '\'' !in name -> "'$name'"
+            else -> null
         }
 
         /**
@@ -2608,6 +2731,9 @@ class SwayWindowManager(
          * `floating=user_on`, centred over the surface. Measured on 1.12.
          */
         const val FLOATING_CON = "floating_con"
+
+        /** The `type` sway gives a workspace node. */
+        const val WORKSPACE = "workspace"
 
         /**
          * How far [Node.percent] may sit from the configured fraction and still count as landed.
