@@ -297,9 +297,15 @@ open class SwayHideTest {
      * ordinary workspace on the `__i3` output, `Node.windows` walks `floating_nodes` as well as
      * `nodes`, and the mark rides along with the window. So the sweep enumerates a hidden dock
      * exactly as it does a standing one.
+     *
+     * The sweep here is the one this test calls, so the collector's sweep on close is switched
+     * off: with it on, the close event can reap the panel before the precondition reads the tree,
+     * and under load it did (#230). That is the product working early, not a leak — and the
+     * collector's own reach into the scratchpad is held by the test after this one.
      */
     @Test
     fun `a hidden dock is still reaped when its surface closes`() = swayTest {
+        store.put(WmFlags.sweepOnClose, false)
         val app = openSurface("aw-app1")
         val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
         val pid = assertNotNull(pidOf(dock.dockId))
@@ -319,6 +325,35 @@ open class SwayHideTest {
         assertNull(
             wm.tree().find(dock.dockId.raw),
             "the sweep reached into the scratchpad and took the hidden panel down",
+        )
+        assertTrue(
+            awaitProcessGone(pid),
+            "and the agent behind it exited, rather than being left running invisibly",
+        )
+    }
+
+    /**
+     * The same hazard with nobody driving the sweep: the close event alone takes a hidden panel
+     * down. The test before this one proves the sweep can see into the scratchpad; this one proves
+     * the collector, which is what a desktop nobody is calling into actually relies on, does.
+     */
+    @Test
+    fun `a hidden dock is reaped on close without anyone driving the sweep`() = swayTest {
+        val app = openSurface("aw-app1")
+        val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+        val pid = assertNotNull(pidOf(dock.dockId))
+        dock.hide()
+        assertTrue(dock.hidden(), "it really is out of the layout before the surface dies")
+
+        command("[con_id=${app.raw}] kill")
+
+        assertNotNull(
+            withTimeoutOrNull(WAIT_MS) {
+                while (wm.tree().find(dock.dockId.raw) != null) yield()
+                true
+            },
+            "the hidden panel is still standing ${WAIT_MS}ms after its surface closed, and nothing " +
+                "in this test called the sweep — the collector did not reach into the scratchpad",
         )
         assertTrue(
             awaitProcessGone(pid),
