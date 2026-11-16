@@ -6,6 +6,7 @@ import com.monkopedia.awakener.config.PrivateFiles
 import com.monkopedia.awakener.config.oneLine
 import java.io.IOException
 import java.nio.channels.FileChannel
+import java.nio.file.FileAlreadyExistsException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
@@ -385,7 +386,15 @@ class FileBindingStore(
                 PrivateFiles.createDirectories(location, permissions)
             ResidueLayout.PER_KEY_FILE -> {
                 PrivateFiles.createParentDirectories(location, permissions)
-                if (!location.exists()) PrivateFiles.createFile(location, permissions)
+                // Created rather than looked for first: `exists()` then `createFile` is
+                // check-then-act, and a press that lost the gap to another one preparing the same
+                // surface raised over the file that press had just made (#167). Under the default
+                // `registry.key.window_identity=APP_ID` that is two windows of one application.
+                try {
+                    PrivateFiles.createFile(location, permissions)
+                } catch (_: FileAlreadyExistsException) {
+                    // Already there, which is all this asked for.
+                }
             }
         }
         location
