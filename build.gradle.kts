@@ -43,7 +43,7 @@ fun toolFingerprint(vararg tools: String): String {
 // of the awk coverage, since a workflow step runs under the runner's awk alone while a `check`
 // task runs under whatever the developer host has. Both hosts are needed to cover mawk *and*
 // gawk *and* busybox awk between them.
-val summaryMatrixTest by tasks.registering(Exec::class) {
+val summaryMatrixTest = tasks.register<Exec>("summaryMatrixTest") {
     group = LifecycleBasePlugin.VERIFICATION_GROUP
     description = "Runs .github/scripts/test-summary.sh against its fixture and mutant matrix."
     val matrix = layout.projectDirectory.file(".github/scripts/test-summary-matrix.sh")
@@ -101,7 +101,7 @@ tasks.named("check") { dependsOn(summaryMatrixTest) }
 // `busybox`, which #156 put on a roster the suite *skips* when they are absent. So the
 // fingerprint below is not a copy of the sibling's; it is the first tool dependency this task has
 // ever had that meets its own stated bar.
-val uploadOutcomeMatrixTest by tasks.registering(Exec::class) {
+val uploadOutcomeMatrixTest = tasks.register<Exec>("uploadOutcomeMatrixTest") {
     group = LifecycleBasePlugin.VERIFICATION_GROUP
     description = "Runs .github/scripts/upload-outcome.sh against its input and mutant matrix."
     val matrix = layout.projectDirectory.file(".github/scripts/upload-outcome-matrix.sh")
@@ -161,7 +161,7 @@ tasks.named("check") { dependsOn(uploadOutcomeMatrixTest) }
 // rests on. Gradle treats neither PATH nor the environment as an input (#28, #29), so without this
 // the build cache would replay a run recorded against one git into a run whose point was another,
 // and an upgraded git would never re-run the suite that exists to characterise it.
-val stalenessMatrixTest by tasks.registering(Exec::class) {
+val stalenessMatrixTest = tasks.register<Exec>("stalenessMatrixTest") {
     group = LifecycleBasePlugin.VERIFICATION_GROUP
     description = "Runs .github/scripts/check-staleness.sh against its fixture and mutant matrix."
     val matrix = layout.projectDirectory.file(".github/scripts/staleness-matrix.sh")
@@ -204,7 +204,7 @@ tasks.named("check") { dependsOn(stalenessMatrixTest) }
 // outright with `CANNOT VOUCH` if `grep` or `awk` is missing, so there is no reduced-coverage run
 // for the cache to replay. A fingerprint earns its place when a *missing* tool would leave the
 // suite running with less coverage and still green, and nothing here has that shape.
-val wrapperPinMatrixTest by tasks.registering(Exec::class) {
+val wrapperPinMatrixTest = tasks.register<Exec>("wrapperPinMatrixTest") {
     group = LifecycleBasePlugin.VERIFICATION_GROUP
     description = "Runs .github/scripts/check-wrapper-pin.sh against its case and mutant matrix."
     val matrix = layout.projectDirectory.file(".github/scripts/check-wrapper-pin-matrix.sh")
@@ -254,7 +254,7 @@ tasks.named("check") { dependsOn(wrapperPinMatrixTest) }
 // current one, which is the same reason `git status` cannot tell a stale checkout from a current
 // one, and it is worth stating rather than papering over: an mtime rule would red every legitimate
 // up-to-date test task, trading a narrow blind spot for a broad false alarm.
-val verifyTestFloors by tasks.registering(Exec::class) {
+val verifyTestFloors = tasks.register<Exec>("verifyTestFloors") {
     group = LifecycleBasePlugin.VERIFICATION_GROUP
     description = "Fails if a module ran fewer tests than .github/scripts/test-floors declares."
     dependsOn(subprojects.map { "${it.path}:check" })
