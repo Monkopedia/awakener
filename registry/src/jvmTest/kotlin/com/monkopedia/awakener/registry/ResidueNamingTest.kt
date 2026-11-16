@@ -354,13 +354,18 @@ class ResidueNamingTest {
             slugResidue(key, "model")
             val stores = listOf(store(), store())
             val barrier = java.util.concurrent.CyclicBarrier(2)
+            // Collected, because a bare `Thread` hands a raise to the default handler and the
+            // test passes over it (#167).
+            val failures = java.util.concurrent.ConcurrentLinkedQueue<Throwable>()
             val threads = stores.map { store ->
                 Thread {
                     barrier.await()
-                    kotlinx.coroutines.runBlocking { store.prepareResidue(key) }
+                    runCatching { kotlinx.coroutines.runBlocking { store.prepareResidue(key) } }
+                        .exceptionOrNull()?.let(failures::add)
                 }.apply { start() }
             }
             threads.forEach { it.join() }
+            assertTrue(failures.isEmpty(), "trial $trial: $failures")
             stores.forEach { store ->
                 val note = store.residueMigrated.orEmpty()
                 assertFalse("could not move" in note, "trial $trial: $note")
