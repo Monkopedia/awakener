@@ -28,12 +28,12 @@ kotlin {
 // second place for that ordering to drift, and a drifted gate is invisible until the day the tool
 // is missing. `jvmMain` is the wrong home for it — `org.junit.Assume` has no business in the
 // production artifact.
-val jvmTestClasses: Configuration by configurations.creating {
+val jvmTestClasses = configurations.create("jvmTestClasses") {
     isCanBeResolved = false
     isCanBeConsumed = true
 }
 
-val jvmTestJar by tasks.registering(Jar::class) {
+val jvmTestJar = tasks.register<Jar>("jvmTestJar") {
     archiveClassifier.set("jvm-test")
     from(kotlin.jvm().compilations.getByName("test").output.allOutputs)
 }

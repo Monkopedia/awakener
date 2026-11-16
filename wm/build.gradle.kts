@@ -33,12 +33,12 @@ kotlin {
 // `:cli` would drift from this one, and the drift would show up as leaked compositors on a shared
 // machine rather than as a failing test; and moving the harness into `jvmMain` would ship test
 // scaffolding in the production artifact, where `org.junit.Assume` has no business being.
-val jvmTestClasses: Configuration by configurations.creating {
+val jvmTestClasses = configurations.create("jvmTestClasses") {
     isCanBeResolved = false
     isCanBeConsumed = true
 }
 
-val jvmTestJar by tasks.registering(Jar::class) {
+val jvmTestJar = tasks.register<Jar>("jvmTestJar") {
     archiveClassifier.set("jvm-test")
     from(kotlin.jvm().compilations.getByName("test").output.allOutputs)
 }

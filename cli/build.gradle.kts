@@ -177,7 +177,7 @@ val launcherScripts: Map<String, String> = entryPoints.mapValues { (name, main) 
     launcher(name, main)
 }
 
-val launchers by tasks.registering {
+val launchers = tasks.register("launchers") {
     description = "Writes the start scripts for every entry point."
     val target = layout.buildDirectory.dir("launchers")
     val scripts = launcherScripts
@@ -195,7 +195,7 @@ val launchers by tasks.registering {
     }
 }
 
-val installDist by tasks.registering(Sync::class) {
+val installDist = tasks.register<Sync>("installDist") {
     group = "distribution"
     description = "Lays out runnable CLIs under build/install/awakener: put its bin/ on PATH."
     into(layout.buildDirectory.dir("install/awakener"))
@@ -229,7 +229,7 @@ val installDist by tasks.registering(Sync::class) {
 //
 // Three review rounds found three defects here by hand, which is two more than a script this
 // small should get to have.
-val launcherTest by tasks.registering(Exec::class) {
+val launcherTest = tasks.register<Exec>("launcherTest") {
     group = LifecycleBasePlugin.VERIFICATION_GROUP
     description = "Runs the shipped launchers under a JDK, PATH and symlink matrix."
     val script = layout.projectDirectory.file("launcher-matrix.sh")
