@@ -269,7 +269,14 @@ class SwayHarness private constructor(
         fun start(extraConfig: String = ""): SwayHarness {
             val runtimeDir = Files.createTempDirectory("awakener-sway")
             val socket = runtimeDir.resolve("sway-ipc.sock")
-            return SwayHarness(launch(runtimeDir, socket, extraConfig), socket, runtimeDir, extraConfig)
+            // A launch that fails never reaches [close], so its directory is removed here.
+            val process = try {
+                launch(runtimeDir, socket, extraConfig)
+            } catch (e: Throwable) {
+                runtimeDir.toFile().deleteRecursively()
+                throw e
+            }
+            return SwayHarness(process, socket, runtimeDir, extraConfig)
         }
 
         /**
