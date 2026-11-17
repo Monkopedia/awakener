@@ -1,7 +1,6 @@
 // Explicit: inside a build script `java` names the Java plugin extension, not the package.
 import java.io.File
 import java.nio.file.Files
-import java.nio.file.attribute.PosixFilePermissions
 
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
@@ -264,18 +263,28 @@ tasks.withType<Test>().configureEach {
     // fresh socket — so a suite run against the developer's real runtime directory left hundreds
     // of lock files there (335 after one review). The harness hands this same directory to the
     // sways it starts, so their Wayland sockets land here too and the grim tests still find them.
-    // Short on purpose: a Wayland socket path has to fit in sun_path's 108 bytes.
-    val testRuntime = layout.buildDirectory.dir("xdg-run").get().asFile
-    environment("XDG_RUNTIME_DIR", testRuntime.absolutePath)
+    //
+    // Under the system temp directory rather than build/ (#240): a Wayland socket path has to fit
+    // in sun_path's 108 bytes, and build/ is as long as wherever the checkout happens to be — from
+    // a worktree under the session scratchpad every sway test failed with "Unable to open wayland
+    // socket". `createTempDirectory` makes it 0700, as the spec requires of a runtime directory.
+    // Its name is random, which is fine only because it reaches the task through the environment,
+    // which Gradle does not track: as a declared input it would give every run a new cache key.
+    var testRuntime: File? = null
     doFirst {
-        testRuntime.deleteRecursively()
-        testRuntime.mkdirs()
-        // 0700, as the spec requires of a runtime directory.
-        Files.setPosixFilePermissions(
-            testRuntime.toPath(),
-            PosixFilePermissions.fromString("rwx------"),
-        )
+        val dir = Files.createTempDirectory("awakener-xdg").toFile()
+        testRuntime = dir
+        environment("XDG_RUNTIME_DIR", dir.absolutePath)
     }
+    // On the root suite finishing rather than in doLast, which a failing test run never reaches.
+    addTestListener(object : TestListener {
+        override fun beforeSuite(suite: TestDescriptor) {}
+        override fun afterSuite(suite: TestDescriptor, result: TestResult) {
+            if (suite.parent == null) testRuntime?.deleteRecursively()
+        }
+        override fun beforeTest(testDescriptor: TestDescriptor) {}
+        override fun afterTest(testDescriptor: TestDescriptor, result: TestResult) {}
+    })
     // So the suite can assert the wiring above actually happened, for whatever the current set
     // of modules is rather than for a set frozen into a test.
     systemProperty("awakener.modules", siblingModules.joinToString(","))

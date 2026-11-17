@@ -269,7 +269,14 @@ class SwayHarness private constructor(
         fun start(extraConfig: String = ""): SwayHarness {
             val runtimeDir = Files.createTempDirectory("awakener-sway")
             val socket = runtimeDir.resolve("sway-ipc.sock")
-            return SwayHarness(launch(runtimeDir, socket, extraConfig), socket, runtimeDir, extraConfig)
+            // A launch that fails never reaches [close], so its directory is removed here.
+            val process = try {
+                launch(runtimeDir, socket, extraConfig)
+            } catch (e: Throwable) {
+                runtimeDir.toFile().deleteRecursively()
+                throw e
+            }
+            return SwayHarness(process, socket, runtimeDir, extraConfig)
         }
 
         /**
@@ -280,6 +287,10 @@ class SwayHarness private constructor(
          * restart test is that the successor is an ordinary session.
          */
         private fun launch(runtimeDir: Path, socket: Path, extraConfig: String = ""): Process {
+            val xdgRuntime = System.getenv("XDG_RUNTIME_DIR") ?: runtimeDir.absolutePathString()
+            requireBindable(socket)
+            // `wl_display_add_socket_auto` names it `wayland-0` through `wayland-32`.
+            requireBindable(Path.of(xdgRuntime, "wayland-32"))
             val config = runtimeDir.resolve("sway.conf")
             // No bar, no xwayland, no autostart: the tests assert on tree shape, and anything
             // that maps a window of its own would show up as a surface.
@@ -296,7 +307,7 @@ class SwayHarness private constructor(
                 .redirectOutput(runtimeDir.resolve("sway.log").toFile())
                 .apply {
                     environment().apply {
-                        put("XDG_RUNTIME_DIR", System.getenv("XDG_RUNTIME_DIR") ?: runtimeDir.absolutePathString())
+                        put("XDG_RUNTIME_DIR", xdgRuntime)
                         put("SWAYSOCK", socket.absolutePathString())
                         put("WLR_BACKENDS", "headless")
                         put("WLR_LIBINPUT_NO_DEVICES", "1")
@@ -315,6 +326,26 @@ class SwayHarness private constructor(
             process.destroyForcibly()
             fail("sway did not come up within ${STARTUP_TIMEOUT_NANOS / 1_000_000_000}s: " + runtimeDir.resolve("sway.log").toFile().readText())
         }
+
+        /**
+         * Fails, naming the path, when a Unix socket at [path] could not be bound (#240).
+         *
+         * `sun_path` is 108 bytes including its NUL, and a sway that cannot bind its Wayland
+         * socket logs `Unable to open wayland socket` and exits — which, fifteen seconds of
+         * startup timeout later, reads as a broken compositor rather than a long checkout path.
+         */
+        private fun requireBindable(path: Path) {
+            val bytes = path.absolutePathString().toByteArray().size
+            if (bytes + 1 > SUN_PATH_BYTES) {
+                fail(
+                    "socket path $path is $bytes bytes, and a Unix socket path must fit in " +
+                        "$SUN_PATH_BYTES bytes with its NUL; point XDG_RUNTIME_DIR or " +
+                        "java.io.tmpdir somewhere shorter",
+                )
+            }
+        }
+
+        private const val SUN_PATH_BYTES = 108
 
         private const val STARTUP_TIMEOUT_NANOS = 15_000_000_000L
 
