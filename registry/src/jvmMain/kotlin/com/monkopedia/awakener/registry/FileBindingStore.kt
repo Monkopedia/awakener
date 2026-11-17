@@ -2,6 +2,7 @@ package com.monkopedia.awakener.registry
 
 import com.monkopedia.awakener.config.Config
 import com.monkopedia.awakener.config.ConfigStore
+import com.monkopedia.awakener.config.FilePermissions
 import com.monkopedia.awakener.config.PrivateFiles
 import com.monkopedia.awakener.config.oneLine
 import java.io.IOException
@@ -197,6 +198,16 @@ class FileBindingStore(
      */
     val residueMigrated: String? get() = migrated
 
+    @Volatile
+    private var tightened: String? = null
+
+    /**
+     * The sentence to print when the most recent prepare took group or other access off residue
+     * that already existed, or could not, else null (#238). Set by [prepareResidue] alone, like
+     * every property of this shape; once a tree is private the next press has nothing to say.
+     */
+    val residueTightened: String? get() = tightened
+
     private val state = MutableStateFlow(snapshot.bindings)
 
     override val bindings: StateFlow<Map<SurfaceKey, Binding>> = state.asStateFlow()
@@ -362,8 +373,10 @@ class FileBindingStore(
      * world-readable; what stopped that mattering was `/home/<user>` being `0700`, a property
      * of directories this store neither creates nor checks.
      *
-     * The permissions are what this store can put on what it makes. Where it was *told* to
-     * make it is a separate question, asked once here and answered by
+     * The permissions are what this store can put on what it makes. What it *finds* already
+     * there — residue from before #102, carried unchanged through a rename by [migrateSlugResidue]
+     * — is tightened afterwards to match, as far as [RegistryFlags.residueTighten] says (#238).
+     * Where it was *told* to make it is a separate question, asked once here and answered by
      * [RegistryFlags.residueExposure].
      */
     suspend fun prepareResidue(key: SurfaceKey): Path = withContext(Dispatchers.IO) {
@@ -397,7 +410,36 @@ class FileBindingStore(
                 }
             }
         }
+        tightenResidue(cfg, key, location)
         location
+    }
+
+    /**
+     * Takes group and other access off [location] and what leads to it, per
+     * [RegistryFlags.residueTighten]. After creation, so the one pass covers whatever was found and
+     * whatever was just made; on what was just made it changes nothing. Never raises: an entry it
+     * cannot change is reported, and the press goes on.
+     */
+    private fun tightenResidue(cfg: Config, key: SurfaceKey, location: Path) {
+        tightened = null
+        if (cfg[RegistryFlags.filePermissions] != FilePermissions.OWNER_ONLY) return
+        val recursive = when (cfg[RegistryFlags.residueTighten]) {
+            ResidueTighten.OFF -> return
+            ResidueTighten.LOCATION -> false
+            ResidueTighten.TREE -> true
+        }
+        val root = RegistryPaths.residueDir(cfg, path)
+        val result = ResidueModes.tighten(root, location, recursive)
+        if (result.tightened == 0 && result.failed.isEmpty()) return
+        val failures = result.failed.takeIf { it.isNotEmpty() }?.let {
+            "; could not tighten ${it.size}, first ${oneLine(it.first())}"
+        }.orEmpty()
+        // No claim about why they were open. Under TREE this runs every press, so on a current
+        // install the entries are mostly files Claude or a connector wrote at its own umask since
+        // the last one, not residue from before #102; saying either would be guessing.
+        tightened = "${oneLine(key.canonical)}: tightened ${result.tightened} entries in or above " +
+            "${oneLine(location.toString())} to owner-only$failures; set " +
+            "${RegistryFlags.residueTighten.key}=${ResidueTighten.OFF} to leave them"
     }
 
     /**
