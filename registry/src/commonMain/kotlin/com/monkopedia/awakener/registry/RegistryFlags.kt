@@ -344,6 +344,34 @@ enum class ResidueExposureScope {
     PARENT,
 }
 
+/**
+ * How much existing residue a prepare takes group and other access off (#238).
+ *
+ * Residue written before #102 took the umask — `0755` directories, `0644` files — and a rename,
+ * which is all #210's migration does, carries the mode with it. Only group and other bits are
+ * ever cleared, so nothing is widened and an executable stays executable. Applies only under
+ * `registry.store.permissions=OWNER_ONLY`: a deployment on `UMASK` asked for the umask's modes.
+ */
+enum class ResidueTighten {
+    /**
+     * The residue root, any application directory, the surface's residue, and everything inside
+     * it. The default, because the leak the issue measured is inside: Claude's
+     * `.claude/settings.local.json` and whatever a connector wrote are created by them, not by
+     * awakener, at whatever mode their own umask gave. Symlinks are neither followed nor changed.
+     */
+    TREE,
+
+    /**
+     * The residue root, any application directory, and the surface's residue itself — not what is
+     * inside it. For a residue directory whose contents something else deliberately shares.
+     */
+    LOCATION,
+
+    /** Touch nothing that already exists: the behaviour before #238. */
+    OFF,
+}
+
+
 /** How a surface's durable residue is laid out on disk. */
 enum class ResidueLayout {
     /** One file per surface, `<slug>.md`. Simplest thing that stays readable by hand. */
@@ -678,9 +706,23 @@ object RegistryFlags {
             "process umask leaves, which under the usual 022 is a world-readable 0644 on " +
             "every residue file — and is kept for a deployment that widens the umask or sets " +
             "a default ACL on purpose so that a group or a backup agent can read the state " +
-            "directory. Only creation is governed: a directory that already exists is left as " +
-            "it is, which is registry.residue.exposed_dir's question rather than this one. " +
+            "directory. Creation is what this governs; residue that already exists is " +
+            "registry.residue.tighten's, and whether the directory it was pointed into is " +
+            "exposed is registry.residue.exposed_dir's. " +
             "`:config` has the same switch over its own files as config.store.permissions.",
+    )
+
+    val residueTighten = Flags.enum(
+        "registry.residue.tighten",
+        ResidueTighten.TREE,
+        "What each prepare takes group and other access off when it finds residue that already " +
+            "exists, which is how residue written before #102 at 0755/0644 — and carried along " +
+            "unchanged by a slug-to-digest rename — becomes private. Only those bits are cleared: " +
+            "0755 becomes 0700, 0644 becomes 0600, an executable stays executable, and nothing is " +
+            "ever widened. TREE covers the residue root, the application directory, the surface's " +
+            "residue and everything inside it, never following a symlink; LOCATION stops at the " +
+            "surface's residue itself; OFF touches nothing that exists. Ignored under " +
+            "registry.store.permissions=UMASK. What was tightened is reported once per press.",
     )
 
     val residueExposure = Flags.enum(
