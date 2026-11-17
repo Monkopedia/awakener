@@ -722,7 +722,11 @@ object RegistryFlags {
             "ever widened. TREE covers the residue root, the application directory, the surface's " +
             "residue and everything inside it, never following a symlink; LOCATION stops at the " +
             "surface's residue itself; OFF touches nothing that exists. Ignored under " +
-            "registry.store.permissions=UMASK. What was tightened is reported once per press.",
+            "registry.store.permissions=UMASK. What was tightened is reported once per press. " +
+            "TREE walks the whole residue on every press — about 10 ms for 4,000 files once " +
+            "they are private, 100 ms for 50,000 — because the Lifeless and its connectors " +
+            "keep writing new files at their own umask between presses, so a marker saying " +
+            "the tree was once tightened would go stale; LOCATION costs nothing for a large tree.",
     )
 
     val residueExposure = Flags.enum(

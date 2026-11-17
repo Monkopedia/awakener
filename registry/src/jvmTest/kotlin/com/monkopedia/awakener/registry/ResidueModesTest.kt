@@ -6,7 +6,9 @@ import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
+import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.PosixFilePermissions
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.io.path.createDirectories
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.exists
@@ -239,9 +241,8 @@ class ResidueModesTest {
         chmod(at, "rwxr-xr-x")
         chmod(root, "rwxr-xr-x")
 
-        val result = ResidueModes.tighten(root, at, recursive = true) { path, mode ->
+        val result = ResidueModes.tighten(root, at, recursive = true) { path ->
             if (path.fileName.toString() == "b.md") throw IOException("Operation not permitted")
-            Files.setPosixFilePermissions(path, mode)
         }
 
         assertEquals(4, result.tightened, "the root, the surface, a.md and c.md")
@@ -249,5 +250,91 @@ class ResidueModesTest {
         assertTrue(result.failed.single().contains("b.md"), result.failed.single())
         assertEquals("rw-------", modeOf(at.resolve("c.md")), "the walk went on past it")
         assertEquals("rw-r--r--", modeOf(at.resolve("b.md")))
+    }
+
+    /**
+     * A directory inside the residue, swapped for a symlink to somewhere outside it after the walk
+     * has classified it as a directory. A walk by path string follows the link for every child
+     * (review of #241, at `bcf3e66`); a walk by descriptor is still holding the real directory.
+     *
+     * The swap is made from the seam, just before `sub`'s own mode is set, which is after the walk
+     * decided `sub` was a directory and before it reads what is inside — the window a real race
+     * has to hit, held open deterministically.
+     */
+    @Test
+    fun `a directory swapped for a symlink mid-walk does not carry the walk out of the root`() {
+        val root = dir.resolve("residue").createDirectories()
+        val at = root.resolve("surface").createDirectories()
+        val sub = at.resolve("sub").createDirectories()
+        sub.resolve("id").writeText("inside")
+        chmod(sub.resolve("id"), "rw-r--r--")
+        chmod(sub, "rwxr-xr-x")
+        outsideDir.createDirectories()
+        outsideDir.resolve("id").writeText("outside")
+        chmod(outsideDir.resolve("id"), "rw-r--r--")
+        val moved = at.resolve("sub-real")
+
+        val result = ResidueModes.tighten(root, at, recursive = true) { path ->
+            if (path == sub) {
+                Files.move(sub, moved)
+                Files.createSymbolicLink(sub, outsideDir)
+            }
+        }
+
+        assertEquals("rw-r--r--", modeOf(outsideDir.resolve("id")), "outside the root is untouched")
+        assertEquals("rw-------", modeOf(moved.resolve("id")), "the real directory's child was reached")
+        assertTrue(result.failed.isEmpty(), "${result.failed}")
+    }
+
+    /**
+     * The same escape without a seam: one thread flips `sub` between a real directory and a
+     * symlink out of the root with atomic renames while the walk runs. A path walk escaped within
+     * tens of milliseconds in review; this runs for a fixed number of rounds and checks, after
+     * every one, that nothing outside the root changed mode.
+     */
+    @Test
+    fun `a directory flipping to a symlink under a real race never leads out of the root`() {
+        val root = dir.resolve("residue").createDirectories()
+        val at = root.resolve("surface").createDirectories()
+        val real = at.resolve("real").createDirectories()
+        val sub = at.resolve("sub")
+        val parked = at.resolve("parked")
+        outsideDir.createDirectories()
+        val outsideFiles = (0 until 50).map { i ->
+            outsideDir.resolve("f$i").also {
+                it.writeText("outside")
+                chmod(it, "rw-r--r--")
+            }
+        }
+        (0 until 50).forEach { i -> real.resolve("f$i").writeText("inside") }
+        Files.createSymbolicLink(parked, outsideDir)
+        val stop = AtomicBoolean(false)
+        val flipper = Thread {
+            // Each move on its own, so one that loses to the walk does not stall the cycle.
+            val cycle = listOf(real to sub, sub to real, parked to sub, sub to parked)
+            while (!stop.get()) {
+                cycle.forEach { (from, to) ->
+                    runCatching { Files.move(from, to, StandardCopyOption.ATOMIC_MOVE) }
+                }
+            }
+        }
+        flipper.isDaemon = true
+        flipper.start()
+        try {
+            repeat(RACE_ROUNDS) { round ->
+                runCatching { chmod(sub, "rwxr-xr-x") }
+                runCatching { chmod(real, "rwxr-xr-x") }
+                ResidueModes.tighten(root, at, recursive = true)
+                val escaped = outsideFiles.filter { modeOf(it) != "rw-r--r--" }
+                assertTrue(escaped.isEmpty(), "round $round reached outside the root: $escaped")
+            }
+        } finally {
+            stop.set(true)
+            flipper.join()
+        }
+    }
+
+    private companion object {
+        const val RACE_ROUNDS = 400
     }
 }
