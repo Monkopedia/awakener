@@ -416,7 +416,7 @@ private fun awaken(args: Array<String>, store: FileConfigStore): Int {
                 bindings.residueStranded?.let { System.err.println("warning: $it") }
                 // And whether this press renamed the surface's model off its slug-named path.
                 bindings.residueMigrated?.let { System.err.println("note: $it") }
-                // And whether it had to take group/other access off residue older than #102.
+                // And whether it had to take group/other access off anything in the residue.
                 bindings.residueTightened?.let { System.err.println("note: $it") }
                 // And whether this press ran without the cross-process attach lock, which is the
                 // one condition under which #199's double-claimed dock can come back.

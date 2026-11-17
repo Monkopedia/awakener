@@ -434,10 +434,12 @@ class FileBindingStore(
         val failures = result.failed.takeIf { it.isNotEmpty() }?.let {
             "; could not tighten ${it.size}, first ${oneLine(it.first())}"
         }.orEmpty()
-        tightened = "${oneLine(key.canonical)}: took group/other access off ${result.tightened} " +
-            "existing residue entries at or above $location$failures — residue written before " +
-            "#102 kept its umask modes; set ${RegistryFlags.residueTighten.key}=" +
-            "${ResidueTighten.OFF} to leave them"
+        // No claim about why they were open. Under TREE this runs every press, so on a current
+        // install the entries are mostly files Claude or a connector wrote at its own umask since
+        // the last one, not residue from before #102; saying either would be guessing.
+        tightened = "${oneLine(key.canonical)}: tightened ${result.tightened} entries in or above " +
+            "${oneLine(location.toString())} to owner-only$failures; set " +
+            "${RegistryFlags.residueTighten.key}=${ResidueTighten.OFF} to leave them"
     }
 
     /**
