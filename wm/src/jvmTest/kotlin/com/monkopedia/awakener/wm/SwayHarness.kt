@@ -3,6 +3,7 @@ package com.monkopedia.awakener.wm
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.io.path.absolutePathString
 import kotlin.io.path.deleteIfExists
 import kotlin.io.path.exists
@@ -128,12 +129,27 @@ class SwayHarness private constructor(
      * nothing.
      */
     override fun close() {
-        process.destroy()
-        if (!process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) process.destroyForcibly()
-        val clients = spawned()
-        clients.forEach { it.destroyForcibly() }
-        awaitGone(clients)
-        socket.deleteIfExists()
+        try {
+            process.destroy()
+            if (!process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) process.destroyForcibly()
+            val clients = spawned()
+            clients.forEach { it.destroyForcibly() }
+            awaitGone(clients)
+        } finally {
+            // In a finally because a reap that throws is still a session that has ended, and its
+            // directory is otherwise left on a tmpfs for good (#243).
+            open.remove(this)
+            runtimeDir.toFile().deleteRecursively()
+        }
+    }
+
+    /**
+     * What the shutdown hook can still do for a session nobody closed: stop the compositor and
+     * remove its directory. No waiting and no reaping of clients, since a hook that outstays the
+     * signal that started it is cut short anyway.
+     */
+    private fun abandon() {
+        process.destroyForcibly()
         runtimeDir.toFile().deleteRecursively()
     }
 
@@ -267,7 +283,7 @@ class SwayHarness private constructor(
          * assertion.
          */
         fun start(extraConfig: String = ""): SwayHarness {
-            val runtimeDir = Files.createTempDirectory("awakener-sway")
+            val runtimeDir = createRuntimeDir()
             val socket = runtimeDir.resolve("sway-ipc.sock")
             // A launch that fails never reaches [close], so its directory is removed here.
             val process = try {
@@ -276,7 +292,41 @@ class SwayHarness private constructor(
                 runtimeDir.toFile().deleteRecursively()
                 throw e
             }
-            return SwayHarness(process, socket, runtimeDir, extraConfig)
+            return SwayHarness(process, socket, runtimeDir, extraConfig).also { open.add(it) }
+        }
+
+        /**
+         * The environment variable naming where session directories go; see [createRuntimeDir].
+         */
+        const val TMPDIR_VAR = "AWAKENER_SWAY_TMPDIR"
+
+        /**
+         * A fresh directory for one session, under [TMPDIR_VAR] when it is set (#243).
+         *
+         * [close] removes it and the shutdown hook covers a JVM that exits with sessions still
+         * open, but a SIGKILLed worker runs neither — measured, that and a cancelled build each
+         * left a directory in `/tmp`, which is RAM on kaladin. So the build points this at a
+         * per-run directory and removes that when the root suite finishes, which happens in the
+         * Gradle daemon and so outlives the worker. Unset — a run from outside Gradle — it is the
+         * system temp directory, as it always was.
+         */
+        private fun createRuntimeDir(): Path {
+            val parent = System.getenv(TMPDIR_VAR)?.takeIf { it.isNotEmpty() }
+            return if (parent == null) {
+                Files.createTempDirectory(DIR_PREFIX)
+            } else {
+                Files.createTempDirectory(Path.of(parent), DIR_PREFIX)
+            }
+        }
+
+        /** What every session directory is named after, and what the build's sweep looks for. */
+        private const val DIR_PREFIX = "awakener-sway"
+
+        /** Every session started and not yet closed, for the shutdown hook. */
+        private val open: MutableSet<SwayHarness> = ConcurrentHashMap.newKeySet<SwayHarness>().also { live ->
+            Runtime.getRuntime().addShutdownHook(
+                Thread({ live.toList().forEach { runCatching { it.abandon() } } }, "sway-harness-shutdown"),
+            )
         }
 
         /**
