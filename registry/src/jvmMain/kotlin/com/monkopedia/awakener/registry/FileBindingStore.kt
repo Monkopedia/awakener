@@ -438,9 +438,21 @@ class FileBindingStore(
     /**
      * The lock a prepare's section and a disposal of [key]'s residue both take (#239).
      *
-     * One per surface, because a disposal touches that surface's residue alone — never an
-     * application directory its siblings share, measured clean in 600 of 600 overlapping trials in
-     * the issue — so a forget of one window has no reason to wait on a press of another.
+     * **One of [RESIDUE_LOCK_BUCKETS], chosen by the first byte of the surface's digest — not one
+     * per surface.** A lock file per surface would be a file named for every surface ever pressed,
+     * which nothing could remove — unlinking an `fcntl` lock file reopens the race it guards — so
+     * a DELETE forget would leave behind a name that, under the default `APP_ID` identity, is a
+     * digest of `window:<app_id>` and checkable against a list of application names. A bucket
+     * names eight bits of it, which no forget changes and no surface owns, and the directory is
+     * bounded at 256 files. The cost is that two surfaces sharing a bucket — one pair in 256 —
+     * serialise: a forget of one waits behind a press of the other for as long as that press's
+     * section takes — measured at a median of 0.35ms more than a forget in another bucket, with
+     * the mint and bus local. Nothing is lost by it:
+     * a disposal touches its own surface's residue alone — never an application directory its
+     * siblings share, measured clean in 600 of 600 overlapping trials in the issue — so the
+     * finer-grained lock bought concurrency and nothing else. Two buckets nested in one coroutine
+     * do not arise, since no section prepares or disposes of a second surface, and the same
+     * bucket nested would be a re-entry.
      *
      * **Beside the bindings file, not in the residue directory.** Not *in* the residue it guards,
      * since that is what an archive moves and a delete removes; and not anywhere else under the
@@ -490,7 +502,8 @@ class FileBindingStore(
     }
 
     private fun residueLockFile(key: SurfaceKey): Path =
-        path.resolveSibling("${path.name}.residue-locks").resolve("${key.kind}-${key.digest}.lock")
+        path.resolveSibling("${path.name}.residue-locks")
+            .resolve("${key.digest.take(RESIDUE_LOCK_BUCKET_CHARS)}.lock")
 
     private fun prepareLocked(key: SurfaceKey): Path {
         val cfg = config
@@ -926,6 +939,12 @@ class FileBindingStore(
 
         /** How many names within one second an archive will try before giving up. */
         private const val ARCHIVE_ATTEMPTS = 100
+
+        /** Hex characters of a key's digest that name its residue lock: one byte. */
+        private const val RESIDUE_LOCK_BUCKET_CHARS = 2
+
+        /** How many residue lock files there can ever be; see [residueLock]. */
+        const val RESIDUE_LOCK_BUCKETS = 1 shl (4 * RESIDUE_LOCK_BUCKET_CHARS)
 
         /**
          * The mode bits that let somebody other than the owner create an entry in a directory.

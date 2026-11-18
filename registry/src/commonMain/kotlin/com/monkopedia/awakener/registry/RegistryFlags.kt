@@ -834,6 +834,9 @@ object RegistryFlags {
             "lock before giving up with nothing changed. A press holds it from preparing the " +
             "residue to the end of rendering its connector, and a forget holds it while it " +
             "archives or deletes, so the two can never interleave on one surface (#239). The " +
+            "locks are 256 files beside the bindings file, one per first byte of a surface's " +
+            "digest, so they name no surface and a DELETE forget leaves nothing behind that " +
+            "does; two surfaces sharing one occasionally wait on each other. The " +
             "press's span includes a mint and up to two spanreed list runs, 36s under default " +
             "timeouts, rounded up to 60s. A forget that gives up reports its residue as failed " +
             "with the binding already gone, as any failed disposal does; a press that gives up " +
