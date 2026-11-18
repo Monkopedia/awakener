@@ -89,6 +89,7 @@ object RegistryCli {
         // Non-fatal — the write did happen — but a `forget` that ran with no cross-process
         // exclusion is one another process can undo, and that is the whole of #50.
         store.lockError?.let { out("warning: $it") }
+        store.residueLockError?.let { out("warning: $it") }
         return code
     }
 

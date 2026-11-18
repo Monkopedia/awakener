@@ -295,4 +295,16 @@ interface BindingStore {
      * never been bound — which is what lets a cold spawn load residue before it has an agent.
      */
     fun residueLocation(key: SurfaceKey): String
+
+    /**
+     * Runs [block] — a press's prepare of [key]'s residue and everything that writes into it —
+     * with no disposal of that residue by [unbind] able to interleave, in this process or another
+     * (#239). Without it a forget could archive or delete the directory a press had just prepared
+     * and was rendering into, or meet the press's new file halfway through deleting the old model.
+     *
+     * Keyed on the surface's residue rather than on anything about the compositor, so it holds
+     * between a press and an `awakener-registry forget` whatever environment each runs in. A store
+     * with nothing on disk has nothing to interleave, and runs [block] as it is.
+     */
+    suspend fun <T> holdingResidue(key: SurfaceKey, block: suspend () -> T): T = block()
 }

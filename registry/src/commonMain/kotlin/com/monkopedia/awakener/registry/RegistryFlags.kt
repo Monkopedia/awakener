@@ -501,7 +501,10 @@ object RegistryFlags {
             "bindings file. Off keeps the hotkey working on a filesystem that will not lock (an " +
             "NFS home without lockd), reporting the degradation rather than hiding it, at the " +
             "cost that a concurrent `awakener-registry forget` can be lost. On refuses to bind " +
-            "at all rather than write without exclusion.",
+            "at all rather than write without exclusion. The same switch governs the residue " +
+            "lock (registry.residue.lock_wait_ms): off, a prepare or a forget that cannot take " +
+            "it goes ahead and the store reports that; on, a press fails and a forget reports " +
+            "its residue as not disposed.",
     )
 
     val forgetConflict = Flags.enum(
@@ -807,5 +810,39 @@ object RegistryFlags {
             "it is, so that surface — and any new window of an application whose slug-named " +
             "app directory exists — keeps publishing its app_id words as its working " +
             "directory.",
+    )
+
+    /**
+     * The longest [residueLockWaitMs] may be set to, for the reason `wm.attach.lock_wait_ms` has
+     * the same bound: the value becomes a deadline, and a forget queued for ten minutes is a
+     * wedged forget either way.
+     */
+    const val MAX_RESIDUE_LOCK_WAIT_MS = 600_000L
+
+    /**
+     * Sixty seconds, because a press holds the residue lock from its prepare to the end of its
+     * connector rendering (#239), and between those it binds and asks the bus. Under defaults
+     * that is one mint and up to two `spanreed list` runs at `registry.agent.command_timeout_ms`
+     * plus two `registry.agent.drain_grace_ms` each — 36s — and the round sixty matches
+     * `wm.attach.lock_wait_ms`, which bounds the same press. A forget holds it only for one
+     * rename or one recursive delete.
+     */
+    val residueLockWaitMs = Flags.long(
+        "registry.residue.lock_wait_ms",
+        60_000,
+        "How long a press or a forget waits for another process holding one surface's residue " +
+            "lock before giving up with nothing changed. A press holds it from preparing the " +
+            "residue to the end of rendering its connector, and a forget holds it while it " +
+            "archives or deletes, so the two can never interleave on one surface (#239). The " +
+            "locks are 256 files beside the bindings file, one per first byte of a surface's " +
+            "digest, so they name no surface and a DELETE forget leaves nothing behind that " +
+            "does; two surfaces sharing one occasionally wait on each other. The " +
+            "press's span includes a mint and up to two spanreed list runs, 36s under default " +
+            "timeouts, rounded up to 60s. A forget that gives up reports its residue as failed " +
+            "with the binding already gone, as any failed disposal does; a press that gives up " +
+            "fails before it prepares anything. Zero gives up at once rather than queue. Whether " +
+            "a lock file that cannot be created or locked refuses is " +
+            "registry.store.lock_required.",
+        requires = Flags.within(0L..MAX_RESIDUE_LOCK_WAIT_MS),
     )
 }

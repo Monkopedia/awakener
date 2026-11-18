@@ -187,11 +187,15 @@ class ResidueAppLayoutTest {
         // Nothing was created outside the residue directory by any of the above. Asserted as
         // "nothing unexpected is here" rather than "the escape target is absent", because the
         // list above aims at several different places and only one of them is nameable here.
+        // The residue locks sit beside the bindings file by design (#239), and hold lock files
+        // only, so an escape into them would show up as something else there.
         assertEquals(
-            setOf("residue"),
+            setOf("residue", "bindings.json.residue-locks"),
             dir.toFile().list()!!.toSet(),
             "an escape would have left something beside the residue directory",
         )
+        val locks = dir.resolve("bindings.json.residue-locks").toFile().list()!!
+        assertTrue(locks.all { it.endsWith(".lock") }, "only lock files there: ${locks.toList()}")
     }
 
     /** The same strings in the *title* slot, which is where a key with no `app_id` reads from. */

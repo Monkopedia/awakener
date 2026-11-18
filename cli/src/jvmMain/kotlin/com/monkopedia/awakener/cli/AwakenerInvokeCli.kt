@@ -418,6 +418,9 @@ private fun awaken(args: Array<String>, store: FileConfigStore): Int {
                 bindings.residueMigrated?.let { System.err.println("note: $it") }
                 // And whether it had to take group/other access off anything in the residue.
                 bindings.residueTightened?.let { System.err.println("note: $it") }
+                // And whether it prepared without the residue lock, under which a forget of this
+                // surface can interleave with it (#239).
+                bindings.residueLockError?.let { System.err.println("warning: $it") }
                 // And whether this press ran without the cross-process attach lock, which is the
                 // one condition under which #199's double-claimed dock can come back.
                 wm.lockDegraded?.let { System.err.println("warning: $it") }
