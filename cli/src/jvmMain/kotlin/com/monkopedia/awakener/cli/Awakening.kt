@@ -329,10 +329,56 @@ class Awakening(
             // and it is also what a press does after the panel has been closed by hand.
         }
 
-        // Before the bind rather than after, so that a cold Lifeless launched by the command
-        // below finds an empty model at {residue} instead of a path that is not there yet.
-        if (cfg[InvokeFlags.residuePrepare]) prepareResidue(key)
+        // Everything that writes into the residue, as one section against a forget of the same
+        // surface (#239): without it a forget could archive or delete the directory between the
+        // prepare and the connector rendering into it, or meet that rendering half-way through a
+        // delete. Held only while a prepare runs, since a press that prepares nothing has nothing
+        // of its own there to protect; the attach after it runs outside, because the panel's
+        // session outlives the press either way.
+        val staged = if (cfg[InvokeFlags.residuePrepare]) {
+            registry.holdingResidue(key) {
+                prepareResidue(key)
+                stage(cfg, key, surface, surfaces, pressedFrom, connector)
+            }
+        } else {
+            stage(cfg, key, surface, surfaces, pressedFrom, connector)
+        }
+        val (binding, residue, applied) = when (staged) {
+            is Staged.Stopped -> return staged.result
+            is Staged.Ready -> staged
+        }
 
+        val command = cfg[InvokeFlags.dockCommand]
+            .replace(AGENT_NAME, binding.spanreedName)
+            .replace(AGENT_ID, binding.agentId)
+            .replace(RESIDUE, residue)
+
+        // The agent is handed to `attach` rather than left for it to work out. Its own bind is
+        // then a recall of the row this method just wrote, so the identity baked into the command
+        // above and the identity the handle reports cannot disagree — which they could if each
+        // side resolved independently across a `registry.binding.rebind_policy` flip.
+        val dock = wm.attach(
+            surface.id,
+            DockSpec(cfg[InvokeFlags.dockAppId], command),
+            binding.agent,
+        )
+        return Awakened.Animated(surface.id, key, binding, dock, wasADrab, applied)
+    }
+
+    /**
+     * A press from the bind to its connector: what runs inside the residue section after the
+     * prepare. The prepare is ahead of the bind rather than after it, so that a cold Lifeless
+     * launched by the command finds an empty model at {residue} instead of a path that is not
+     * there yet.
+     */
+    private suspend fun stage(
+        cfg: Config,
+        key: SurfaceKey,
+        surface: Surface,
+        surfaces: List<Surface>,
+        pressedFrom: DockHandle?,
+        connector: ConnectorChoice,
+    ): Staged {
         // Recall or mint. This is the only moment an identity is ever created — the design brief
         // settles that spawning is on first *invocation*, not on first sight of a window, because
         // window creation as a trigger would mint hundreds a day for tabs glanced at and closed.
@@ -347,7 +393,7 @@ class Awakening(
             val panel = cfg[InvokeFlags.reuseEvidence] == ReuseEvidence.BUS_OR_PANEL &&
                 (pressedFrom != null || panelStandsFor(binding, surfaces, cfg))
             if (panel || bus.isAnimated(binding.agent)) {
-                return Awakened.AlreadyAnimated(surface.id, key, binding)
+                return Staged.Stopped(Awakened.AlreadyAnimated(surface.id, key, binding))
             }
         }
 
@@ -378,24 +424,20 @@ class Awakening(
             ),
         )
         if (applied is ConnectorOutcome.Refused) {
-            return Awakened.ConnectorRefused(surface.id, key, binding, applied)
+            return Staged.Stopped(Awakened.ConnectorRefused(surface.id, key, binding, applied))
         }
+        return Staged.Ready(binding, residue, applied)
+    }
 
-        val command = cfg[InvokeFlags.dockCommand]
-            .replace(AGENT_NAME, binding.spanreedName)
-            .replace(AGENT_ID, binding.agentId)
-            .replace(RESIDUE, residue)
+    /** Where [stage] left a press: answered already, or ready to attach. */
+    private sealed interface Staged {
+        class Stopped(val result: Awakened) : Staged
 
-        // The agent is handed to `attach` rather than left for it to work out. Its own bind is
-        // then a recall of the row this method just wrote, so the identity baked into the command
-        // above and the identity the handle reports cannot disagree — which they could if each
-        // side resolved independently across a `registry.binding.rebind_policy` flip.
-        val dock = wm.attach(
-            surface.id,
-            DockSpec(cfg[InvokeFlags.dockAppId], command),
-            binding.agent,
-        )
-        return Awakened.Animated(surface.id, key, binding, dock, wasADrab, applied)
+        data class Ready(
+            val binding: Binding,
+            val residue: String,
+            val applied: ConnectorOutcome,
+        ) : Staged
     }
 
     /**

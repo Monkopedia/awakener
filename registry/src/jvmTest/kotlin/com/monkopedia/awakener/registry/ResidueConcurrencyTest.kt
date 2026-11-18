@@ -31,7 +31,11 @@ import kotlinx.coroutines.runBlocking
  * on neither: two compositors, a press whose environment names a different runtime directory,
  * `wm.attach.lock_scope=PROCESS`, and a lock that could not be taken under
  * `wm.attach.lock_required=false` all reach one residue directory with nothing serialising them.
- * `prepareResidue` itself takes no lock, so its correctness under overlap is its own.
+ * Since #239 `prepareResidue` takes a residue lock of its own, but that lock is per surface —
+ * two surfaces of one application share an application directory and not a lock — and it degrades
+ * to no lock at all where the lock file cannot be taken, so its correctness under overlap is
+ * still its own. The same-surface races below now queue on that lock unless it degrades; they
+ * stay because the degraded path is a real one.
  *
  * **Why it is the ordinary case once it is reachable.** Under the default
  * `registry.key.window_identity=APP_ID` two windows of one application *are* one surface, so the

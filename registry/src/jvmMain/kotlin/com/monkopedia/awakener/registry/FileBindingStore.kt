@@ -2,6 +2,7 @@ package com.monkopedia.awakener.registry
 
 import com.monkopedia.awakener.config.Config
 import com.monkopedia.awakener.config.ConfigStore
+import com.monkopedia.awakener.config.FileLocks
 import com.monkopedia.awakener.config.FilePermissions
 import com.monkopedia.awakener.config.PrivateFiles
 import com.monkopedia.awakener.config.oneLine
@@ -138,6 +139,17 @@ class FileBindingStore(
      * Cleared as soon as a write does get the lock.
      */
     val lockError: String? get() = unlocked
+
+    @Volatile
+    private var residueUnlocked: String? = null
+
+    /**
+     * Why the last prepare or disposal went ahead without its surface's residue lock, if one did
+     * (#239) — [lockError]'s shape, for the second lock this store takes. Without it a forget can
+     * archive or delete residue a press is part-way through preparing, so it is reported rather
+     * than assumed.
+     */
+    val residueLockError: String? get() = residueUnlocked
 
     @Volatile
     private var exposureCheck = ResidueExposureCheck()
@@ -295,9 +307,23 @@ class FileBindingStore(
      * right way round: the fix is to take the snapshot once, not to re-read more often.
      */
     @OptIn(ExperimentalPathApi::class)
-    private suspend fun disposeResidue(key: SurfaceKey): ResidueOutcome =
+    private suspend fun disposeResidue(key: SurfaceKey): ResidueOutcome {
+        val cfg = config
+        if (cfg[RegistryFlags.forgetResidue] == ForgetResidue.KEEP) {
+            return ResidueOutcome.Kept(residueLocation(key))
+        }
+        // Under the lock a press prepares and renders in (#239), and the location resolved inside
+        // it: a press can have moved the residue off its slug-named path while this waited.
+        return try {
+            residueLock(cfg, key) { disposeLocked(cfg, key) }
+        } catch (e: IOException) {
+            ResidueOutcome.Failed(residueLocation(key), e.message ?: e.toString())
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    private suspend fun disposeLocked(cfg: Config, key: SurfaceKey): ResidueOutcome =
         withContext(Dispatchers.IO) {
-            val cfg = config
             val layout = cfg[RegistryFlags.residueLayout]
             val naming = cfg[RegistryFlags.residueNaming]
             val location = RegistryPaths.residueLocation(cfg, path, key)
@@ -379,14 +405,96 @@ class FileBindingStore(
      * Where it was *told* to make it is a separate question, asked once here and answered by
      * [RegistryFlags.residueExposure].
      */
-    suspend fun prepareResidue(key: SurfaceKey): Path = withContext(Dispatchers.IO) {
+    suspend fun prepareResidue(key: SurfaceKey): Path = holdingResidue(key) {
+        withContext(Dispatchers.IO) { prepareLocked(key) }
+    }
+
+    /**
+     * Holds [key]'s residue lock across [block], unless this coroutine already holds it, which is
+     * how [prepareResidue] inside a press's section takes it once rather than twice.
+     *
+     * The exposure question is asked here, before the lock, and not in the prepare: the lock file
+     * lives beside the bindings file, and creating it can create the directory that holds both it
+     * and the default residue directory. Asked after that, a first press under
+     * [ResidueExposureScope.DEEPEST_EXISTING] would examine the `0700` directory the lock had just
+     * made rather than the shared one the user pointed awakener into — the one chance #120 says
+     * that warning has to be seen. Only a prepare's section reaches here; a disposal takes the
+     * lock directly and asks nothing.
+     */
+    override suspend fun <T> holdingResidue(key: SurfaceKey, block: suspend () -> T): T {
+        val cfg = config
+        val file = residueLockFile(key)
+        if (FileLocks.holds(file)) return block()
+        withContext(Dispatchers.IO) {
+            checkExposure(
+                RegistryPaths.residueDir(cfg, path),
+                cfg[RegistryFlags.residueExposure],
+                cfg[RegistryFlags.residueExposureScope],
+            )
+        }
+        return residueLock(cfg, key, block)
+    }
+
+    /**
+     * The lock a prepare's section and a disposal of [key]'s residue both take (#239).
+     *
+     * One per surface, because a disposal touches that surface's residue alone — never an
+     * application directory its siblings share, measured clean in 600 of 600 overlapping trials in
+     * the issue — so a forget of one window has no reason to wait on a press of another.
+     *
+     * **Beside the bindings file, not in the residue directory.** Not *in* the residue it guards,
+     * since that is what an archive moves and a delete removes; and not anywhere else under the
+     * residue directory either, which holds models and nothing else and is read that way. Beside
+     * the bindings file is also where every process that can race here already agrees to look: a
+     * disposal only follows a forget of a binding in that file. And it is not under
+     * `$XDG_RUNTIME_DIR` with the attach lock, because what serialises a press with a forget must
+     * not depend on the two having been started from one environment — the hole in keying the
+     * residue on the attach lock that #239 exists to close.
+     *
+     * Ordered after the attach lock wherever both are held, never before: a press takes the attach
+     * lock for its whole run and this inside it, and a dock teardown's forget takes this after its
+     * tree edit, inside whatever attach lock its caller holds. Nothing holding this one takes the
+     * attach lock: the one compositor call inside a press's section is `dockFor`, which reads the
+     * tree without it — and were that to change, it would be a re-entry into the press's own hold.
+     */
+    private suspend fun <T> residueLock(cfg: Config, key: SurfaceKey, block: suspend () -> T): T {
+        val file = residueLockFile(key)
+        val waitMs = cfg[RegistryFlags.residueLockWaitMs]
+        // Cleared before rather than inside: a lock that could not be taken still runs [block],
+        // and that is the run the report is about.
+        residueUnlocked = null
+        return FileLocks.withLock(
+            file,
+            waitMs,
+            contended = { holder ->
+                IOException(
+                    "$holder held the residue lock for ${oneLine(key.canonical)} ($file); " +
+                        "this waited up to ${RegistryFlags.residueLockWaitMs.key}=${waitMs}ms; " +
+                        "nothing was changed",
+                )
+            },
+            unlockable = { why, cause ->
+                val said = "$file: $why (${cause.message})"
+                if (cfg[RegistryFlags.lockRequired]) {
+                    throw IOException(
+                        "$said, and ${RegistryFlags.lockRequired.key}=true refuses to touch " +
+                            "residue without it",
+                        cause,
+                    )
+                }
+                residueUnlocked = "$said; touching ${oneLine(key.canonical)}'s residue without " +
+                    "cross-process exclusion, so a concurrent forget and press can interleave"
+            },
+            block = block,
+        )
+    }
+
+    private fun residueLockFile(key: SurfaceKey): Path =
+        path.resolveSibling("${path.name}.residue-locks").resolve("${key.kind}-${key.digest}.lock")
+
+    private fun prepareLocked(key: SurfaceKey): Path {
         val cfg = config
         val permissions = cfg[RegistryFlags.filePermissions]
-        checkExposure(
-            RegistryPaths.residueDir(cfg, path),
-            cfg[RegistryFlags.residueExposure],
-            cfg[RegistryFlags.residueExposureScope],
-        )
         // Before the location is resolved, so it resolves to where the model now is.
         migrateSlugResidue(cfg, key)
         val location = RegistryPaths.residueLocation(cfg, path, key)
@@ -411,7 +519,7 @@ class FileBindingStore(
             }
         }
         tightenResidue(cfg, key, location)
-        location
+        return location
     }
 
     /**
