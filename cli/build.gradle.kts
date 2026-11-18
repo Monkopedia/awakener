@@ -270,17 +270,33 @@ tasks.withType<Test>().configureEach {
     // socket". `createTempDirectory` makes it 0700, as the spec requires of a runtime directory.
     // Its name is random, which is fine only because it reaches the task through the environment,
     // which Gradle does not track: as a declared input it would give every run a new cache key.
+    //
+    // SwayHarness makes each session's own directory under it too (#243). Its `close` removes that,
+    // but a worker that is SIGKILLed or cancelled mid-test never gets there, and before this every
+    // such run left an `awakener-sway*` in /tmp — RAM on kaladin. The sweep below runs here, in the
+    // daemon, so it outlives the worker. A daemon that is itself SIGKILLed still leaks the lot.
     var testRuntime: File? = null
     doFirst {
         val dir = Files.createTempDirectory("awakener-xdg").toFile()
         testRuntime = dir
         environment("XDG_RUNTIME_DIR", dir.absolutePath)
+        environment("AWAKENER_SWAY_TMPDIR", dir.absolutePath)
     }
     // On the root suite finishing rather than in doLast, which a failing test run never reaches.
     addTestListener(object : TestListener {
         override fun beforeSuite(suite: TestDescriptor) {}
         override fun afterSuite(suite: TestDescriptor, result: TestResult) {
-            if (suite.parent == null) testRuntime?.deleteRecursively()
+            if (suite.parent != null) return
+            // A suite that passed closed every session it started, so anything left is a test
+            // that skipped `close` — swept all the same, but reported, since on a run outside
+            // Gradle nothing would have swept it.
+            val stranded = testRuntime?.listFiles { f -> f.name.startsWith("awakener-sway") }.orEmpty()
+            testRuntime?.deleteRecursively()
+            if (result.resultType == TestResult.ResultType.SUCCESS && stranded.isNotEmpty()) {
+                throw GradleException(
+                    "sessions outlived a passing suite: ${stranded.map { it.name }.sorted()}",
+                )
+            }
         }
         override fun beforeTest(testDescriptor: TestDescriptor) {}
         override fun afterTest(testDescriptor: TestDescriptor, result: TestResult) {}
