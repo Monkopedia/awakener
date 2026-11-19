@@ -1,6 +1,7 @@
 // Explicit: inside a build script `java` names the Java plugin extension, not the package.
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.TimeUnit
 
 plugins {
     alias(libs.plugins.kotlin.multiplatform) apply false
@@ -29,47 +30,48 @@ fun toolFingerprint(vararg tools: String): String {
     }
 }
 
-// A directory of each test run's own, for every module's tests, and its sweep.
+// Directories of each test run's own, for every module's tests, and their sweep.
 //
 // The runtime directory came first (#199): the attach lock lives under $XDG_RUNTIME_DIR/awakener,
 // one file per compositor socket, and every harness sway has a fresh socket, so a suite run
 // against the developer's real runtime directory left hundreds of lock files there. The harness
 // hands it to the sways it starts too, so their Wayland sockets land here and the grim tests find
-// them. Under the system temp directory rather than build/ (#240): a Wayland socket path has to
-// fit in sun_path's 108 bytes, and build/ is as long as wherever the checkout happens to be.
+// them.
 //
-// `tmp/` inside it is the test JVM's `java.io.tmpdir`, and where SwayHarness puts its session
+// The temp directory is the test JVM's `java.io.tmpdir`, and where SwayHarness puts its session
 // directories (#243, #246). Every fixture that makes a scratch directory with `createTempDirectory`
-// lands here without naming it — before #246 four of them left one in /tmp on every run, and any
-// test killed mid-way left its own. The sweep below runs in the daemon, on the root suite
-// finishing, so it outlives a worker that was SIGKILLed or cancelled. A daemon that is itself
-// SIGKILLed still leaks the lot.
+// lands in it without naming it — before #246 four of them left one in /tmp on every run, and any
+// test killed mid-way left its own. A sibling of the runtime directory rather than inside it, and
+// both under the system temp directory rather than build/, because a Unix socket path has to fit
+// in sun_path's 108 bytes (#240) and fixtures bind sockets two directories down from here.
 //
-// The name is random, which is fine only because nothing declares it: it reaches the worker
-// through the environment and an argument provider with no input properties, neither of which
-// Gradle fingerprints. As a declared input it would give every run a new cache key.
+// The sweep runs in the daemon, on the root suite finishing, so it outlives a worker that was
+// SIGKILLed or cancelled. A daemon that is itself SIGKILLed still leaks the lot. The names are
+// random, which is fine only because nothing declares them: they reach the worker through the
+// environment and an argument provider with no input properties, neither of which Gradle
+// fingerprints. As a declared input either would give every run a new cache key.
 subprojects {
     tasks.withType<Test>().configureEach {
-        var run: File? = null
+        var runtime: File? = null
+        var tmp: File? = null
         doFirst {
-            val dir = Files.createTempDirectory("awakener-test").toFile()
-            run = dir
-            val tmp = dir.resolve("tmp").apply { mkdir() }
-            environment("XDG_RUNTIME_DIR", dir.absolutePath)
+            val xdg = Files.createTempDirectory("awakener-xdg").toFile().also { runtime = it }
+            val scratch = Files.createTempDirectory("awakener-tmp").toFile().also { tmp = it }
+            environment("XDG_RUNTIME_DIR", xdg.absolutePath)
             // As well as `java.io.tmpdir`, because the environment reaches the JVMs a test starts
             // and a system property does not.
-            environment("AWAKENER_SWAY_TMPDIR", tmp.absolutePath)
+            environment("AWAKENER_SWAY_TMPDIR", scratch.absolutePath)
         }
-        jvmArgumentProviders.add(RunTmpdir { run?.resolve("tmp") })
+        jvmArgumentProviders.add(RunTmpdir { tmp })
         // On the root suite finishing rather than in doLast, which a failing run never reaches.
         addTestListener(object : TestListener {
             override fun beforeSuite(suite: TestDescriptor) {}
             override fun afterSuite(suite: TestDescriptor, result: TestResult) {
                 if (suite.parent != null) return
-                val dir = run ?: return
-                val left = dir.resolve("tmp").listFiles().orEmpty()
+                val left = tmp?.listFiles().orEmpty()
                 left.forEach(::killRecordedSway)
-                dir.deleteRecursively()
+                tmp?.deleteRecursively()
+                runtime?.deleteRecursively()
                 // A suite that passed had every chance to clean up after itself, so anything left
                 // is a test that skipped it — swept all the same, but reported, since on a run
                 // outside Gradle nothing would have swept it.
@@ -93,7 +95,7 @@ class RunTmpdir(private val dir: () -> File?) : CommandLineArgumentProvider {
  * Kills the sway a session directory recorded, if it is still the process that was recorded.
  *
  * A worker that is SIGKILLed takes neither `SwayHarness.close` nor its shutdown hook with it, so
- * the compositor it started is reparented to init and runs on; its windows go when it does. The
+ * the compositor it started is reparented to init and runs on, and its windows with it. The
  * harness writes `sway.pid` as `<pid> <start, epoch ms>`, and the start time is what stops a pid
  * the kernel has since handed to something else from being signalled. Nothing here kills a
  * process this run did not record, so concurrent runs from other worktrees are untouched.
@@ -104,7 +106,12 @@ fun killRecordedSway(session: File) {
     val started = recorded.getOrNull(1)?.toLongOrNull() ?: return
     ProcessHandle.of(pid)
         .filter { it.info().startInstant().map { s -> s.toEpochMilli() == started }.orElse(false) }
-        .ifPresent { it.destroyForcibly() }
+        .ifPresent { sway ->
+            // Waited for, so its windows are on their way out before the directory goes: with
+            // sway left running, a client that outlived the sweep wrote a directory back into it.
+            sway.destroyForcibly()
+            runCatching { sway.onExit().get(5, TimeUnit.SECONDS) }
+        }
 }
 
 // The test-summary script's own suite.
