@@ -6,6 +6,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.io.path.absolutePathString
 import kotlin.io.path.writeText
+import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -27,6 +28,14 @@ class SpanreedCliTest {
     private val config = InMemoryConfigStore()
     private val calls = mutableListOf<Pair<List<String>, Map<String, String?>>>()
     private var response = ProcessResult(0, "agent-from-spanreed\n", "")
+
+    /** Every directory [againstScript] made, removed whether or not its test passed (#246). */
+    private val scripts = mutableListOf<Path>()
+
+    @AfterTest
+    fun removeScripts() {
+        scripts.forEach { it.toFile().deleteRecursively() }
+    }
 
     private val cli = SpanreedCli(
         configStore = config,
@@ -512,7 +521,8 @@ class SpanreedCliTest {
 
     /** A `SpanreedCli` driving [script] as its spanreed, through the real subprocess runner. */
     private fun againstScript(script: String): SpanreedCli {
-        val path = Files.createTempDirectory("awakener-fake-spanreed").resolve("spanreed")
+        val dir = Files.createTempDirectory("awakener-fake-spanreed").also(scripts::add)
+        val path = dir.resolve("spanreed")
         path.writeText("#!/bin/sh\n$script\n")
         assertTrue(path.toFile().setExecutable(true))
         return SpanreedCli(

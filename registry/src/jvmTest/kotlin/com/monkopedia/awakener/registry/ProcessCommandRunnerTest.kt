@@ -7,6 +7,7 @@ import java.io.InputStream
 import java.nio.file.Files
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
+import kotlin.io.path.deleteIfExists
 import kotlin.io.path.readText
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -369,32 +370,39 @@ class ProcessCommandRunnerTest {
     @Test
     fun `a child is reaped when the call is interrupted`() {
         val pidFile = Files.createTempFile("awakener-reap", ".pid")
-        val raised = CompletableFuture<Throwable?>()
+        try {
+            val raised = CompletableFuture<Throwable?>()
 
-        val caller = Thread {
-            try {
-                ProcessCommandRunner(timeoutMs = { 60_000L }).run(
-                    listOf("sh", "-c", "echo $$ > '$pidFile'; exec sleep 30"),
-                    emptyMap(),
-                )
-                raised.complete(null)
-            } catch (e: Throwable) {
-                raised.complete(e)
-            }
-        }.apply { isDaemon = true; start() }
+            val caller = Thread {
+                try {
+                    ProcessCommandRunner(timeoutMs = { 60_000L }).run(
+                        listOf("sh", "-c", "echo $$ > '$pidFile'; exec sleep 30"),
+                        emptyMap(),
+                    )
+                    raised.complete(null)
+                } catch (e: Throwable) {
+                    raised.complete(e)
+                }
+            }.apply { isDaemon = true; start() }
 
-        val pid = await(seconds = 15) { pidFile.readText().trim().toLongOrNull() }
-        assertTrue(await(seconds = 5) { ProcessHandle.of(pid).orElse(null)?.isAlive })
-        // Give the caller time to be inside waitFor rather than on its way there.
-        Thread.sleep(250)
-        caller.interrupt()
+            val pid = await(seconds = 15) { pidFile.readText().trim().toLongOrNull() }
+            assertTrue(await(seconds = 5) { ProcessHandle.of(pid).orElse(null)?.isAlive })
+            // Give the caller time to be inside waitFor rather than on its way there.
+            Thread.sleep(250)
+            caller.interrupt()
 
-        val thrown = raised.get(15, TimeUnit.SECONDS)
-        assertTrue(thrown is InterruptedException, "expected the interrupt to escape, got $thrown")
-        assertTrue(
-            await(seconds = 10) { ProcessHandle.of(pid).map { !it.isAlive }.orElse(true) },
-            "the child outlived the call that started it: pid $pid is still running",
-        )
+            val thrown = raised.get(15, TimeUnit.SECONDS)
+            assertTrue(
+                thrown is InterruptedException,
+                "expected the interrupt to escape, got $thrown",
+            )
+            assertTrue(
+                await(seconds = 10) { ProcessHandle.of(pid).map { !it.isAlive }.orElse(true) },
+                "the child outlived the call that started it: pid $pid is still running",
+            )
+        } finally {
+            pidFile.deleteIfExists()
+        }
     }
 
     /** Polls [probe] until it answers with something other than null or false. */

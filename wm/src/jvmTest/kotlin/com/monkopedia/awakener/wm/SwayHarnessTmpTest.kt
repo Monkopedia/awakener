@@ -38,6 +38,17 @@ class SwayHarnessTmpTest {
     }
 
     /**
+     * The same root is this JVM's temp directory, so a fixture's `createTempDirectory` is swept
+     * with it (#246). The build sets this for every module's tests at once, so one module's test
+     * is enough to say the wiring is there; without it, a worker killed mid-test leaves whatever
+     * scratch directory that test had made in /tmp.
+     */
+    @Test
+    fun `the test JVM's temp directory is the run's sweep root`() {
+        assertEquals(System.getenv(SwayHarness.TMPDIR_VAR), System.getProperty("java.io.tmpdir"))
+    }
+
+    /**
      * The half the JVM owns: a worker told to stop, which is how Gradle ends one on a cancelled
      * build, runs its shutdown hooks and nothing else. SIGTERM, not SIGKILL, because a hook is
      * exactly what SIGKILL cannot run — that case belongs to the sweep above.

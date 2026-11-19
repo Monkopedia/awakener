@@ -365,6 +365,13 @@ class SwayHarness private constructor(
                     }
                 }
                 .start()
+            // For the build's sweep, which kills what a SIGKILLed worker leaves running (#246):
+            // the root build script reads this as `<pid> <start, epoch ms>`. It cannot find sway
+            // the way [spawned] finds clients — sway carries `cap_sys_nice`, which makes its
+            // environment unreadable — and the start time keeps a recycled pid from being signalled.
+            process.toHandle().info().startInstant().ifPresent {
+                runtimeDir.resolve("sway.pid").writeText("${process.pid()} ${it.toEpochMilli()}")
+            }
 
             val deadline = System.nanoTime() + STARTUP_TIMEOUT_NANOS
             while (System.nanoTime() < deadline) {
