@@ -216,6 +216,155 @@ class SwaySplitChainTest {
     }
 
     /**
+     * #171's remaining leak, as the #217 reviewer measured it: two docks on one surface, attached
+     * one at a time, then both closed by hand. Each further dock used to wrap the surface in a
+     * split of its own, and a hand close runs no awakener code, so every round left one more
+     * wrapper — 2 → 6 single-child splits over five rounds. Held to the one a single hand-closed
+     * dock leaves, and to a depth that does not move.
+     */
+    @Test
+    fun `two docks closed by hand newest first do not compound`() =
+        twoDocksClosedByHand(newestFirst = true)
+
+    @Test
+    fun `two docks closed by hand oldest first do not compound`() =
+        twoDocksClosedByHand(newestFirst = false)
+
+    /** The control: with the split not shared, the same rounds compound, as on `main`. */
+    @Test
+    fun `with share_split off two docks closed by hand compound`() = swayTest {
+        store.put(WmFlags.shareDockSplit, false)
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        repeat(3) {
+            val first = wm.attach(app, dockSpec(), AGENT)
+            val second = wm.attach(app, dockSpec(), AGENT)
+            close(second.dockId)
+            close(first.dockId)
+        }
+        assertEquals(4, singleChildSplits(), describe())
+    }
+
+    /**
+     * Two docks in one split, torn down in every order: the first detach must leave the split to
+     * the dock still standing — `split none` there is refused for the sibling — and the last one
+     * must take it back.
+     */
+    @Test
+    fun `two docks detached newest first leave no single-child split`() = cycles { app ->
+        val first = wm.attach(app, dockSpec(), AGENT)
+        val second = wm.attach(app, dockSpec(), AGENT)
+        second.detach()
+        first.detach()
+    }
+
+    /**
+     * The shared split by the other road: a restore lands beside a second dock that was stood up
+     * while the first was hidden. Before #171 the first detach then raised "Can only flatten a
+     * child container with no siblings" after its kill.
+     */
+    @Test
+    fun `a dock restored beside a second dock detaches cleanly`() = cycles { app ->
+        val first = wm.attach(app, dockSpec(), AGENT)
+        first.hide()
+        val second = wm.attach(app, dockSpec(), AGENT)
+        first.show()
+        first.detach()
+        second.detach()
+    }
+
+    /** Both docks orphaned at once: the sweep reaps them and nothing of the split is left. */
+    @Test
+    fun `a surface closing under two docks, cycled, leaves no single-child split`() {
+        store.put(WmFlags.sweepOnClose, false)
+        cycles(freshSurface = true) { app ->
+            val first = wm.attach(app, dockSpec(), AGENT)
+            val second = wm.attach(app, dockSpec(), AGENT)
+            close(app)
+            wm.reapOrphans()
+            awaitGone(first.dockId)
+            awaitGone(second.dockId)
+        }
+    }
+
+    /**
+     * A split the user made is never awakener's to take. The surface shares a `splith` with a
+     * window of the user's, and every lifecycle above runs inside it: the user's container must
+     * still be standing, holding the surface's side and the user's window, after every round, and
+     * the second dock must not be let into it.
+     */
+    @Test
+    fun `a split the user made survives every lifecycle and is never shared`() = swayTest {
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        command("[con_id=${app.raw}] focus; split horizontal")
+        val mine = openSurface("aw-mine")
+        val users = assertNotNull(wm.tree().parentOf(mine.raw), "the user's split")
+        assertEquals("splith[tabbed[aw-other splith[aw-app aw-mine]]]", describe(), "baseline")
+        val baseline = describe()
+
+        fun assertUsersSplitStands(stage: String) = runBlocking {
+            val tree = wm.tree()
+            val node = assertNotNull(tree.find(users.id), "$stage: the user's split: ${describe()}")
+            assertEquals("splith", node.layout, "$stage: ${describe()}")
+            assertEquals(2, node.nodes.size, "$stage: ${describe()}")
+            assertEquals(users.id, tree.parentOf(mine.raw)?.id, "$stage: ${describe()}")
+        }
+
+        repeat(CYCLES) { cycle ->
+            val first = wm.attach(app, dockSpec(), AGENT)
+            val second = wm.attach(app, dockSpec(), AGENT)
+            val tree = wm.tree()
+            assertEquals(
+                false,
+                tree.parentOf(second.dockId.raw)?.id == users.id,
+                "cycle ${cycle + 1}: the second dock is kept out of the user's split: ${describe()}",
+            )
+            assertUsersSplitStands("cycle ${cycle + 1}, docked")
+            close(second.dockId)
+            close(first.dockId)
+            assertUsersSplitStands("cycle ${cycle + 1}, closed by hand")
+            assertEquals(1, singleChildSplits(), "cycle ${cycle + 1}: ${describe()}")
+
+            val again = wm.attach(app, dockSpec(), AGENT)
+            again.hide()
+            again.show()
+            again.detach()
+            assertUsersSplitStands("cycle ${cycle + 1}, detached")
+            assertEquals(baseline, describe(), "cycle ${cycle + 1}")
+        }
+    }
+
+    private fun twoDocksClosedByHand(newestFirst: Boolean) = swayTest {
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        var depth: Int? = null
+        repeat(CYCLES) { cycle ->
+            val first = wm.attach(app, dockSpec(), AGENT)
+            val second = wm.attach(app, dockSpec(), AGENT)
+            if (newestFirst) {
+                close(second.dockId)
+                close(first.dockId)
+            } else {
+                close(first.dockId)
+                close(second.dockId)
+            }
+            assertEquals(1, singleChildSplits(), "after cycle ${cycle + 1}: ${describe()}")
+            val now = depth()
+            assertEquals(depth ?: now, now, "depth after cycle ${cycle + 1}: ${describe()}")
+            depth = now
+        }
+        wm.attach(app, dockSpec(), AGENT).detach()
+        assertEquals(0, singleChildSplits(), "the next detach clears it: ${describe()}")
+    }
+
+    /** How deep the deepest window on workspace 1 sits. */
+    private suspend fun depth(): Int {
+        fun depth(node: Node): Int = if (node.nodes.isEmpty()) 0 else 1 + node.nodes.maxOf { depth(it) }
+        return depth(workspace())
+    }
+
+    /**
      * The control for the concurrent case below: [CONCURRENT] docks on one surface, attached one
      * after another, then all detached in the order they were attached. Several docks on one
      * surface is a shape the interface permits (`invoke.when_animated=SECOND_DOCK` asks for it), so
