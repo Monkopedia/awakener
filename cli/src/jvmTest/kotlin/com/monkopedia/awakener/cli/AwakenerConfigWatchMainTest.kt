@@ -36,13 +36,16 @@ import kotlin.test.fail
  */
 class AwakenerConfigWatchMainTest {
     private val running = mutableListOf<Watched>()
+    private val homes = mutableListOf<Path>()
 
     @AfterTest
     fun stopEverything() {
         // A `watch` that is working never exits on its own — that is its contract — so every
         // one of these has to be taken down by the test that started it, including the ones
-        // whose assertions failed on the way.
-        running.forEach { it.process.destroyForcibly() }
+        // whose assertions failed on the way. Waited for before its home goes, so nothing is
+        // still writing into the directory being removed (#246).
+        running.forEach { it.process.destroyForcibly().waitFor() }
+        homes.forEach { it.toFile().deleteRecursively() }
     }
 
     /**
@@ -258,7 +261,7 @@ class AwakenerConfigWatchMainTest {
     }
 
     private fun watch(config: String): Watched {
-        val home: Path = Files.createTempDirectory("awakener-config-watch-main")
+        val home = Files.createTempDirectory("awakener-config-watch-main").also(homes::add)
         val file = home.resolve("config.json")
         file.writeText(config)
         home.resolve("state").createDirectories()

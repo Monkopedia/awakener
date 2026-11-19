@@ -99,37 +99,44 @@ class AwakenerInvokeMainTest {
 
     private fun invoke(config: String, args: Array<String> = arrayOf("list")): Run {
         val home: Path = Files.createTempDirectory("awakener-invoke-main")
-        val configFile = home.resolve("config.json")
-        configFile.writeText(config)
-        home.resolve("state").createDirectories()
-        // Empty, and its own: discovery searches it, so a runtime directory holding the
-        // developer's live sway would connect and this test would have no failure to report on.
-        val runtime = home.resolve("run").createDirectories()
+        // Removed however the run ends: it holds nothing a failure report needs (#246).
+        try {
+            val configFile = home.resolve("config.json")
+            configFile.writeText(config)
+            home.resolve("state").createDirectories()
+            // Empty, and its own: discovery searches it, so a runtime directory holding the
+            // developer's live sway would connect and this test would have no failure to
+            // report on.
+            val runtime = home.resolve("run").createDirectories()
 
-        val process = ProcessBuilder(
-            listOf("${System.getProperty("java.home")}/bin/java", "-cp", CLASSPATH, MAIN) + args,
-        ).apply {
-            // A shell that launched the test may have any of these; the point of the scratch
-            // directory is defeated if one survives.
-            environment().remove("SWAYSOCK")
-            environment().remove("SPANREED_AGENT_NAME")
-            environment()["HOME"] = home.absolutePathString()
-            environment()["AWAKENER_CONFIG"] = configFile.absolutePathString()
-            environment()["XDG_CONFIG_HOME"] = home.absolutePathString()
-            environment()["XDG_STATE_HOME"] = home.resolve("state").absolutePathString()
-            environment()["XDG_RUNTIME_DIR"] = runtime.absolutePathString()
-        }.start()
+            val process = ProcessBuilder(
+                listOf("${System.getProperty("java.home")}/bin/java", "-cp", CLASSPATH, MAIN) + args,
+            ).apply {
+                // A shell that launched the test may have any of these; the point of the scratch
+                // directory is defeated if one survives.
+                environment().remove("SWAYSOCK")
+                environment().remove("SPANREED_AGENT_NAME")
+                environment()["HOME"] = home.absolutePathString()
+                environment()["AWAKENER_CONFIG"] = configFile.absolutePathString()
+                environment()["XDG_CONFIG_HOME"] = home.absolutePathString()
+                environment()["XDG_STATE_HOME"] = home.resolve("state").absolutePathString()
+                environment()["XDG_RUNTIME_DIR"] = runtime.absolutePathString()
+            }.start()
 
-        // Both pipes before waitFor, for the reason `ProcessCommandRunner` spells out: reading
-        // one to EOF first deadlocks on a child that fills the other.
-        val stdout = process.inputStream.bufferedReader()
-        val stderr = StringBuilder()
-        val drain = Thread { process.errorStream.bufferedReader().forEachLine { stderr.appendLine(it) } }
-            .apply { isDaemon = true; start() }
-        val out = stdout.readText()
-        val code = process.waitFor()
-        drain.join(10_000)
-        return Run(code, out, stderr.toString())
+            // Both pipes before waitFor, for the reason `ProcessCommandRunner` spells out: reading
+            // one to EOF first deadlocks on a child that fills the other.
+            val stdout = process.inputStream.bufferedReader()
+            val stderr = StringBuilder()
+            val drain = Thread {
+                process.errorStream.bufferedReader().forEachLine { stderr.appendLine(it) }
+            }.apply { isDaemon = true; start() }
+            val out = stdout.readText()
+            val code = process.waitFor()
+            drain.join(10_000)
+            return Run(code, out, stderr.toString())
+        } finally {
+            home.toFile().deleteRecursively()
+        }
     }
 
     private companion object {
