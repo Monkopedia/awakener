@@ -672,6 +672,19 @@ object WmFlags {
             "split containers, and a leftover one silently swallows the next window opened.",
     )
 
+    val shareDockSplit = Flags.boolean(
+        "wm.dock.share_split",
+        true,
+        "Stand a second dock for one surface inside the split its first dock already shares " +
+            "with it, rather than splitting the surface again. Off restores the old shape, " +
+            "where each further dock wraps the surface in a split of its own beside the one " +
+            "before: closing those docks by hand leaves every wrapper behind with one child, so " +
+            "the nesting grows by a level each time it happens and nothing between presses " +
+            "takes it back (#171). Only a split whose other children are all this surface's " +
+            "docks is shared; a split the surface shares with any other window is split again, " +
+            "as before.",
+    )
+
     val flattenOnHide = Flags.boolean(
         "wm.dock.flatten_on_hide",
         true,

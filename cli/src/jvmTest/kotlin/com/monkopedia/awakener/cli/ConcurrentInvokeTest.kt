@@ -279,6 +279,50 @@ class ConcurrentInvokeTest {
         closeDocksByHand()
     }
 
+    /**
+     * #171 through the shipped entry point: two SECOND_DOCK presses on one surface, one at a time,
+     * then both panels closed by hand. Each further dock used to wrap the surface in a split of its
+     * own, so this compounded 2 → 6 single-child splits over five rounds; it must stay at the one a
+     * single hand-closed dock leaves, at a depth that does not move.
+     */
+    @Test
+    fun `two second-dock presses closed by hand do not compound`() = runBlocking {
+        val config = config(whenAnimated = "SECOND_DOCK")
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        assertNoCompounding { listOf(finish(start(config, app)), finish(start(config, app))) }
+    }
+
+    /** The key-repeat burst under SECOND_DOCK: four docks per round, each serialised by the lock. */
+    @Test
+    fun `a second-dock burst closed by hand does not compound`() = runBlocking {
+        val config = config(whenAnimated = "SECOND_DOCK")
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        assertNoCompounding { pressTogether(config, List(BURST) { app }) }
+    }
+
+    private suspend fun assertNoCompounding(press: () -> List<Run>) {
+        var depth: Int? = null
+        for (round in 1..ROUNDS) {
+            val runs = press()
+            runs.forEach { assertEquals(0, it.exitCode, "round $round: ${it.stdout}${it.stderr}") }
+            assertEquals(runs.size, docks(wm.tree()).size, "round $round: ${describe()}")
+            command("[app_id=\"$DOCK_APP_ID\"] kill")
+            withTimeoutOrNull(STARTUP_MS) { while (docks(wm.tree()).isNotEmpty()) delay(POLL_MS) }
+            assertEquals(0, docks(wm.tree()).size, "round $round: closed by hand: ${describe()}")
+            assertEquals(1, singleChildSplits(), "after round $round: ${describe()}")
+            val now = depth()
+            assertEquals(depth ?: now, now, "depth after round $round: ${describe()}")
+            depth = now
+        }
+    }
+
+    private suspend fun depth(): Int {
+        fun depth(node: Node): Int = if (node.nodes.isEmpty()) 0 else 1 + node.nodes.maxOf { depth(it) }
+        return depth(workspace())
+    }
+
     /** Once the agent has registered, the bus answers as it always did. */
     @Test
     fun `a press after registration is declined by the bus as before`() = runBlocking {

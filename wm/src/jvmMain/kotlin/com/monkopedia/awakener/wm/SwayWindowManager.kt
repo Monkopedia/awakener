@@ -518,6 +518,25 @@ class SwayWindowManager(
     }
 
     /**
+     * Whether every tiled child of [split] other than [surface] is one of [surface]'s docks, and
+     * there is at least one — the split a dock of [surface] made and is still standing in.
+     *
+     * Asked from the table and the mark, like [dockedTo], but without its adoption side effect:
+     * this decides where a split goes, not what a window is, so it records nothing. A split that
+     * holds any other window — the user's own, or a dock of somebody else's — answers false, and
+     * the caller treats it as it always did.
+     */
+    private fun holdsOnlyDocksOf(split: Node, surface: SurfaceId, cfg: Config): Boolean {
+        val table = docks.snapshot()
+        val others = split.nodes.filter { it.id != surface.raw }
+        return others.isNotEmpty() && others.all { node ->
+            val recorded = table.entries[node.id]?.surface
+            val marked = node.dockMark(cfg[WmFlags.dockMarkPrefix], cfg[WmFlags.dockMarkScheme]).surface
+            (if (cfg.consultsTable) recorded ?: marked else marked) == surface
+        }
+    }
+
+    /**
      * Whether an attach in flight has reserved the `app_id` [node] reports.
      *
      * Distinct from [dockedTo] because a reservation names no surface: it covers the window
@@ -1204,7 +1223,14 @@ class SwayWindowManager(
             // the hide and this show and the tree is what the batch will actually meet.
             val before = tree()
             val floating = floatingAncestorOf(before, surface)
-            val resplit = dockSplitOf(before, surface) == null
+            // And a split is only the dock's to come back into when it holds nothing else: the
+            // surface alone, or beside its other docks. One the surface shares with a window of
+            // the user's is split again, the same rule attach applies (#171) — tiling the dock
+            // into it put the panel inside the user's container, and the detach after then had
+            // `split none` refused for the user's window.
+            val split = dockSplitOf(before, surface)
+            val resplit = split == null ||
+                (split.nodes.size > 1 && !holdsOnlyDocksOf(split, surface, cfg))
             val restore = buildList {
                 add("[con_id=${dock.raw}] scratchpad show")
                 // Before `floating disable`, because that re-tiles beside the focused node.
@@ -1603,18 +1629,30 @@ class SwayWindowManager(
                     // Focus first: sway's split applies to the focused container, and the dock has
                     // to land inside this surface's tab rather than wherever focus happened to be.
                     focus(surface)
+                    // A surface that already sits in its own dock split — a second dock, under
+                    // invoke.when_animated=SECOND_DOCK or a press the bus could not yet answer —
+                    // takes the new dock into that split rather than being wrapped in another
+                    // (#171). The wrapper was the leak: sway's `split` on a window with siblings
+                    // makes a fresh container, so the surface went one level deeper per extra
+                    // dock, and a dock closed by hand runs no awakener code to take the level
+                    // back. Two docks closed by hand compounded 2 → 6 single-child splits over
+                    // five rounds. Not this attach's container, so the unwind leaves it alone.
+                    val sharing = cfg[WmFlags.shareDockSplit] &&
+                        dockSplitOf(tree(), surface)?.let { holdsOnlyDocksOf(it, surface, cfg) } == true
                     // Recorded before the command rather than after it, for the same reason
                     // `pending` is: a fact recorded on the far side of a round trip is one the
                     // failure that needs it can arrive ahead of — a cancellation landing on this
                     // acknowledgement would otherwise leave the container built and unrecorded.
                     // Rolled back only where sway itself refuses, which is the one failure that
                     // means the container certainly does not exist.
-                    container = true
-                    try {
-                        run("split horizontal")
-                    } catch (rejected: IllegalStateException) {
-                        container = false
-                        throw rejected
+                    container = !sharing
+                    if (!sharing) {
+                        try {
+                            run("split horizontal")
+                        } catch (rejected: IllegalStateException) {
+                            container = false
+                            throw rejected
+                        }
                     }
 
                     // Must precede the exec — sway evaluates focus rules when the window maps, so
@@ -2386,6 +2424,14 @@ class SwayWindowManager(
                 docks.forget(dockId)
 
                 if (!cfg[WmFlags.normalizeContainerOnDetach]) return@treeEdit
+                // A split still holding another of this surface's docks is not done with: the
+                // last dock out is the one that flattens it. Asking `split none` now would be
+                // refused for the sibling, after the kill (#171) — the shape wm.dock.share_split
+                // makes, and one a restore beside a second dock already made before it.
+                if (parent != null) {
+                    val rest = parent.copy(nodes = parent.nodes.filter { it.id != dockId.raw })
+                    if (rest.nodes.size > 1 && holdsOnlyDocksOf(rest, surface, cfg)) return@treeEdit
+                }
                 val survivor =
                     parent?.children?.firstOrNull { it.id != dockId.raw } ?: return@treeEdit
                 // Raised rather than caught: the orphan sweep's aggregate is what a normalisation
