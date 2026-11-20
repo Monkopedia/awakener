@@ -248,6 +248,38 @@ class SwaySplitChainTest {
         usersSplitSurvives("split vertical; focus parent; split horizontal")
 
     /**
+     * The mark has to be atomic with the split. An attach cancelled between making its split and
+     * marking it left a split nothing flattens under MARKED, and the next attach nested inside
+     * it — measured by the #250 review at 19 leaks in 180 cancellations. Swept across the first
+     * [INTERRUPT_DELAYS_MS] of the attach for [INTERRUPT_ROUNDS] rounds, every single-child split
+     * left after each must carry its mark, and one attach and detach must then bring the
+     * workspace back to its baseline.
+     */
+    @Test
+    fun `an interrupted attach leaves no split without its mark`() = swayTest {
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        val baseline = describe()
+        repeat(INTERRUPT_ROUNDS) { round ->
+            val attach = scope.async { wm.attach(app, dockSpec(), AGENT) }
+            delay(round % INTERRUPT_DELAYS_MS)
+            attach.cancel()
+            runCatching { attach.await() }.getOrNull()?.detach()
+            // A dock that maps after the unwind's last look is #32's late dock, not this test's:
+            // closed by hand, which runs no awakener code and so leaves the split as it found it.
+            delay(LATE_DOCK_MS)
+            wm.tree().windows.filter { it.appId == "aw-dock" }.forEach { close(SurfaceId(it.id)) }
+            assertEquals(
+                emptyList(),
+                unmarkedSingleChildSplits(),
+                "round ${round + 1}, cancelled after ${round % INTERRUPT_DELAYS_MS}ms: ${describe()}",
+            )
+        }
+        wm.attach(app, dockSpec(), AGENT).detach()
+        assertEquals(baseline, describe(), "one attach and detach clears whatever was left")
+    }
+
+    /**
      * A dock a build before #248 attached: its split carries no provenance mark. Under MARKED the
      * detach leaves the surface standing in it rather than guessing whose it is.
      */
@@ -475,11 +507,24 @@ class SwaySplitChainTest {
             .toList()
     }
 
+    /** Single-child splits on workspace 1 carrying no `_awakener_split_` mark, by `con_id`. */
+    private suspend fun unmarkedSingleChildSplits(): List<Long> {
+        fun walk(node: Node): List<Long> =
+            listOfNotNull(
+                node.id.takeIf {
+                    node.type == "con" && node.layout?.startsWith("split") == true &&
+                        node.nodes.size == 1 && node.marks.none { it.startsWith("_awakener_split_") }
+                },
+            ) + node.children.flatMap { walk(it) }
+        return walk(workspace())
+    }
+
     /** Takes the provenance mark off [app]'s split, as a build before #248 never put it on. */
     private suspend fun unmarkSplitOf(app: SurfaceId): Long {
         val split = assertNotNull(wm.tree().parentOf(app.raw), "the dock's split")
-        assertEquals(listOf("_awakener_split_${split.id}"), split.marks, describe())
-        command("unmark _awakener_split_${split.id}")
+        val mark = split.marks.single()
+        assertEquals(true, mark.startsWith("_awakener_split_"), "${split.marks}: ${describe()}")
+        command("unmark $mark")
         return split.id
     }
 
@@ -835,6 +880,9 @@ class SwaySplitChainTest {
 
         /** Long enough for an exec to be accepted, short enough that five failures stay cheap. */
         const val NEVER_MAPS_WAIT_MS = 600L
+        const val INTERRUPT_ROUNDS = 120
+        const val INTERRUPT_DELAYS_MS = 16L
+        const val LATE_DOCK_MS = 150L
         val AGENT = AgentId("agent-1")
     }
 }

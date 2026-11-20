@@ -688,9 +688,9 @@ object WmFlags {
         "wm.dock.split_ownership",
         SplitOwnership.MARKED,
         "Which split containers awakener treats as its own (#248). MARKED: only a split an " +
-            "attach or a show made, which carries a hidden '_awakener_split_<con_id>' mark from " +
-            "that moment; a detach, a hide, a failed attach's unwind and a second dock act on " +
-            "that split and nothing else, and its flatten stops at it rather than walking on " +
+            "attach or a show made, which carries a hidden '_awakener_split_<nonce>' mark set " +
+            "in the same sway message that makes it; a detach, a hide, a failed attach's " +
+            "unwind and a second dock act on that split and nothing else, and its flatten stops at it rather than walking on " +
             "into the containers above. A container that predates the dock is never collapsed, " +
             "re-laid, named or shared, whatever it holds — a surface the user put alone in a " +
             "split of their own gets a split of awakener's inside it. SHAPE: any split of the " +
