@@ -10,6 +10,7 @@ import com.monkopedia.awakener.registry.FileBindingStore
 import com.monkopedia.awakener.registry.ResidueOutcome
 import com.monkopedia.awakener.registry.SpanreedCli
 import com.monkopedia.awakener.registry.describe
+import com.monkopedia.awakener.wm.DockHandle
 import com.monkopedia.awakener.wm.SurfaceId
 import com.monkopedia.awakener.wm.SwaySocket
 import com.monkopedia.awakener.wm.SwayWindowManager
@@ -224,13 +225,9 @@ object AwakenerInvokeCli {
             0
         }
 
-        // `agent.raw` and not `agent`: AgentId is a value class over a String, so interpolating
-        // it prints `AgentId(raw=agent-…)`. Measured through the shipped launcher, which is the
-        // only place that would have shown it — every other reader of an agent here goes through
-        // `Binding.agentId`, which is already the String.
         is Awakened.Hidden -> {
             out("hid dock ${awakened.dock.dockId.raw} beside surface ${awakened.surface.raw}")
-            out("  ${awakened.dock.agent.raw} is still running; press again to bring it back")
+            out("  ${agentOf(awakened.dock)} is still running; press again to bring it back")
             0
         }
 
@@ -239,7 +236,7 @@ object AwakenerInvokeCli {
                 "restored dock ${awakened.dock.dockId.raw} beside surface " +
                     "${awakened.surface.raw}",
             )
-            out("  ${awakened.dock.agent.raw} is back on screen")
+            out("  ${agentOf(awakened.dock)} is back on screen")
             0
         }
 
@@ -262,6 +259,22 @@ object AwakenerInvokeCli {
             1
         }
     }
+
+    /**
+     * The agent behind [dock], as a toggle line names it.
+     *
+     * `agent.raw` and not `agent`: AgentId is a value class over a String, so interpolating it
+     * prints `AgentId(raw=agent-…)`. Measured through the shipped launcher, which is the only place
+     * that would have shown it — every other reader of an agent here goes through
+     * `Binding.agentId`, which is already the String.
+     *
+     * And blank is a real value here, not a hypothetical (#168): a dock is recovered from the tree
+     * by its mark, and its agent from the surface's binding, so a panel whose surface was forgotten
+     * while it stood has no agent to name. The dock is the one thing still known about it.
+     */
+    private fun agentOf(dock: DockHandle): String =
+        dock.agent.raw.takeIf { it.isNotBlank() }?.let(::oneLine)
+            ?: "the agent in dock ${dock.dockId.raw} (no binding names it)"
 
     private fun reportConnector(outcome: ConnectorOutcome, out: (String) -> Unit) {
         when (outcome) {
