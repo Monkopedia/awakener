@@ -5,6 +5,7 @@ import com.monkopedia.awakener.registry.AgentId
 import com.monkopedia.awakener.registry.DerivedAgentIdentities
 import com.monkopedia.awakener.registry.FileBindingStore
 import java.nio.file.Path
+import java.util.concurrent.locks.LockSupport
 import kotlin.io.path.createTempDirectory
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
@@ -177,24 +178,221 @@ class SwaySplitChainTest {
         dock.detach()
     }
 
+    /**
+     * The three chain tests are wm.dock.split_ownership=SHAPE's: a chain no build marked is a
+     * user's as far as provenance can tell, so under the default MARKED it stands (#248) — the
+     * `a chain no build marked` tests below hold that side.
+     */
     @Test
     fun `detach collapses a chain it did not make`() = chainCollapsedBy { app ->
+        store.put(WmFlags.splitOwnership, SplitOwnership.SHAPE)
         wm.attach(app, dockSpec(), AGENT).detach()
     }
 
     @Test
     fun `hide collapses a chain it did not make`() = chainCollapsedBy { app ->
+        store.put(WmFlags.splitOwnership, SplitOwnership.SHAPE)
         wm.attach(app, dockSpec(), AGENT).hide()
     }
 
     @Test
     fun `an unwound attach collapses a chain it did not make`() {
         store.put(WmFlags.mapWaitMs, NEVER_MAPS_WAIT_MS)
+        store.put(WmFlags.splitOwnership, SplitOwnership.SHAPE)
         chainCollapsedBy { app ->
             assertFailsWith<IllegalStateException> {
                 wm.attach(app, DockSpec("aw-never", "sleep 3600"), AGENT)
             }
         }
+    }
+
+    @Test
+    fun `a chain no build marked survives a detach`() = chainSurvives { app ->
+        wm.attach(app, dockSpec(), AGENT).detach()
+    }
+
+    @Test
+    fun `a chain no build marked survives a hide, a show and a detach`() = chainSurvives { app ->
+        val dock = wm.attach(app, dockSpec(), AGENT)
+        dock.hide()
+        dock.show()
+        dock.detach()
+    }
+
+    @Test
+    fun `a chain no build marked survives an unwound attach`() {
+        store.put(WmFlags.mapWaitMs, NEVER_MAPS_WAIT_MS)
+        chainSurvives { app ->
+            assertFailsWith<IllegalStateException> {
+                wm.attach(app, DockSpec("aw-never", "sleep 3600"), AGENT)
+            }
+        }
+    }
+
+    /**
+     * #248: a split the user put the surface alone in. sway's `split` on an only child re-lays its
+     * parent rather than wrapping it, so the dock used to land inside the user's container — a
+     * `splitv` turned `splith` — and the last detach flattened it away. Each shape is run through
+     * every lifecycle, and the user's containers must come back with the same ids, layouts and
+     * children, with the dock while it stood in a split of awakener's own inside them.
+     */
+    @Test
+    fun `a horizontal split the user put the surface alone in survives`() =
+        usersSplitSurvives("split horizontal")
+
+    @Test
+    fun `a vertical split the user put the surface alone in survives`() =
+        usersSplitSurvives("split vertical")
+
+    @Test
+    fun `nested splits the user put the surface alone in survive`() =
+        usersSplitSurvives("split vertical; focus parent; split horizontal")
+
+    /**
+     * The mark has to be atomic with the split. An attach cancelled between making its split and
+     * marking it left a split nothing flattens under MARKED, and the next attach nested inside
+     * it — measured by the #250 review at 19 leaks in 180 cancellations. Swept across the first
+     * [INTERRUPT_DELAYS_MS] of the attach for [INTERRUPT_ROUNDS] rounds, every single-child split
+     * left after each must carry its mark, and one attach and detach must then bring the
+     * workspace back to its baseline.
+     */
+    @Test
+    fun `an interrupted attach leaves no split without its mark`() = swayTest {
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        val baseline = describe()
+        repeat(INTERRUPT_ROUNDS) { round ->
+            val attach = scope.async { wm.attach(app, dockSpec(), AGENT) }
+            delay(round % INTERRUPT_DELAYS_MS)
+            attach.cancel()
+            runCatching { attach.await() }.getOrNull()?.detach()
+            // A dock that maps after the unwind's last look is #32's late dock, not this test's:
+            // closed by hand, which runs no awakener code and so leaves the split as it found it.
+            delay(LATE_DOCK_MS)
+            wm.tree().windows.filter { it.appId == "aw-dock" }.forEach { close(SurfaceId(it.id)) }
+            assertEquals(
+                emptyList(),
+                unmarkedSingleChildSplits(),
+                "round ${round + 1}, cancelled after ${round % INTERRUPT_DELAYS_MS}ms: ${describe()}",
+            )
+        }
+        wm.attach(app, dockSpec(), AGENT).detach()
+        assertEquals(baseline, describe(), "one attach and detach clears whatever was left")
+    }
+
+    /**
+     * The #250 review's deterministic case: the dock maps beside whatever is focused when it maps,
+     * and a user who moves focus while the panel starts up has it map away from the surface. The
+     * wrap then found the surface still alone in the user's split, re-laid that split in place,
+     * marked it, and the detach destroyed it.
+     */
+    @Test
+    fun `a dock that maps while focus is elsewhere leaves the user's split standing`() = swayTest {
+        val other = openSurface("aw-other")
+        val app = openSurface("aw-app")
+        command("[con_id=${app.raw}] focus; split vertical")
+        val users = usersSplits(app)
+        val baseline = describe()
+        val slow = DockSpec(
+            "aw-dock",
+            "sh -c 'sleep $SLOW_DOCK_S; exec ${sway.windowCommand(DockSpec.APP_ID_PLACEHOLDER)}'",
+        )
+        repeat(3) { cycle ->
+            val attach = scope.async { wm.attach(app, slow, AGENT) }
+            delay(FOCUS_MOVE_MS)
+            command("[con_id=${other.raw}] focus")
+            val dock = attach.await()
+            val tree = wm.tree()
+            val own = assertNotNull(tree.parentOf(dock.dockId.raw), "cycle ${cycle + 1}: dock's split")
+            assertEquals(listOf(app.raw, dock.dockId.raw), own.nodes.map { it.id }, describe())
+            assertEquals(users.first().id, tree.parentOf(own.id)?.id, describe())
+            assertEquals(users.first().layout, tree.find(users.first().id)?.layout, describe())
+            dock.detach()
+            assertEquals(users, usersSplits(app), "cycle ${cycle + 1}: ${describe()}")
+            assertEquals(baseline, describe(), "cycle ${cycle + 1}")
+            assertEquals(emptyList(), splitMarks(), "cycle ${cycle + 1}: no split mark is left")
+        }
+    }
+
+    /**
+     * The #250 review's race: the surface's last sibling in the user's split closes between the
+     * tree read attach decides from and the message that splits. `split` then re-lays the user's
+     * split rather than wrapping the surface, and the mark landed on the user's container. It
+     * now lands inert, so the detach leaves the split standing — re-laid, as on `main`, but
+     * there. Swept across the first few milliseconds of the attach.
+     */
+    @Test
+    fun `the user's split survives its last sibling closing as an attach starts`() = swayTest {
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        command("[con_id=${app.raw}] focus; split vertical")
+        val users = assertNotNull(wm.tree().parentOf(app.raw), "the user's split").id
+        repeat(KILL_RACE_ROUNDS) { round ->
+            val offset = (round % KILL_RACE_STEPS) * KILL_RACE_STEP_NS
+            command("[con_id=${app.raw}] focus")
+            val mine = openSurface("aw-mine$round")
+            assertEquals(users, wm.tree().parentOf(mine.raw)?.id, "round ${round + 1}: ${describe()}")
+            val attach = scope.async { wm.attach(app, dockSpec(), AGENT) }
+            LockSupport.parkNanos(offset)
+            command("[con_id=${mine.raw}] kill")
+            val dock = attach.await()
+            awaitGone(mine)
+            dock.detach()
+            val stage = "round ${round + 1}, killed after ${offset / 1000}us"
+            assertEquals(users, wm.tree().parentOf(app.raw)?.id, "$stage: ${describe()}")
+            assertEquals(emptyList(), splitMarks(), "$stage: no split mark is left")
+        }
+    }
+
+    /**
+     * A split mark on a container no younger than the high-water mark it names is one the
+     * message that placed it cannot have made the container for — the user's own, re-laid, or
+     * forged. Ignored by every ownership check, and taken off at the next attach.
+     */
+    @Test
+    fun `a split mark on a container older than it names is inert`() = swayTest {
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        command("[con_id=${app.raw}] focus; split vertical")
+        val users = usersSplits(app)
+        val baseline = describe()
+        val id = users.first().id
+        command("[con_id=$id] mark --add _awakener_split_${id}_beef")
+        val dock = wm.attach(app, dockSpec(), AGENT)
+        assertEquals(users.first().layout, wm.tree().find(id)?.layout, describe())
+        assertEquals(emptyList(), splitMarks().filter { it.first == id }, "the inert mark is taken off")
+        dock.detach()
+        assertEquals(users, usersSplits(app), describe())
+        assertEquals(baseline, describe())
+    }
+
+    /**
+     * A dock a build before #248 attached: its split carries no provenance mark. Under MARKED the
+     * detach leaves the surface standing in it rather than guessing whose it is.
+     */
+    @Test
+    fun `a dock whose split carries no mark leaves the split standing`() = swayTest {
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        val dock = wm.attach(app, dockSpec(), AGENT)
+        val split = unmarkSplitOf(app)
+        dock.detach()
+        val tree = wm.tree()
+        assertEquals(split, tree.parentOf(app.raw)?.id, "the unmarked split stands: ${describe()}")
+        assertEquals(1, singleChildSplits(), describe())
+    }
+
+    /** The same dock under SHAPE is flattened by shape, as before #248. */
+    @Test
+    fun `under SHAPE a dock whose split carries no mark is flattened`() = swayTest {
+        store.put(WmFlags.splitOwnership, SplitOwnership.SHAPE)
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        val baseline = describe()
+        val dock = wm.attach(app, dockSpec(), AGENT)
+        unmarkSplitOf(app)
+        dock.detach()
+        assertEquals(baseline, describe())
     }
 
     /**
@@ -335,6 +533,112 @@ class SwaySplitChainTest {
         }
     }
 
+    private fun usersSplitSurvives(split: String) = swayTest {
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        command("[con_id=${app.raw}] focus; $split")
+        val users = usersSplits(app)
+        assertEquals(true, users.isNotEmpty(), "the user's split stands: ${describe()}")
+        val baseline = describe()
+
+        suspend fun assertStands(stage: String) {
+            assertEquals(users, usersSplits(app), "$stage: ${describe()}")
+            assertEquals(baseline, describe(), stage)
+        }
+
+        suspend fun assertDockedInOwnSplit(dock: DockHandle, stage: String) {
+            val tree = wm.tree()
+            val own = assertNotNull(tree.parentOf(dock.dockId.raw), "$stage: dock's split")
+            assertEquals(
+                listOf(app.raw, dock.dockId.raw),
+                own.nodes.map { it.id },
+                "$stage: the dock stands beside the surface in a split of its own: ${describe()}",
+            )
+            assertEquals(users.first().id, tree.parentOf(own.id)?.id, "$stage: ${describe()}")
+            assertEquals(users.first().layout, tree.find(users.first().id)?.layout, "$stage: ${describe()}")
+        }
+
+        repeat(3) { cycle ->
+            val stage = "cycle ${cycle + 1}"
+            val dock = wm.attach(app, dockSpec(), AGENT)
+            assertDockedInOwnSplit(dock, "$stage, attached")
+            dock.detach()
+            assertStands("$stage, detached")
+
+            val shown = wm.attach(app, dockSpec(), AGENT)
+            shown.hide()
+            assertStands("$stage, hidden")
+            shown.show()
+            assertDockedInOwnSplit(shown, "$stage, shown")
+            shown.hide()
+            shown.show()
+            shown.detach()
+            assertStands("$stage, hidden, shown and detached")
+
+            val hidden = wm.attach(app, dockSpec(), AGENT)
+            hidden.hide()
+            hidden.detach()
+            assertStands("$stage, detached while hidden")
+        }
+    }
+
+    /** One of the user's split containers: what #248 says has to survive a detach. */
+    private data class UserSplit(val id: Long, val layout: String?, val children: List<Long>)
+
+    /** The split containers above [app], innermost first. */
+    private suspend fun usersSplits(app: SurfaceId): List<UserSplit> {
+        val tree = wm.tree()
+        return generateSequence(tree.parentOf(app.raw)) { tree.parentOf(it.id) }
+            .takeWhile { it.type == "con" && it.layout?.startsWith("split") == true }
+            .map { UserSplit(it.id, it.layout, it.nodes.map { child -> child.id }) }
+            .toList()
+    }
+
+    /** Every `_awakener_split_` mark in the tree, with the `con_id` it is on. */
+    private suspend fun splitMarks(): List<Pair<Long, String>> {
+        fun walk(node: Node): List<Pair<Long, String>> =
+            node.marks.filter { it.startsWith("_awakener_split_") }.map { node.id to it } +
+                node.children.flatMap { walk(it) }
+        return walk(wm.tree())
+    }
+
+    /** Single-child splits on workspace 1 carrying no `_awakener_split_` mark, by `con_id`. */
+    private suspend fun unmarkedSingleChildSplits(): List<Long> {
+        fun walk(node: Node): List<Long> =
+            listOfNotNull(
+                node.id.takeIf {
+                    node.type == "con" && node.layout?.startsWith("split") == true &&
+                        node.nodes.size == 1 && node.marks.none { it.startsWith("_awakener_split_") }
+                },
+            ) + node.children.flatMap { walk(it) }
+        return walk(workspace())
+    }
+
+    /** Takes the provenance mark off [app]'s split, as a build before #248 never put it on. */
+    private suspend fun unmarkSplitOf(app: SurfaceId): Long {
+        val split = assertNotNull(wm.tree().parentOf(app.raw), "the dock's split")
+        val mark = split.marks.single()
+        assertEquals(true, mark.startsWith("_awakener_split_"), "${split.marks}: ${describe()}")
+        command("unmark $mark")
+        return split.id
+    }
+
+    /** [chainCollapsedBy]'s chain under the default MARKED: every split in it still stands. */
+    private fun chainSurvives(act: suspend (SurfaceId) -> Unit) = swayTest {
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        command("[con_id=${app.raw}] focus")
+        repeat(CHAIN) { command("split horizontal; focus parent") }
+        val chain = usersSplits(app)
+        assertEquals(CHAIN, chain.size, "the chain stands: ${describe()}")
+        val baseline = describe()
+
+        act(app)
+
+        assertEquals(chain, usersSplits(app), describe())
+        assertEquals(baseline, describe())
+    }
+
     private fun twoDocksClosedByHand(newestFirst: Boolean) = swayTest {
         openSurface("aw-other")
         val app = openSurface("aw-app")
@@ -453,9 +757,13 @@ class SwaySplitChainTest {
         }
     }
 
-    /** A chain of splits inside a lone tab still goes, and the tab still stays. */
+    /**
+     * A chain of splits inside a lone tab still goes under SHAPE, and the tab still stays. Under
+     * MARKED the chain is nobody's awakener can prove, and stands like the one above.
+     */
     @Test
     fun `hide collapses a chain inside a lone tab and keeps the tab`() = swayTest {
+        store.put(WmFlags.splitOwnership, SplitOwnership.SHAPE)
         val app = openSurface("aw-app")
         command("[con_id=${app.raw}] focus")
         repeat(CHAIN) { command("split horizontal; focus parent") }
@@ -667,6 +975,14 @@ class SwaySplitChainTest {
 
         /** Long enough for an exec to be accepted, short enough that five failures stay cheap. */
         const val NEVER_MAPS_WAIT_MS = 600L
+        const val INTERRUPT_ROUNDS = 120
+        const val INTERRUPT_DELAYS_MS = 16L
+        const val LATE_DOCK_MS = 150L
+        const val SLOW_DOCK_S = "0.4"
+        const val FOCUS_MOVE_MS = 150L
+        const val KILL_RACE_ROUNDS = 100
+        const val KILL_RACE_STEPS = 20
+        const val KILL_RACE_STEP_NS = 250_000L
         val AGENT = AgentId("agent-1")
     }
 }
