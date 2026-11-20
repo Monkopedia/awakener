@@ -94,10 +94,24 @@ open class SwayHideTest {
     /**
      * The claim the whole feature rests on: the window goes and the agent does not.
      *
-     * The process assertion is the one that matters and is deliberately made against
-     * `ProcessHandle` rather than against anything sway says. A tree with no dock node in it looks
-     * identical whether the panel was hidden or killed, which is exactly the difference between
-     * this feature and the one Jason first suggested and then talked himself out of.
+     * The process assertion is made against `ProcessHandle` rather than against anything sway
+     * says, because a tree with no dock node in it looks identical whether the panel was hidden or
+     * killed — which is exactly the difference between this feature and the one Jason first
+     * suggested and then talked himself out of.
+     *
+     * **It is waited on, not sampled (#168).** A kill is asynchronous — sway asks the client to
+     * close and the client exits when it gets round to it — so a check made the instant `hide`
+     * returns sees a live process whether or not something is killing it. The first version
+     * sampled: with `hide` mutated to `kill` the panel as it returns and a gone dock reading as
+     * hidden, it went red 4 runs in 10, only when the kill won the race; a kill 300ms late it
+     * never caught. So the assertion is that [awaitProcessGone] runs out its whole bound without
+     * seeing the process leave, which goes red on both every time.
+     *
+     * It is not the only guard on this property, and does not claim to be the primary one:
+     * `DockHandle.hidden` going false for a dock no longer in the tree catches a kill that has
+     * landed by the time it is asked, and `:cli`'s `AwakeningSwayTest` toggle test holds the pid
+     * equal across both presses, which a panel killed and re-stood cannot satisfy. What this adds
+     * is the case those two can miss — a kill that lands after the hide reported success.
      */
     @Test
     fun `hiding a dock takes the window out of the layout and leaves its process running`() =
@@ -111,11 +125,11 @@ open class SwayHideTest {
 
             assertFalse(inTab(app, dock.dockId), "the window has left the surface's tab")
             assertTrue(dock.hidden(), "and it is in the scratchpad")
-            assertTrue(
-                ProcessHandle.of(pid.toLong()).map { it.isAlive }.orElse(false),
-                "the agent behind the panel is still running, which is the entire point: a " +
-                    "dock is a terminal with a live claude session in it, and killing it would " +
-                    "destroy the accumulated model this project exists to keep",
+            assertFalse(
+                awaitProcessGone(pid),
+                "the agent behind the panel is still running ${WAIT_MS}ms on, which is the " +
+                    "entire point: a dock is a terminal with a live claude session in it, and " +
+                    "killing it would destroy the accumulated model this project exists to keep",
             )
         }
 
@@ -997,6 +1011,9 @@ open class SwayHideTest {
      * A kill is asynchronous twice over: sway asks the client to close, and the client's own exit
      * is then whatever the kernel gets round to. Sampling straight after the sweep would be a race
      * that passes on a quiet machine.
+     *
+     * Read the other way it is the bound on "still running": false means the process outlived the
+     * whole wait, which a sample taken at once cannot say (#168).
      */
     private suspend fun awaitProcessGone(pid: Int): Boolean = withTimeoutOrNull(WAIT_MS) {
         while (ProcessHandle.of(pid.toLong()).map { it.isAlive }.orElse(false)) yield()

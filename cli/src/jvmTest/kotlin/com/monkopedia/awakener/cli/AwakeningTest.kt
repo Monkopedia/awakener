@@ -544,6 +544,28 @@ class AwakeningTest {
         )
     }
 
+    /**
+     * #168: a panel whose surface has no binding — forgotten while it was hidden — has no agent
+     * `dockFor` can name, and both toggle lines used to print a blank where it goes:
+     * `"  is back on screen"`. They name the dock instead, which is the one thing still known.
+     */
+    @Test
+    fun `a toggle press on a panel nothing binds names the dock, not a blank`() = runTest {
+        config.put(InvokeFlags.whenAnimated, WhenAnimated.TOGGLE_HIDE)
+        wm.standing[app.id] =
+            FakeDock(app.id, AgentId(""), SurfaceId(1005)).apply { isHidden = true }
+
+        val printed = mutableListOf<String>()
+        assertEquals(0, AwakenerInvokeCli.run(arrayOf("invoke"), awakening, printed::add))
+        assertEquals(0, AwakenerInvokeCli.run(arrayOf("invoke"), awakening, printed::add))
+
+        val agentLines = printed.filter { it.startsWith("  ") }
+        assertEquals(2, agentLines.size, printed.toString())
+        agentLines.forEach { line ->
+            assertTrue(line.startsWith("  the agent in dock 1005 "), printed.toString())
+        }
+    }
+
     @Test
     fun `reap delegates to the sweep the composition root supplied`() = runTest {
         awakening.reap()
