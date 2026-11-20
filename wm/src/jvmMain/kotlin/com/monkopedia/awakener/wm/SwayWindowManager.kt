@@ -812,7 +812,9 @@ class SwayWindowManager(
             // directly in the tab strip, and a `tabbed` or `stacked` parent is the user's tab
             // strip rather than a container attach made — naming it would put a page title on
             // the wrong thing.
-            val container = dockSplitOf(tree, surface) ?: return
+            // And only awakener's own (#248): a user's split the surface sits in — once a hide has
+            // lifted it out of the split attach made — is theirs to name.
+            val container = ownSplitOf(tree, surface, cfg) ?: return
             // app_id is the fallback because it is what sway's own leaf title falls back to, so a
             // window with no title keeps reading the way it read before the dock existed. With
             // neither, there is nothing to say that beats what sway would put there itself.
@@ -889,14 +891,40 @@ class SwayWindowManager(
          * **Only splits are flattened.** Where `split none` would also take a tab strip awakener
          * did not make — see [tabAbove] — the survivor is lifted into that tab strip instead,
          * which empties the splits below it and leaves the strip standing (#226).
+         *
+         * **Only awakener's own split** under the default [WmFlags.splitOwnership] (#248): a
+         * survivor whose split carries no provenance mark is left in it, and the flatten stops at
+         * the marked split rather than walking on into whatever single-child containers stand
+         * above it — see [liftTarget].
          */
         suspend fun normalizeContainer(survivor: SurfaceId) {
+            val cfg = config
             val tree = tree()
             if (tree.find(survivor.raw) == null) return
-            val tab = tabAbove(tree, survivor)
+            val tab = when (cfg[WmFlags.splitOwnership]) {
+                SplitOwnership.SHAPE -> tabAbove(tree, survivor)
+                SplitOwnership.MARKED -> {
+                    val split = ownSplitOf(tree, survivor, cfg) ?: return
+                    liftTarget(tree, split, survivor, cfg)
+                }
+            }
             if (tab != null) return run(liftInto(tab, survivor))
             focus(survivor)
             run("split none")
+        }
+
+        /**
+         * Marks the split [surface] now sits in as awakener's (#248), for a caller that has just
+         * made it. Read from the tree because the split's `con_id` is minted by the command that
+         * made it, and a split that already carries the mark is left alone. A parent that is no
+         * split — a lone window's workspace, re-laid by `split` in place — gets nothing.
+         */
+        suspend fun claimSplit(surface: SurfaceId) {
+            val split = tree().parentOf(surface.raw)
+                ?.takeIf { (it.type == CON || it.type == FLOATING_CON) && it.layout?.startsWith("split") == true }
+                ?: return
+            val mark = splitMark(split.id)
+            if (mark !in split.marks) run("[con_id=${split.id}] mark --add $mark")
         }
 
         /**
@@ -1129,13 +1157,13 @@ class SwayWindowManager(
                     floating,
                     surface,
                     dock,
-                    cfg[WmFlags.flattenFloatingOnHide],
+                    cfg[WmFlags.flattenFloatingOnHide] && ownsSplit(floating, cfg),
                 )
                 // #187, the visible-dock half. Planned from one read and sent in the same message
                 // as the move, for #172's reason: one message, one present, so the user never
                 // sees the windows leaving the tab as a separate frame from the panel going away.
                 cfg[WmFlags.evictOnHide] ->
-                    evictionCommands(before, surface, dock) + "[con_id=${dock.raw}] move scratchpad"
+                    evictionCommands(before, surface, dock, cfg) + "[con_id=${dock.raw}] move scratchpad"
                 else -> listOf("[con_id=${dock.raw}] move scratchpad")
             }
             run(hide.joinToString("; "))
@@ -1160,9 +1188,14 @@ class SwayWindowManager(
             // the hide leaves focus exactly where sway put it. And only the split: with the
             // surface alone on a `workspace_layout tabbed` workspace, `split none` would take the
             // tab strip too (#226), so there the surface is lifted into the strip instead.
+            //
+            // And only awakener's own split (#248), collapsed no further than itself: a surface
+            // the user put alone in a split of theirs got one of awakener's inside it at attach,
+            // and that is the one this takes away.
             val tree = tree()
-            if (cfg[WmFlags.flattenOnHide] && dockSplitOf(tree, surface)?.nodes?.size == 1) {
-                val tab = tabAbove(tree, surface)
+            val split = ownSplitOf(tree, surface, cfg)
+            if (cfg[WmFlags.flattenOnHide] && split?.nodes?.size == 1) {
+                val tab = liftTarget(tree, split, surface, cfg)
                 run(if (tab != null) liftInto(tab, surface) else "[con_id=${surface.raw}] split none")
             }
             return true
@@ -1228,9 +1261,17 @@ class SwayWindowManager(
             // the user's is split again, the same rule attach applies (#171) — tiling the dock
             // into it put the panel inside the user's container, and the detach after then had
             // `split none` refused for the user's window.
+            //
+            // And only a split that is awakener's (#248). Where the surface sits alone in a split
+            // of the user's — the hide lifted it out of attach's — `split` would re-lay theirs in
+            // place, so the dock is tiled in beside the surface first and the surface wrapped
+            // after, as attach does.
             val split = dockSplitOf(before, surface)
-            val resplit = split == null ||
-                (split.nodes.size > 1 && !holdsOnlyDocksOf(split, surface, cfg))
+            val usable = split?.takeIf {
+                ownsSplit(it, cfg) && (it.nodes.size == 1 || holdsOnlyDocksOf(it, surface, cfg))
+            }
+            val wrapAfter = usable == null && split?.nodes?.size == 1
+            val resplit = usable == null && !wrapAfter
             val restore = buildList {
                 add("[con_id=${dock.raw}] scratchpad show")
                 // Before `floating disable`, because that re-tiles beside the focused node.
@@ -1241,6 +1282,10 @@ class SwayWindowManager(
                     // one present.
                     if (resplit) add("split horizontal")
                     add("[con_id=${dock.raw}] floating disable")
+                    if (wrapAfter) {
+                        add("[con_id=${surface.raw}] split horizontal")
+                        add(moveToMarkOn(surface.raw, dock.raw))
+                    }
                 } else {
                     // #229. `floating disable` tiles beside the focused *tiled* node, and a
                     // floating surface is not one, so the dock is tiled wherever that puts it and
@@ -1269,6 +1314,12 @@ class SwayWindowManager(
             check(landed) {
                 "dock ${dock.raw} was not docked beside surface ${surface.raw} " +
                     "${cfg[WmFlags.unmapWaitMs]}ms after the restore went out: $fault"
+            }
+
+            // A split made by the batch is marked as awakener's here, after it, since the batch
+            // cannot name a container it has not yet made.
+            if (if (floating == null) resplit || wrapAfter else floating.id == surface.raw) {
+                claimSplit(surface)
             }
 
             // Re-issued rather than relied upon. Under wm.dock.flatten_on_hide the hide collapsed
@@ -1637,22 +1688,34 @@ class SwayWindowManager(
                     // dock, and a dock closed by hand runs no awakener code to take the level
                     // back. Two docks closed by hand compounded 2 → 6 single-child splits over
                     // five rounds. Not this attach's container, so the unwind leaves it alone.
-                    val sharing = cfg[WmFlags.shareDockSplit] &&
-                        dockSplitOf(tree(), surface)?.let { holdsOnlyDocksOf(it, surface, cfg) } == true
+                    //
+                    // Only a split that is awakener's (#248). A user's split holding the surface
+                    // and a dock a build before the provenance mark put there is not shared.
+                    val split = dockSplitOf(tree(), surface)
+                    val sharing = cfg[WmFlags.shareDockSplit] && split != null &&
+                        ownsSplit(split, cfg) && holdsOnlyDocksOf(split, surface, cfg)
+                    // #248. sway's `split` on the only child of a split does not wrap it: it
+                    // re-lays the parent in place — a user's `splitv` turned `splith` — and the
+                    // dock then maps into the user's container, which the last detach used to
+                    // flatten away. There is no command that wraps an only child, so this split
+                    // is made once the dock has mapped beside the surface and given it a sibling.
+                    val wrapAfterMap = !sharing && split != null && split.nodes.size == 1 &&
+                        !ownsSplit(split, cfg)
                     // Recorded before the command rather than after it, for the same reason
                     // `pending` is: a fact recorded on the far side of a round trip is one the
                     // failure that needs it can arrive ahead of — a cancellation landing on this
                     // acknowledgement would otherwise leave the container built and unrecorded.
                     // Rolled back only where sway itself refuses, which is the one failure that
                     // means the container certainly does not exist.
-                    container = !sharing
-                    if (!sharing) {
+                    container = !sharing && !wrapAfterMap
+                    if (container) {
                         try {
                             run("split horizontal")
                         } catch (rejected: IllegalStateException) {
                             container = false
                             throw rejected
                         }
+                        claimSplit(surface)
                     }
 
                     // Must precede the exec — sway evaluates focus rules when the window maps, so
@@ -1757,6 +1820,15 @@ class SwayWindowManager(
                         cfg[WmFlags.dockMarkScheme],
                     )
                     run("[con_id=${dockId.raw}] mark --add $mark")
+                    if (wrapAfterMap) {
+                        // The dock mapped inside the user's split beside the surface, so the
+                        // surface has a sibling and `split` wraps it; the move by mark onto the
+                        // surface, a leaf, then puts the dock beside it in the new split. Recorded
+                        // first for the reason `container` is above.
+                        container = true
+                        run("[con_id=${surface.raw}] split horizontal; " + moveToMarkOn(surface.raw, dockId.raw))
+                        claimSplit(surface)
+                    }
                     if (cfg[WmFlags.dockSide] == DockSide.LEFT) {
                         run("[con_id=${dockId.raw}] move left")
                     }
@@ -2515,9 +2587,46 @@ class SwayWindowManager(
         private fun dockSplitOf(tree: Node, surface: SurfaceId): Node? =
             tree.parentOf(surface.raw)?.takeIf { it.isSplit() }
 
+        /** [dockSplitOf], when that split is awakener's under [WmFlags.splitOwnership]. */
+        private fun ownSplitOf(tree: Node, surface: SurfaceId, cfg: Config): Node? =
+            dockSplitOf(tree, surface)?.takeIf { ownsSplit(it, cfg) }
+
         /** A split container — the shape `attach` makes — as opposed to a tab strip or workspace. */
         private fun Node.isSplit(): Boolean =
             type == CON && (layout == "splith" || layout == "splitv")
+
+        /**
+         * The provenance mark an attach or a show puts on a split it made (#248): the record that
+         * the split is awakener's, since one a user made can be identical in shape.
+         *
+         * Named by the split's own `con_id` because a sway mark is one global set and a name held
+         * by two containers is taken off the first by the second — a per-surface name would move
+         * off an outer split of awakener's the moment it wrapped the surface again inside it. The
+         * leading underscore is sway's rule for a mark never drawn in a title bar, and the prefix
+         * is the namespace [moveToMarkOn] already uses, which no dock mark falls under.
+         */
+        private fun splitMark(split: Long): String = "_awakener_split_$split"
+
+        /** Whether [split] is awakener's to share, collapse, re-lay or name. See [SplitOwnership]. */
+        private fun ownsSplit(split: Node, cfg: Config): Boolean =
+            cfg[WmFlags.splitOwnership] == SplitOwnership.SHAPE || splitMark(split.id) in split.marks
+
+        /**
+         * The container a flatten of [split] around [survivor] has to lift the survivor into
+         * rather than `split none`, or null when `split none` stops where it should.
+         *
+         * Under [SplitOwnership.MARKED] that is any single-child container directly above
+         * [split]: sway's flatten walks on through every one of them ([tabAbove]), and none is
+         * awakener's — a split of the user's the surface sat alone in, or a chain no build has a
+         * record of making. Under [SplitOwnership.SHAPE] the walk is wanted, and only a tab strip
+         * stops it, as before #248.
+         */
+        private fun liftTarget(tree: Node, split: Node, survivor: SurfaceId, cfg: Config): Node? =
+            when (cfg[WmFlags.splitOwnership]) {
+                SplitOwnership.SHAPE -> tabAbove(tree, survivor)
+                SplitOwnership.MARKED ->
+                    tree.parentOf(split.id)?.takeIf { it.type == CON && it.nodes.size == 1 }
+            }
 
         /**
          * The tab strip a `split none` on [survivor] would destroy along with the split it is
@@ -2692,8 +2801,16 @@ class SwayWindowManager(
          * **Focus.** Every command targets by `con_id`, and a criteria-targeted `move` leaves
          * focus where it was — measured on 1.12 with the surface focused and an intruder moved.
          */
-        private fun evictionCommands(tree: Node, surface: SurfaceId, dock: SurfaceId): List<String> {
-            val split = tree.parentOf(dock.raw)?.takeIf { it.isSplit() } ?: return emptyList()
+        private fun evictionCommands(
+            tree: Node,
+            surface: SurfaceId,
+            dock: SurfaceId,
+            cfg: Config,
+        ): List<String> {
+            // Awakener's own split only (#248): a dock standing in a split of the user's — one a
+            // build before the provenance mark attached — does not make their windows its to move.
+            val split = tree.parentOf(dock.raw)?.takeIf { it.isSplit() && ownsSplit(it, cfg) }
+                ?: return emptyList()
             if (split.nodes.none { it.id == surface.raw }) return emptyList()
             val parent = tree.parentOf(split.id) ?: return emptyList()
             val horizontal = when (parent.layout) {

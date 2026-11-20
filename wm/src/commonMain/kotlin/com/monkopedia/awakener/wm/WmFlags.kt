@@ -46,6 +46,18 @@ enum class AttachLockScope {
 /** Which side of the surface the dock sits on. */
 enum class DockSide { LEFT, RIGHT }
 
+/**
+ * What makes a split container awakener's to share, collapse, re-lay or name (#248). See
+ * [WmFlags.splitOwnership].
+ */
+enum class SplitOwnership {
+    /** Only a split carrying the provenance mark the attach that made it put on it. */
+    MARKED,
+
+    /** Any split of the right shape, marked or not — the rule before #248. */
+    SHAPE,
+}
+
 /** What a tab is left focused on once dock interaction ends. */
 enum class RestingFocus { APP, DOCK }
 
@@ -670,6 +682,26 @@ object WmFlags {
         true,
         "Collapse the split container once the dock leaves. sway does not remove single-child " +
             "split containers, and a leftover one silently swallows the next window opened.",
+    )
+
+    val splitOwnership = Flags.enum(
+        "wm.dock.split_ownership",
+        SplitOwnership.MARKED,
+        "Which split containers awakener treats as its own (#248). MARKED: only a split an " +
+            "attach or a show made, which carries a hidden '_awakener_split_<con_id>' mark from " +
+            "that moment; a detach, a hide, a failed attach's unwind and a second dock act on " +
+            "that split and nothing else, and its flatten stops at it rather than walking on " +
+            "into the containers above. A container that predates the dock is never collapsed, " +
+            "re-laid, named or shared, whatever it holds — a surface the user put alone in a " +
+            "split of their own gets a split of awakener's inside it. SHAPE: any split of the " +
+            "right shape, as before #248, which flattens a user's split holding only the " +
+            "surface and its dock, and collapses a whole chain of single-child splits above " +
+            "the surface. MARKED by default because the two cannot be told apart by shape, and " +
+            "a split wrongly left standing costs one container while one wrongly flattened " +
+            "destroys layout the user built. What MARKED costs: a split made by a build before " +
+            "#248 carries no mark, so detaching a dock that build attached leaves the surface " +
+            "alone in that split, and a chain #171 left behind stays until it is flattened by " +
+            "hand or once under SHAPE.",
     )
 
     val shareDockSplit = Flags.boolean(
