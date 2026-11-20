@@ -5,6 +5,7 @@ import com.monkopedia.awakener.registry.AgentId
 import com.monkopedia.awakener.registry.DerivedAgentIdentities
 import com.monkopedia.awakener.registry.FileBindingStore
 import java.nio.file.Path
+import java.util.concurrent.locks.LockSupport
 import kotlin.io.path.createTempDirectory
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
@@ -280,6 +281,92 @@ class SwaySplitChainTest {
     }
 
     /**
+     * The #250 review's deterministic case: the dock maps beside whatever is focused when it maps,
+     * and a user who moves focus while the panel starts up has it map away from the surface. The
+     * wrap then found the surface still alone in the user's split, re-laid that split in place,
+     * marked it, and the detach destroyed it.
+     */
+    @Test
+    fun `a dock that maps while focus is elsewhere leaves the user's split standing`() = swayTest {
+        val other = openSurface("aw-other")
+        val app = openSurface("aw-app")
+        command("[con_id=${app.raw}] focus; split vertical")
+        val users = usersSplits(app)
+        val baseline = describe()
+        val slow = DockSpec(
+            "aw-dock",
+            "sh -c 'sleep $SLOW_DOCK_S; exec ${sway.windowCommand(DockSpec.APP_ID_PLACEHOLDER)}'",
+        )
+        repeat(3) { cycle ->
+            val attach = scope.async { wm.attach(app, slow, AGENT) }
+            delay(FOCUS_MOVE_MS)
+            command("[con_id=${other.raw}] focus")
+            val dock = attach.await()
+            val tree = wm.tree()
+            val own = assertNotNull(tree.parentOf(dock.dockId.raw), "cycle ${cycle + 1}: dock's split")
+            assertEquals(listOf(app.raw, dock.dockId.raw), own.nodes.map { it.id }, describe())
+            assertEquals(users.first().id, tree.parentOf(own.id)?.id, describe())
+            assertEquals(users.first().layout, tree.find(users.first().id)?.layout, describe())
+            dock.detach()
+            assertEquals(users, usersSplits(app), "cycle ${cycle + 1}: ${describe()}")
+            assertEquals(baseline, describe(), "cycle ${cycle + 1}")
+            assertEquals(emptyList(), splitMarks(), "cycle ${cycle + 1}: no split mark is left")
+        }
+    }
+
+    /**
+     * The #250 review's race: the surface's last sibling in the user's split closes between the
+     * tree read attach decides from and the message that splits. `split` then re-lays the user's
+     * split rather than wrapping the surface, and the mark landed on the user's container. It
+     * now lands inert, so the detach leaves the split standing — re-laid, as on `main`, but
+     * there. Swept across the first few milliseconds of the attach.
+     */
+    @Test
+    fun `the user's split survives its last sibling closing as an attach starts`() = swayTest {
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        command("[con_id=${app.raw}] focus; split vertical")
+        val users = assertNotNull(wm.tree().parentOf(app.raw), "the user's split").id
+        repeat(KILL_RACE_ROUNDS) { round ->
+            val offset = (round % KILL_RACE_STEPS) * KILL_RACE_STEP_NS
+            command("[con_id=${app.raw}] focus")
+            val mine = openSurface("aw-mine$round")
+            assertEquals(users, wm.tree().parentOf(mine.raw)?.id, "round ${round + 1}: ${describe()}")
+            val attach = scope.async { wm.attach(app, dockSpec(), AGENT) }
+            LockSupport.parkNanos(offset)
+            command("[con_id=${mine.raw}] kill")
+            val dock = attach.await()
+            awaitGone(mine)
+            dock.detach()
+            val stage = "round ${round + 1}, killed after ${offset / 1000}us"
+            assertEquals(users, wm.tree().parentOf(app.raw)?.id, "$stage: ${describe()}")
+            assertEquals(emptyList(), splitMarks(), "$stage: no split mark is left")
+        }
+    }
+
+    /**
+     * A split mark on a container no younger than the high-water mark it names is one the
+     * message that placed it cannot have made the container for — the user's own, re-laid, or
+     * forged. Ignored by every ownership check, and taken off at the next attach.
+     */
+    @Test
+    fun `a split mark on a container older than it names is inert`() = swayTest {
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        command("[con_id=${app.raw}] focus; split vertical")
+        val users = usersSplits(app)
+        val baseline = describe()
+        val id = users.first().id
+        command("[con_id=$id] mark --add _awakener_split_${id}_beef")
+        val dock = wm.attach(app, dockSpec(), AGENT)
+        assertEquals(users.first().layout, wm.tree().find(id)?.layout, describe())
+        assertEquals(emptyList(), splitMarks().filter { it.first == id }, "the inert mark is taken off")
+        dock.detach()
+        assertEquals(users, usersSplits(app), describe())
+        assertEquals(baseline, describe())
+    }
+
+    /**
      * A dock a build before #248 attached: its split carries no provenance mark. Under MARKED the
      * detach leaves the surface standing in it rather than guessing whose it is.
      */
@@ -505,6 +592,14 @@ class SwaySplitChainTest {
             .takeWhile { it.type == "con" && it.layout?.startsWith("split") == true }
             .map { UserSplit(it.id, it.layout, it.nodes.map { child -> child.id }) }
             .toList()
+    }
+
+    /** Every `_awakener_split_` mark in the tree, with the `con_id` it is on. */
+    private suspend fun splitMarks(): List<Pair<Long, String>> {
+        fun walk(node: Node): List<Pair<Long, String>> =
+            node.marks.filter { it.startsWith("_awakener_split_") }.map { node.id to it } +
+                node.children.flatMap { walk(it) }
+        return walk(wm.tree())
     }
 
     /** Single-child splits on workspace 1 carrying no `_awakener_split_` mark, by `con_id`. */
@@ -883,6 +978,11 @@ class SwaySplitChainTest {
         const val INTERRUPT_ROUNDS = 120
         const val INTERRUPT_DELAYS_MS = 16L
         const val LATE_DOCK_MS = 150L
+        const val SLOW_DOCK_S = "0.4"
+        const val FOCUS_MOVE_MS = 150L
+        const val KILL_RACE_ROUNDS = 100
+        const val KILL_RACE_STEPS = 20
+        const val KILL_RACE_STEP_NS = 250_000L
         val AGENT = AgentId("agent-1")
     }
 }

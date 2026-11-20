@@ -914,6 +914,19 @@ class SwayWindowManager(
         }
 
         /**
+         * Takes off every split mark [isInertSplitMark] refuses, after a message that may have
+         * placed one. Inert marks are already ignored by every ownership check; this is so that a
+         * user's container does not go on carrying awakener's name.
+         */
+        suspend fun dropInertSplitMarks() {
+            fun inert(node: Node): List<String> =
+                node.marks.filter { it.startsWith(SPLIT_MARK_PREFIX) && node.isInertSplitMark(it) }
+                    .map { "[con_id=${node.id}] unmark $it" } + node.children.flatMap { inert(it) }
+            val commands = inert(tree())
+            if (commands.isNotEmpty()) run(commands.joinToString("; "))
+        }
+
+        /**
          * Issues the `no_focus` rule for [appId], unless this session already has one.
          *
          * sway has no verb that revokes one, so a second rule for a name that already carries one
@@ -1270,10 +1283,14 @@ class SwayWindowManager(
                     // After the focus, because `split` applies to the focused node — the same
                     // order attach uses, and inside the batch for #172's reason: one message,
                     // one present.
-                    if (resplit) add(if (wraps) splitAndClaim(surface) else "split horizontal")
+                    if (resplit) add(if (wraps) splitAndClaim(surface, before) else "split horizontal")
                     add("[con_id=${dock.raw}] floating disable")
                     if (wrapAfter) {
-                        add(splitAndClaim(surface))
+                        // Beside the surface first, for attach's reason: `floating disable` tiles
+                        // beside the focused node, which the read above cannot promise is still
+                        // the surface.
+                        add(moveToMarkOn(surface.raw, dock.raw))
+                        add(splitAndClaim(surface, before))
                         add(moveToMarkOn(surface.raw, dock.raw))
                     }
                 } else {
@@ -1282,7 +1299,7 @@ class SwayWindowManager(
                     // then moved beside the surface by mark — into the floating split, which a
                     // surface the hide left floating alone gets back first. A `split` on a
                     // floating window makes a floating split on its rectangle, measured on 1.12.
-                    if (floating.id == surface.raw) add(splitAndClaim(surface))
+                    if (floating.id == surface.raw) add(splitAndClaim(surface, before))
                     add("[con_id=${dock.raw}] floating disable")
                     add(moveToMarkOn(surface.raw, dock.raw))
                 }
@@ -1292,6 +1309,8 @@ class SwayWindowManager(
                 add("[con_id=${dock.raw}] resize set width $sizePpt ppt")
             }.joinToString("; ")
             run(restore)
+            val claimed = if (floating == null) (resplit && wraps) || wrapAfter else floating.id == surface.raw
+            if (claimed) dropInertSplitMarks()
 
             // Held from inside the poll rather than re-read after it: a diagnosis taken once the
             // deadline has expired races a tree that may have settled in the meantime, and would
@@ -1701,15 +1720,19 @@ class SwayWindowManager(
                             // cancellation or process death can split. See [splitAndClaim].
                             run(
                                 if (splitWraps(before, surface)) {
-                                    splitAndClaim(surface)
+                                    splitAndClaim(surface, before)
                                 } else {
                                     "split horizontal"
                                 },
                             )
                         } catch (rejected: IllegalStateException) {
-                            container = false
+                            // Rolled back only where no split of awakener's stands: the message
+                            // carries more than the split, and a refusal of a later command in it
+                            // leaves the split made and marked.
+                            container = dockSplitOf(tree(), surface)?.carriesLiveSplitMark() == true
                             throw rejected
                         }
+                        dropInertSplitMarks()
                     }
 
                     // Must precede the exec — sway evaluates focus rules when the window maps, so
@@ -1815,18 +1838,23 @@ class SwayWindowManager(
                     )
                     run("[con_id=${dockId.raw}] mark --add $mark")
                     if (wrapAfterMap) {
-                        // The dock mapped inside the user's split beside the surface, so the
-                        // surface has a sibling and `split` wraps it; the move by mark onto the
-                        // surface, a leaf, then puts the dock beside it in the new split. Recorded
-                        // first for the reason `container` is above.
-                        // Focus goes back where the map left it, in the same message, so that what
-                        // the focus flags below see is what they would have seen without the wrap.
+                        // The dock maps beside whatever is focused when it maps, which is the
+                        // surface only if nobody moved focus during the start-up; so it is moved
+                        // beside the surface first, which gives the surface the sibling `split`
+                        // needs to wrap rather than re-lay the user's split, then into the new
+                        // split beside it. One message, so nothing in between is presented. Focus
+                        // goes back where the map left it, so the focus flags below see what they
+                        // would have seen without the wrap. Recorded first for `container`'s
+                        // reason above.
                         container = true
-                        val focused = tree().focusedId() ?: surface.raw
+                        val mapped = tree()
+                        val focused = mapped.focusedId() ?: surface.raw
                         run(
-                            splitAndClaim(surface, refocus = focused) + "; " +
+                            moveToMarkOn(surface.raw, dockId.raw) + "; " +
+                                splitAndClaim(surface, mapped, refocus = focused) + "; " +
                                 moveToMarkOn(surface.raw, dockId.raw),
                         )
+                        dropInertSplitMarks()
                     }
                     if (cfg[WmFlags.dockSide] == DockSide.LEFT) {
                         run("[con_id=${dockId.raw}] move left")
@@ -2609,8 +2637,38 @@ class SwayWindowManager(
 
         /** Whether [split] is awakener's to share, collapse, re-lay or name. See [SplitOwnership]. */
         private fun ownsSplit(split: Node, cfg: Config): Boolean =
-            cfg[WmFlags.splitOwnership] == SplitOwnership.SHAPE ||
-                split.marks.any { it.startsWith(SPLIT_MARK_PREFIX) }
+            cfg[WmFlags.splitOwnership] == SplitOwnership.SHAPE || split.carriesLiveSplitMark()
+
+        /**
+         * Whether this node carries a split mark that is not [inert][isInertSplitMark] — the
+         * provenance under [SplitOwnership.MARKED], whatever the flag says.
+         */
+        private fun Node.carriesLiveSplitMark(): Boolean =
+            marks.any { it.startsWith(SPLIT_MARK_PREFIX) && !isInertSplitMark(it) }
+
+        /**
+         * Whether [mark], a split mark on this node, is one this node cannot have earned: the
+         * node is no younger than the newest container the claiming message's tree read had
+         * seen, which [splitAndClaim] writes into the mark. sway mints `con_id`s in increasing
+         * order, so a split that message made is always younger; one that is not existed
+         * before it, and is a container `split` re-laid in place — the user's — that `focus
+         * parent` happened to reach (#250's review: a dock mapping beside a window focused during
+         * its start-up, or the surface's last sibling closing between the read and the message).
+         * A mark that does not parse as one this build writes is inert too.
+         */
+        private fun Node.isInertSplitMark(mark: String): Boolean {
+            val newest = mark.removePrefix(SPLIT_MARK_PREFIX).substringBefore('_').toLongOrNull()
+            return newest == null || id <= newest
+        }
+
+        /**
+         * The largest container `con_id` in the tree — the high-water mark [splitAndClaim]
+         * records. Containers only: sway gives the `__i3` output and its scratchpad workspace
+         * `INT_MAX` and `INT_MAX - 1` (measured on 1.12), which would make every mark inert.
+         */
+        private fun Node.newestId(): Long = children.fold(
+            if (type == CON || type == FLOATING_CON) id else 0L,
+        ) { acc, child -> maxOf(acc, child.newestId()) }
 
         /**
          * One message that splits [surface] and marks the new split as awakener's, leaving focus
@@ -2628,9 +2686,17 @@ class SwayWindowManager(
          * Only for a split that will wrap — see [splitWraps]. Where sway re-lays the parent in
          * place instead, `focus parent` reaches a workspace and sway refuses to mark it,
          * measured on 1.12.
+         *
+         * **And the mark is only good on a split this message made**, which the read [before]
+         * cannot promise: that read is a round trip old by the time the message runs, and a split
+         * that re-lays rather than wraps puts the mark on a container that already stood. So the
+         * mark carries [before]'s newest `con_id`, and [isInertSplitMark] refuses it on anything
+         * no younger — a guard that needs no read of its own, since the message itself is what
+         * minted the only ids above it. [dropInertSplitMarks] then takes such a mark back off.
          */
-        private fun splitAndClaim(surface: SurfaceId, refocus: Long = surface.raw): String {
-            val mark = SPLIT_MARK_PREFIX + Random.nextLong().toULong().toString(16)
+        private fun splitAndClaim(surface: SurfaceId, before: Node, refocus: Long = surface.raw): String {
+            val mark = SPLIT_MARK_PREFIX + before.newestId() + "_" +
+                Random.nextLong().toULong().toString(16)
             return "[con_id=${surface.raw}] split horizontal; [con_id=${surface.raw}] focus; " +
                 "focus parent; mark --add $mark; [con_id=$refocus] focus"
         }
