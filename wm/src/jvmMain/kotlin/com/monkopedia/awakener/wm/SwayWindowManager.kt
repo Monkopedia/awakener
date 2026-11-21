@@ -12,6 +12,7 @@ import java.io.File
 import java.security.SecureRandom
 import kotlin.math.abs
 import kotlin.random.Random
+import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.TimeSource
 import kotlinx.coroutines.CancellationException
@@ -909,9 +910,48 @@ class SwayWindowManager(
                 }
             }
             if (tab != null) return run(liftInto(tab, survivor))
+            val floating = tree.parentOf(survivor.raw)?.takeIf { it.type == FLOATING_CON }
             focus(survivor)
             run("split none")
+            floating?.rect?.let { holdFloatingRect(survivor, it) }
         }
+
+        /**
+         * Keeps [surface], just collapsed out of a floating split, on [rect] — the split's — for
+         * [WmFlags.floatingDetachSettleMs] (#253).
+         *
+         * The collapse is the one moment the surface becomes a floating window of its own, and
+         * sway resizes a floating window to whatever its client next commits. A client that had
+         * not yet committed the narrower size the split gave it — a detach soon after an attach
+         * or a show — commits it after the collapse, and the window keeps the dock's share of
+         * its width lost for good: #232's loss, met by the detach rather than the hide. Nothing
+         * over IPC says when a client has committed, so this watches the outcome instead, and
+         * puts the rectangle back whenever the surface leaves it. Within [GEOMETRY_SLACK],
+         * because a client sizes itself in whole buffer pixels and at a fractional scale the
+         * window it ends up in can be a pixel off the logical rectangle it was asked for.
+         */
+        private suspend fun holdFloatingRect(surface: SurfaceId, rect: Rect) {
+            val cfg = config
+            val settle = cfg[WmFlags.floatingDetachSettleMs].milliseconds
+            if (settle == Duration.ZERO) return
+            val deadline = TimeSource.Monotonic.markNow() + cfg[WmFlags.unmapWaitMs].milliseconds
+            var held = TimeSource.Monotonic.markNow()
+            while (held.elapsedNow() < settle && deadline.hasNotPassedNow()) {
+                val now = tree().find(surface.raw)?.takeIf { it.type == FLOATING_CON }?.rect ?: return
+                if (!now.near(rect)) {
+                    run(
+                        "[con_id=${surface.raw}] resize set ${rect.width} px ${rect.height} px; " +
+                            "[con_id=${surface.raw}] move absolute position ${rect.x} px ${rect.y} px",
+                    )
+                    held = TimeSource.Monotonic.markNow()
+                }
+                delay(cfg[WmFlags.pollIntervalMs].milliseconds)
+            }
+        }
+
+        private fun Rect.near(other: Rect): Boolean =
+            maxOf(abs(x - other.x), abs(y - other.y), abs(width - other.width), abs(height - other.height)) <=
+                GEOMETRY_SLACK
 
         /**
          * Takes off every split mark [isInertSplitMark] refuses, after a message that may have
@@ -1680,6 +1720,9 @@ class SwayWindowManager(
                 // PendingDock: without it the unwind cannot name a window that maps in that span.
                 var pending: PendingDock? = null
                 try {
+                    // Before anything is touched, focus included, so a refusal leaves the tree
+                    // exactly as the press found it (#253).
+                    refuseByFlag(tree(), surface, cfg)
                     // Focus first: sway's split applies to the focused container, and the dock has
                     // to land inside this surface's tab rather than wherever focus happened to be.
                     focus(surface)
@@ -1837,6 +1880,17 @@ class SwayWindowManager(
                         cfg[WmFlags.dockMarkScheme],
                     )
                     run("[con_id=${dockId.raw}] mark --add $mark")
+                    // #253. The dock maps beside whatever is focused when it maps, and a user who
+                    // clicked another window during the start-up has put focus there: the panel
+                    // then stood as a tab beside that window, or for a floating surface in the
+                    // tiled layout behind it, and the split made for it was left holding the
+                    // surface alone. Moved beside the surface by mark, which puts it into that
+                    // split whether it floats or not; the window it mapped beside is left as it
+                    // was. Not for wrapAfterMap, whose own message starts with this same move.
+                    val mapped = tree()
+                    if (!wrapAfterMap && mapped.parentOf(dockId.raw)?.id != mapped.parentOf(surface.raw)?.id) {
+                        run(moveToMarkOn(surface.raw, dockId.raw))
+                    }
                     if (wrapAfterMap) {
                         // The dock maps beside whatever is focused when it maps, which is the
                         // surface only if nobody moved focus during the start-up; so it is moved
@@ -1847,7 +1901,6 @@ class SwayWindowManager(
                         // would have seen without the wrap. Recorded first for `container`'s
                         // reason above.
                         container = true
-                        val mapped = tree()
                         val focused = mapped.focusedId() ?: surface.raw
                         run(
                             moveToMarkOn(surface.raw, dockId.raw) + "; " +
@@ -2618,9 +2671,38 @@ class SwayWindowManager(
         private fun ownSplitOf(tree: Node, surface: SurfaceId, cfg: Config): Node? =
             dockSplitOf(tree, surface)?.takeIf { ownsSplit(it, cfg) }
 
-        /** A split container — the shape `attach` makes — as opposed to a tab strip or workspace. */
+        /**
+         * A split container — the shape `attach` makes — as opposed to a tab strip or workspace.
+         * A floating one counts (#253): `split` on a floating window makes a floating split on its
+         * rectangle, and that is the split attach made around a floating surface, which a detach
+         * has to collapse and a second dock has to share like any other.
+         */
         private fun Node.isSplit(): Boolean =
-            type == CON && (layout == "splith" || layout == "splitv")
+            (type == CON || type == FLOATING_CON) && (layout == "splith" || layout == "splitv")
+
+        /**
+         * Fails an attach that [WmFlags.floatingSurface] or [WmFlags.fullscreenSurface] refuses,
+         * from the read [tree], before it has changed anything.
+         */
+        private fun refuseByFlag(tree: Node, surface: SurfaceId, cfg: Config) {
+            val floating = floatingAncestorOf(tree, surface) != null
+            check(!floating || cfg[WmFlags.floatingSurface] != FloatingSurface.REFUSE) {
+                "surface ${surface.raw} is floating, which wm.dock.floating_surface=REFUSE declines"
+            }
+            val fullscreen = generateSequence(tree.find(surface.raw)) { tree.parentOf(it.id) }
+                .takeWhile { it.type == CON || it.type == FLOATING_CON }
+                .any { it.fullscreenMode != 0 }
+            val mode = cfg[WmFlags.fullscreenSurface]
+            val refused = fullscreen && when (mode) {
+                FullscreenSurface.DOCK -> false
+                FullscreenSurface.DOCK_TILED -> floating
+                FullscreenSurface.REFUSE -> true
+            }
+            check(!refused) {
+                "surface ${surface.raw} is fullscreen${if (floating) " and floating" else ""}, " +
+                    "which wm.dock.fullscreen_surface=$mode declines"
+            }
+        }
 
         /**
          * The provenance mark an attach or a show puts on a split it made (#248): the record that
@@ -3000,6 +3082,9 @@ class SwayWindowManager(
          * `floating=user_on`, centred over the surface. Measured on 1.12.
          */
         const val FLOATING_CON = "floating_con"
+
+        /** How far a floating window may sit from a rectangle it was put back on, in pixels. */
+        const val GEOMETRY_SLACK = 2
 
         /** The `type` sway gives a workspace node. */
         const val WORKSPACE = "workspace"
