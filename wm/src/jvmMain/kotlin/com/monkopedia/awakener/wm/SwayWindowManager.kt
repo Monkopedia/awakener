@@ -12,7 +12,6 @@ import java.io.File
 import java.security.SecureRandom
 import kotlin.math.abs
 import kotlin.random.Random
-import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.TimeSource
 import kotlinx.coroutines.CancellationException
@@ -898,60 +897,31 @@ class SwayWindowManager(
          * the marked split rather than walking on into whatever single-child containers stand
          * above it — see [liftTarget].
          */
-        suspend fun normalizeContainer(survivor: SurfaceId) {
+        suspend fun normalizeContainer(survivor: SurfaceId, docked: Rect? = null): FloatingSettle? {
             val cfg = config
             val tree = tree()
-            if (tree.find(survivor.raw) == null) return
+            if (tree.find(survivor.raw) == null) return null
             val tab = when (cfg[WmFlags.splitOwnership]) {
                 SplitOwnership.SHAPE -> tabAbove(tree, survivor)
                 SplitOwnership.MARKED -> {
-                    val split = ownSplitOf(tree, survivor, cfg) ?: return
+                    val split = ownSplitOf(tree, survivor, cfg) ?: return null
                     liftTarget(tree, split, survivor, cfg)
                 }
             }
-            if (tab != null) return run(liftInto(tab, survivor))
+            if (tab != null) {
+                run(liftInto(tab, survivor))
+                return null
+            }
             val floating = tree.parentOf(survivor.raw)?.takeIf { it.type == FLOATING_CON }
             focus(survivor)
             run("split none")
-            floating?.rect?.let { holdFloatingRect(survivor, it) }
+            val rect = floating?.rect ?: return null
+            // The size the surface had beside its dock, which is the one a late commit reverts
+            // to. Read off the tree when the detach saw the dock standing; for a dock already in
+            // the scratchpad, worked out from the share the dock is configured to take.
+            val stale = docked ?: rect.copy(width = rect.width * (100 - cfg[WmFlags.dockSizePpt]) / 100)
+            return FloatingSettle(survivor, rect, stale)
         }
-
-        /**
-         * Keeps [surface], just collapsed out of a floating split, on [rect] — the split's — for
-         * [WmFlags.floatingDetachSettleMs] (#253).
-         *
-         * The collapse is the one moment the surface becomes a floating window of its own, and
-         * sway resizes a floating window to whatever its client next commits. A client that had
-         * not yet committed the narrower size the split gave it — a detach soon after an attach
-         * or a show — commits it after the collapse, and the window keeps the dock's share of
-         * its width lost for good: #232's loss, met by the detach rather than the hide. Nothing
-         * over IPC says when a client has committed, so this watches the outcome instead, and
-         * puts the rectangle back whenever the surface leaves it. Within [GEOMETRY_SLACK],
-         * because a client sizes itself in whole buffer pixels and at a fractional scale the
-         * window it ends up in can be a pixel off the logical rectangle it was asked for.
-         */
-        private suspend fun holdFloatingRect(surface: SurfaceId, rect: Rect) {
-            val cfg = config
-            val settle = cfg[WmFlags.floatingDetachSettleMs].milliseconds
-            if (settle == Duration.ZERO) return
-            val deadline = TimeSource.Monotonic.markNow() + cfg[WmFlags.unmapWaitMs].milliseconds
-            var held = TimeSource.Monotonic.markNow()
-            while (held.elapsedNow() < settle && deadline.hasNotPassedNow()) {
-                val now = tree().find(surface.raw)?.takeIf { it.type == FLOATING_CON }?.rect ?: return
-                if (!now.near(rect)) {
-                    run(
-                        "[con_id=${surface.raw}] resize set ${rect.width} px ${rect.height} px; " +
-                            "[con_id=${surface.raw}] move absolute position ${rect.x} px ${rect.y} px",
-                    )
-                    held = TimeSource.Monotonic.markNow()
-                }
-                delay(cfg[WmFlags.pollIntervalMs].milliseconds)
-            }
-        }
-
-        private fun Rect.near(other: Rect): Boolean =
-            maxOf(abs(x - other.x), abs(y - other.y), abs(width - other.width), abs(height - other.height)) <=
-                GEOMETRY_SLACK
 
         /**
          * Takes off every split mark [isInertSplitMark] refuses, after a message that may have
@@ -1492,6 +1462,69 @@ class SwayWindowManager(
      * Nothing here is the design's forbidden unattended action: this runs only inside a call a
      * caller made, and it ends when that call does.
      */
+    /**
+     * What a detach that collapsed a floating split leaves to watch (#253): [surface], now
+     * floating alone, owed [target] — the split's rectangle — and liable to a late commit of
+     * [stale], the size it had beside its dock.
+     */
+    private class FloatingSettle(val surface: SurfaceId, val target: Rect, val stale: Rect)
+
+    /**
+     * Puts [settle]'s surface back to its full size if, within [WmFlags.floatingDetachSettleMs],
+     * its client reverts it to the size it had beside the dock (#253).
+     *
+     * The collapse is the one moment the surface becomes a floating window of its own, and sway
+     * resizes a floating window to whatever its client next commits. A client that had not yet
+     * committed the narrower size the split gave it — a detach soon after an attach or a show —
+     * commits it after the collapse, and the window would keep the dock's share of its width lost
+     * for good: #232's loss, met by the detach rather than the hide. Nothing over IPC says when a
+     * client has committed, so this watches the outcome.
+     *
+     * **Only that outcome is corrected, and only its size** (the review of #255). A client can
+     * change its size and never its position, so the one thing put back is a window that is
+     * still where the split was and has exactly the stale size, which is put back to the split's
+     * size and place. Any other change — the user moving it, dragging it, resizing it — is the user's, and
+     * ends the watch at once, so the settle never fights them. Unlocked between corrections: it
+     * reads the tree the way every reader does, and each correction is its own short edit.
+     */
+    private suspend fun holdFloatingSize(settle: FloatingSettle) {
+        val cfg = config
+        val window = cfg[WmFlags.floatingDetachSettleMs].milliseconds
+        var corrections = 0
+        var held = TimeSource.Monotonic.markNow()
+        while (held.elapsedNow() < window) {
+            val now = tree().find(settle.surface.raw)?.takeIf { it.type == FLOATING_CON }?.rect ?: return
+            when {
+                now.near(settle.target) -> Unit
+                corrections < SETTLE_CORRECTIONS && now.isStaleOf(settle) -> {
+                    treeEdit {
+                        // The move only undoes `resize set`'s own: sway grows a floating
+                        // window about its centre, measured on 1.12 — a 697 → 995 correction
+                        // left it 149 px to the left of where the split was.
+                        val id = settle.surface.raw
+                        run(
+                            "[con_id=$id] resize set ${settle.target.width} px ${settle.target.height} px; " +
+                                "[con_id=$id] move absolute position ${settle.target.x} px ${settle.target.y} px",
+                        )
+                    }
+                    corrections++
+                    held = TimeSource.Monotonic.markNow()
+                }
+                else -> return
+            }
+            delay(cfg[WmFlags.pollIntervalMs].milliseconds)
+        }
+    }
+
+    /** Within [GEOMETRY_SLACK] of [other] on every side. */
+    private fun Rect.near(other: Rect): Boolean =
+        maxOf(abs(x - other.x), abs(y - other.y), abs(width - other.width), abs(height - other.height)) <=
+            GEOMETRY_SLACK
+
+    /** Where [settle]'s split was, at the stale size: a client's revert, not a user's edit. */
+    private fun Rect.isStaleOf(settle: FloatingSettle): Boolean =
+        near(settle.target.copy(width = settle.stale.width, height = settle.stale.height))
+
     private suspend fun <T : Any> pollTree(timeoutMs: Long, read: suspend () -> T?): T? =
         withTimeoutOrNull(timeoutMs) {
             val started = TimeSource.Monotonic.markNow()
@@ -2501,7 +2534,7 @@ class SwayWindowManager(
         override suspend fun detach() {
             checkSession("detach")
             val cfg = config
-            treeEdit {
+            val settle = treeEdit {
                 // Which container has to be flattened afterwards depends on where the dock *is*.
                 // Beside its surface, the dock's own parent is the split container `attach` made
                 // and the surface is the survivor in it. In the scratchpad, the dock's parent is
@@ -2527,6 +2560,9 @@ class SwayWindowManager(
                 } else {
                     tree().parentOf(dockId.raw)?.takeIf { it.isSplit() }
                 }
+                // The surface's size beside its standing dock, for the settle below (#253).
+                val docked = parent?.takeIf { it.type == FLOATING_CON && it.find(dockId.raw) != null }
+                    ?.let { split -> split.find(surface.raw)?.rect }
                 // Ungated, and **before** the kill, which is where it has to be rather than
                 // where it reads most naturally. A dock whose surface has already gone is the
                 // ordinary reap case, and there the container's only remaining child is the dock
@@ -2568,28 +2604,31 @@ class SwayWindowManager(
                                 "is not servicing the close request",
                         )
                     }
-                    return@treeEdit
+                    return@treeEdit null
                 }
                 // Only once the node has actually left the tree: a dock that outlived its kill is
                 // still a dock, and forgetting it here would hand the wedged panel back to
                 // enumeration as a bindable surface.
                 docks.forget(dockId)
 
-                if (!cfg[WmFlags.normalizeContainerOnDetach]) return@treeEdit
+                if (!cfg[WmFlags.normalizeContainerOnDetach]) return@treeEdit null
                 // A split still holding another of this surface's docks is not done with: the
                 // last dock out is the one that flattens it. Asking `split none` now would be
                 // refused for the sibling, after the kill (#171) — the shape wm.dock.share_split
                 // makes, and one a restore beside a second dock already made before it.
                 if (parent != null) {
                     val rest = parent.copy(nodes = parent.nodes.filter { it.id != dockId.raw })
-                    if (rest.nodes.size > 1 && holdsOnlyDocksOf(rest, surface, cfg)) return@treeEdit
+                    if (rest.nodes.size > 1 && holdsOnlyDocksOf(rest, surface, cfg)) return@treeEdit null
                 }
                 val survivor =
-                    parent?.children?.firstOrNull { it.id != dockId.raw } ?: return@treeEdit
+                    parent?.children?.firstOrNull { it.id != dockId.raw } ?: return@treeEdit null
                 // Raised rather than caught: the orphan sweep's aggregate is what a normalisation
                 // sway refuses is reported through, and it tags the dock the failure came from.
-                normalizeContainer(SurfaceId(survivor.id))
+                normalizeContainer(SurfaceId(survivor.id), docked)
             }
+            // Outside the lock: it is a watch over a window the detach is already done with, and
+            // the next press should not queue behind it. Each correction takes the lock itself.
+            settle?.let { holdFloatingSize(it) }
             // Outside the section for the same reason as attach's bind: the registry is not the
             // tree, and the dock is already down by here.
             if (cfg[WmFlags.forgetBindingOnDetach] && key != null) {
@@ -3086,6 +3125,9 @@ class SwayWindowManager(
 
         /** How far a floating window may sit from a rectangle it was put back on, in pixels. */
         const val GEOMETRY_SLACK = 2
+
+        /** How many late commits one floating detach's settle puts right before it gives up. */
+        const val SETTLE_CORRECTIONS = 3
 
         /** The `type` sway gives a workspace node. */
         const val WORKSPACE = "workspace"

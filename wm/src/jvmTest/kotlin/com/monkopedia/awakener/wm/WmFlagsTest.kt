@@ -237,4 +237,21 @@ class WmFlagsTest {
             "raising the spanreed timeout past what the default covers has to say so: ${raised.problems}",
         )
     }
+
+    /**
+     * The review of #255: the floating settle used to accept any length and then stop at
+     * `wm.wait.unmap_ms` regardless, which is a cap nobody was told about. It now has a range of
+     * its own, and the watch no longer reads `unmap_ms` at all, so there is no pair rule left.
+     */
+    @Test
+    fun `a floating settle beyond its range is reported and degraded`() {
+        val config = snapshot("wm.dock.floating_detach_settle_ms" to 99_999_999L)
+        assertTrue(
+            config.problems.any {
+                it.key == "wm.dock.floating_detach_settle_ms" && "between 0 and 5000" in it.reason
+            },
+            "99999999 was accepted in silence: ${config.problems}",
+        )
+        assertEquals(300L, config[WmFlags.floatingDetachSettleMs])
+    }
 }

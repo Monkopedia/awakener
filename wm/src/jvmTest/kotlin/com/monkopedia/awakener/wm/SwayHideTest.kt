@@ -816,6 +816,76 @@ open class SwayHideTest {
         cycleAttach(app) { dock -> assertTrue(dock.hide()) }
     }
 
+    /**
+     * The review of #255: the detach's settle watch is for a late *client* commit, and a client
+     * can change only its size. A user who closes the panel and moves the window straight away —
+     * 30 ms after the collapse — keeps the window where they put it, in every cycle.
+     */
+    @Test
+    fun `a window moved during the detach's settle stays where the user put it`() = swayTest {
+        openSurface("aw-tiled1")
+        val app = openFloatingSurface("aw-float1")
+        repeat(ATTACH_CYCLES) { cycle ->
+            val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+            coroutineScope {
+                val detach = launch { dock.detach() }
+                awaitFloatingAlone(app)
+                delay(USER_MOVE_DELAY_MS)
+                command("[con_id=${app.raw}] move absolute position $MOVED_X px $MOVED_Y px")
+                detach.join()
+            }
+            val (x, y) = settledGeometryOf(app).split(" ").take(2).map { it.substringAfter("=").toInt() }
+            assertTrue(
+                kotlin.math.abs(x - MOVED_X) <= GEOMETRY_SLACK && kotlin.math.abs(y - MOVED_Y) <= GEOMETRY_SLACK,
+                "cycle $cycle: the window stayed where the user moved it, at $x,$y",
+            )
+            command("[con_id=${app.raw}] move absolute position $FLOAT_X px $FLOAT_Y px")
+            settledGeometryOf(app)
+        }
+    }
+
+    /**
+     * A drag that starts as the panel closes — a move every 25 ms for 1.5 s — is never snapped
+     * back, and the detach does not wait for the drag to finish.
+     */
+    @Test
+    fun `a drag during the detach's settle is never snapped back`() = swayTest {
+        openSurface("aw-tiled1")
+        val app = openFloatingSurface("aw-float1")
+        repeat(ATTACH_CYCLES) { cycle ->
+            val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+            var detachMs = 0L
+            var snapBacks = 0
+            coroutineScope {
+                val detach = launch {
+                    val started = kotlin.time.TimeSource.Monotonic.markNow()
+                    dock.detach()
+                    detachMs = started.elapsedNow().inWholeMilliseconds
+                }
+                awaitFloatingAlone(app)
+                repeat(DRAG_STEPS) { step ->
+                    val x = MOVED_X + step * 2
+                    command("[con_id=${app.raw}] move absolute position $x px $MOVED_Y px")
+                    delay(DRAG_STEP_MS)
+                    val now = geometryOf(app).split(" ").take(2).map { it.substringAfter("=").toInt() }
+                    if (kotlin.math.abs(now[0] - FLOAT_X) <= GEOMETRY_SLACK &&
+                        kotlin.math.abs(now[1] - FLOAT_Y) <= GEOMETRY_SLACK
+                    ) {
+                        snapBacks++
+                    }
+                }
+                detach.join()
+            }
+            assertEquals(0, snapBacks, "cycle $cycle: snap-backs during the drag")
+            assertTrue(
+                detachMs < DRAG_STEPS * DRAG_STEP_MS,
+                "cycle $cycle: the detach returned before the drag ended, in ${detachMs}ms",
+            )
+            command("[con_id=${app.raw}] move absolute position $FLOAT_X px $FLOAT_Y px")
+            settledGeometryOf(app)
+        }
+    }
+
     /** `wm.dock.floating_surface=REFUSE`: the attach fails, saying why, and touches nothing. */
     @Test
     fun `under floating_surface REFUSE a floating surface is refused untouched`() = swayTest {
@@ -881,6 +951,17 @@ open class SwayHideTest {
             assertEquals(shape, workspaceShape(), "cycle $cycle: the workspace, after the detach")
             if (geometry) assertNear(rect, settledGeometryOf(app), "cycle $cycle: the surface")
         }
+    }
+
+    /** Waits until [app] floats alone again, which is the detach's collapse having run. */
+    private suspend fun awaitFloatingAlone(app: SurfaceId) {
+        assertNotNull(
+            withTimeoutOrNull(WAIT_MS) {
+                while (floatingAncestorOf(app)?.id != app.raw) delay(2)
+                true
+            },
+            "the detach never collapsed the floating split",
+        )
     }
 
     private fun assertNear(expected: String, actual: String, what: String) {
@@ -1270,6 +1351,15 @@ open class SwayHideTest {
 
         /** Attach/detach cycles [cycleAttach] runs: a leftover shows on the second (#253). */
         const val ATTACH_CYCLES = 5
+
+        /** When the user moves the window after the detach's collapse, and where to. */
+        const val USER_MOVE_DELAY_MS = 30L
+        const val MOVED_X = 400
+        const val MOVED_Y = 250
+
+        /** A drag: one move every [DRAG_STEP_MS] for [DRAG_STEPS] steps, about 1.5 s. */
+        const val DRAG_STEPS = 60
+        const val DRAG_STEP_MS = 25L
 
         /** How far a surface's settled rectangle may move across a cycle, in logical pixels. */
         const val GEOMETRY_SLACK = 2

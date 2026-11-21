@@ -786,16 +786,18 @@ object WmFlags {
         "wm.dock.floating_detach_settle_ms",
         300,
         "How long a detach watches a floating surface once it has collapsed the floating split " +
-            "around it, putting the split's rectangle back each time the surface leaves it (#253). " +
-            "The collapse makes the surface a floating window of its own, and sway resizes a " +
-            "floating window to whatever its client next commits: a client that had not yet " +
-            "committed the narrower size the split gave it commits that after the collapse, and " +
-            "without the watch the window keeps the dock's share of its width lost — measured on " +
-            "headless sway 1.12 with foot at scale 1.5, in 11 of 25 runs of five-cycle floating " +
-            "attach/detach tests, and in none of 25 with the watch at 300. The detach ends once " +
-            "the rectangle has held for this long, " +
-            "and never later than wm.wait.unmap_ms after the collapse. Zero skips the watch.",
-        requires = Flags.atLeast(0L),
+            "around it (#253), and puts its size back if the client reverts it to the narrower " +
+            "size it had beside the dock. The collapse makes the surface a floating window of its " +
+            "own, and sway resizes a floating window to whatever its client next commits: a " +
+            "client that had not yet committed the in-split size commits it after the collapse, " +
+            "and the window keeps the dock's share of its width lost. Measured on headless sway " +
+            "1.12 with foot at scale 1.5: lost in 11 of 25 runs of five-cycle floating detach " +
+            "tests with no watch, in none with it. Only that revert is corrected — a window still " +
+            "where the split was, at exactly that size, put back on the split's rectangle; " +
+            "any other change to the window is the user's and ends the watch at once. The watch " +
+            "runs after the detach has let go of the tree lock, and restarts after each of at " +
+            "most 3 corrections. Zero skips it.",
+        requires = Flags.within(0L..5_000L),
     )
 
     val flattenFloatingOnHide = Flags.boolean(
