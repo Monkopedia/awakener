@@ -2805,15 +2805,16 @@ class SwayWindowManager(
          *
          * Under [SplitOwnership.MARKED] that is any single-child container directly above
          * [split]: sway's flatten walks on through every one of them ([tabAbove]), and none is
-         * awakener's — a split of the user's the surface sat alone in, or a chain no build has a
-         * record of making. Under [SplitOwnership.SHAPE] the walk is wanted, and only a tab strip
+         * awakener's — a split of the user's the surface sat alone in, floating or not (#253), or a
+         * chain no build has a record of making. Under [SplitOwnership.SHAPE] the walk is wanted, and only a tab strip
          * stops it, as before #248.
          */
         private fun liftTarget(tree: Node, split: Node, survivor: SurfaceId, cfg: Config): Node? =
             when (cfg[WmFlags.splitOwnership]) {
                 SplitOwnership.SHAPE -> tabAbove(tree, survivor)
-                SplitOwnership.MARKED ->
-                    tree.parentOf(split.id)?.takeIf { it.type == CON && it.nodes.size == 1 }
+                SplitOwnership.MARKED -> tree.parentOf(split.id)?.takeIf {
+                    (it.type == CON || it.type == FLOATING_CON) && it.nodes.size == 1
+                }
             }
 
         /**

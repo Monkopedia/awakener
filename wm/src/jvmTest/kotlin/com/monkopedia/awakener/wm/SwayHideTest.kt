@@ -718,6 +718,24 @@ open class SwayHideTest {
             cycleAttach(app, dockSpec = focusStealingDock(other))
         }
 
+    /**
+     * A floating split that is not awakener's — the user's, or another client's — holding the
+     * surface alone. It counts as a split now, so the attach takes #248's route: the dock maps
+     * beside the surface and the surface is wrapped in a split of awakener's *inside* it, rather
+     * than the unmarked re-lay `split` would make of it. The user's container keeps its id and its
+     * `splitv` through every cycle, and the detach collapses only awakener's split.
+     */
+    @Test
+    fun `a floating split that is not awakener's survives attach and detach`() = swayTest {
+        openSurface("aw-tiled1")
+        val app = openFloatingSurface("aw-float1")
+        command("[con_id=${app.raw}] split vertical")
+        val user = assertNotNull(floatingAncestorOf(app))
+        assertEquals("splitv", user.layout, "the fixture is a floating splitv around the surface")
+        cycleAttach(app)
+        assertEquals(user.id, floatingAncestorOf(app)?.id, "the user's floating split stands")
+    }
+
     /** The same move for a tiled surface, whose dock used to stand as a tab beside the window. */
     @Test
     fun `a tiled surface's dock lands beside it when focus moves during start-up`() = swayTest {
