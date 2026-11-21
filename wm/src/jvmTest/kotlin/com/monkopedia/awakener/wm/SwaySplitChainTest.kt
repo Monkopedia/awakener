@@ -358,11 +358,11 @@ class SwaySplitChainTest {
     fun `a split another client makes as an attach starts is never claimed`() = userSplitRace()
 
     /**
-     * The same race with the surface directly on a split workspace, where sway refuses to mark the
-     * parent: attach splits there only once the dock is beside the surface. The user's message
-     * cannot mark a workspace either, so it marks the next sibling. That climbs from an only child
-     * to the nearest ancestor of the same orientation (measured on 1.12), so the workspace is
-     * vertical: from the surface alone in awakener's `splith` it then stays on the surface.
+     * The same race with the surface directly on a split workspace, which sway refuses to mark, so
+     * the claim's anchor goes on the surface instead of its parent. The user's message cannot mark
+     * a workspace either, so it marks the next sibling. That climbs from an only child to the
+     * nearest ancestor of the same orientation (measured on 1.12), so the workspace is vertical:
+     * from the surface alone in awakener's `splith` it then stays on the surface.
      */
     @Test
     fun `a split another client makes on a split workspace is never claimed`() {
