@@ -253,8 +253,9 @@ class SwaySplitChainTest {
      * marking it left a split nothing flattens under MARKED, and the next attach nested inside
      * it — measured by the #250 review at 19 leaks in 180 cancellations. Swept across the first
      * [INTERRUPT_DELAYS_MS] of the attach for [INTERRUPT_ROUNDS] rounds, every single-child split
-     * left after each must carry its mark, and one attach and detach must then bring the
-     * workspace back to its baseline.
+     * left after each must carry its mark, no claim's anchor may be left (#254's review: a
+     * cancellation landing on the claim's acknowledgement skipped the settle), and one attach and
+     * detach must then bring the workspace back to its baseline.
      */
     @Test
     fun `an interrupted attach leaves no split without its mark`() = swayTest {
@@ -270,11 +271,9 @@ class SwaySplitChainTest {
             // closed by hand, which runs no awakener code and so leaves the split as it found it.
             delay(LATE_DOCK_MS)
             wm.tree().windows.filter { it.appId == "aw-dock" }.forEach { close(SurfaceId(it.id)) }
-            assertEquals(
-                emptyList(),
-                unmarkedSingleChildSplits(),
-                "round ${round + 1}, cancelled after ${round % INTERRUPT_DELAYS_MS}ms: ${describe()}",
-            )
+            val stage = "round ${round + 1}, cancelled after ${round % INTERRUPT_DELAYS_MS}ms"
+            assertEquals(emptyList(), unmarkedSingleChildSplits(), "$stage: ${describe()}")
+            assertEquals(emptyList(), anchorMarks(), "$stage: no anchor is left")
         }
         wm.attach(app, dockSpec(), AGENT).detach()
         assertEquals(baseline, describe(), "one attach and detach clears whatever was left")
@@ -341,6 +340,129 @@ class SwaySplitChainTest {
             val stage = "round ${round + 1}, killed after ${offset / 1000}us"
             assertEquals(users, wm.tree().parentOf(app.raw)?.id, "$stage: ${describe()}")
             assertEquals(emptyList(), splitMarks(), "$stage: no split mark is left")
+        }
+    }
+
+    /**
+     * #252: another client splits the surface between the tree read attach decides from and the
+     * message that splits. Its container is younger than anything that read saw, so the age guard
+     * alone took it for awakener's when attach's `split` re-laid it and the mark landed on it, and
+     * the detach destroyed it. Swept across the first [USER_SPLIT_STEPS] × [USER_SPLIT_STEP_NS] of
+     * the attach. Which container is the user's is read off the user's own message, with the same
+     * two marks awakener uses: one beside the surface before the split and one on its parent
+     * after, so a split that re-laid what stood (awakener's) makes nothing of the user's to look
+     * for.
+     */
+    @Test
+    fun `a split another client makes as an attach starts is never claimed`() = userSplitRace()
+
+    /**
+     * The same race with the surface directly on a split workspace, which sway refuses to mark, so
+     * the claim's anchor goes on the surface instead of its parent. The user's message cannot mark
+     * a workspace either, so it marks the next sibling. That climbs from an only child to the
+     * nearest ancestor of the same orientation (measured on 1.12), so the workspace is vertical:
+     * from the surface alone in awakener's `splith` it then stays on the surface.
+     */
+    @Test
+    fun `a split another client makes on a split workspace is never claimed`() {
+        SwayHarness.assumeAvailable()
+        sway.close()
+        sway = SwayHarness.start("default_orientation vertical")
+        wm = SwayWindowManager({ sway.connection() }, store, registry, scope)
+        userSplitRace(beside = "focus next sibling")
+    }
+
+    /**
+     * [USER_SPLIT_ROUNDS] attaches, each with a second connection splitting the surface a little
+     * later into it. [beside] is how the user's message reaches what it marks before splitting.
+     */
+    private fun userSplitRace(beside: String = "focus parent") = swayTest {
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        val baseline = describe()
+        var made = 0
+        repeat(USER_SPLIT_ROUNDS) { round ->
+            val offset = (round % USER_SPLIT_STEPS) * USER_SPLIT_STEP_NS
+            val stage = "round ${round + 1}, split after ${offset / 1000}us"
+            assertEquals(baseline, describe(), "$stage, before")
+            command("[con_id=${app.raw}] focus")
+            val attach = scope.async { wm.attach(app, dockSpec(), AGENT) }
+            LockSupport.parkNanos(offset)
+            command(
+                "[con_id=${app.raw}] focus; $beside; mark --add user_before; " +
+                    "[con_id=${app.raw}] split vertical; [con_id=${app.raw}] focus; focus parent; " +
+                    "mark --add user_after; [con_id=${app.raw}] focus",
+            )
+            val dock = attach.await()
+            val users = wm.tree().let { tree ->
+                val after = tree.find(assertNotNull(tree.holderOf("user_after"), stage))
+                after?.id?.takeUnless { after.holdsMark("user_before") }
+            }
+            if (users != null) made++
+            dock.detach()
+            val tree = wm.tree()
+            if (users != null) {
+                assertNotNull(tree.find(users), "$stage: the user's split $users survives: ${describe()}")
+            }
+            assertEquals(emptyList(), splitMarks(), "$stage: no split mark is left: ${describe()}")
+            assertEquals(emptyList(), anchorMarks(), "$stage: no anchor mark is left")
+            command("unmark user_before; unmark user_after")
+            if (tree.parentOf(app.raw)?.let { it.type == "con" && it.nodes.size == 1 } == true) {
+                command("[con_id=${app.raw}] focus; split none")
+            }
+        }
+        assert(made > 0) { "no round had the user's split land first; the sweep tests nothing" }
+    }
+
+    /**
+     * #254's review: a surface inside a floating split — its second dock's, or the user's own —
+     * walks from the floating container to the workspace, where `focus child` finds no tiled
+     * window when the workspace holds none and the anchor's `mark` is refused, which ends the
+     * message and fails the attach. Each case with and without a tiled window beside it.
+     */
+    @Test
+    fun `a second dock on a floating surface attaches with no tiled window`() =
+        floatingSecondDock(tiled = false)
+
+    @Test
+    fun `a second dock on a floating surface attaches beside a tiled window`() =
+        floatingSecondDock(tiled = true)
+
+    @Test
+    fun `a user's floating split with no tiled window survives an attach`() =
+        floatingUserSplit(tiled = false)
+
+    @Test
+    fun `a user's floating split beside a tiled window survives an attach`() =
+        floatingUserSplit(tiled = true)
+
+    private fun floatingSecondDock(tiled: Boolean) = swayTest {
+        if (tiled) openSurface("aw-other")
+        val app = openFloating("aw-app")
+        repeat(3) { cycle ->
+            val first = wm.attach(app, dockSpec(), AGENT)
+            val second = wm.attach(app, dockSpec(), AGENT)
+            assertEquals(emptyList(), anchorMarks(), "cycle ${cycle + 1}: ${describe()}")
+            second.detach()
+            first.detach()
+            assertNotNull(wm.tree().find(app.raw), "cycle ${cycle + 1}: the surface stands")
+            assertEquals(emptyList(), anchorMarks(), "cycle ${cycle + 1}: ${describe()}")
+        }
+    }
+
+    private fun floatingUserSplit(tiled: Boolean) = swayTest {
+        if (tiled) openSurface("aw-other")
+        val app = openFloating("aw-app")
+        command("[con_id=${app.raw}] focus; split vertical")
+        val mine = openSurface("aw-mine")
+        val users = assertNotNull(wm.tree().parentOf(app.raw), "the user's floating split")
+        assertEquals(listOf(app.raw, mine.raw), users.nodes.map { it.id }, describe())
+        repeat(3) { cycle ->
+            wm.attach(app, dockSpec(), AGENT).detach()
+            val after = wm.tree().find(users.id)
+            assertEquals(users.layout, after?.layout, "cycle ${cycle + 1}: ${describe()}")
+            assertEquals(users.nodes.map { it.id }, after?.nodes?.map { it.id }, describe())
+            assertEquals(emptyList(), anchorMarks(), "cycle ${cycle + 1}: ${describe()}")
         }
     }
 
@@ -601,6 +723,21 @@ class SwaySplitChainTest {
                 node.children.flatMap { walk(it) }
         return walk(wm.tree())
     }
+
+    /** Every `_awakener_anchor_` mark in the tree, with the `con_id` it is on. */
+    private suspend fun anchorMarks(): List<Pair<Long, String>> {
+        fun walk(node: Node): List<Pair<Long, String>> =
+            node.marks.filter { it.startsWith("_awakener_anchor_") }.map { node.id to it } +
+                node.children.flatMap { walk(it) }
+        return walk(wm.tree())
+    }
+
+    private fun Node.holdsMark(mark: String): Boolean =
+        mark in marks || children.any { it.holdsMark(mark) }
+
+    /** The `con_id` of the node carrying [mark], or null. */
+    private fun Node.holderOf(mark: String): Long? =
+        if (mark in marks) id else children.firstNotNullOfOrNull { it.holderOf(mark) }
 
     /** Single-child splits on workspace 1 carrying no `_awakener_split_` mark, by `con_id`. */
     private suspend fun unmarkedSingleChildSplits(): List<Long> {
@@ -942,6 +1079,18 @@ class SwaySplitChainTest {
         return SurfaceId(assertNotNull(id, "window '$appId' never appeared"))
     }
 
+    /** A window that floats from the moment it maps, by a `for_window` rule. */
+    private suspend fun openFloating(appId: String): SurfaceId {
+        command("for_window [app_id=\"^$appId\$\"] floating enable")
+        val id = openSurface(appId)
+        val floated = withTimeoutOrNull(WAIT_MS) {
+            while (wm.tree().find(id.raw)?.type != "floating_con") delay(POLL_MS)
+            true
+        }
+        assertNotNull(floated, "window ${id.raw} never floated")
+        return id
+    }
+
     private fun dockSpec() = DockSpec("aw-dock", sway.windowCommand(DockSpec.APP_ID_PLACEHOLDER))
 
     /** Split containers on workspace 1 holding exactly one child — the shape #171 counted. */
@@ -975,7 +1124,7 @@ class SwaySplitChainTest {
 
         /** Long enough for an exec to be accepted, short enough that five failures stay cheap. */
         const val NEVER_MAPS_WAIT_MS = 600L
-        const val INTERRUPT_ROUNDS = 120
+        const val INTERRUPT_ROUNDS = 320
         const val INTERRUPT_DELAYS_MS = 16L
         const val LATE_DOCK_MS = 150L
         const val SLOW_DOCK_S = "0.4"
@@ -983,6 +1132,9 @@ class SwaySplitChainTest {
         const val KILL_RACE_ROUNDS = 100
         const val KILL_RACE_STEPS = 20
         const val KILL_RACE_STEP_NS = 250_000L
+        const val USER_SPLIT_ROUNDS = 400
+        const val USER_SPLIT_STEPS = 400
+        const val USER_SPLIT_STEP_NS = 25_000L
         val AGENT = AgentId("agent-1")
     }
 }
