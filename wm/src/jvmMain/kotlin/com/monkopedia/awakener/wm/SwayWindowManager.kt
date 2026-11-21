@@ -1021,6 +1021,9 @@ class SwayWindowManager(
         ) {
             if (!config[WmFlags.unwindFailedAttach]) return
             withContext(NonCancellable) {
+                // First, because a cancellation landing on a claim's acknowledgement skips the
+                // settle after it, which would leave the claim's anchor on the user's container.
+                compensate(cause) { settleSplitMarks() }
                 // A dock that outlives its kill stops the normalisation: a container that still
                 // holds two windows is one sway refuses to flatten, so attempting it would report
                 // a second failure that says nothing the first did not.
@@ -1314,9 +1317,13 @@ class SwayWindowManager(
                 if (cfg[WmFlags.dockSide] == DockSide.LEFT) add("[con_id=${dock.raw}] move left")
                 add("[con_id=${dock.raw}] resize set width $sizePpt ppt")
             }.joinToString("; ")
-            run(restore)
             val claimed = if (floating == null) (resplit && wraps) || wrapAfter else floating.id == surface.raw
-            if (claimed) settleSplitMarks()
+            // Together, so a cancellation landing on the restore's acknowledgement cannot skip the
+            // settle and leave the claim's anchor behind: show has no unwind to settle it in.
+            withContext(NonCancellable) {
+                run(restore)
+                if (claimed) settleSplitMarks()
+            }
 
             // Held from inside the poll rather than re-read after it: a diagnosis taken once the
             // deadline has expired races a tree that may have settled in the meantime, and would
@@ -2649,7 +2656,9 @@ class SwayWindowManager(
         /**
          * The mark [splitAndClaim] puts on what holds the surface before it splits, named for the
          * claim's nonce, so the split mark can be checked against where the surface stood. Taken
-         * off by [settleSplitMarks] in every outcome.
+         * off by [settleSplitMarks] in every outcome but a killed process — after the claim, or in
+         * [unwindAttach] when the attach fails or is cancelled first — and a leftover one only
+         * keeps the verdict it already gave.
          */
         private const val ANCHOR_PREFIX = "_awakener_anchor_"
 
@@ -2732,16 +2741,21 @@ class SwayWindowManager(
          *   [settleSplitMarks] takes it off with any mark it condemns, so a process dying in
          *   between leaves the verdict standing rather than undone.
          *
-         * No anchor for a floating surface: its parent is a workspace, and `focus child` from
-         * there went to a tiled window both with the surface floating alone and with another
-         * client's floating split around it (measured on 1.12), so the anchor cannot tell the two
-         * apart. There a container another client wraps the surface in between the read and the
-         * message can still be claimed.
+         * No anchor for a floating surface, alone or inside a floating split: the walk leaves the
+         * floating container for the workspace, and `focus child` from there goes to a tiled
+         * window — both with the surface floating alone and with another client's floating split
+         * around it, so the anchor cannot tell the two apart — or, on a workspace with no tiled
+         * window, to nothing, so the `mark` is refused and ends the message (all measured on
+         * 1.12; #254's review). There a container another client wraps the surface in between
+         * the read and the message can still be claimed.
+         *
+         * Even a refused claim has re-laid that container in place, so another client's `splitv`
+         * is left a `splith`. It survives; no command in the message can avoid the re-lay.
          */
         private fun splitAndClaim(surface: SurfaceId, before: Node, refocus: Long = surface.raw): String {
             val nonce = Random.nextLong().toULong().toString(16)
             val mark = SPLIT_MARK_PREFIX + before.newestId() + "_" + nonce
-            val anchor = if (floatingAncestorOf(before, surface)?.id == surface.raw) {
+            val anchor = if (floatingAncestorOf(before, surface) != null) {
                 ""
             } else {
                 "[con_id=${surface.raw}] focus; focus parent; focus parent; focus child; " +
