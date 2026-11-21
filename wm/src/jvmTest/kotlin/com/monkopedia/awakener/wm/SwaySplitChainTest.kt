@@ -345,6 +345,77 @@ class SwaySplitChainTest {
     }
 
     /**
+     * #252: another client splits the surface between the tree read attach decides from and the
+     * message that splits. Its container is younger than anything that read saw, so the age guard
+     * alone took it for awakener's when attach's `split` re-laid it and the mark landed on it, and
+     * the detach destroyed it. Swept across the first [USER_SPLIT_STEPS] × [USER_SPLIT_STEP_NS] of
+     * the attach. Which container is the user's is read off the user's own message, with the same
+     * two marks awakener uses: one beside the surface before the split and one on its parent
+     * after, so a split that re-laid what stood (awakener's) makes nothing of the user's to look
+     * for.
+     */
+    @Test
+    fun `a split another client makes as an attach starts is never claimed`() = userSplitRace()
+
+    /**
+     * The same race with the surface directly on a split workspace, where sway refuses to mark the
+     * parent: attach splits there only once the dock is beside the surface. The user's message
+     * cannot mark a workspace either, so it marks the next sibling. That climbs from an only child
+     * to the nearest ancestor of the same orientation (measured on 1.12), so the workspace is
+     * vertical: from the surface alone in awakener's `splith` it then stays on the surface.
+     */
+    @Test
+    fun `a split another client makes on a split workspace is never claimed`() {
+        SwayHarness.assumeAvailable()
+        sway.close()
+        sway = SwayHarness.start("default_orientation vertical")
+        wm = SwayWindowManager({ sway.connection() }, store, registry, scope)
+        userSplitRace(beside = "focus next sibling")
+    }
+
+    /**
+     * [USER_SPLIT_ROUNDS] attaches, each with a second connection splitting the surface a little
+     * later into it. [beside] is how the user's message reaches what it marks before splitting.
+     */
+    private fun userSplitRace(beside: String = "focus parent") = swayTest {
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        val baseline = describe()
+        var made = 0
+        repeat(USER_SPLIT_ROUNDS) { round ->
+            val offset = (round % USER_SPLIT_STEPS) * USER_SPLIT_STEP_NS
+            val stage = "round ${round + 1}, split after ${offset / 1000}us"
+            assertEquals(baseline, describe(), "$stage, before")
+            command("[con_id=${app.raw}] focus")
+            val attach = scope.async { wm.attach(app, dockSpec(), AGENT) }
+            LockSupport.parkNanos(offset)
+            command(
+                "[con_id=${app.raw}] focus; $beside; mark --add user_before; " +
+                    "[con_id=${app.raw}] split vertical; [con_id=${app.raw}] focus; focus parent; " +
+                    "mark --add user_after; [con_id=${app.raw}] focus",
+            )
+            val dock = attach.await()
+            val users = wm.tree().let { tree ->
+                val after = tree.find(assertNotNull(tree.holderOf("user_after"), stage))
+                after?.id?.takeUnless { after.holdsMark("user_before") }
+            }
+            if (users != null) made++
+            dock.detach()
+            val tree = wm.tree()
+            if (users != null) {
+                assertNotNull(tree.find(users), "$stage: the user's split $users survives: ${describe()}")
+            }
+            assertEquals(emptyList(), splitMarks(), "$stage: no split mark is left: ${describe()}")
+            assertEquals(emptyList(), anchorMarks(), "$stage: no anchor mark is left")
+            command("unmark user_before; unmark user_after")
+            if (tree.parentOf(app.raw)?.let { it.type == "con" && it.nodes.size == 1 } == true) {
+                command("[con_id=${app.raw}] focus; split none")
+            }
+        }
+        assert(made > 0) { "no round had the user's split land first; the sweep tests nothing" }
+    }
+
+    /**
      * A split mark on a container no younger than the high-water mark it names is one the
      * message that placed it cannot have made the container for — the user's own, re-laid, or
      * forged. Ignored by every ownership check, and taken off at the next attach.
@@ -601,6 +672,21 @@ class SwaySplitChainTest {
                 node.children.flatMap { walk(it) }
         return walk(wm.tree())
     }
+
+    /** Every `_awakener_anchor_` mark in the tree, with the `con_id` it is on. */
+    private suspend fun anchorMarks(): List<Pair<Long, String>> {
+        fun walk(node: Node): List<Pair<Long, String>> =
+            node.marks.filter { it.startsWith("_awakener_anchor_") }.map { node.id to it } +
+                node.children.flatMap { walk(it) }
+        return walk(wm.tree())
+    }
+
+    private fun Node.holdsMark(mark: String): Boolean =
+        mark in marks || children.any { it.holdsMark(mark) }
+
+    /** The `con_id` of the node carrying [mark], or null. */
+    private fun Node.holderOf(mark: String): Long? =
+        if (mark in marks) id else children.firstNotNullOfOrNull { it.holderOf(mark) }
 
     /** Single-child splits on workspace 1 carrying no `_awakener_split_` mark, by `con_id`. */
     private suspend fun unmarkedSingleChildSplits(): List<Long> {
@@ -983,6 +1069,9 @@ class SwaySplitChainTest {
         const val KILL_RACE_ROUNDS = 100
         const val KILL_RACE_STEPS = 20
         const val KILL_RACE_STEP_NS = 250_000L
+        const val USER_SPLIT_ROUNDS = 400
+        const val USER_SPLIT_STEPS = 400
+        const val USER_SPLIT_STEP_NS = 25_000L
         val AGENT = AgentId("agent-1")
     }
 }
