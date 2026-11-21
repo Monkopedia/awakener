@@ -58,6 +58,27 @@ enum class SplitOwnership {
     SHAPE,
 }
 
+/** What `attach` does with a floating surface (#253). See [WmFlags.floatingSurface]. */
+enum class FloatingSurface {
+    /** Dock inside a floating split with the surface, on the surface's own rectangle. */
+    SPLIT,
+
+    /** Refuse the attach, before anything in the tree is touched. */
+    REFUSE,
+}
+
+/** What `attach` does with a fullscreen surface (#253). See [WmFlags.fullscreenSurface]. */
+enum class FullscreenSurface {
+    /** Dock beside any fullscreen surface, floating or tiled. */
+    DOCK,
+
+    /** Dock beside a tiled fullscreen surface; refuse a floating one. */
+    DOCK_TILED,
+
+    /** Refuse every fullscreen surface, before anything in the tree is touched. */
+    REFUSE,
+}
+
 /** What a tab is left focused on once dock interaction ends. */
 enum class RestingFocus { APP, DOCK }
 
@@ -732,6 +753,53 @@ object WmFlags {
             "window opened while the dock is visible: sway places a new window beside the " +
             "focused one, which is the surface or the dock, and both are inside the split. A " +
             "floating surface's split is wm.dock.flatten_floating_on_hide's, not this flag's.",
+    )
+
+    val floatingSurface = Flags.enum(
+        "wm.dock.floating_surface",
+        FloatingSurface.SPLIT,
+        "What an attach does with a floating surface (#253). SPLIT: the dock stands inside a " +
+            "floating split with the surface, on the rectangle the surface had, so dragging the " +
+            "window moves both; the dock is moved in beside the surface by mark once it maps, " +
+            "whichever window was focused then, and a detach collapses the split so the surface " +
+            "floats alone where it was. REFUSE: the attach fails with a message saying the " +
+            "surface is floating, before anything in the tree is touched — for a desktop where " +
+            "a floating window is a transient one no panel should be bound to.",
+    )
+
+    val fullscreenSurface = Flags.enum(
+        "wm.dock.fullscreen_surface",
+        FullscreenSurface.DOCK_TILED,
+        "What an attach does with a fullscreen surface (#253). sway moves the fullscreen state " +
+            "onto the split attach makes around a fullscreen window, so the surface and its " +
+            "panel fill the output together, and the detach's collapse hands it back to the " +
+            "surface. DOCK_TILED: dock beside a tiled fullscreen surface, which round-trips " +
+            "exactly, and refuse a floating one before anything is touched — measured on " +
+            "headless sway 1.12, a floating fullscreen window that has been through one attach " +
+            "and detach leaves fullscreen at the output's size rather than the floating " +
+            "rectangle it had before it went fullscreen, since sway's saved rectangle went to " +
+            "the split. DOCK: dock beside either, accepting that loss. REFUSE: refuse every " +
+            "fullscreen surface, saying so.",
+    )
+
+    val floatingDetachSettleMs = Flags.long(
+        "wm.dock.floating_detach_settle_ms",
+        300,
+        "How long a detach watches a floating surface once it has collapsed the floating split " +
+            "around it (#253), and puts its size back if the client reverts it to the narrower " +
+            "size it had beside the dock. The collapse makes the surface a floating window of its " +
+            "own, and sway resizes a floating window to whatever its client next commits: a " +
+            "client that had not yet committed the in-split size commits it after the collapse, " +
+            "and the window keeps the dock's share of its width lost. Measured on headless sway " +
+            "1.12 with foot at scale 1.5: lost in 11 of 25 runs of five-cycle floating detach " +
+            "tests with no watch, in none with it. Only that revert is corrected — a window still " +
+            "where the split was, at its height and at a width attach or show gave it beside the " +
+            "dock (the even split, or what the dock's share leaves), grown back to the split's " +
+            "width from its right edge so that it is never moved; " +
+            "any other change to the window is the user's and ends the watch at once. The watch " +
+            "runs after the detach has let go of the tree lock, and restarts after each of at " +
+            "most 3 corrections. Zero skips it.",
+        requires = Flags.within(0L..5_000L),
     )
 
     val flattenFloatingOnHide = Flags.boolean(

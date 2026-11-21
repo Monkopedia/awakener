@@ -32,6 +32,17 @@ data class Node(
      */
     val percent: Double? = null,
     val marks: List<String> = emptyList(),
+    /**
+     * Nonzero when this node is fullscreen — `1` on its workspace, `2` across every output. Read
+     * so that `attach` can honour [WmFlags.fullscreenSurface] (#253). A workspace always reports
+     * `1`, so it means something only on a container.
+     */
+    @SerialName("fullscreen_mode") val fullscreenMode: Int = 0,
+    /**
+     * Where sway has this node, in logical pixels. Read for one thing only: a floating split's
+     * rectangle, which a detach collapsing it owes the surface back (#253).
+     */
+    val rect: Rect? = null,
     val nodes: List<Node> = emptyList(),
     @SerialName("floating_nodes") val floatingNodes: List<Node> = emptyList(),
 ) {
@@ -63,6 +74,10 @@ data class Node(
         else -> children.firstNotNullOfOrNull { it.workspace(name) }
     }
 }
+
+/** A rectangle as sway reports one. */
+@Serializable
+data class Rect(val x: Int = 0, val y: Int = 0, val width: Int = 0, val height: Int = 0)
 
 @Serializable
 data class WindowEvent(val change: String, val container: Node? = null)

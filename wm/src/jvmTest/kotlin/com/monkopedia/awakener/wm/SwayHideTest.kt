@@ -691,7 +691,328 @@ open class SwayHideTest {
         assertEquals(floating, settledGeometryOf(floater), "and has not moved")
     }
 
+    /**
+     * #253. A floating surface's dock stands inside a floating split with it, and a detach
+     * collapses that split again: the surface floats alone on the rectangle it had before the
+     * attach, and nothing else on the workspace has changed. Five cycles, because a leftover that
+     * the next attach reuses or nests inside only shows on the second.
+     */
+    @Test
+    fun `attach and detach on a floating surface leave the tree as it was`() = swayTest {
+        openSurface("aw-tiled1")
+        val app = openFloatingSurface("aw-float1")
+        cycleAttach(app)
+    }
+
+    /**
+     * #253's first half, found by #250's review: the dock maps beside whatever is focused when it
+     * maps, and a user who presses the key and then clicks a tiled window has moved focus there
+     * before the panel is up. The dock has to end up inside the floating surface's split all the
+     * same, and the tiled window the user clicked must not have gained or lost anything.
+     */
+    @Test
+    fun `a floating surface's dock lands beside it when focus moves during start-up`() =
+        swayTest {
+            val other = openSurface("aw-tiled1")
+            val app = openFloatingSurface("aw-float1")
+            cycleAttach(app, dockSpec = focusStealingDock(other))
+        }
+
+    /**
+     * A floating split that is not awakener's — the user's, or another client's — holding the
+     * surface alone. It counts as a split now, so the attach takes #248's route: the dock maps
+     * beside the surface and the surface is wrapped in a split of awakener's *inside* it, rather
+     * than the unmarked re-lay `split` would make of it. The user's container keeps its id and its
+     * `splitv` through every cycle, and the detach collapses only awakener's split.
+     */
+    @Test
+    fun `a floating split that is not awakener's survives attach and detach`() = swayTest {
+        openSurface("aw-tiled1")
+        val app = openFloatingSurface("aw-float1")
+        command("[con_id=${app.raw}] split vertical")
+        val user = assertNotNull(floatingAncestorOf(app))
+        assertEquals("splitv", user.layout, "the fixture is a floating splitv around the surface")
+        cycleAttach(app)
+        assertEquals(user.id, floatingAncestorOf(app)?.id, "the user's floating split stands")
+    }
+
+    /** The same move for a tiled surface, whose dock used to stand as a tab beside the window. */
+    @Test
+    fun `a tiled surface's dock lands beside it when focus moves during start-up`() = swayTest {
+        val other = openSurface("aw-tiled1")
+        val app = openSurface("aw-app1")
+        cycleAttach(app, dockSpec = focusStealingDock(other))
+    }
+
+    /** The same with the surface not focused at the press: the attach is aimed at it by id. */
+    @Test
+    fun `attaching to an unfocused floating surface leaves the focused window alone`() =
+        swayTest {
+            val other = openSurface("aw-tiled1")
+            val app = openFloatingSurface("aw-float1")
+            cycleAttach(app, before = { command("[con_id=${other.raw}] focus") })
+        }
+
+    /**
+     * #253's fullscreen half, tiled. sway moves the fullscreen state to the split attach makes
+     * around a fullscreen window, so the surface and its panel fill the output together; the
+     * detach has to hand it back to the surface, or the surface is left windowed.
+     */
+    @Test
+    fun `attach and detach on a fullscreen tiled surface leave the tree as it was`() = swayTest {
+        openSurface("aw-tiled1")
+        val app = openSurface("aw-full1")
+        command("[con_id=${app.raw}] fullscreen enable")
+        cycleAttach(app)
+    }
+
+    /**
+     * A surface that is floating and fullscreen is refused by default, because its round trip is
+     * not clean: the pre-fullscreen floating rectangle sway saved goes to the split. Under
+     * `wm.dock.fullscreen_surface=DOCK` it docks, and the detach still hands the fullscreen back.
+     */
+    @Test
+    fun `a fullscreen floating surface is refused by default and docks under DOCK`() = swayTest {
+        openSurface("aw-tiled1")
+        val app = openFloatingSurface("aw-float1")
+        command("[con_id=${app.raw}] fullscreen enable")
+        val shape = workspaceShape()
+        val failure = runCatching { wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1")) }
+            .exceptionOrNull()
+        assertTrue(
+            failure?.message?.contains("fullscreen and floating") == true,
+            "the refusal names the reason: $failure",
+        )
+        assertEquals(shape, workspaceShape(), "and the tree is untouched")
+
+        store.put(WmFlags.fullscreenSurface, FullscreenSurface.DOCK)
+        cycleAttach(app, geometry = false)
+    }
+
+    /**
+     * A hide and a show between the attach and the detach, on a floating surface: #232's path,
+     * which must keep working, followed by the detach #253 fixes — still back to the baseline.
+     */
+    @Test
+    fun `a floating surface hidden and shown before its detach is left as it was`() = swayTest {
+        openSurface("aw-tiled1")
+        val app = openFloatingSurface("aw-float1")
+        cycleAttach(app) { dock ->
+            assertTrue(dock.hide())
+            assertTrue(dock.show())
+            assertEquals(
+                floatingAncestorOf(app)?.id,
+                floatingAncestorOf(dock.dockId)?.id,
+                "the panel came back into the surface's floating window",
+            )
+        }
+    }
+
+    /** And a detach straight from hidden. */
+    @Test
+    fun `a floating surface detached while its panel is hidden is left as it was`() = swayTest {
+        openSurface("aw-tiled1")
+        val app = openFloatingSurface("aw-float1")
+        cycleAttach(app) { dock -> assertTrue(dock.hide()) }
+    }
+
+    /**
+     * The review of #255: the detach's settle watch is for a late *client* commit, and a client
+     * can change only its size. A user who closes the panel and moves the window straight away —
+     * 30 ms after the collapse — keeps the window where they put it, in every cycle.
+     */
+    @Test
+    fun `a window moved during the detach's settle stays where the user put it`() = swayTest {
+        openSurface("aw-tiled1")
+        val app = openFloatingSurface("aw-float1")
+        repeat(ATTACH_CYCLES) { cycle ->
+            val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+            coroutineScope {
+                val detach = launch { dock.detach() }
+                awaitFloatingAlone(app)
+                delay(USER_MOVE_DELAY_MS)
+                command("[con_id=${app.raw}] move absolute position $MOVED_X px $MOVED_Y px")
+                detach.join()
+            }
+            val (x, y) = settledGeometryOf(app).split(" ").take(2).map { it.substringAfter("=").toInt() }
+            assertTrue(
+                kotlin.math.abs(x - MOVED_X) <= GEOMETRY_SLACK && kotlin.math.abs(y - MOVED_Y) <= GEOMETRY_SLACK,
+                "cycle $cycle: the window stayed where the user moved it, at $x,$y",
+            )
+            command("[con_id=${app.raw}] move absolute position $FLOAT_X px $FLOAT_Y px")
+            settledGeometryOf(app)
+        }
+    }
+
+    /**
+     * A drag that starts as the panel closes — a move every 25 ms for 1.5 s — is never snapped
+     * back, and the detach does not wait for the drag to finish.
+     */
+    @Test
+    fun `a drag during the detach's settle is never snapped back`() = swayTest {
+        openSurface("aw-tiled1")
+        val app = openFloatingSurface("aw-float1")
+        repeat(ATTACH_CYCLES) { cycle ->
+            val dock = wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1"))
+            var detachMs = 0L
+            var snapBacks = 0
+            coroutineScope {
+                val detach = launch {
+                    val started = kotlin.time.TimeSource.Monotonic.markNow()
+                    dock.detach()
+                    detachMs = started.elapsedNow().inWholeMilliseconds
+                }
+                awaitFloatingAlone(app)
+                repeat(DRAG_STEPS) { step ->
+                    val x = MOVED_X + step * 2
+                    command("[con_id=${app.raw}] move absolute position $x px $MOVED_Y px")
+                    delay(DRAG_STEP_MS)
+                    val now = geometryOf(app).split(" ").take(2).map { it.substringAfter("=").toInt() }
+                    if (kotlin.math.abs(now[0] - FLOAT_X) <= GEOMETRY_SLACK &&
+                        kotlin.math.abs(now[1] - FLOAT_Y) <= GEOMETRY_SLACK
+                    ) {
+                        snapBacks++
+                    }
+                }
+                detach.join()
+            }
+            assertEquals(0, snapBacks, "cycle $cycle: snap-backs during the drag")
+            assertTrue(
+                detachMs < DRAG_STEPS * DRAG_STEP_MS,
+                "cycle $cycle: the detach returned before the drag ended, in ${detachMs}ms",
+            )
+            command("[con_id=${app.raw}] move absolute position $FLOAT_X px $FLOAT_Y px")
+            settledGeometryOf(app)
+        }
+    }
+
+    /** `wm.dock.floating_surface=REFUSE`: the attach fails, saying why, and touches nothing. */
+    @Test
+    fun `under floating_surface REFUSE a floating surface is refused untouched`() = swayTest {
+        store.put(WmFlags.floatingSurface, FloatingSurface.REFUSE)
+        openSurface("aw-tiled1")
+        val app = openFloatingSurface("aw-float1")
+        val shape = workspaceShape()
+        val failure = runCatching { wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1")) }
+            .exceptionOrNull()
+        assertTrue(
+            failure?.message?.contains("floating") == true,
+            "the refusal names the reason: $failure",
+        )
+        assertEquals(shape, workspaceShape(), "and the tree is untouched")
+        assertTrue(wm.tree().windows.none { it.appId == "aw-dock" }, "with no dock started")
+    }
+
+    /** `wm.dock.fullscreen_surface=REFUSE`: the same for a fullscreen surface. */
+    @Test
+    fun `under fullscreen_surface REFUSE a fullscreen surface is refused untouched`() = swayTest {
+        store.put(WmFlags.fullscreenSurface, FullscreenSurface.REFUSE)
+        val app = openSurface("aw-full1")
+        command("[con_id=${app.raw}] fullscreen enable")
+        val shape = workspaceShape()
+        val failure = runCatching { wm.attach(app, dockSpec("aw-dock"), AgentId("agent-1")) }
+            .exceptionOrNull()
+        assertTrue(
+            failure?.message?.contains("fullscreen") == true,
+            "the refusal names the reason: $failure",
+        )
+        assertEquals(shape, workspaceShape(), "and the tree is untouched")
+    }
+
     // -- helpers ------------------------------------------------------------------------
+
+    /**
+     * [ATTACH_CYCLES] attaches and detaches of [app], each held to the baseline taken before the
+     * first: the workspace's whole shape — every container's id, type, layout, fullscreen state
+     * and marks, and every tiled rectangle — and, unless [geometry] is false, [app]'s own settled
+     * rectangle to within [GEOMETRY_SLACK]. [before] runs ahead of each attach and [between]
+     * while the dock stands.
+     */
+    private suspend fun cycleAttach(
+        app: SurfaceId,
+        dockSpec: DockSpec = dockSpec("aw-dock"),
+        before: suspend () -> Unit = {},
+        geometry: Boolean = true,
+        between: suspend (DockHandle) -> Unit = {},
+    ) {
+        val rect = settledGeometryOf(app)
+        val shape = workspaceShape()
+        repeat(ATTACH_CYCLES) { cycle ->
+            before()
+            val dock = wm.attach(app, dockSpec, AgentId("agent-1"))
+            assertEquals(
+                wm.tree().parentOf(app.raw)?.id,
+                wm.tree().parentOf(dock.dockId.raw)?.id,
+                "cycle $cycle: the panel stands beside the surface: ${workspaceShape()}",
+            )
+            between(dock)
+            dock.detach()
+            awaitGone(dock.dockId)
+            assertEquals(shape, workspaceShape(), "cycle $cycle: the workspace, after the detach")
+            if (geometry) assertNear(rect, settledGeometryOf(app), "cycle $cycle: the surface")
+        }
+    }
+
+    /** Waits until [app] floats alone again, which is the detach's collapse having run. */
+    private suspend fun awaitFloatingAlone(app: SurfaceId) {
+        assertNotNull(
+            withTimeoutOrNull(WAIT_MS) {
+                while (floatingAncestorOf(app)?.id != app.raw) delay(2)
+                true
+            },
+            "the detach never collapsed the floating split",
+        )
+    }
+
+    private fun assertNear(expected: String, actual: String, what: String) {
+        fun parse(g: String) = g.split(" ").map { it.substringAfter("=").toInt() }
+        val off = parse(expected).zip(parse(actual)).maxOf { (a, b) -> kotlin.math.abs(a - b) }
+        assertTrue(off <= GEOMETRY_SLACK, "$what: expected $expected, was $actual")
+    }
+
+    /**
+     * A dock that moves focus to [elsewhere] before its window maps — a user clicking another
+     * window while the panel starts, made deterministic. `swaymsg` reaches this session through
+     * the `SWAYSOCK` sway hands every process it execs.
+     */
+    private fun focusStealingDock(elsewhere: SurfaceId) = DockSpec(
+        "aw-dock",
+        "sh -c 'swaymsg [con_id=${elsewhere.raw}] focus >/dev/null; exec " +
+            sway.windowCommand(DockSpec.APP_ID_PLACEHOLDER) + "'",
+    )
+
+    /**
+     * Workspace `1` as one string: every node's id, type, layout, fullscreen state and marks,
+     * nested, with the rectangle of every tiled node. Floating rectangles are left out, because
+     * a client settles those on its own schedule; [cycleAttach] compares the surface's settled.
+     */
+    private suspend fun workspaceShape(): String {
+        val raw = sway.connection().use { it.request(I3Ipc.Request.GET_TREE, "") }
+        val root = Json.parseToJsonElement(raw).jsonObject
+        fun walk(node: JsonObject, floating: Boolean): String {
+            val type = node["type"]?.jsonPrimitive?.contentOrNull
+            val inFloat = floating || type == FLOATING
+            val rect = node.getValue("rect").jsonObject
+            val geometry = if (inFloat) "" else listOf("x", "y", "width", "height")
+                .joinToString(",", "@") { rect.getValue(it).jsonPrimitive.int.toString() }
+            val tiled = node["nodes"]?.jsonArray.orEmpty().map { walk(it.jsonObject, inFloat) }
+            val floats = node["floating_nodes"]?.jsonArray.orEmpty()
+                .map { walk(it.jsonObject, inFloat) }
+            return "${node["id"]}:$type:${node["layout"]?.jsonPrimitive?.contentOrNull}" +
+                ":fs=${node["fullscreen_mode"]}:${node["marks"]}$geometry" +
+                tiled.joinToString(",", "[", "]") + floats.joinToString(",", "~{", "}")
+        }
+        fun workspace(node: JsonObject): JsonObject? =
+            if (node["type"]?.jsonPrimitive?.contentOrNull == "workspace" &&
+                node["name"]?.jsonPrimitive?.contentOrNull == "1"
+            ) {
+                node
+            } else {
+                node["nodes"]?.jsonArray.orEmpty().firstNotNullOfOrNull { workspace(it.jsonObject) }
+            }
+        return walk(assertNotNull(workspace(root), "no workspace 1"), false)
+    }
+
 
     /** [FLOATING_CYCLES] hides and restores of a floating surface's panel, each read settled. */
     private suspend fun cycleFloating(appId: String) {
@@ -882,10 +1203,9 @@ open class SwayHideTest {
     /**
      * Size and position, which is what a restore has to give back.
      *
-     * Read straight out of `GET_TREE`'s payload rather than through [Node], which deliberately
-     * models only the fields awakener reasons about. Geometry is not one of them — nothing in the
-     * product reads a rect — so it is parsed here rather than added to a type every decode in the
-     * build pays for.
+     * Read straight out of `GET_TREE`'s payload rather than through [Node], so that the test's
+     * reading of a rectangle does not go through the decoding the code under test uses for its
+     * own (#253's detach reads `Node.rect`).
      */
     private suspend fun geometryOf(id: SurfaceId): String {
         val raw = sway.connection().use { it.request(I3Ipc.Request.GET_TREE, "") }
@@ -1028,6 +1348,21 @@ open class SwayHideTest {
 
         /** How many reads in a row a window has to hold still for to count as settled. */
         const val SETTLE_READS = 10
+
+        /** Attach/detach cycles [cycleAttach] runs: a leftover shows on the second (#253). */
+        const val ATTACH_CYCLES = 5
+
+        /** When the user moves the window after the detach's collapse, and where to. */
+        const val USER_MOVE_DELAY_MS = 30L
+        const val MOVED_X = 400
+        const val MOVED_Y = 250
+
+        /** A drag: one move every [DRAG_STEP_MS] for [DRAG_STEPS] steps, about 1.5 s. */
+        const val DRAG_STEPS = 60
+        const val DRAG_STEP_MS = 25L
+
+        /** How far a surface's settled rectangle may move across a cycle, in logical pixels. */
+        const val GEOMETRY_SLACK = 2
 
         /** Hide/restore cycles one floating census covers; the first fix's loss compounded. */
         const val FLOATING_CYCLES = 5
