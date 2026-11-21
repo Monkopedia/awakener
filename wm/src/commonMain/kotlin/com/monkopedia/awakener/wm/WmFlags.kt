@@ -793,7 +793,9 @@ object WmFlags {
             "and the window keeps the dock's share of its width lost. Measured on headless sway " +
             "1.12 with foot at scale 1.5: lost in 11 of 25 runs of five-cycle floating detach " +
             "tests with no watch, in none with it. Only that revert is corrected — a window still " +
-            "where the split was, at exactly that size, put back on the split's rectangle; " +
+            "where the split was, at its height and at a width attach or show gave it beside the " +
+            "dock (the even split, or what the dock's share leaves), grown back to the split's " +
+            "width from its right edge so that it is never moved; " +
             "any other change to the window is the user's and ends the watch at once. The watch " +
             "runs after the detach has let go of the tree lock, and restarts after each of at " +
             "most 3 corrections. Zero skips it.",
