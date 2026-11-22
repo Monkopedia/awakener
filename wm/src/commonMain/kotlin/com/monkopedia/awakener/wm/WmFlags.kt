@@ -842,6 +842,26 @@ object WmFlags {
             "purpose.",
     )
 
+    val evictOnDetach = Flags.boolean(
+        "wm.dock.evict_on_detach",
+        false,
+        "On a detach of a visible dock, move every window sharing the dock's split that is " +
+            "neither the surface nor one of its docks out of that split first, exactly as " +
+            "wm.dock.evict_on_hide does on a hide, so the split is down to the surface and the " +
+            "detach collapses it back to the shape the attach found (#256). Off, the default, " +
+            "leaves such a window where it is: a split that holds a window of the user's is " +
+            "theirs from then on, so the detach takes only the dock out of it and takes " +
+            "awakener's mark off it, and it is never collapsed, re-laid or shared later. A " +
+            "hide does the same to the split it leaves. A window gets into the dock's split by " +
+            "being opened while the surface or the dock is focused, or by being moved there. " +
+            "Where no side of the split can take a window without moving it into another " +
+            "container, nothing moves and the split is left to the user as with this off. A " +
+            "dock detached while hidden has no split of its own to empty and is not covered, " +
+            "and neither is a floating surface: its split is a floating window of its own, " +
+            "and eviction moves nothing out of one. Every dock of the surface stays where it " +
+            "is, so a second dock sharing the split (wm.dock.share_split) is never evicted.",
+    )
+
     val unwindFailedAttach = Flags.boolean(
         "wm.dock.unwind_failed_attach",
         true,
