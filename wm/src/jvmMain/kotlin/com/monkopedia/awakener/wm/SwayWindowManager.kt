@@ -527,13 +527,15 @@ class SwayWindowManager(
      * the caller treats it as it always did.
      */
     private fun holdsOnlyDocksOf(split: Node, surface: SurfaceId, cfg: Config): Boolean {
-        val table = docks.snapshot()
         val others = split.nodes.filter { it.id != surface.raw }
-        return others.isNotEmpty() && others.all { node ->
-            val recorded = table.entries[node.id]?.surface
-            val marked = node.dockMark(cfg[WmFlags.dockMarkPrefix], cfg[WmFlags.dockMarkScheme]).surface
-            (if (cfg.consultsTable) recorded ?: marked else marked) == surface
-        }
+        return others.isNotEmpty() && others.all { isDockOf(it, surface, cfg) }
+    }
+
+    /** Whether [node] is one of [surface]'s docks, by [holdsOnlyDocksOf]'s test. */
+    private fun isDockOf(node: Node, surface: SurfaceId, cfg: Config): Boolean {
+        val recorded = docks.snapshot().entries[node.id]?.surface
+        val marked = node.dockMark(cfg[WmFlags.dockMarkPrefix], cfg[WmFlags.dockMarkScheme]).surface
+        return (if (cfg.consultsTable) recorded ?: marked else marked) == surface
     }
 
     /**
@@ -1207,7 +1209,7 @@ class SwayWindowManager(
                 // as the move, for #172's reason: one message, one present, so the user never
                 // sees the windows leaving the tab as a separate frame from the panel going away.
                 cfg[WmFlags.evictOnHide] ->
-                    evictionCommands(before, surface, dock, cfg) + "[con_id=${dock.raw}] move scratchpad"
+                    evictionCommands(before, surface, dock, cfg) { isDockOf(it, surface, cfg) } + "[con_id=${dock.raw}] move scratchpad"
                 else -> listOf("[con_id=${dock.raw}] move scratchpad")
             }
             run(hide.joinToString("; "))
@@ -1215,12 +1217,18 @@ class SwayWindowManager(
                 "dock ${dock.raw} was still outside the scratchpad " +
                     "${cfg[WmFlags.unmapWaitMs]}ms after being moved into it"
             }
-            // The floating hide has already flattened, or kept, the split as the flag says; one
-            // the user has put a window into is theirs from here on (#256).
-            if (floating != null) {
-                disownIfShared(floating, surface, dock)
-                return true
-            }
+            // A split the dock stood in that a window of the user's got into is theirs from here
+            // on (#256): the show makes a split of its own rather than coming back into it. The
+            // dock's split rather than the surface's, tiled or floating, because the two can
+            // differ: a show beside a second dock lands in that dock's split, inside the one the
+            // user's window is in, and that outer one would otherwise keep the mark for good.
+            // Judged as the hide left it, since an eviction may have emptied it of the user's.
+            val tree = tree()
+            before.parentOf(dock.raw)?.takeIf { it.isSplit() }
+                ?.let { tree.find(it.id) }
+                ?.let { disownIfShared(it, surface, dock) }
+            // The floating hide has already flattened, or kept, the split as the flag says.
+            if (floating != null) return true
             // #187. With the dock gone the surface is alone in the split attach made, and sway
             // places a new window beside the focused one *inside its parent* — so the next window
             // opened in this tab would land in that split, sharing the tab with the surface,
@@ -1240,16 +1248,10 @@ class SwayWindowManager(
             // And only awakener's own split (#248), collapsed no further than itself: a surface
             // the user put alone in a split of theirs got one of awakener's inside it at attach,
             // and that is the one this takes away.
-            //
-            // And one that has taken a window in is the user's from here on (#256): the show
-            // makes a split of its own inside it rather than coming back into theirs.
-            val tree = tree()
-            val split = ownSplitOf(tree, surface, cfg) ?: return true
-            if (cfg[WmFlags.flattenOnHide] && split.nodes.size == 1) {
+            val split = ownSplitOf(tree, surface, cfg)
+            if (cfg[WmFlags.flattenOnHide] && split?.nodes?.size == 1) {
                 val tab = liftTarget(tree, split, surface, cfg)
                 run(if (tab != null) liftInto(tab, surface) else "[con_id=${surface.raw}] split none")
-            } else {
-                disownIfShared(split, surface, dock)
             }
             return true
         }
@@ -2595,7 +2597,7 @@ class SwayWindowManager(
             val settle = treeEdit {
                 // Before anything is read, so the read below finds the split down to the surface.
                 if (cfg[WmFlags.evictOnDetach] && !inScratchpad(dockId)) {
-                    val evict = evictionCommands(tree(), surface, dockId, cfg)
+                    val evict = evictionCommands(tree(), surface, dockId, cfg) { isDockOf(it, surface, cfg) }
                     if (evict.isNotEmpty()) run(evict.joinToString("; "))
                 }
                 // Which container has to be flattened afterwards depends on where the dock *is*.
@@ -3144,6 +3146,7 @@ class SwayWindowManager(
             surface: SurfaceId,
             dock: SurfaceId,
             cfg: Config,
+            isDock: (Node) -> Boolean,
         ): List<String> {
             // Awakener's own split only (#248): a dock standing in a split of the user's — one a
             // build before the provenance mark attached — does not make their windows its to move.
@@ -3174,7 +3177,10 @@ class SwayWindowManager(
             }
             val along = (split.layout == "splith") == horizontal
             val order = split.nodes.map { it.id }
-            val staying = { id: Long -> id == surface.raw || id == dock.raw }
+            // Every dock of the surface stays, not only the one this is for: a second dock sharing
+            // the split (wm.dock.share_split) is no intruder (#260's review).
+            val docked = split.nodes.filter { it.id == dock.raw || isDock(it) }.map { it.id }.toSet()
+            val staying = { id: Long -> id == surface.raw || id in docked }
             // Nearest the exit first, so that only the surface and the dock are ever stepped past.
             val sequence = if (forward) order.indices.reversed() else order.indices
             return sequence

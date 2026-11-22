@@ -1,5 +1,6 @@
 package com.monkopedia.awakener.wm
 
+import com.monkopedia.awakener.config.Flag
 import com.monkopedia.awakener.config.InMemoryConfigStore
 import com.monkopedia.awakener.registry.AgentId
 import com.monkopedia.awakener.registry.DerivedAgentIdentities
@@ -1039,6 +1040,65 @@ class SwaySplitChainTest {
                 assertEquals(emptyList(), splitMarks(), "cycle ${cycle + 1}: no split mark is left")
             }
         }
+
+    /**
+     * #260's review: eviction kept only the surface and the dock it was for, so a second dock of
+     * the same surface sharing the split (wm.dock.share_split) was evicted into a tab of its own
+     * when the first one went. It has been so for wm.dock.evict_on_hide since #187.
+     */
+    @Test
+    fun `under evict_on_detach a second dock sharing the split stays docked`() =
+        secondDockStaysDocked(WmFlags.evictOnDetach) { first -> first.detach() }
+
+    @Test
+    fun `under evict_on_hide a second dock sharing the split stays docked`() =
+        secondDockStaysDocked(WmFlags.evictOnHide) { first -> first.hide(); first.detach() }
+
+    private fun secondDockStaysDocked(
+        flag: Flag<Boolean>,
+        goes: suspend (DockHandle) -> Unit,
+    ) = swayTest {
+        store.put(flag, true)
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        val baseline = describe()
+        val first = wm.attach(app, dockSpec(), AGENT)
+        val second = wm.attach(app, dockSpec(), AGENT)
+        val split = wm.tree().parentOf(app.raw)?.id
+        assertEquals(split, wm.tree().parentOf(second.dockId.raw)?.id, "the docks share a split: ${describe()}")
+        goes(first)
+        assertEquals(split, wm.tree().parentOf(second.dockId.raw)?.id, "the second dock stays docked: ${describe()}")
+        assertEquals(split, wm.tree().parentOf(app.raw)?.id, describe())
+        second.detach()
+        assertEquals(baseline, describe())
+    }
+
+    /**
+     * #260's review: a window moved in, a second press, and the first dock hidden and shown. The
+     * show brings the first dock back into the second's split, inside the one the user's window
+     * is in, and the hide had cleared the mark only off the surface's own split — not off the one
+     * the dock had been standing in — so that outer split kept awakener's mark for good.
+     */
+    @Test
+    fun `a second dock and a hide and show leave no mark on the user's split, newest first`() =
+        secondDockAfterMoveIn(newestFirst = true)
+
+    @Test
+    fun `a second dock and a hide and show leave no mark on the user's split, oldest first`() =
+        secondDockAfterMoveIn(newestFirst = false)
+
+    private fun secondDockAfterMoveIn(newestFirst: Boolean) = swayTest {
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        val mine = openSurface("aw-mine")
+        val first = wm.attach(app, dockSpec(), AGENT)
+        moveBeside(mine, app)
+        val second = wm.attach(app, dockSpec(), AGENT)
+        assertEquals(true, first.hide(), "the hide")
+        assertEquals(true, first.show(), "the show")
+        (if (newestFirst) listOf(second, first) else listOf(first, second)).forEach { it.detach() }
+        assertUsersSplitHolds(app, mine, "after both docks went")
+    }
 
     private fun movedIn(floating: Boolean, act: suspend (DockHandle) -> Unit) = swayTest {
         openSurface("aw-other")

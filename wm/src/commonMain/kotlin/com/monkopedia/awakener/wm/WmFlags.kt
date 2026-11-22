@@ -856,7 +856,10 @@ object WmFlags {
             "being opened while the surface or the dock is focused, or by being moved there. " +
             "Where no side of the split can take a window without moving it into another " +
             "container, nothing moves and the split is left to the user as with this off. A " +
-            "dock detached while hidden has no split of its own to empty and is not covered.",
+            "dock detached while hidden has no split of its own to empty and is not covered, " +
+            "and neither is a floating surface: its split is a floating window of its own, " +
+            "and eviction moves nothing out of one. Every dock of the surface stays where it " +
+            "is, so a second dock sharing the split (wm.dock.share_split) is never evicted.",
     )
 
     val unwindFailedAttach = Flags.boolean(
