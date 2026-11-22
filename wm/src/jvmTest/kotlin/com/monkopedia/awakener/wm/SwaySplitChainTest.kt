@@ -939,30 +939,197 @@ class SwaySplitChainTest {
     }
 
     /**
-     * The general half of #224: a cleanup sway refuses *after* the dock has gone is still
-     * reported, but as what it is. The surface closes out of a split that two other windows have
-     * joined, so the split outlives the dock holding two of them and sway refuses to flatten it.
+     * The general half of #224, met by #256: the surface closes out of a split that two other
+     * windows have joined. sway refused to flatten a split still holding two of them, and the
+     * reap reported that as a cleanup that failed after the dock had gone. The split now holds
+     * nothing but the user's windows, so it is theirs: the reap takes the dock and leaves the split
+     * standing, with no mark of awakener's on it.
      */
     @Test
-    fun `a reap whose cleanup is refused says the dock was reaped`() = swayTest {
+    fun `a reap out of a split two other windows joined leaves the split to them`() = swayTest {
         store.put(WmFlags.sweepOnClose, false)
         openSurface("aw-other")
         val app = openSurface("aw-app")
         val dock = wm.attach(app, dockSpec(), AGENT)
         command("[con_id=${app.raw}] focus")
-        openSurface("aw-in1")
-        openSurface("aw-in2")
+        val in1 = openSurface("aw-in1")
+        val in2 = openSurface("aw-in2")
+        val split = wm.tree().parentOf(dock.dockId.raw)?.id
         close(app)
 
-        val failure = assertFailsWith<IllegalStateException> { wm.reapOrphans() }
+        wm.reapOrphans()
 
-        assertEquals(null, wm.tree().find(dock.dockId.raw), "the dock is gone: ${describe()}")
-        assertEquals(
-            "dock ${dock.dockId.raw}, bound to the gone surface ${app.raw}, was reaped, but " +
-                "tidying the tree after it failed",
-            failure.message,
-        )
+        val tree = wm.tree()
+        assertEquals(null, tree.find(dock.dockId.raw), "the dock is gone: ${describe()}")
+        assertEquals(listOf(in1.raw, in2.raw), tree.find(assertNotNull(split))?.nodes?.map { it.id }, describe())
+        assertEquals(emptyList(), splitMarks(), "no split mark is left: ${describe()}")
     }
+
+    // -- #256: a window of the user's inside the dock's split -------------------------------
+
+    /**
+     * #256, the deliberate half: with the dock up, the user moves one of their windows into the
+     * dock's split. `split none` is refused on a split that still holds two windows, so the detach
+     * failed and left the split standing, marked as awakener's, around the user's window. The
+     * split now holds user content and is left as theirs: the dock goes, the split stays, and it
+     * carries no mark of awakener's. Two plain cycles after it must leave that shape alone.
+     */
+    @Test
+    fun `a window moved into the dock's split stays when the dock detaches`() =
+        movedIn(floating = false) { it.detach() }
+
+    @Test
+    fun `a window moved into the dock's floating split stays when the dock detaches`() =
+        movedIn(floating = true) { it.detach() }
+
+    /** Hidden first: the hide leaves the split to the user, and the detach after it is a kill. */
+    @Test
+    fun `a window moved into the dock's split stays through a hide and a detach`() =
+        movedIn(floating = false) { dock -> hideDisowns(dock); dock.detach() }
+
+    @Test
+    fun `a window moved into the dock's floating split stays through a hide and a detach`() =
+        movedIn(floating = true) { dock -> hideDisowns(dock); dock.detach() }
+
+    /**
+     * Hidden and shown again: the show treats the split as the user's, so the dock comes back
+     * in a split of awakener's own around the surface inside it (tiled) or beside the surface in
+     * the user's floating container (floating), and the detach takes only that back.
+     */
+    @Test
+    fun `a window moved into the dock's split stays through a hide, a show and a detach`() =
+        movedIn(floating = false) { dock -> hideDisowns(dock); showBeside(dock); dock.detach() }
+
+    @Test
+    fun `a window moved into the dock's floating split stays through a hide, a show and a detach`() =
+        movedIn(floating = true) { dock -> hideDisowns(dock); showBeside(dock); dock.detach() }
+
+    /**
+     * The commonest way in on a real desktop: a window opened while the dock is focused maps
+     * beside it, inside its split.
+     */
+    @Test
+    fun `a window opened beside the focused dock stays when the dock detaches`() = swayTest {
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        val dock = wm.attach(app, dockSpec(), AGENT)
+        command("[con_id=${dock.dockId.raw}] focus")
+        val mine = openSurface("aw-mine")
+        val split = wm.tree().parentOf(dock.dockId.raw)?.id
+        assertEquals(split, wm.tree().parentOf(mine.raw)?.id, "it mapped in the dock's split: ${describe()}")
+        dock.detach()
+        assertUsersSplitHolds(app, mine, "after the detach")
+    }
+
+    /** The alternative: wm.dock.evict_on_detach moves the window out, and the attach is undone. */
+    @Test
+    fun `under evict_on_detach a window moved into the dock's split is moved out and the split goes`() =
+        swayTest {
+            store.put(WmFlags.evictOnDetach, true)
+            openSurface("aw-other")
+            val app = openSurface("aw-app")
+            val mine = openSurface("aw-mine")
+            val baseline = describe()
+            repeat(3) { cycle ->
+                val dock = wm.attach(app, dockSpec(), AGENT)
+                moveBeside(mine, app)
+                assertEquals(wm.tree().parentOf(dock.dockId.raw)?.id, wm.tree().parentOf(mine.raw)?.id, describe())
+                dock.detach()
+                assertEquals(baseline, describe(), "cycle ${cycle + 1}")
+                assertEquals(emptyList(), splitMarks(), "cycle ${cycle + 1}: no split mark is left")
+            }
+        }
+
+    private fun movedIn(floating: Boolean, act: suspend (DockHandle) -> Unit) = swayTest {
+        openSurface("aw-other")
+        val app = if (floating) openFloating("aw-app") else openSurface("aw-app")
+        val mine = openSurface("aw-mine")
+        val dock = wm.attach(app, dockSpec(), AGENT)
+        val split = assertNotNull(wm.tree().parentOf(dock.dockId.raw), "the dock's split").id
+        moveBeside(mine, app)
+        assertEquals(split, wm.tree().parentOf(mine.raw)?.id, "moved into the dock's split: ${describe()}")
+        act(dock)
+        assertUsersSplitHolds(app, mine, "after the dock went")
+        val users = wm.tree().parentOf(app.raw)?.id
+        val shape = describe()
+        repeat(2) { cycle ->
+            wm.attach(app, dockSpec(), AGENT).detach()
+            assertEquals(users, wm.tree().parentOf(app.raw)?.id, "cycle ${cycle + 1}: ${describe()}")
+            assertEquals(shape, describe(), "cycle ${cycle + 1}")
+            assertEquals(emptyList(), splitMarks(), "cycle ${cycle + 1}: no split mark is left")
+        }
+    }
+
+    private suspend fun hideDisowns(dock: DockHandle) {
+        assertEquals(true, dock.hide(), "the hide")
+        assertEquals(emptyList(), splitMarks(), "a split holding a user's window is not awakener's: ${describe()}")
+    }
+
+    private suspend fun showBeside(dock: DockHandle) {
+        assertEquals(true, dock.show(), "the show")
+        assertEquals(dock.surface.raw, wm.tree().parentOf(dock.dockId.raw)?.nodes?.firstOrNull()?.id, describe())
+    }
+
+    /** The dock is gone, [mine] still shares a container with [app], and no mark of ours is left. */
+    private suspend fun assertUsersSplitHolds(app: SurfaceId, mine: SurfaceId, stage: String) {
+        val tree = wm.tree()
+        assertEquals(emptyList(), tree.windows.filter { it.appId == "aw-dock" }.map { it.id }, "$stage: ${describe()}")
+        assertNotNull(tree.find(app.raw), "$stage: the surface stands")
+        assertEquals(tree.parentOf(app.raw)?.id, tree.parentOf(mine.raw)?.id, "$stage: ${describe()}")
+        assertEquals(emptyList(), splitMarks(), "$stage: no split mark is left: ${describe()}")
+        assertEquals(emptyList(), anchorMarks(), "$stage: no anchor is left")
+    }
+
+    /**
+     * #256, the race the #254 review found: a second connection moves a user's window beside the
+     * surface 0–10 ms into each attach, so it lands in the tab, in the split as it is made, or in
+     * the split once the dock is in it. Every detach must succeed, and leave the surface and the
+     * window standing with no mark of awakener's on anything. Failures are counted rather than
+     * thrown at the first, so a red run says how many rounds of [MOVE_IN_ROUNDS] failed.
+     */
+    @Test
+    fun `a window another client moves in as an attach starts never fails the detach`() = swayTest {
+        val other = openSurface("aw-other")
+        val app = openSurface("aw-app")
+        val baseline = describe()
+        val failed = mutableListOf<String>()
+        var inside = 0
+        repeat(MOVE_IN_ROUNDS) { round ->
+            val offset = (round % MOVE_IN_STEPS) * MOVE_IN_STEP_NS
+            val stage = "round ${round + 1}, moved after ${offset / 1000}us"
+            assertEquals(baseline, describe(), "$stage, before")
+            command("[con_id=${other.raw}] focus")
+            val mine = openSurface("aw-mine$round")
+            command("[con_id=${app.raw}] focus")
+            val attach = scope.async { wm.attach(app, dockSpec(), AGENT) }
+            LockSupport.parkNanos(offset)
+            moveBeside(mine, app)
+            val dock = attach.await()
+            wm.tree().let { if (it.parentOf(mine.raw)?.id == it.parentOf(dock.dockId.raw)?.id) inside++ }
+            val problems = listOfNotNull(runCatching { dock.detach() }.exceptionOrNull()?.let { "detach: ${it.message}" })
+                .toMutableList()
+            val tree = wm.tree()
+            if (tree.find(app.raw) == null || tree.find(mine.raw) == null) problems += "lost a window"
+            splitMarks().takeIf { it.isNotEmpty() }?.let { marks ->
+                problems += "marks $marks on ${describe()}"
+                command(marks.joinToString("; ") { (id, mark) -> "[con_id=$id] unmark $mark" })
+            }
+            if (anchorMarks().isNotEmpty()) problems += "anchors ${anchorMarks()}"
+            if (problems.isNotEmpty()) failed += "$stage: ${problems.joinToString("; ")}"
+            close(mine)
+            if (wm.tree().parentOf(app.raw)?.let { it.type == "con" && it.nodes.size == 1 } == true) {
+                command("[con_id=${app.raw}] focus; split none")
+            }
+        }
+        assert(inside > 0) { "no round had the window land in the dock's split; the sweep tests nothing" }
+        assertEquals(emptyList(), failed, "${failed.size} of $MOVE_IN_ROUNDS rounds failed ($inside landed inside)")
+    }
+
+    /** Moves [window] beside [app], into whatever holds it — the dock's split, while docked. */
+    private suspend fun moveBeside(window: SurfaceId, app: SurfaceId) = command(
+        "[con_id=${app.raw}] mark --add _test_beside; " +
+            "[con_id=${window.raw}] move window to mark _test_beside; unmark _test_beside",
+    )
 
     // -- helpers ------------------------------------------------------------------------
 
@@ -1135,6 +1302,9 @@ class SwaySplitChainTest {
         const val USER_SPLIT_ROUNDS = 400
         const val USER_SPLIT_STEPS = 400
         const val USER_SPLIT_STEP_NS = 25_000L
+        const val MOVE_IN_ROUNDS = 400
+        const val MOVE_IN_STEPS = 400
+        const val MOVE_IN_STEP_NS = 25_000L
         val AGENT = AgentId("agent-1")
     }
 }
