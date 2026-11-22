@@ -152,6 +152,27 @@ enum class FailureDetail {
     TRACE,
 }
 
+/** What a press says about the residue exposure check, beyond its warning (#153). */
+enum class ExposureReport {
+    /**
+     * The warning alone, when the check found the residue directory exposed under
+     * `registry.residue.exposed_dir=REPORT` — the behaviour before #153, and the default because
+     * a clean press says nothing.
+     *
+     * Read this knowing what the silence covers: never asked, `ALLOW`, checked-and-private, and
+     * an exposure `REFUSE` raised on all print no warning, and which one it was is exactly what
+     * this value does not say.
+     */
+    WARNING,
+
+    /**
+     * One `note:` line on every press naming which of those it was, and the directory the check
+     * examined — which under `registry.residue.exposure_scope=DEEPEST_EXISTING` changes after the
+     * first press, from the directory awakener was pointed into to the `0700` one it created.
+     */
+    ALWAYS,
+}
+
 /**
  * How a hotkey turns a Drab into a Lifeless.
  *
@@ -311,6 +332,25 @@ object InvokeFlags {
             "which is what the deliberate refusals on this path — an unreadable bus, an id " +
             "spanreed did not issue — already say in as many words. TRACE adds the stack trace " +
             "under it, which is the same failure made debuggable rather than merely legible.",
+    )
+
+    /**
+     * Whether a press reports what the residue exposure check answered, and about which directory.
+     *
+     * The check is `:registry`'s and runs on every press that prepares residue; its answer lives
+     * in that process's store and goes with it, so the press that asked is the only place it can
+     * be read. See [ExposureReport].
+     */
+    val exposureReport = Flags.enum(
+        "invoke.residue.exposure_report",
+        ExposureReport.WARNING,
+        "What a press prints about the residue exposure check (registry.residue.exposed_dir). " +
+            "WARNING prints only its warning, when the directory was found writable by other " +
+            "users under REPORT, so a clean press stays quiet. ALWAYS adds one `note:` line to " +
+            "stderr on every press saying which answer it was — not run (nothing prepared " +
+            "residue), not asked (ALLOW), private, or EXPOSED — and the directory it examined, " +
+            "which under exposure_scope=DEEPEST_EXISTING moves from the directory awakener was " +
+            "pointed into to the one it created there.",
     )
 
     /**

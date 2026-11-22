@@ -7,6 +7,9 @@ import com.monkopedia.awakener.connector.ConnectorFlags
 import com.monkopedia.awakener.connector.ConnectorOutcome
 import com.monkopedia.awakener.connector.FileConnectorCatalog
 import com.monkopedia.awakener.registry.FileBindingStore
+import com.monkopedia.awakener.registry.RegistryFlags
+import com.monkopedia.awakener.registry.ResidueExposureCheck
+import com.monkopedia.awakener.registry.ResidueExposureFinding
 import com.monkopedia.awakener.registry.ResidueOutcome
 import com.monkopedia.awakener.registry.SpanreedCli
 import com.monkopedia.awakener.registry.describe
@@ -422,6 +425,11 @@ private fun awaken(args: Array<String>, store: FileConfigStore): Int {
                 // other reason has still created the directory, and on stderr for the reason
                 // every warning here is: stdout is what the press reports about its surface.
                 bindings.residueExposure?.let { System.err.println("warning: $it") }
+                // And, when asked for, what that check answered even when it had nothing to warn
+                // about — the four answers a missing warning cannot tell apart (#153).
+                if (store.config.value[InvokeFlags.exposureReport] == ExposureReport.ALWAYS) {
+                    System.err.println("note: ${bindings.residueExposureCheck.report()}")
+                }
                 // And whether a `registry.residue.layout` flip left this surface's earlier model
                 // in a file this build no longer opens. Beside the exposure warning because it
                 // has the same shape: a condition only the store can see, on the one call that
@@ -451,5 +459,24 @@ private fun awaken(args: Array<String>, store: FileConfigStore): Int {
         }
     } finally {
         scope.cancel()
+    }
+}
+
+/**
+ * One line saying what [ResidueExposureCheck] answered and about which directory, for
+ * `invoke.residue.exposure_report=ALWAYS`.
+ *
+ * Every finding reads differently, because telling them apart is the whole of what this line is
+ * for. The directory goes through [oneLine]: it is the operator's own configuration, but it is
+ * printed as one line of a report and a newline in a path would forge a second.
+ */
+internal fun ResidueExposureCheck.report(): String {
+    val subject = examined?.let(::oneLine) ?: "nothing"
+    return "residue exposure check: " + when (finding) {
+        ResidueExposureFinding.NOT_RUN -> "not run, since nothing prepared residue"
+        ResidueExposureFinding.ALLOWED ->
+            "not asked, since ${RegistryFlags.residueExposure.key}=ALLOW"
+        ResidueExposureFinding.PRIVATE -> "private; examined $subject"
+        ResidueExposureFinding.EXPOSED -> "EXPOSED, writable by other users; examined $subject"
     }
 }
