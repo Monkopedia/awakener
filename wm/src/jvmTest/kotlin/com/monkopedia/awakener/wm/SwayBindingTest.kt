@@ -1239,33 +1239,30 @@ class SwayBindingTest {
     }
 
     /**
-     * The consequence that actually matters. `reapOrphans` is the whole mechanism for Hazard 2,
-     * and it gets one shot per `close` event — so a teardown that throws partway through does not
-     * merely lose that dock, it strands every orphan the sweep had not reached yet, with nothing
-     * scheduled to come back for them.
-     *
-     * The failure here is a real sway rejection rather than an injected one: `split none` is
-     * refused on a child that still has siblings, so a tab holding two other windows besides the
-     * dock cannot be normalised. A user splitting a second window into a tab produces exactly
-     * that shape.
+     * The shape this used to fail a teardown with, as what it is since #256. `reapOrphans` gets one
+     * shot per `close` event, so a teardown that throws partway through strands every orphan the
+     * sweep had not reached. Two other windows in the dock's tab made `split none` refuse — the
+     * container held more than one survivor — and that refusal was this test's real sway failure.
+     * The split now holds only the user's windows and is left to them, so the same sweep reaps
+     * both orphans and reports nothing. That a failure does not abandon the rest of the sweep is
+     * held by the wedged dock below, which is a failure no tree shape can repair.
      */
     @Test
-    fun `a failing teardown does not abandon the rest of the sweep`() = swayTest {
+    fun `a teardown out of a tab two other windows joined reaps every orphan`() = swayTest {
         // This drives the sweep by hand and asserts on what one pass of it did, so the collector
-        // that now runs one per close event has to be out of the way — it would reap these orphans
-        // before the call below and leave it nothing to fail on. What the collector does with a
-        // failing sweep is SwayRepairTest's.
+        // that now runs one per close event has to be out of the way. What the collector does
+        // with a failing sweep is SwayRepairTest's.
         store.put(WmFlags.sweepOnClose, false)
         val stuck = openSurface("aw-app1")
         val clean = openSurface("aw-app2")
         val stuckDock = wm.attach(stuck, dockFor("aw-dock"), AgentId("agent-1"))
 
-        // Two extra windows in the stuck dock's tab, so the container it leaves behind has more
-        // than one survivor and sway will refuse to flatten it.
+        // Two extra windows in the first dock's tab, so the container it leaves behind has more
+        // than one survivor.
         command("[con_id=${stuck.raw}] focus")
         val extra = openSurface("aw-app3")
         command("[con_id=${extra.raw}] focus")
-        openSurface("aw-app4")
+        val other = openSurface("aw-app4")
 
         val cleanDock = wm.attach(clean, dockFor("aw-dock"), AgentId("agent-2"))
         for (surface in listOf(stuck, clean)) {
@@ -1273,17 +1270,13 @@ class SwayBindingTest {
             awaitGone(surface)
         }
 
-        assertFailsWith<IllegalStateException>("a teardown that fails must still be reported") {
-            wm.reapOrphans()
-        }
+        wm.reapOrphans()
 
         val root = wm.tree()
-        assertNull(
-            root.find(cleanDock.dockId.raw),
-            "the orphan after the failing one must still have been reaped — abandoning the rest " +
-                "of the sweep is what turns one lost race into tree damage nothing repairs",
-        )
-        assertNull(root.find(stuckDock.dockId.raw), "and the failing dock itself is still down")
+        assertNull(root.find(stuckDock.dockId.raw), "the first orphan is down")
+        assertNull(root.find(cleanDock.dockId.raw), "and so is the one after it")
+        assertEquals(root.parentOf(extra.raw)?.id, root.parentOf(other.raw)?.id, "the user's windows stay together")
+        assertNotNull(root.parentOf(extra.raw)?.takeIf { parent -> parent.marks.none { it.startsWith("_awakener_split_") } })
     }
 
     /**
