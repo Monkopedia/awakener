@@ -191,7 +191,12 @@ enum class ResidueExposureFinding {
     ALLOWED,
 
     /**
-     * Examined, and no other local user can write it.
+     * Examined, and no write bit for group or others was found on it.
+     *
+     * That is weaker than "no other local user can write it" in one place: a directory whose
+     * mode bits could not be read — no POSIX view, or gone between the walk and the read — is
+     * also reported here, with nothing to separate it, because the check treats what it cannot
+     * examine as unexposed rather than raise a warning that may be false.
      *
      * Read [ResidueExposureCheck.examined] before reading this as "the residue is somewhere
      * private": under [ResidueExposureScope.DEEPEST_EXISTING] this is also what a deployment
