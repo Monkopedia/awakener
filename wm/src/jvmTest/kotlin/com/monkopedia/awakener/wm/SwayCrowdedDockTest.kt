@@ -136,8 +136,51 @@ open class SwayCrowdedDockTest {
      * [refusedResize] has no excuse to make for it and the show must fail naming the width.
      */
     @Test
-    fun `a dock narrowed after its restore in an uncrowded split fails the readback`() = swayTest {
+    fun `a dock narrowed after its restore in an uncrowded split fails the readback`() =
+        misplacedDuringReadback { dock -> command("[con_id=${dock.dockId.raw}] resize set width 15 ppt") }
+
+    /**
+     * #263's review: the excuse is for the surface's own split only. A dock another client moves
+     * into a crowded split on another workspace during the readback is misplaced, and sway
+     * refusing it 30% there must not pass it. Head `36b8fd9` returned true here, with the dock
+     * left on workspace 2.
+     */
+    @Test
+    fun `a dock moved into a crowded split elsewhere after its restore fails the readback`() {
+        var narrow = SurfaceId(0)
+        misplacedDuringReadback(
+            prepare = {
+                command("workspace 2")
+                narrow = openSurface("aw-narrow")
+                command("[con_id=${narrow.raw}] layout splith")
+                openSurface("aw-wide1")
+                openSurface("aw-wide2")
+                command("[con_id=${narrow.raw}] resize set width $NARROW_PX px")
+                command("workspace 1")
+            },
+        ) { dock ->
+            command(
+                "[con_id=${narrow.raw}] mark --add _test_foreign; " +
+                    "[con_id=${dock.dockId.raw}] move window to mark _test_foreign; unmark _test_foreign",
+            )
+            val tree = wm.tree()
+            assertNotNull(
+                tree.refusedResize(dock.dockId.raw, 30),
+                "the foreign split is one sway refuses the dock 30% in, or this tests nothing: ${describe(tree.workspace("2"))}",
+            )
+        }
+    }
+
+    /**
+     * One dock beside its surface, hidden, and shown with the first tree read after the restore
+     * held at the valve while [misplace] puts the dock wrong. The show must fail on its width.
+     */
+    private fun misplacedDuringReadback(
+        prepare: suspend () -> Unit = {},
+        misplace: suspend (DockHandle) -> Unit,
+    ) = swayTest {
         store.put(WmFlags.unmapWaitMs, MISPLACED_WAIT_MS)
+        prepare()
         SwayValve.open(sway.socket).use { valve ->
             val valved = valvedCommands(valve)
             val app = openSurface("aw-app")
@@ -150,7 +193,7 @@ open class SwayCrowdedDockTest {
             }
             val show = scope.async { runCatching { dock.show() } }
             valve.awaitHeld(WAIT_MS)
-            command("[con_id=${dock.dockId.raw}] resize set width 15 ppt")
+            misplace(dock)
             valve.release()
             val failure = assertNotNull(show.await().exceptionOrNull(), "the show must fail: ${describe()}")
             assertContains(assertNotNull(failure.message), "rather than the configured 30%")
@@ -253,7 +296,9 @@ open class SwayCrowdedDockTest {
     private fun dockSpec() = DockSpec("aw-dock", sway.windowCommand(DockSpec.APP_ID_PLACEHOLDER))
 
     /** Workspace 1 as layouts, app_ids and width fractions, so a failure shows the shape. */
-    private suspend fun describe(): String {
+    private suspend fun describe(): String = describe(assertNotNull(wm.tree().workspace("1"), "workspace 1 exists"))
+
+    private fun describe(workspace: Node?): String {
         fun describe(node: Node): String {
             val share = node.percent?.let { "@%.3f".format(it) }.orEmpty()
             return if (node.children.isEmpty()) {
@@ -262,7 +307,7 @@ open class SwayCrowdedDockTest {
                 "${node.layout}$share[${node.children.joinToString(" ") { describe(it) }}]"
             }
         }
-        return describe(assertNotNull(wm.tree().workspace("1"), "workspace 1 exists"))
+        return workspace?.let { describe(it) } ?: "no such workspace"
     }
 
     private companion object {
@@ -271,6 +316,9 @@ open class SwayCrowdedDockTest {
 
         /** Long enough for a restore to land, short enough that the expected failure is quick. */
         const val MISPLACED_WAIT_MS = 1_000L
+
+        /** Narrow enough that any resize taking a share from it is refused once the dock joins. */
+        const val NARROW_PX = 102
         val AGENT = AgentId("agent-1")
     }
 }

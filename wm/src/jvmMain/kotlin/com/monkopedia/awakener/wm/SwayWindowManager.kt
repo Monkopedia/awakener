@@ -1377,7 +1377,7 @@ class SwayWindowManager(
             // report "nothing wrong" for the run that just failed.
             var fault: String? = null
             val landed = pollTree(cfg[WmFlags.unmapWaitMs]) {
-                fault = restoreFault(dock, sizePpt)
+                fault = restoreFault(surface, dock, sizePpt)
                 if (fault == null) true else null
             } == true
             check(landed) {
@@ -1412,9 +1412,11 @@ class SwayWindowManager(
          * A dock short of its width is not a fault where sway refused the resize ([refusedResize],
          * #261): the restore did everything it could, and the layout is one sway will not leave.
          * That is decided by sway's own rule rather than by a wider tolerance, so the same dock
-         * short of its width in a split sway *would* have resized still fails the readback.
+         * short of its width in a split sway *would* have resized still fails the readback. And
+         * only in [surface]'s own split: a dock that ended up in some other crowded split is
+         * misplaced, however reasonable sway's refusal there was.
          */
-        private suspend fun restoreFault(dock: SurfaceId, sizePpt: Int): String? {
+        private suspend fun restoreFault(surface: SurfaceId, dock: SurfaceId, sizePpt: Int): String? {
             val tree = tree()
             val node = tree.find(dock.raw) ?: return "it is not in the tree at all"
             if (tree.workspace(SCRATCH_WORKSPACE)?.find(dock.raw) != null) {
@@ -1426,7 +1428,9 @@ class SwayWindowManager(
             val percent = node.percent
                 ?: return "sway reports no width fraction for it, so it is in no tiled container"
             val wanted = sizePpt / 100.0
-            if (abs(percent - wanted) > PPT_TOLERANCE && tree.refusedResize(dock.raw, sizePpt) == null) {
+            val excused = tree.parentOf(dock.raw)?.id == tree.parentOf(surface.raw)?.id &&
+                tree.refusedResize(dock.raw, sizePpt) != null
+            if (abs(percent - wanted) > PPT_TOLERANCE && !excused) {
                 return "it is ${percent * 100}% of its container wide rather than the " +
                     "configured $sizePpt%"
             }
