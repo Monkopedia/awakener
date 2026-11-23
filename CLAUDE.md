@@ -353,15 +353,17 @@ someone believes it — it is that an agent who measures, catches the loose clau
   `kernel.panic=30` and `panic_on_oops=1` so a panic reboots instead of hanging forever, a 60s
   systemd hardware watchdog, netconsole streaming kernel output to adolin
   (`~/kaladin-netconsole/kernel.log`), and a 15s load/thermal sampler at
-  `/var/log/kaladin-load.log`. Cause unproven. It **froze again on 2026-11-02** with 22 JVMs
-  up across the fleet, and the cross-agent cap that followed is host-side, not here: wrap every
-  Gradle command in `fleet-build` (`~/.local/bin`, `FLEET_BUILD_SLOTS`, default 4 slots shared
-  by every repo). A bare `./gradlew` bypasses it. The slot is freed when the command exits,
-  while its daemon stays resident until the 15-minute idle timeout in
-  `~/.gradle/gradle.properties` or the `jvm-reaper` user timer, which reaps idle daemons only
-  under 12000 MB available. `gradle.properties` bounds one daemon, not how many run; its
-  comment says what bounds the rest, with numbers. Keep concurrent heavy work modest and
-  prefer targeted module tests over repeated full builds.
+  `/var/log/kaladin-load.log`. Cause unproven. It **froze again on 2026-11-02** with 22 JVMs up
+  across the fleet (the figure fleet-build's header records; the sampler log that would hold it
+  has since been truncated), and the cross-agent cap that followed is host-side, not here: wrap
+  every Gradle command in `fleet-build` (`~/.local/bin`, `FLEET_BUILD_SLOTS`, default 4 slots
+  shared by every repo). A bare `./gradlew` bypasses it. The slot is freed when the command
+  exits, while its daemon stays resident until the 15-minute idle timeout in
+  `~/.gradle/gradle.properties` or the `jvm-reaper` user timer, which, only under 12000 MB
+  available, reaps any daemon whose CPU time in whole seconds did not advance over 30s (so a
+  daemon using under a second of CPU mid-build counts as idle). `gradle.properties` bounds one
+  daemon, not how many run; its comment says what bounds the rest, with numbers. Keep
+  concurrent heavy work modest and prefer targeted module tests over repeated full builds.
 - **adolin** — the desktop, and awakener's actual target. GPU, active seat0 on tty2, running
   **GNOME Shell**. Known present: `google-chrome-stable`, `xorg-xwayland`, `sway 1.12`,
   `foot 1.27.0`, `waydroid 1.6.3`, `spanreed`, `jq`, `qemu`. Reachable by passwordless ssh
