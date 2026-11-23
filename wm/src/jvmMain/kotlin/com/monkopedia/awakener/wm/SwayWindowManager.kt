@@ -1377,13 +1377,14 @@ class SwayWindowManager(
             // report "nothing wrong" for the run that just failed.
             var fault: String? = null
             val landed = pollTree(cfg[WmFlags.unmapWaitMs]) {
-                fault = restoreFault(dock, sizePpt)
+                fault = restoreFault(surface, dock, sizePpt)
                 if (fault == null) true else null
             } == true
             check(landed) {
                 "dock ${dock.raw} was not docked beside surface ${surface.raw} " +
                     "${cfg[WmFlags.unmapWaitMs]}ms after the restore went out: $fault"
             }
+            takeRefusedWidthFromSurface(surface, dock, sizePpt)
 
             // Re-issued rather than relied upon. Under wm.dock.flatten_on_hide the hide collapsed
             // the split, so the `split horizontal` above made a *new* container that has never
@@ -1407,8 +1408,15 @@ class SwayWindowManager(
          * The tolerance is not slack. `resize set width 30 ppt` reads back as
          * `0.29999999999999999`, and the layouts this is here to reject are nowhere near: the
          * 50/50 sway leaves behind when only `floating disable` has run is `0.5`.
+         *
+         * A dock short of its width is not a fault where sway refused the resize ([refusedResize],
+         * #261): the restore did everything it could, and the layout is one sway will not leave.
+         * That is decided by sway's own rule rather than by a wider tolerance, so the same dock
+         * short of its width in a split sway *would* have resized still fails the readback. And
+         * only in [surface]'s own split: a dock that ended up in some other crowded split is
+         * misplaced, however reasonable sway's refusal there was.
          */
-        private suspend fun restoreFault(dock: SurfaceId, sizePpt: Int): String? {
+        private suspend fun restoreFault(surface: SurfaceId, dock: SurfaceId, sizePpt: Int): String? {
             val tree = tree()
             val node = tree.find(dock.raw) ?: return "it is not in the tree at all"
             if (tree.workspace(SCRATCH_WORKSPACE)?.find(dock.raw) != null) {
@@ -1420,11 +1428,38 @@ class SwayWindowManager(
             val percent = node.percent
                 ?: return "sway reports no width fraction for it, so it is in no tiled container"
             val wanted = sizePpt / 100.0
-            if (abs(percent - wanted) > PPT_TOLERANCE) {
+            val excused = tree.parentOf(dock.raw)?.id == tree.parentOf(surface.raw)?.id &&
+                tree.refusedResize(dock.raw, sizePpt) != null
+            if (abs(percent - wanted) > PPT_TOLERANCE && !excused) {
                 return "it is ${percent * 100}% of its container wide rather than the " +
                     "configured $sizePpt%"
             }
             return null
+        }
+
+        /**
+         * Under [WmFlags.crowdedWidth] `FROM_SURFACE`, gives [dock] the width sway refused it
+         * (#261) out of [surface] alone, which it sits right beside.
+         *
+         * `resize grow left|right` takes the growth from the one neighbour on that side, so the
+         * docks squeezed towards the floor are not asked for any of it. Skipped where the
+         * surface itself would end under the floor, which sway would refuse too — the dock then
+         * keeps the share it has, as under `AS_SWAY_LEAVES`.
+         */
+        suspend fun takeRefusedWidthFromSurface(surface: SurfaceId, dock: SurfaceId, sizePpt: Int) {
+            if (config[WmFlags.crowdedWidth] != CrowdedWidth.FROM_SURFACE) return
+            val tree = tree()
+            val shortfall = tree.refusedResize(dock.raw, sizePpt) ?: return
+            val siblings = tree.parentOf(dock.raw)?.nodes ?: return
+            val index = siblings.indexOfFirst { it.id == dock.raw }
+            val edge = when (surface.raw) {
+                siblings.getOrNull(index - 1)?.id -> "left"
+                siblings.getOrNull(index + 1)?.id -> "right"
+                else -> return
+            }
+            val room = siblings.first { it.id == surface.raw }.rect?.width ?: return
+            if (room - shortfall < MIN_SANE_WIDTH) return
+            run("[con_id=${dock.raw}] resize grow $edge $shortfall px")
         }
 
         /**
@@ -2006,6 +2041,7 @@ class SwayWindowManager(
                         run("[con_id=${dockId.raw}] move left")
                     }
                     run("[con_id=${dockId.raw}] resize set width ${cfg[WmFlags.dockSizePpt]} ppt")
+                    takeRefusedWidthFromSurface(surface, dockId, cfg[WmFlags.dockSizePpt])
 
                     // After the dock is in its final place, so the container this names is the one
                     // the user will be looking at. Inside the unwind's reach on purpose: a title
@@ -3265,4 +3301,44 @@ class SwayWindowManager(
          */
         val spawnTokens = SecureRandom()
     }
+}
+
+/**
+ * sway's floor on a tiled window's width, `MIN_SANE_W` in sway 1.12's `include/sway/tree/node.h`.
+ * A resize that would take any window under it is not made.
+ */
+internal const val MIN_SANE_WIDTH = 100
+
+/**
+ * How many pixels short of [sizePpt] sway leaves the window [dock] because it refused the
+ * `resize set width` that asked for it, or null when sway would have made that resize (#261).
+ *
+ * This is sway 1.12's own decision, recomputed from the tree it acted on rather than allowed
+ * for with slack. `resize set width` on a tiled window converts the percentage to pixels of the
+ * nearest horizontal split, then takes the growth from **every** sibling in that split in an
+ * equal share, rounded up — and when any one of them would end under [MIN_SANE_WIDTH], it
+ * changes nothing and still reports success (`resize_set_tiled` and `container_resize_tiled`
+ * in `sway/commands/resize.c`). A refused resize leaves the tree exactly as it was, so the tree
+ * read afterwards is the one sway judged.
+ *
+ * Several docks on one surface is what reaches it: each new one is tiled beside the surface and
+ * the oldest is squeezed towards the floor, so the restore's resize is refused and the dock
+ * keeps the share `floating disable` gave it — measured on headless 1.12 at 25% of a split of
+ * four and 20% of a split of five, against 30 configured.
+ *
+ * Null for anything sway would have resized, so a dock short of its width in a split with room
+ * to give it — the resize never sent, or undone by another client — is still a fault.
+ */
+internal fun Node.refusedResize(dock: Long, sizePpt: Int): Int? {
+    val split = parentOf(dock)?.takeIf { it.layout == "splith" } ?: return null
+    val node = split.nodes.firstOrNull { it.id == dock } ?: return null
+    val siblings = split.nodes - node
+    val splitWidth = split.rect?.width ?: return null
+    val width = node.rect?.width ?: return null
+    if (siblings.isEmpty()) return null
+    val growth = splitWidth * sizePpt / 100 - width
+    if (growth <= 0) return null
+    val share = (growth + siblings.size - 1) / siblings.size
+    val refused = siblings.any { (it.rect?.width ?: return null) - share < MIN_SANE_WIDTH }
+    return growth.takeIf { refused }
 }

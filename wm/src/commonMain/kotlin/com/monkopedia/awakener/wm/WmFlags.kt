@@ -79,6 +79,18 @@ enum class FullscreenSurface {
     REFUSE,
 }
 
+/**
+ * What a dock gets when sway refuses it its configured width because the split is crowded
+ * (#261). See [WmFlags.crowdedWidth].
+ */
+enum class CrowdedWidth {
+    /** The share sway leaves it, with the other windows in the split as they were. */
+    AS_SWAY_LEAVES,
+
+    /** Its configured width, taken from the surface beside it, if the surface can spare it. */
+    FROM_SURFACE,
+}
+
 /** What a tab is left focused on once dock interaction ends. */
 enum class RestingFocus { APP, DOCK }
 
@@ -436,6 +448,19 @@ object WmFlags {
         "wm.dock.size_ppt",
         30,
         "Dock width as a percentage of the tab, applied after the dock maps.",
+    )
+
+    val crowdedWidth = Flags.enum(
+        "wm.dock.crowded_width",
+        CrowdedWidth.AS_SWAY_LEAVES,
+        "What a dock gets when sway will not give it wm.dock.size_ppt (#261). sway takes a " +
+            "resize from every window in the split at once and refuses it outright when any one " +
+            "would end under 100 px, which several docks on one surface reach: the oldest is " +
+            "squeezed towards that floor. AS_SWAY_LEAVES: the dock keeps the share sway gave it " +
+            "on tiling — 25% of a split of four, 20% of five — and nothing else moves. " +
+            "FROM_SURFACE: one more resize, after the attach or show, takes the shortfall from " +
+            "the surface beside the dock alone, unless that would put the surface under the " +
+            "floor; the cost is a second layout reaching the screen.",
     )
 
     val dockFocusOnMap = Flags.boolean(
