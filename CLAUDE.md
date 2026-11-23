@@ -21,7 +21,7 @@ is the ephemeral per-task coordinator.
 
 ```sh
 AWAKENER_REQUIRE_SWAY=1 AWAKENER_REQUIRE_SPANREED=1 \
-  JAVA_HOME=/usr/lib/jvm/java-21-openjdk ./gradlew clean build --no-build-cache
+  JAVA_HOME=/usr/lib/jvm/java-21-openjdk fleet-build ./gradlew clean build --no-build-cache
 ```
 
 *That* is the full autonomous check — it compiles every module and runs all tests, including
@@ -29,6 +29,9 @@ the `:wm` integration suite against a real headless sway. Every piece of it is l
 and dropping any piece still prints `BUILD SUCCESSFUL`:
 
 - **`JAVA_HOME`** pins 21, because the system JDK on kaladin is 8.
+- **`fleet-build`** takes one of kaladin's fleet-wide build slots, the only cross-agent cap on
+  concurrent builds; the kaladin bullet below says what it does and does not bound. It is a
+  kaladin tool, so drop it elsewhere.
 - **The two REQUIRE flags** turn a missing `sway`/`foot`/`spanreed` into a failure instead of
   a skip. The bullet below is the long version, and it calls them mandatory; a fence that
   omitted them was a way to disobey the rule by following the documentation (#91).
@@ -350,8 +353,15 @@ someone believes it — it is that an agent who measures, catches the loose clau
   `kernel.panic=30` and `panic_on_oops=1` so a panic reboots instead of hanging forever, a 60s
   systemd hardware watchdog, netconsole streaming kernel output to adolin
   (`~/kaladin-netconsole/kernel.log`), and a 15s load/thermal sampler at
-  `/var/log/kaladin-load.log`. Cause unproven. Keep concurrent heavy work modest and prefer
-  targeted module tests over repeated full builds.
+  `/var/log/kaladin-load.log`. Cause unproven. It **froze again on 2026-11-02** with 22 JVMs
+  up across the fleet, and the cross-agent cap that followed is host-side, not here: wrap every
+  Gradle command in `fleet-build` (`~/.local/bin`, `FLEET_BUILD_SLOTS`, default 4 slots shared
+  by every repo). A bare `./gradlew` bypasses it. The slot is freed when the command exits,
+  while its daemon stays resident until the 15-minute idle timeout in
+  `~/.gradle/gradle.properties` or the `jvm-reaper` user timer, which reaps idle daemons only
+  under 12000 MB available. `gradle.properties` bounds one daemon, not how many run; its
+  comment says what bounds the rest, with numbers. Keep concurrent heavy work modest and
+  prefer targeted module tests over repeated full builds.
 - **adolin** — the desktop, and awakener's actual target. GPU, active seat0 on tty2, running
   **GNOME Shell**. Known present: `google-chrome-stable`, `xorg-xwayland`, `sway 1.12`,
   `foot 1.27.0`, `waydroid 1.6.3`, `spanreed`, `jq`, `qemu`. Reachable by passwordless ssh
