@@ -45,8 +45,9 @@ Keep the interface **tiny** and compositor-agnostic:
 - `resolve(surface) -> agent`
 - `attach(surface, dock)`
 - change notification (every window the compositor tracks fires it — appearing, vanishing,
-  focus, retitle; a multiplexed surface's inner changes, such as a Chrome tab switch, never
-  reach it and are its manager's to report)
+  focus, retitle; a multiplexed surface's inner identity — which tab or origin a Chrome window
+  is showing — is its manager's to report, since the compositor sees a tab switch at most as a
+  retitle of the one outer window)
 
 First implementation is a **sway IPC client**. `get_tree`, window events, marks, and
 criteria are enough to prototype the entire binding model without touching compositor code.

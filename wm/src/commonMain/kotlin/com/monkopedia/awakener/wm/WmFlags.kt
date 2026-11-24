@@ -496,7 +496,7 @@ object WmFlags {
             "is why REFOCUS_AFTER_MAP is the default; what is fixed is the accumulation, and " +
             "only within one window manager: the memory of which app_ids already carry a rule " +
             "is that manager's, held in process memory and dropped when it sees the session " +
-            "end, so at most one rule is issued per app_id per manager rather than one per " +
+            "end — which with wm.events.enabled off it never does — so at most one rule is issued per app_id per manager rather than one per " +
             "attach. sway has no way to read its rules back, so a fresh process starts with " +
             "nothing and issues another — and awakener-invoke is a fresh process on every " +
             "press, so in the shipped deployment this still adds one rule per attach. " +
@@ -625,9 +625,9 @@ object WmFlags {
             "once something takes that mark off it — a hand-run unmark, or, under " +
             "wm.dock.mark_scheme=SURFACE, a second attach on the same surface (#14). Nothing " +
             "withdraws that record short of the compositor session ending, which discards all " +
-            "of it, so under MARK_OR_TABLE a node that carried a dock mark of " +
+            "of it when wm.events.enabled is on to observe the end, so under MARK_OR_TABLE a node that carried a dock mark of " +
             "its own at any single read is a dock for the life of the process — or of the " +
-            "session, if that ends first — whatever its marks say afterwards. MARK_ONLY is the " +
+            "session, if that ends first and events are on — whatever its marks say afterwards. MARK_ONLY is the " +
             "previous behaviour and the debuggable one — the " +
             "whole truth is then in `swaymsg -t get_tree` with nothing held in process memory " +
             "— and it is the lever to reach for if the record is ever suspected of hiding a " +
@@ -670,7 +670,7 @@ object WmFlags {
             "recognition outlives the mark that produced it. A genuine window carrying a user's " +
             "own mark that happens to be shaped exactly like that window's dock mark (#15's " +
             "residual) is therefore hidden from enumeration for the life of the process, or " +
-            "until the compositor session ends, even " +
+            "until the compositor session ends if wm.events.enabled is on to see it end, even " +
             "after the mark is removed. Being hidden is recoverable — " +
             "wm.dock.recognition=MARK_ONLY, " +
             "or an awakener restart — and being killed is not, so CURRENT will not reap on that " +
