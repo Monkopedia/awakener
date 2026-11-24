@@ -487,7 +487,11 @@ which is the same predicate `no_focus` uses: the dock's `app_id`. So the table c
 **reservations** as well as entries. `attach` files a reservation immediately before `exec`,
 and converts it to an entry when the node is identified. While a reservation is outstanding,
 `surfaces()` excludes any window reporting that `app_id` that it did not already know as a
-surface.
+surface. *(Amended 2026-11-23, #54: nothing converts anything. As built, `attach` records the
+entry when the node is identified and, separately, releases the reservation in a `finally` around
+the whole call — `DockTable` has `reserve`, `release` and `record`, and no operation that turns
+one into the other. Until that `finally` runs the two coexist, the reservation still covering
+any further window under the name.)*
 
 A reservation is `{ appId, standing: Set<SurfaceId>, deadline }`, and **`standing` is part of
 the record, not something the reader recomputes.** "Did not already know as a surface" is the
@@ -500,7 +504,17 @@ Two properties make this tolerable rather than a blunt instrument:
 - Reservations are created only inside the tree-edit critical section, so at most one is
   outstanding at a time, bounded by the existing 5s map timeout. *(Amended by Decision 2: a
   failed attach converts its reservation into a claim that outlives it by one further map
-  timeout. Restated in full there.)*
+  timeout. Restated in full there.)* *(Amended 2026-11-23, #54: neither half holds as built,
+  and Decision 2's claim was never built either. Reservations are still **filed** only inside
+  the critical section, but they are **released** outside it — the `finally` that evicts one
+  wraps the whole of `attach`, including the registry bind that runs after the tree-edit section
+  has ended — so a second attach in the same manager can file its own while the first's is
+  still outstanding. `DockTableSnapshot.reservations` is a `List` and `reserves` asks `.any {}`
+  for exactly that reason, and the deadline exists for a reservation whose attach never reached
+  its `finally`. The bound is that deadline, `wm.wait.reservation_grace_ms` (5s by default,
+  constrained to be at least `wm.wait.map_ms`), counted from the filing, not the map timeout.
+  So the blast radius of `NEW_NODE` suppression is every reservation alive at once, each for up
+  to its grace, rather than one.)*
 - Under `DockIdentity.PER_SURFACE_APP_ID` the reservation is exact. Under the default
   `NEW_NODE` it is coarse — it also hides a hand-launched window reporting the dock's name for
   the length of the attach. That is the same trust assumption `NEW_NODE` already documents in
@@ -692,6 +706,11 @@ accepted it — but worth knowing before someone invents a heartbeat.
   `swaymsg -t get_tree`, with nothing hidden in process memory. It is the lever to reach for
   if the table is ever suspected of hiding a real surface — and since adoption records, it is
   the *only* thing short of a restart that releases one; see "Recording is one-way".
+  *(Amended 2026-11-23, #54: "today's" was the behaviour before PR #23 and has not been since;
+  `MARK_ONLY` is the **previous** behaviour, which is what the flag's own description calls it.
+  Two consequences the flag list here did not state: under `MARK_ONLY` a filed reservation is
+  never consulted, so `wm.dock.pending_suppression` has no effect; and with no record there is
+  no latch, so `wm.dock.reap_evidence=CURRENT` and `=RECOGNITION` reap the same nodes.)*
 - `wm.dock.reap_evidence` = `STOOD_UP` | `CURRENT` | `RECOGNITION`, **default `CURRENT`.** *(Added
   2026-07-31 with #23; `STOOD_UP` added the same day with #35.)* What the orphan sweep must see
   before it kills a node enumeration calls a dock: an entry this process wrote when it stood the
@@ -722,7 +741,9 @@ accepted it — but worth knowing before someone invents a heartbeat.
 - `wm.dock.pending_suppression` = boolean, **default `true`.** The reservation. Off is
   today's behaviour, i.e. #9 unfixed but with no over-suppression risk at all. It gates whether
   a reservation is *filed*; it never gates whether one is cleared, and neither does any other
-  flag — see "Bookkeeping is not compensation".
+  flag — see "Bookkeeping is not compensation". *(Amended 2026-11-23, #54: off is the
+  **previous** behaviour, not today's — PR #23 shipped it on. And it is a no-op under
+  `wm.dock.recognition=MARK_ONLY`, which consults no reservation.)*
 
 ### Rejected
 
@@ -1331,6 +1352,11 @@ needs the hotkey path, which does not exist yet. Do not force it into these flag
   them gates bookkeeping**, which is the property that matters and the one an earlier draft got
   wrong. *(As built, five of the six exist. `wm.dock.late_dock` does not: it gates a claim
   mechanism nothing builds and nothing reads — see the amendment on "The late dock".)*
+  *(Amended 2026-11-23, #54: the note introduces **seven**, not six — `wm.dock.mark_scheme`
+  is specified in "Flags" above beside `recognition`, `reap_evidence` and
+  `pending_suppression`, and was left out of this count. Six of the seven exist; `late_dock`
+  is still the one that does not. `mark_scheme` gates no bookkeeping either: it decides which
+  marks are read and written, not whether an entry or reservation is filed or cleared.)*
   *(#18 adds three more, outside this note's six and in their own namespace:
   `wm.repair.sweep_on_close`, `wm.repair.sweep_failure` and `wm.repair.collector_failure`. None of
   them gates bookkeeping either, and the session-boundary discard is under no flag at all, since a
