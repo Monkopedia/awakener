@@ -210,6 +210,10 @@ open class SwayCrowdedDockTest {
      * such one found it. Counted, so a run in which no dock ever came back to its own split
      * cannot pass.
      *
+     * The user's window, where there is one, is held to the same per-round bound: #264 was filed
+     * as the user's window being squeezed, and a show that widened the surface out of it would
+     * pass a check on the surface alone.
+     *
      * Narrower only, because that is #264: a surface already at sway's floor leaves the
      * proportional plan no room, and the show then falls back to `resize set width`, whose
      * equal share can hand the surface a few px more than the hide took. Measured on CI's sway
@@ -232,12 +236,17 @@ open class SwayCrowdedDockTest {
                 val tree = wm.tree()
                 val split = tree.parentOf(dock.dockId.raw)?.id
                 val surface = assertNotNull(tree.find(app.raw)?.rect?.width, stage)
+                val theirs = mine?.let { assertNotNull(tree.find(it.raw)?.rect?.width, stage) }
                 assertEquals(true, dock.hide(), "$stage: the hide")
                 assertEquals(true, dock.show(), "$stage: the show")
                 val after = wm.tree()
                 if (after.parentOf(dock.dockId.raw)?.id != split) continue
                 last = assertNotNull(after.find(app.raw)?.rect?.width, stage)
                 assertTrue(surface - last <= ROUND_TRIP_PX, "$stage: the surface went from $surface to $last px: ${describe()}")
+                if (mine != null) {
+                    val now = assertNotNull(after.find(mine.raw)?.rect?.width, stage)
+                    assertTrue(theirs!! - now <= ROUND_TRIP_PX, "$stage: the user's window went from $theirs to $now px: ${describe()}")
+                }
                 if (first == null) first = surface
                 held++
             }
