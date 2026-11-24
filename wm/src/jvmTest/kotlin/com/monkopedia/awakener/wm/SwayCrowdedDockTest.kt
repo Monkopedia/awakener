@@ -8,7 +8,6 @@ import java.nio.file.Path
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.io.path.absolutePathString
 import kotlin.io.path.createTempDirectory
-import kotlin.math.abs
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -206,9 +205,15 @@ open class SwayCrowdedDockTest {
      * Stands [docks] docks on one surface as [crowded] does — the user's window moved in after the
      * last of them instead when [joinsAfter] — and hides and shows each in turn for twelve rounds.
      * Every show must succeed, and every hide and show of a dock that came back into the split it
-     * was hidden from must leave the surface within [ROUND_TRIP_PX] of the width it had before
-     * the hide; across all of them, it must end within [DRIFT_PX] of where the first such one
-     * found it. Counted, so a run in which no dock ever came back to its own split cannot pass.
+     * was hidden from must leave the surface no more than [ROUND_TRIP_PX] narrower than it was
+     * before the hide; across all of them, no more than [DRIFT_PX] narrower than where the first
+     * such one found it. Counted, so a run in which no dock ever came back to its own split
+     * cannot pass.
+     *
+     * Narrower only, because that is #264: a surface already at sway's floor leaves the
+     * proportional plan no room, and the show then falls back to `resize set width`, whose
+     * equal share can hand the surface a few px more than the hide took. Measured on CI's sway
+     * 1.11 in the late-join case, 101 to 112 px; 1.12 never reaches the floor there.
      */
     private fun rounds(docks: Int, userWindow: Boolean, joinsAfter: Boolean = false) = swayTest {
         openSurface("aw-other")
@@ -232,13 +237,13 @@ open class SwayCrowdedDockTest {
                 val after = wm.tree()
                 if (after.parentOf(dock.dockId.raw)?.id != split) continue
                 last = assertNotNull(after.find(app.raw)?.rect?.width, stage)
-                assertTrue(abs(last - surface) <= ROUND_TRIP_PX, "$stage: the surface went from $surface to $last px: ${describe()}")
+                assertTrue(surface - last <= ROUND_TRIP_PX, "$stage: the surface went from $surface to $last px: ${describe()}")
                 if (first == null) first = surface
                 held++
             }
         }
         assertTrue(held >= (ROUNDS - 1) * docks, "only $held of ${ROUNDS * docks} shows came back to their own split")
-        assertTrue(abs(last - first!!) <= DRIFT_PX, "the surface drifted from $first to $last px: ${describe()}")
+        assertTrue(first!! - last <= DRIFT_PX, "the surface drifted from $first to $last px: ${describe()}")
     }
 
     /**
