@@ -16,7 +16,7 @@ import java.util.jar.JarFile
  * them, and an entry point that forgets to name one silently under-reports. Discovery is by
  * convention instead: any class under [PACKAGE] whose name ends in [SUFFIX] and is not [Flags]
  * itself, anywhere on the classpath. A module added by someone who has never read this file is
- * covered, provided it follows the convention its three predecessors already follow.
+ * covered, provided it follows the convention every existing declarer already follows.
  *
  * Loading is idempotent — the JVM runs a class initialiser once — so calling this twice does
  * not trip [Flags]' duplicate-key check.

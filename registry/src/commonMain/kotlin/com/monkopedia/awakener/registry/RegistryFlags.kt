@@ -491,7 +491,9 @@ object RegistryFlags {
             "`awakener-registry forget` runs, so re-reading is what keeps a forget from being " +
             "undone; NEVER is the old single-writer store, cheapest and unsafe beside a CLI. " +
             "BEFORE_WRITE keeps the file correct but not the answers: a holder goes on " +
-            "resolving to an agent that was forgotten until something makes it write.",
+            "resolving to an agent that was forgotten until something makes it write. " +
+            "BEFORE_READ, the default, also re-reads before each resolve — a small file read on " +
+            "the hotkey path — so once a forget returns nothing resolves to the old agent.",
     )
 
     val lockRequired = Flags.boolean(
@@ -532,8 +534,15 @@ object RegistryFlags {
     val windowIdentity = Flags.enum(
         "registry.key.window_identity",
         WindowIdentity.APP_ID,
-        "What makes two windows the same surface. Per-app is stable across restarts; per-title " +
-            "splits a multi-window app but inherits that app's title churn.",
+        "What makes two windows the same surface. APP_ID, the default, is one agent per " +
+            "application and stable across restarts. APP_ID_AND_TITLE splits a multi-window app " +
+            "but inherits that app's title churn: a title carrying a dirty marker or a line " +
+            "number mints a new agent each time it changes. APP_ID_AND_PID is one agent per " +
+            "running process and deliberately not stable across restarts, since pids are " +
+            "recycled — a fresh agent per launch, for when the accumulated model would be " +
+            "noise. A surface its manager names by origin is keyed on that origin under every " +
+            "value, and a window with no app_id is keyed on whatever registry.key.missing_app_id " +
+            "says, with the title or pid still added under the latter two values.",
     )
 
     val missingAppId = Flags.enum(

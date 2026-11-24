@@ -522,11 +522,16 @@ object WmFlags {
             "wm.dock.identity=NEW_NODE those criteria are the app_id every dock shares, so one " +
             "attach under it suppresses focus for every dock afterwards, including docks " +
             "attached while this flag says to focus on map. That half is not fixable here and " +
-            "is why REFOCUS_AFTER_MAP is the default; what is fixed is the accumulation — at " +
-            "most one rule is issued per app_id per compositor session rather than one per " +
-            "attach. Combining it with wm.dock.identity=PER_SURFACE_APP_ID is the one " +
-            "arrangement whose rule list still grows without bound, since every attach mints a " +
-            "fresh name for the memory to miss.",
+            "is why REFOCUS_AFTER_MAP is the default; what is fixed is the accumulation, and " +
+            "only within one window manager: the memory of which app_ids already carry a rule " +
+            "is that manager's, held in process memory and dropped when it sees the session " +
+            "end — which with wm.events.enabled off it never does — so at most one rule is issued per app_id per manager rather than one per " +
+            "attach. sway has no way to read its rules back, so a fresh process starts with " +
+            "nothing and issues another — and awakener-invoke is a fresh process on every " +
+            "press, so in the shipped deployment this still adds one rule per attach. " +
+            "Combining it with wm.dock.identity=PER_SURFACE_APP_ID is the other " +
+            "arrangement whose rule list grows without bound even inside one manager, since " +
+            "every attach mints a fresh name for the memory to miss.",
     )
 
     val dockIdentity = Flags.enum(
@@ -565,7 +570,8 @@ object WmFlags {
             "mark — this prefix followed by whatever wm.dock.mark_scheme says, and nothing " +
             "else — is what " +
             "keeps them out of surface enumeration and focus scripting across an awakener " +
-            "restart, while sway keeps running. Changing it against a running desktop orphans " +
+            "restart, while sway keeps running. Under the default wm.dock.recognition=" +
+            "MARK_OR_TABLE, changing it against a running desktop orphans " +
             "less than it looks and hides more. It orphans only a dock nothing has enumerated " +
             "since this process started: everything else is already in the record — the docks " +
             "this process stood up, and every dock recognised from its old-prefix mark by any " +
@@ -573,7 +579,11 @@ object WmFlags {
             "against the prefix again, so the flip carries it. That last clause is also the " +
             "sharp edge: a genuine window hidden by a prefix-shaped user mark under the old " +
             "value stays hidden under the new one, and removing the mark does not release it " +
-            "either. Moving the prefix is a restart with no docks standing, not a flip.",
+            "either. Under MARK_ONLY there is no record to carry anything, so a flip orphans " +
+            "every standing dock, as a restart into the new value does under either — and " +
+            "awakener-invoke is a restart on every press, so for the shipped hotkey every flip " +
+            "is one. Moving " +
+            "the prefix is a restart with no docks standing, not a flip.",
         PLAIN_NAME,
     )
 
@@ -609,11 +619,21 @@ object WmFlags {
             "which is what #15 is. Both older values are here because a downgrade is the whole " +
             "of the recovery if an upgrade lands while docks are standing, and each is worth its " +
             "price only in a session with no marks under this prefix that awakener did not " +
-            "write. This decides reading and writing together, so an upgrade over standing docks " +
-            "— or a flip against a live desktop — strands every dock marked under another value: " +
-            "those marks stop being recognised, the docks become bindable surfaces a hotkey will " +
-            "mint an agent for, and their names are reported through the manager's unrecognised " +
-            "dock marks rather than passed over. A stranded dock is never reaped and no scheme " +
+            "write. This decides reading and writing together, so a dock marked under another " +
+            "value is stranded unless something already holds it: its mark stops being " +
+            "recognised, it becomes a bindable surface a hotkey will " +
+            "mint an agent for, and the mark is reported through the manager's unrecognised " +
+            "dock marks rather than passed over. What holds one is the record " +
+            "wm.dock.recognition=MARK_OR_TABLE keeps, exactly as wm.dock.mark_prefix states for " +
+            "that flag: under that default a flip against a live desktop carries every dock this " +
+            "process stood up or recognised at any read before the flip, and strands only the " +
+            "rest — though a carried dock that was adopted is then reaped only under " +
+            "wm.dock.reap_evidence=RECOGNITION, since its mark no longer counts as one. An " +
+            "upgrade is a new process with an empty record, so it strands every dock standing " +
+            "under the old value, and so does any flip under MARK_ONLY — and so does any flip " +
+            "under awakener-invoke, which is a new process on every press and so has recorded " +
+            "nothing from before it. A stranded dock is " +
+            "never reaped and no scheme " +
             "reads another scheme's mark as a dock mark, so that costs a leak and never a kill: " +
             "close the stranded panels by hand, or flip to the value they were marked under, " +
             "close them, and flip back. Move it with no docks standing.",
@@ -633,13 +653,16 @@ object WmFlags {
             "adds it to the record, so a dock adopted after a restart stays recognised even " +
             "once something takes that mark off it — a hand-run unmark, or, under " +
             "wm.dock.mark_scheme=SURFACE, a second attach on the same surface (#14). Nothing " +
-            "withdraws that record, so under MARK_OR_TABLE a node that carried a dock mark of " +
-            "its own at any single read is a dock for the life of the process whatever its " +
-            "marks say afterwards. MARK_ONLY is the previous behaviour and the debuggable one — the " +
+            "withdraws that record short of the compositor session ending, which discards all " +
+            "of it when wm.events.enabled is on to observe the end, so under MARK_OR_TABLE a node that carried a dock mark of " +
+            "its own at any single read is a dock for the life of the process — or of the " +
+            "session, if that ends first and events are on — whatever its marks say afterwards. MARK_ONLY is the " +
+            "previous behaviour and the debuggable one — the " +
             "whole truth is then in `swaymsg -t get_tree` with nothing held in process memory " +
             "— and it is the lever to reach for if the record is ever suspected of hiding a " +
             "real window, being the only thing that releases one live. It also stops a pending " +
-            "attach's reservation from suppressing anything, for the same reason. The record is " +
+            "attach's reservation from suppressing anything, for the same reason, which makes " +
+            "wm.dock.pending_suppression a no-op under it. The record is " +
             "never written to disk and holds no agent, so nothing this flag decides can change " +
             "which agent a surface is bound to: that is the registry's, keyed on what outlives " +
             "the window. What it does decide is which windows are enumerable, and under " +
@@ -663,7 +686,9 @@ object WmFlags {
             "for a moment, while a dock briefly present costs a minted agent and a durable " +
             "registry write for the panel. Under PER_SURFACE_APP_ID the suppression is exact. " +
             "This decides only whether a reservation is filed; nothing decides whether one is " +
-            "cleared, which is unconditional.",
+            "cleared, which is unconditional. Under wm.dock.recognition=MARK_ONLY a filed " +
+            "reservation is never consulted, so this has no effect there and enumeration has " +
+            "the map-to-mark gap whichever way it is set.",
     )
 
     val reapEvidence = Flags.enum(
@@ -673,7 +698,8 @@ object WmFlags {
             "Recognising a dock by its mark records it, and that record is never withdrawn, so " +
             "recognition outlives the mark that produced it. A genuine window carrying a user's " +
             "own mark that happens to be shaped exactly like that window's dock mark (#15's " +
-            "residual) is therefore hidden from enumeration for the life of the process even " +
+            "residual) is therefore hidden from enumeration for the life of the process, or " +
+            "until the compositor session ends if wm.events.enabled is on to see it end, even " +
             "after the mark is removed. Being hidden is recoverable — " +
             "wm.dock.recognition=MARK_ONLY, " +
             "or an awakener restart — and being killed is not, so CURRENT will not reap on that " +
@@ -705,7 +731,11 @@ object WmFlags {
             "by this process, so it is never reaped — its panel stands when its surface closes " +
             "and has to be closed by hand. That is a leaked panel against a destroyed window, " +
             "and CURRENT stays the default because the default wm.dock.mark_scheme already makes " +
-            "the destroyed window need a mark nobody writes by accident.",
+            "the destroyed window need a mark nobody writes by accident. Under " +
+            "wm.dock.recognition=MARK_ONLY there is no record and so no latch: everything the " +
+            "sweep calls a dock is carrying a dock mark at that moment, which CURRENT accepts, " +
+            "so CURRENT and RECOGNITION reap exactly the same nodes there and only STOOD_UP " +
+            "differs.",
     )
 
     val stoodUpProof = Flags.enum(
@@ -1026,7 +1056,8 @@ object WmFlags {
             "repair by hand or to leave the tree damage visible while diagnosing without also " +
             "giving up the session boundary — the collector still watches for the compositor " +
             "going away either way. Nothing is swept on a timer: this reacts to an event or it " +
-            "does not run.",
+            "does not run. With wm.events.enabled off there is no collector and no close event, " +
+            "so this has no effect and nothing watches for the session ending either.",
     )
 
     val sweepFailure = Flags.enum(
@@ -1043,7 +1074,8 @@ object WmFlags {
             "sweep is treated as a defect to be looked at rather than a wedged panel to be lived " +
             "with. Under STOP nothing repairs anything afterwards, and nothing restarts the " +
             "collector. Either way the failure is reported through the manager's repair status, " +
-            "and under STOP wm.repair.collector_failure decides where the exception itself goes.",
+            "and under STOP wm.repair.collector_failure decides where the exception itself goes. " +
+            "Unreachable with wm.events.enabled off, which leaves no collector to drive a sweep.",
     )
 
     val collectorFailure = Flags.enum(
@@ -1069,7 +1101,9 @@ object WmFlags {
             "missing thing, and none of these three failures — a connect that raised, a " +
             "subscription sway refused, a payload that will not parse — is one a fresh " +
             "connection is known to fix. Reconnecting on them would be a retry loop wearing " +
-            "another name.",
+            "another name. Unreachable with wm.events.enabled off: the collector then finds its " +
+            "change stream already closed and returns without opening a connection, so there " +
+            "is nothing to fail.",
     )
 
     val resolveKeySource = Flags.enum(
@@ -1331,7 +1365,8 @@ object WmFlags {
             "SURFACE is a request rather than a guarantee, because not every sway can carry it: " +
             "1.9 refuses title_format on a container outright ('Only views can have a " +
             "title_format') where 1.12 accepts it. A refusal degrades to COMPOSITOR's behaviour " +
-            "for the rest of the compositor session and is reported through " +
+            "for the rest of that window manager's compositor session — a fresh process, which " +
+            "every awakener-invoke press is, asks again once — and is reported through " +
             "SwayWindowManager.tabTitleUnsupported; it never fails an attach, because a tab's " +
             "name is cosmetic and the panel standing beside it is not.",
     )
