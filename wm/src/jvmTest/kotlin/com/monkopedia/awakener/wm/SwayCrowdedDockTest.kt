@@ -15,6 +15,7 @@ import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
@@ -109,24 +110,149 @@ open class SwayCrowdedDockTest {
      * 25% and 20%, including the attach of a fourth dock beside a user's window. One show per
      * run: each one the surface pays for narrows it, and a second in a split of five finds it
      * unable to spare the width and leaves the dock as the default would, which is the flag's
-     * stated limit rather than something to assert on here.
+     * stated limit rather than something to assert on here. Under wm.dock.show_width=CONFIGURED,
+     * because that is what asks a show for 30%: under AS_HIDDEN it asks for the share the dock
+     * was hidden at.
      */
     @Test
     fun `under FROM_SURFACE three docks and a user window are each at their width`() {
         store.put(WmFlags.crowdedWidth, CrowdedWidth.FROM_SURFACE)
+        store.put(WmFlags.showWidth, ShowWidth.CONFIGURED)
         crowded(docks = 3, userWindow = true, shown = listOf(0, 2), exact = true)
     }
 
     @Test
     fun `under FROM_SURFACE four docks and a user window are each at their width`() {
         store.put(WmFlags.crowdedWidth, CrowdedWidth.FROM_SURFACE)
+        store.put(WmFlags.showWidth, ShowWidth.CONFIGURED)
         crowded(docks = 4, userWindow = true, shown = listOf(2), exact = true)
     }
 
     @Test
     fun `under FROM_SURFACE four docks are each at their width`() {
         store.put(WmFlags.crowdedWidth, CrowdedWidth.FROM_SURFACE)
+        store.put(WmFlags.showWidth, ShowWidth.CONFIGURED)
         crowded(docks = 4, userWindow = false, shown = listOf(1), exact = true)
+    }
+
+    /**
+     * #264, the issue's repro: four docks and a window of the user's, every dock hidden and shown
+     * in turn for twelve rounds. Each show used to take its width from every window in the split
+     * in an equal share, which takes more from the surface than the hide gave it, and walked it
+     * from 217 px down to sway's 100 px floor at either scale, under either
+     * wm.dock.crowded_width.
+     */
+    @Test
+    fun `twelve rounds of four docks and a user window leave the surface where it was`() =
+        rounds(docks = 4, userWindow = true)
+
+    @Test
+    fun `twelve rounds of three docks and a user window leave the surface where it was`() =
+        rounds(docks = 3, userWindow = true)
+
+    @Test
+    fun `twelve rounds of two docks leave the surface where it was`() = rounds(docks = 2, userWindow = false)
+
+    @Test
+    fun `twelve rounds of three docks leave the surface where it was`() = rounds(docks = 3, userWindow = false)
+
+    @Test
+    fun `twelve rounds of four docks leave the surface where it was`() = rounds(docks = 4, userWindow = false)
+
+    @Test
+    fun `under FROM_SURFACE twelve rounds of four docks leave the surface where it was`() {
+        store.put(WmFlags.crowdedWidth, CrowdedWidth.FROM_SURFACE)
+        rounds(docks = 4, userWindow = false)
+    }
+
+    /**
+     * #264's map: the user's window moved in after all four docks, so each dock's first show
+     * leaves the split it shares with it (#256). One of those shows lands in a split too narrow
+     * to narrow the dock to 30% without taking the dock itself under the floor, which sway
+     * refuses too, and the readback took for a misplaced dock: `94c57c8` threw "33.3% … rather
+     * than the configured 30%". The surface pays for each dock's move into its own split once,
+     * which is #256's, so only the rounds after it are held to the surface's width.
+     */
+    @Test
+    fun `twelve rounds of four docks and a user window that joined after them`() =
+        rounds(docks = 4, userWindow = true, joinsAfter = true)
+
+    /**
+     * wm.dock.show_width: a dock the user widened by hand comes back at that width under
+     * AS_HIDDEN, at wm.dock.size_ppt under CONFIGURED, and either way without the mark that
+     * carried the width across the hide.
+     */
+    @Test
+    fun `a dock widened by hand comes back at that width`() = handResized(ShowWidth.AS_HIDDEN, expected = 0.40)
+
+    @Test
+    fun `under CONFIGURED a dock widened by hand comes back at the configured width`() =
+        handResized(ShowWidth.CONFIGURED, expected = 0.30)
+
+    private fun handResized(showWidth: ShowWidth, expected: Double) = swayTest {
+        store.put(WmFlags.showWidth, showWidth)
+        val app = openSurface("aw-app")
+        val dock = wm.attach(app, dockSpec(), AGENT)
+        command("[con_id=${dock.dockId.raw}] resize set width 40 ppt")
+        assertEquals(true, dock.hide(), "the hide")
+        assertEquals(true, dock.show(), "the show")
+        val node = assertNotNull(wm.tree().find(dock.dockId.raw), "the dock: ${describe()}")
+        assertEquals(expected, assertNotNull(node.percent, describe()), 0.005, describe())
+        assertEquals(1, node.marks.size, "the dock mark alone: ${node.marks}")
+    }
+
+    /**
+     * Stands [docks] docks on one surface as [crowded] does — the user's window moved in after the
+     * last of them instead when [joinsAfter] — and hides and shows each in turn for twelve rounds.
+     * Every show must succeed, and every hide and show of a dock that came back into the split it
+     * was hidden from must leave the surface no more than [ROUND_TRIP_PX] narrower than it was
+     * before the hide; across all of them, no more than [DRIFT_PX] narrower than where the first
+     * such one found it. Counted, so a run in which no dock ever came back to its own split
+     * cannot pass.
+     *
+     * The user's window, where there is one, is held to the same per-round bound: #264 was filed
+     * as the user's window being squeezed, and a show that widened the surface out of it would
+     * pass a check on the surface alone.
+     *
+     * Narrower only, because that is #264: a surface already at sway's floor leaves the
+     * proportional plan no room, and the show then falls back to `resize set width`, whose
+     * equal share can hand the surface a few px more than the hide took. Measured on CI's sway
+     * 1.11 in the late-join case, 101 to 112 px; 1.12 never reaches the floor there.
+     */
+    private fun rounds(docks: Int, userWindow: Boolean, joinsAfter: Boolean = false) = swayTest {
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        val mine = if (userWindow) openSurface("aw-mine") else null
+        val handles = mutableListOf(wm.attach(app, dockSpec(), AGENT))
+        if (mine != null && !joinsAfter) moveBeside(mine, app)
+        repeat(docks - 1) { handles += wm.attach(app, dockSpec(), AGENT) }
+        if (mine != null && joinsAfter) moveBeside(mine, app)
+        var held = 0
+        var first: Int? = null
+        var last = 0
+        for (round in 1..ROUNDS) {
+            for ((index, dock) in handles.withIndex()) {
+                val stage = "round $round, dock ${index + 1} of $docks"
+                val tree = wm.tree()
+                val split = tree.parentOf(dock.dockId.raw)?.id
+                val surface = assertNotNull(tree.find(app.raw)?.rect?.width, stage)
+                val theirs = mine?.let { assertNotNull(tree.find(it.raw)?.rect?.width, stage) }
+                assertEquals(true, dock.hide(), "$stage: the hide")
+                assertEquals(true, dock.show(), "$stage: the show")
+                val after = wm.tree()
+                if (after.parentOf(dock.dockId.raw)?.id != split) continue
+                last = assertNotNull(after.find(app.raw)?.rect?.width, stage)
+                assertTrue(surface - last <= ROUND_TRIP_PX, "$stage: the surface went from $surface to $last px: ${describe()}")
+                if (mine != null) {
+                    val now = assertNotNull(after.find(mine.raw)?.rect?.width, stage)
+                    assertTrue(theirs!! - now <= ROUND_TRIP_PX, "$stage: the user's window went from $theirs to $now px: ${describe()}")
+                }
+                if (first == null) first = surface
+                held++
+            }
+        }
+        assertTrue(held >= (ROUNDS - 1) * docks, "only $held of ${ROUNDS * docks} shows came back to their own split")
+        assertTrue(first!! - last <= DRIFT_PX, "the surface drifted from $first to $last px: ${describe()}")
     }
 
     /**
@@ -145,6 +271,15 @@ open class SwayCrowdedDockTest {
      * refusing it 30% there must not pass it. Head `36b8fd9` returned true here, with the dock
      * left on workspace 2.
      */
+    /**
+     * The same with a second dock beside the surface, so the restore sizes the dock by walking
+     * the split's boundaries rather than by `resize set width` (#264), and the readback has to
+     * catch a dock put wrong after that as well.
+     */
+    @Test
+    fun `a dock narrowed after a proportional restore fails the readback`() =
+        misplacedDuringReadback(docks = 2) { dock -> command("[con_id=${dock.dockId.raw}] resize set width 15 ppt") }
+
     @Test
     fun `a dock moved into a crowded split elsewhere after its restore fails the readback`() {
         var narrow = SurfaceId(0)
@@ -177,6 +312,7 @@ open class SwayCrowdedDockTest {
      */
     private fun misplacedDuringReadback(
         prepare: suspend () -> Unit = {},
+        docks: Int = 1,
         misplace: suspend (DockHandle) -> Unit,
     ) = swayTest {
         store.put(WmFlags.unmapWaitMs, MISPLACED_WAIT_MS)
@@ -184,19 +320,24 @@ open class SwayCrowdedDockTest {
         SwayValve.open(sway.socket).use { valve ->
             val valved = valvedCommands(valve)
             val app = openSurface("aw-app")
-            val dock = valved.attach(app, dockSpec(), AGENT)
+            val dock = List(docks) { valved.attach(app, dockSpec(), AGENT) }.last()
             assertEquals(true, dock.hide(), "the hide")
             var restored = false
+            var walked = false
             valve.holdNext { type, payload ->
-                if (type == I3Ipc.Request.RUN_COMMAND && "scratchpad show" in payload) restored = true
+                if (type == I3Ipc.Request.RUN_COMMAND && "scratchpad show" in payload) {
+                    restored = true
+                    walked = " right " in payload
+                }
                 restored && type == I3Ipc.Request.GET_TREE
             }
             val show = scope.async { runCatching { dock.show() } }
             valve.awaitHeld(WAIT_MS)
             misplace(dock)
             valve.release()
+            assertEquals(docks > 1, walked, "the restore is the one this case is for")
             val failure = assertNotNull(show.await().exceptionOrNull(), "the show must fail: ${describe()}")
-            assertContains(assertNotNull(failure.message), "rather than the configured 30%")
+            assertContains(assertNotNull(failure.message), "rather than the 30% the show gave it")
         }
     }
 
@@ -319,6 +460,14 @@ open class SwayCrowdedDockTest {
 
         /** Narrow enough that any resize taking a share from it is refused once the dock joins. */
         const val NARROW_PX = 102
+
+        const val ROUNDS = 12
+
+        /** Each of the plan's widths is a rounding of a fraction sway holds; a few px is that. */
+        const val ROUND_TRIP_PX = 4
+
+        /** And they do not add up: measured on 1.12, at most 5 px over a run of twelve rounds. */
+        const val DRIFT_PX = 8
         val AGENT = AgentId("agent-1")
     }
 }

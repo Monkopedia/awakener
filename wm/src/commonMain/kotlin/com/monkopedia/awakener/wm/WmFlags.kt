@@ -91,6 +91,19 @@ enum class CrowdedWidth {
     FROM_SURFACE,
 }
 
+/** What width a hidden dock comes back at. See [WmFlags.showWidth]. */
+enum class ShowWidth {
+    /**
+     * The share of its split it had when it was hidden, with every other window in the split
+     * giving it back in proportion to its own width, so a hide and a show leave the split as they
+     * found it.
+     */
+    AS_HIDDEN,
+
+    /** [WmFlags.dockSizePpt], taken by sway in an equal share from every window in the split. */
+    CONFIGURED,
+}
+
 /** What a tab is left focused on once dock interaction ends. */
 enum class RestingFocus { APP, DOCK }
 
@@ -447,13 +460,17 @@ object WmFlags {
     val dockSizePpt = Flags.int(
         "wm.dock.size_ppt",
         30,
-        "Dock width as a percentage of the tab, applied after the dock maps.",
+        "Dock width as a percentage of the tab, applied when an attach places the dock. A " +
+            "show applies it only under wm.dock.show_width=CONFIGURED, or under AS_HIDDEN when " +
+            "the hide recorded no share or the dock comes back into a different split.",
     )
 
     val crowdedWidth = Flags.enum(
         "wm.dock.crowded_width",
         CrowdedWidth.AS_SWAY_LEAVES,
-        "What a dock gets when sway will not give it wm.dock.size_ppt (#261). sway takes a " +
+        "What a dock gets when sway will not give it the width an attach or a show asks for " +
+            "(#261): wm.dock.size_ppt, or the share it was hidden at under " +
+            "wm.dock.show_width=AS_HIDDEN. sway takes a " +
             "resize from every window in the split at once and refuses it outright when any one " +
             "would end under 100 px, which several docks on one surface reach: the oldest is " +
             "squeezed towards that floor. AS_SWAY_LEAVES: the dock keeps the share sway gave it " +
@@ -461,6 +478,23 @@ object WmFlags {
             "FROM_SURFACE: one more resize, after the attach or show, takes the shortfall from " +
             "the surface beside the dock alone, unless that would put the surface under the " +
             "floor; the cost is a second layout reaching the screen.",
+    )
+
+    val showWidth = Flags.enum(
+        "wm.dock.show_width",
+        ShowWidth.AS_HIDDEN,
+        "What width a hidden dock comes back at (#264). AS_HIDDEN: the share of its split it " +
+            "had when it was hidden, remembered on the dock as a mark, with the surface and the " +
+            "other docks each giving up width in proportion to their own, which is how the hide " +
+            "handed it out, so a hide and a show leave the surface where they found it. Two " +
+            "exceptions: where that would take some window in the split under sway's 100 px " +
+            "floor, the show falls back to resizing the dock as CONFIGURED does; and a dock that " +
+            "comes back into a different split from the one it was hidden from (#256) gets " +
+            "wm.dock.size_ppt. Otherwise wm.dock.size_ppt reaches only a dock's first placement, " +
+            "and a dock resized by hand comes back at that width. CONFIGURED: wm.dock.size_ppt, which sway takes in an " +
+            "equal share from every window in the split. With several docks on one surface that " +
+            "takes more from the surface on each show than the hide gave it, until it is down to " +
+            "sway's 100 px floor.",
     )
 
     val dockFocusOnMap = Flags.boolean(
