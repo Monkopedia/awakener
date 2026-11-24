@@ -52,6 +52,15 @@ class DockWidthReadbackTest {
         assertNull(split(1000, APP to 601, DOCK to 297, 21L to 102).refusedResize(DOCK, 30))
     }
 
+    /**
+     * #264's map, four docks and a user's window: a split too narrow for the restored dock to be
+     * *narrowed* to its width without going under the floor itself, which sway refuses as well.
+     */
+    @Test
+    fun `a dock that would be narrowed under the floor is excused`() {
+        assertEquals(-11, split(330, APP to 110, 21L to 110, DOCK to 110).refusedResize(DOCK, 30))
+    }
+
     private fun split(width: Int, vararg children: Pair<Long, Int>, layout: String = "splith"): Node {
         val split = Node(
             id = 2,

@@ -11,6 +11,8 @@ import com.monkopedia.awakener.registry.asIdentity
 import java.io.File
 import java.security.SecureRandom
 import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.roundToInt
 import kotlin.random.Random
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.TimeSource
@@ -1212,7 +1214,13 @@ class SwayWindowManager(
                     evictionCommands(before, surface, dock, cfg) { isDockOf(it, surface, cfg) } + "[con_id=${dock.raw}] move scratchpad"
                 else -> listOf("[con_id=${dock.raw}] move scratchpad")
             }
-            run(hide.joinToString("; "))
+            // #264: the share the dock had, for the show to give it back at. Before the move, in
+            // the same message, because the move is what takes the dock out of the split the
+            // share is of; and whatever wm.dock.show_width says, so a flip of it between this
+            // hide and the show still finds the width there.
+            val record = widthMarksOn(before.find(dock.raw)).map { "[con_id=${dock.raw}] unmark $it" } +
+                listOfNotNull(widthMarkFor(before, surface, dock)?.let { "[con_id=${dock.raw}] mark --add $it" })
+            run((record + hide).joinToString("; "))
             check(pollTree(cfg[WmFlags.unmapWaitMs]) { if (inScratchpad(dock)) true else null } == true) {
                 "dock ${dock.raw} was still outside the scratchpad " +
                     "${cfg[WmFlags.unmapWaitMs]}ms after being moved into it"
@@ -1301,7 +1309,9 @@ class SwayWindowManager(
         suspend fun showDock(surface: SurfaceId, dock: SurfaceId): Boolean {
             if (!inScratchpad(dock)) return false
             val cfg = config
-            val sizePpt = cfg[WmFlags.dockSizePpt]
+            val before = tree()
+            val hidden = before.find(dock.raw)
+            val asHidden = cfg[WmFlags.showWidth] == ShowWidth.AS_HIDDEN
             // Read before the batch, because the batch cannot ask: whether the surface still sits
             // in a split decides whether one has to be made. A surface with no split above it —
             // the hide collapsed it under wm.dock.flatten_on_hide, or a user flattened the tab
@@ -1309,7 +1319,6 @@ class SwayWindowManager(
             // tab of its own*, measured on headless sway 1.12, rather than beside it. Decided by
             // the tree rather than by the flag, because the flag can have been flipped between
             // the hide and this show and the tree is what the batch will actually meet.
-            val before = tree()
             val floating = floatingAncestorOf(before, surface)
             // And a split is only the dock's to come back into when it holds nothing else: the
             // surface alone, or beside its other docks. One the surface shares with a window of
@@ -1331,7 +1340,17 @@ class SwayWindowManager(
             // reason: a split made here and marked by a later call is one a failure between the
             // two leaves unmarked, and so standing for good.
             val wraps = splitWraps(before, surface)
+            // #264. The share the dock was hidden at, where it is coming back into the split it
+            // was hidden from.
+            val sizePpt = hiddenWidthOf(hidden, usable)?.takeIf { asHidden } ?: cfg[WmFlags.dockSizePpt]
+            // Only into a split the dock shares with something besides the surface: beside
+            // the surface alone, sway's equal share is the surface's whole share, and the plain
+            // resize below is already exact.
+            val proportional = usable?.takeIf { asHidden && floating == null && it.nodes.size > 1 }
+                ?.proportionalRestore(surface.raw, dock.raw, sizePpt, cfg[WmFlags.dockSide] == DockSide.LEFT)
             val restore = buildList {
+                // Read above; gone before anything can fail, so no later show finds it stale.
+                widthMarksOn(hidden).forEach { add("[con_id=${dock.raw}] unmark $it") }
                 add("[con_id=${dock.raw}] scratchpad show")
                 // Before `floating disable`, because that re-tiles beside the focused node.
                 add("[con_id=${surface.raw}] focus")
@@ -1360,9 +1379,11 @@ class SwayWindowManager(
                     add(moveToMarkOn(surface.raw, dock.raw))
                 }
                 // The same two commands attach ends with, because a restore owes the caller the
-                // dock's configured geometry back: the scratchpad keeps neither side nor width.
+                // dock's geometry back: the scratchpad keeps neither side nor width. The width is
+                // the share it was hidden at under wm.dock.show_width=AS_HIDDEN, and beside other
+                // docks it is walked in proportionally rather than set (#264).
                 if (cfg[WmFlags.dockSide] == DockSide.LEFT) add("[con_id=${dock.raw}] move left")
-                add("[con_id=${dock.raw}] resize set width $sizePpt ppt")
+                if (proportional != null) addAll(proportional) else add("[con_id=${dock.raw}] resize set width $sizePpt ppt")
             }.joinToString("; ")
             val claimed = if (floating == null) (resplit && wraps) || wrapAfter else floating.id == surface.raw
             // Together, so a cancellation landing on the restore's acknowledgement cannot skip the
@@ -1432,7 +1453,7 @@ class SwayWindowManager(
                 tree.refusedResize(dock.raw, sizePpt) != null
             if (abs(percent - wanted) > PPT_TOLERANCE && !excused) {
                 return "it is ${percent * 100}% of its container wide rather than the " +
-                    "configured $sizePpt%"
+                    "$sizePpt% the show gave it"
             }
             return null
         }
@@ -1449,7 +1470,7 @@ class SwayWindowManager(
         suspend fun takeRefusedWidthFromSurface(surface: SurfaceId, dock: SurfaceId, sizePpt: Int) {
             if (config[WmFlags.crowdedWidth] != CrowdedWidth.FROM_SURFACE) return
             val tree = tree()
-            val shortfall = tree.refusedResize(dock.raw, sizePpt) ?: return
+            val shortfall = tree.refusedResize(dock.raw, sizePpt)?.takeIf { it > 0 } ?: return
             val siblings = tree.parentOf(dock.raw)?.nodes ?: return
             val index = siblings.indexOfFirst { it.id == dock.raw }
             val edge = when (surface.raw) {
@@ -2859,6 +2880,56 @@ class SwayWindowManager(
         private const val SPLIT_MARK_PREFIX = "_awakener_split_"
 
         /**
+         * The mark a hide leaves on a dock to say how wide it was (#264): this prefix, the dock's
+         * con_id — a mark name is one global set, so it has to be the dock's own — which split
+         * that was a share of, and the share in ppt. A mark because the process that shows a dock
+         * is routinely not the one that hid it, and the tree is the one record both can read;
+         * and gone again once the show has read it, so a dock put in the scratchpad by anything
+         * else comes back at wm.dock.size_ppt rather than at a width from some older hide.
+         */
+        private const val WIDTH_MARK_PREFIX = "_awakener_width_"
+
+        /**
+         * What a width mark names for a split that held the surface and the dock alone. The hide
+         * collapses that one under wm.dock.flatten_on_hide, so there is no con_id to come back to,
+         * but any split holding the two of them alone is the same share of the same width.
+         */
+        private const val ALONE = "alone"
+
+        /**
+         * The mark recording [dock]'s share of the split it stands in beside [surface], or null
+         * when it is not in a horizontal split beside anything, where a share means nothing to
+         * come back to. Never a share that would put it under sway's floor in that split, which
+         * rounding to a whole ppt can, and which sway would then refuse it.
+         */
+        private fun widthMarkFor(tree: Node, surface: SurfaceId, dock: SurfaceId): String? {
+            val split = tree.parentOf(dock.raw)?.takeIf { it.layout == "splith" && it.nodes.size > 1 } ?: return null
+            val percent = split.nodes.firstOrNull { it.id == dock.raw }?.percent ?: return null
+            val floor = split.rect?.width?.takeIf { it > 0 }?.let { ceil(MIN_SANE_WIDTH * 100.0 / it).toInt() } ?: 1
+            val ppt = (percent * 100).roundToInt().coerceAtLeast(floor).coerceIn(1, 99)
+            val alone = split.nodes.size == 2 && split.nodes.any { it.id == surface.raw }
+            return "$WIDTH_MARK_PREFIX${dock.raw}_${if (alone) ALONE else split.id}_$ppt"
+        }
+
+        /** The width marks on [node], from [widthMarkFor]. */
+        private fun widthMarksOn(node: Node?): List<String> =
+            node?.marks.orEmpty().filter { it.startsWith("$WIDTH_MARK_PREFIX${node?.id}_") }
+
+        /**
+         * The share in ppt the hide recorded on [node], where the show is bringing it back into
+         * the same split: [split], the surface's own one it is coming back into, or null where it
+         * gets a new one beside the surface alone. A share of some other split is no width to
+         * come back to, which is where a show lands after a window of the user's took the old one
+         * over (#256).
+         */
+        private fun hiddenWidthOf(node: Node?, split: Node?): Int? = widthMarksOn(node).firstNotNullOfOrNull { mark ->
+            val (from, ppt) = mark.substringAfter("$WIDTH_MARK_PREFIX${node?.id}_").split('_')
+                .takeIf { it.size == 2 } ?: return@firstNotNullOfOrNull null
+            val same = if (from == ALONE) split == null || split.nodes.size == 1 else from.toLongOrNull() == split?.id
+            ppt.toIntOrNull()?.takeIf { same }
+        }
+
+        /**
          * The mark [splitAndClaim] puts on what holds the surface before it splits, named for the
          * claim's nonce, so the split mark can be checked against where the surface stood. Taken
          * off by [settleSplitMarks] in every outcome but a killed process — after the claim, or in
@@ -3311,7 +3382,9 @@ internal const val MIN_SANE_WIDTH = 100
 
 /**
  * How many pixels short of [sizePpt] sway leaves the window [dock] because it refused the
- * `resize set width` that asked for it, or null when sway would have made that resize (#261).
+ * `resize set width` that asked for it — negative where it was refused a narrowing, which would
+ * have put the dock itself under the floor — or null when sway would have made that resize
+ * (#261).
  *
  * This is sway 1.12's own decision, recomputed from the tree it acted on rather than allowed
  * for with slack. `resize set width` on a tiled window converts the percentage to pixels of the
@@ -3337,8 +3410,79 @@ internal fun Node.refusedResize(dock: Long, sizePpt: Int): Int? {
     val width = node.rect?.width ?: return null
     if (siblings.isEmpty()) return null
     val growth = splitWidth * sizePpt / 100 - width
+    // The dock is in sway's check too: one that would be *narrowed* under the floor is refused
+    // the same way, which a show into a narrow split reaches (#264's map, four docks and a
+    // window of the user's).
+    if (width + growth < MIN_SANE_WIDTH) return growth
     if (growth <= 0) return null
     val share = (growth + siblings.size - 1) / siblings.size
     val refused = siblings.any { (it.rect?.width ?: return null) - share < MIN_SANE_WIDTH }
     return growth.takeIf { refused }
+}
+
+/**
+ * How far a width this predicts may be from the one sway arrives at, in px: each is a rounding
+ * of a fraction sway holds and the tree does not show, and a boundary sits after several.
+ */
+private const val PREDICTION_SLACK = 2
+
+/**
+ * The `resize` commands that bring a dock back into the horizontal split [this] at [sizePpt] of
+ * it, with every window already there giving up width in proportion to its own (#264); or null
+ * where that cannot be planned, and the caller falls back to `resize set width`.
+ *
+ * [this] is the split as it stands before the show, the dock still in the scratchpad. The dock
+ * comes back right after [surface], which is where `floating disable` tiles it beside the focused
+ * window, or right before it when [dockFirst] says a `move left` follows.
+ *
+ * Proportional because that is how the hide handed the dock's width out: sway keeps each
+ * window's fraction of the split and scales the rest up to fill it. So taking it back the same
+ * way, at the share the dock was hidden at, puts every window where it was before the hide.
+ * `resize set width` cannot: it takes the growth from every sibling in an *equal* share, so each
+ * show takes more from a window narrower than the average than the hide gave it, and with several
+ * docks on one surface the surface is walked down to sway's floor (measured on headless 1.12,
+ * 217 px to 100 over twelve rounds of four docks).
+ *
+ * sway has no proportional resize, so this plans the final widths and walks the boundaries
+ * left to right: `resize grow|shrink right` moves one window's right edge, taking from or giving
+ * to its right neighbour alone (`container_resize_tiled` with an edge, sway 1.12), and the
+ * boundary after window i moves by the sum of the changes the windows up to i need. The widths
+ * it walks from are predicted, because the plan has to go out in the same message as the
+ * `floating disable` (#172): sway gives the window it tiles in the mean of the existing
+ * fractions, so with n windows already there the dock gets 1/(n+1) of the split and every other
+ * window keeps its share of the rest. A boundary that would take either window beside it under [MIN_SANE_WIDTH], which sway
+ * refuses while reporting failure, makes the plan null rather than a command that would fail the
+ * batch.
+ */
+internal fun Node.proportionalRestore(surface: Long, dock: Long, sizePpt: Int, dockFirst: Boolean): List<String>? {
+    if (layout != "splith") return null
+    val splitWidth = rect?.width ?: return null
+    val before = nodes.map { node -> node.id to (node.rect?.width ?: return null) }
+    val total = before.sumOf { it.second }
+    val surfaceAt = before.indexOfFirst { it.first == surface }
+    if (surfaceAt < 0 || total <= 0) return null
+    val count = before.size
+    val dockWidth = splitWidth * sizePpt / 100
+    val ids = before.map { it.first }.toMutableList().apply { add(if (dockFirst) surfaceAt else surfaceAt + 1, dock) }
+    val index = before.toMap()
+    fun widths(dockShare: Int, share: (Int) -> Int): List<Int> {
+        val widths = ids.map { if (it == dock) dockShare else share(index.getValue(it)) }
+        // sway gives the last window whatever the rest leave, and so does this.
+        return widths.dropLast(1) + (total - widths.dropLast(1).sum())
+    }
+    val current = widths((total.toDouble() / (count + 1)).roundToInt()) {
+        (it.toDouble() * count / (count + 1)).roundToInt()
+    }
+    val target = widths(dockWidth) { (it.toDouble() * (total - dockWidth) / total).roundToInt() }
+    if (target.any { it < MIN_SANE_WIDTH + PREDICTION_SLACK }) return null
+    var moved = 0
+    return ids.dropLast(1).mapIndexedNotNull { i, id ->
+        moved += target[i] - current[i]
+        if (current[i + 1] - moved < MIN_SANE_WIDTH + PREDICTION_SLACK) return null
+        when {
+            moved > 0 -> "[con_id=$id] resize grow right $moved px"
+            moved < 0 -> "[con_id=$id] resize shrink right ${-moved} px"
+            else -> null
+        }
+    }
 }
