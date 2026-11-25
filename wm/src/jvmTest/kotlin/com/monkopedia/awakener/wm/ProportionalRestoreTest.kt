@@ -62,26 +62,25 @@ class ProportionalRestoreTest {
 
     /**
      * #267's shape: the surface's side of the user's split, beside the user's window and a
-     * second dock, widened by the dock the hide took out of it. Every other window gives back
-     * in proportion to its own width, which is what the hide gave it.
+     * second dock, widened as every other window walks back to its target.
      */
     @Test
-    fun `a split is widened by taking back from every other window in proportion`() {
+    fun `every other window is walked to its target and the side takes the rest`() {
         val split = split(1235, 21L to 300, APP to 535, 22L to 400)
-        val growth = assertNotNull(split.grownBy(APP, 247))
+        val growth = assertNotNull(split.walkedTo(APP, mapOf(21L to 240, 22L to 320)))
         val after = walked(split, growth.commands)
-        assertEquals(growth.width, after.getValue(APP), "$after")
-        assertEquals(1235, after.values.sum(), "$after")
-        listOf(21L to 300, 22L to 400).forEach { (id, width) ->
-            val expected = width * (1235.0 - 247) / 1235
-            assertTrue(kotlin.math.abs(after.getValue(id) - expected) <= 1, "$id: $after, expected $expected")
-        }
-        assertTrue(kotlin.math.abs(growth.width - (535 * (1235.0 - 247) / 1235 + 247)) <= 1, "${growth.width}")
+        assertEquals(mapOf(21L to 240, APP to 675, 22L to 320), after)
+        assertEquals(675, growth.width)
     }
 
     @Test
-    fun `a widening that would take a window under the floor is not made`() {
-        assertNull(split(721, APP to 400, 21L to 150, 22L to 171).grownBy(APP, 300))
+    fun `a walk that would take a window under the floor is not made`() {
+        assertNull(split(721, APP to 400, 21L to 150, 22L to 171).walkedTo(APP, mapOf(21L to 88, 22L to 100)))
+    }
+
+    @Test
+    fun `a walk missing a target is not made`() {
+        assertNull(split(721, APP to 400, 21L to 150, 22L to 171).walkedTo(APP, mapOf(21L to 140)))
     }
 
     /** The widths sway arrives at from [split] once [plan] runs, nothing tiled in. */

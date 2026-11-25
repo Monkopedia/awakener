@@ -2924,12 +2924,17 @@ class SwayWindowManager(
             val ppt = (percent * 100).roundToInt().coerceAtLeast(floor).coerceIn(1, 99)
             val alone = split.nodes.size == 2 && split.nodes.any { it.id == surface.raw }
             if (alone) return "$WIDTH_MARK_PREFIX${dock.raw}_${ALONE}_$ppt"
-            // #270's review: what every other window in the split stood at, so a show coming back
-            // across splits can tell the width the hide hands them from width the user set since.
-            val others = split.nodes.filter { it.id != dock.raw }.map { it.id to it.rect?.width }
-            val sizes = others.takeIf { list -> list.all { it.second != null } }
-                ?.joinToString(".", prefix = "_") { (id, width) -> "${id}x$width" }.orEmpty()
-            return "$WIDTH_MARK_PREFIX${dock.raw}_${split.id}_$ppt$sizes"
+            // #270's reviews: every window's width in the split as it would stand with every
+            // dock hidden out of it back — its home width — so a show coming back across splits
+            // can tell what awakener's own hides and shows did to a window from a width the user
+            // set since, and give back exactly what they handed out. sway renormalises fractions
+            // on a hide, so a window's width is its home width scaled by T / (T − hidden).
+            val widths = split.nodes.map { it.id to (it.rect?.width ?: return "$WIDTH_MARK_PREFIX${dock.raw}_${split.id}_$ppt") }
+            val total = widths.sumOf { it.second }
+            val home = total - hiddenFrom(tree, split.id).values.sum()
+            if (total <= 0 || home <= 0) return "$WIDTH_MARK_PREFIX${dock.raw}_${split.id}_$ppt"
+            val sizes = widths.joinToString(".") { (id, width) -> "${id}x${(width.toDouble() * home / total).roundToInt()}" }
+            return "$WIDTH_MARK_PREFIX${dock.raw}_${split.id}_${ppt}_$sizes"
         }
 
         /** The width marks on [node], from [widthMarkFor]. */
@@ -2951,9 +2956,23 @@ class SwayWindowManager(
 
         /**
          * What a width mark says: the split the dock was a share of, or [ALONE]; the share; and
-         * the px every other window in that split stood at, where the mark recorded them.
+         * the home width of every window in that split, the dock's own included, where the mark
+         * recorded them ([widthMarkFor]).
          */
-        private class RecordedWidth(val from: String, val ppt: Int, val others: Map<Long, Int>?)
+        private class RecordedWidth(val from: String, val ppt: Int, val home: Map<Long, Int>?)
+
+        /**
+         * The docks in the scratchpad that were hidden out of [split], each with its home width
+         * there, from its own width mark. Any surface's: what decides how sway shared out the
+         * split's width is which windows left it, not whose they were.
+         */
+        private fun hiddenFrom(tree: Node, split: Long): Map<Long, Int> {
+            fun all(node: Node): Sequence<Node> = sequenceOf(node) + node.children.asSequence().flatMap { all(it) }
+            val scratch = tree.workspace(SCRATCH_WORKSPACE) ?: return emptyMap()
+            return all(scratch).mapNotNull { node ->
+                recordedWidthOf(node)?.takeIf { it.from == split.toString() }?.home?.get(node.id)?.let { node.id to it }
+            }.toMap()
+        }
 
         /** The width mark on [node], read. */
         private fun recordedWidthOf(node: Node?): RecordedWidth? = widthMarksOn(node).firstNotNullOfOrNull { mark ->
@@ -2967,18 +2986,34 @@ class SwayWindowManager(
         }
 
         /**
-         * Whether every window in [split] is where the hide left it: the same windows as [before],
-         * the widths they stood at beside the dock, each scaled up as sway does when the dock
-         * leaves — every fraction renormalised, so every width by the same factor — to within
-         * [UNTOUCHED_SLACK] px for sway's rounding. A window resized, opened or closed in there
-         * since is a change of the user's, and the show then leaves the split alone.
+         * The widths every child of [split] but [side] goes back to once [dock] is shown out of
+         * it, and the dock's own width; or null where some window there is not where awakener's
+         * own hides and shows put it, which is a change of the user's (#270's reviews).
+         *
+         * Every child but [side] has to be one [home] recorded, at its home width scaled by
+         * T / (T − hidden) for the docks hidden out of [split] now, to within [UNTOUCHED_SLACK]
+         * px; and every one [home] recorded that is no longer a child has to be awakener's: a
+         * dock hidden out of it, or inside [side] — the surface itself, wrapped in a split of its
+         * own since, or a dock shown in beside it. So a window the user resized, opened or closed
+         * is a change, and another dock hidden or shown in between is not. The targets are the
+         * same home widths scaled for the docks still hidden once [dock] is back.
          */
-        private fun untouchedSince(split: Node, before: Map<Long, Int>): Boolean {
-            val now = split.nodes.associate { it.id to (it.rect?.width ?: return false) }
-            val total = before.values.sum()
-            if (now.keys != before.keys || total <= 0) return false
-            val scale = now.values.sum().toDouble() / total
-            return now.all { (id, width) -> abs(width - before.getValue(id) * scale) <= UNTOUCHED_SLACK }
+        private fun restoredAround(split: Node, side: Node, dock: Long, home: Map<Long, Int>, hidden: Map<Long, Int>): Pair<Map<Long, Int>, Int>? {
+            val now = split.nodes.associate { it.id to (it.rect?.width ?: return null) }
+            val total = now.values.sum()
+            val own = hidden[dock] ?: return null
+            val away = hidden.values.sum()
+            if (total - away <= 0) return null
+            val others = now - side.id
+            if (others.keys.any { it !in home }) return null
+            if (home.keys.any { it !in now && it !in hidden && side.find(it) == null }) return null
+            val scale = total.toDouble() / (total - away)
+            if (others.any { (id, width) -> abs(width - home.getValue(id) * scale) > UNTOUCHED_SLACK }) return null
+            val back = total.toDouble() / (total - away + own)
+            // A dock attach squeezed under sway's floor comes back at it, which sway would refuse
+            // it under: four docks leave the oldest at 99 px, measured on 1.12.
+            val width = (own * back).roundToInt().coerceAtLeast(MIN_SANE_WIDTH + PREDICTION_SLACK)
+            return others.mapValues { (id, _) -> (home.getValue(id) * back).roundToInt() } to width
         }
 
         /**
@@ -2999,18 +3034,19 @@ class SwayWindowManager(
          * surface where [wraps]. A width taken in there alone comes out of the surface and its
          * other docks, once per dock, while the user's window keeps what it was given — 268 px
          * of surface down to 116 over the first round of four docks on 1.12. So the surface's
-         * side of the old split is widened by the dock's width first ([grownBy]), and the dock
+         * side of the old split is widened by the dock's width first ([walkedTo]), and the dock
          * then takes exactly that width inside, which leaves every window where it was before
          * the hide. Nothing is shown back into the old split, and nothing marks it: it is the
          * user's.
          *
          * Only where the old split is directly around the surface's side of it, since a width
          * given to anything further down is shared out again on the way; only where the
-         * widening keeps every window off sway's floor; and only where the old split is as the
-         * hide left it ([untouchedSince]). Its current widths are then the hide's hand-out and
-         * nothing else, whereas a window the user has resized since holds a width they chose,
-         * and a show that took the dock's width out of it would undo that (#255's lesson, #270's
-         * review: a user window narrowed by hand to 383 px ended at 306).
+         * widening keeps every window off sway's floor; and only where every window in the old
+         * split is where awakener's own hides and shows left it ([restoredAround]). Its widths
+         * are then awakener's hand-out and nothing else, whereas a window the user has resized
+         * since holds a width they chose, and a show that took the dock's width out of it would
+         * undo that (#255's lesson, #270's review: a user window narrowed by hand to 383 px ended
+         * at 306). Other docks hidden or shown in between are awakener's, and are allowed for.
          */
         private fun acrossSplits(
             tree: Node,
@@ -3021,16 +3057,15 @@ class SwayWindowManager(
             dockFirst: Boolean,
         ): AcrossSplits? {
             val recorded = recordedWidthOf(hidden) ?: return null
-            val ppt = recorded.ppt
-            val outer = recorded.from.toLongOrNull()?.let { tree.find(it) }
-                ?.takeIf { it.id != usable?.id && untouchedSince(it, recorded.others ?: return null) } ?: return null
+            val home = recorded.home ?: return null
+            val outer = recorded.from.toLongOrNull()?.let { tree.find(it) }?.takeIf { it.id != usable?.id } ?: return null
             val side = when {
                 usable != null -> usable.takeIf { tree.parentOf(it.id)?.id == outer.id }
                 wraps -> tree.find(surface.raw)?.takeIf { tree.parentOf(it.id)?.id == outer.id }
                 else -> null
             } ?: return null
-            val dockWidth = (outer.rect?.width ?: return null) * ppt / 100
-            val growth = outer.grownBy(side.id, dockWidth) ?: return null
+            val (targets, dockWidth) = restoredAround(outer, side, hidden.id, home, hiddenFrom(tree, outer.id)) ?: return null
+            val growth = outer.walkedTo(side.id, targets) ?: return null
             if (growth.width - dockWidth < MIN_SANE_WIDTH + PREDICTION_SLACK) return null
             // Planned from the split as the widening leaves it: sway keeps every child's fraction
             // of a split it resizes. Beside the surface alone sway's equal share is the surface's
@@ -3648,31 +3683,29 @@ private fun walk(ids: List<Long>, current: List<Int>, target: List<Int>): List<S
     }
 }
 
-/** What [grownBy] plans: the walk, and the width the grown child ends at. */
+/** What [walkedTo] plans: the walk, and the width the side ends at. */
 internal class Growth(val commands: List<String>, val width: Int)
 
 /**
- * The `resize` commands that widen [child], one of this horizontal split's children, by [width]
- * px, every other child giving up width in proportion to its own; or null where that cannot be
- * planned (#267).
+ * The `resize` commands that take every child of this horizontal split but [side] to its width
+ * in [targets], [side] taking whatever they leave; or null where that cannot be planned (#267).
  *
  * This is the hide's distribution run backwards one split up. A dock hidden out of a split that
  * holds a window of the user's leaves that split to the user (#256), and sway hands the dock's
  * width to every window left in it in proportion, the user's included. The show then brings the
- * dock back into a split of the surface's own one level down — the surface's own [child] of the
- * old split — and a width taken inside that split alone comes out of the surface and its other
- * docks while the user's window keeps what the hide gave it. Widening [child] first takes it
- * back from where it went. Unlike [proportionalRestore] nothing here is predicted: no window is
- * tiled into this split, so the widths are the ones the tree reports.
+ * dock back into a split of the surface's own one level down — [side], in the old split — and a
+ * width taken inside that split alone comes out of the surface and its other docks while the
+ * user's window keeps what the hide gave it. Walking the others back to what they had first
+ * takes it back from where it went. Unlike [proportionalRestore] nothing here is predicted: no
+ * window is tiled into this split, so the widths walked from are the ones the tree reports.
  */
-internal fun Node.grownBy(child: Long, width: Int): Growth? {
-    if (layout != "splith" || width <= 0) return null
+internal fun Node.walkedTo(side: Long, targets: Map<Long, Int>): Growth? {
+    if (layout != "splith" || nodes.size < 2) return null
     val ids = nodes.map { it.id }
     val current = nodes.map { it.rect?.width ?: return null }
-    val total = current.sum()
-    val at = ids.indexOf(child)
-    if (at < 0 || nodes.size < 2 || total <= width) return null
-    val target = current.map { (it.toDouble() * (total - width) / total).roundToInt() }.toMutableList()
-    target[at] = total - (target.sum() - target[at])
+    val at = ids.indexOf(side)
+    if (at < 0 || targets.keys != ids.toSet() - side) return null
+    val target = ids.map { targets[it] ?: 0 }.toMutableList()
+    target[at] = current.sum() - target.sum()
     return walk(ids, current, target)?.let { Growth(it, target[at]) }
 }

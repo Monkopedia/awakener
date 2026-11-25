@@ -195,6 +195,61 @@ open class SwayCrowdedDockTest {
         rounds(docks = 2, userWindow = true)
 
     /**
+     * #270's second review: every dock hidden, then every dock shown, which is one press per
+     * panel from inside each. A check for the user's hand that counted awakener's own hide of a
+     * second dock, or show of the first, as a change turned #267's fix off: back to 268 → 197 px
+     * of surface and 213 → 567 of the user's window with four docks on 1.12.
+     */
+    @Test
+    fun `two docks hidden together and shown in order give the user window back what the hides gave it`() = hideAllShowAll(docks = 2, reversed = false)
+
+    @Test
+    fun `two docks hidden together and shown in reverse give the user window back what the hides gave it`() = hideAllShowAll(docks = 2, reversed = true)
+
+    @Test
+    fun `four docks hidden together and shown in order give the user window back what the hides gave it`() = hideAllShowAll(docks = 4, reversed = false)
+
+    @Test
+    fun `four docks hidden together and shown in reverse give the user window back what the hides gave it`() = hideAllShowAll(docks = 4, reversed = true)
+
+    /**
+     * Stands [docks] docks with the user's window moved in after them, then hides every dock and
+     * shows every dock — in the order they were hidden, or [reversed] — for [ALL_ROUNDS] rounds.
+     * After each, the user's window is within [ROUND_TRIP_PX] of where it started either way,
+     * with no split mark of awakener's above it.
+     *
+     * The surface is held only after round 1, where every show comes back across splits, which
+     * is #267's. From round 2 every dock leaves and re-enters the surface's own split, and with
+     * several hidden at once that path loses the surface width with no user window anywhere:
+     * 619 → 556 px with two docks, 322 → 307 with four, on base `12971a7` as on this branch.
+     * That belongs to #264's restore and is filed separately.
+     */
+    private fun hideAllShowAll(docks: Int, reversed: Boolean) = swayTest {
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        val mine = openSurface("aw-mine")
+        val handles = List(docks) { wm.attach(app, dockSpec(), AGENT) }
+        moveBeside(mine, app)
+        val start = wm.tree()
+        val surface = assertNotNull(start.find(app.raw)?.rect?.width, "the surface")
+        val joined = assertNotNull(start.find(mine.raw)?.rect?.width, "the user's window")
+        for (round in 1..ALL_ROUNDS) {
+            handles.forEachIndexed { i, dock -> assertEquals(true, dock.hide(), "round $round: hide ${i + 1}") }
+            (if (reversed) handles.reversed() else handles).forEach { dock ->
+                assertEquals(true, dock.show(), "round $round: show ${handles.indexOf(dock) + 1}")
+            }
+            val after = wm.tree()
+            val now = assertNotNull(after.find(app.raw)?.rect?.width, "the surface")
+            val theirs = assertNotNull(after.find(mine.raw)?.rect?.width, "the user's window")
+            if (round == 1) assertTrue(surface - now <= ROUND_TRIP_PX, "round $round: the surface went from $surface to $now px: ${describe()}")
+            assertTrue(abs(theirs - joined) <= ROUND_TRIP_PX, "round $round: the user's window went from $joined to $theirs px: ${describe()}")
+            val marked = generateSequence(after.parentOf(mine.raw)) { after.parentOf(it.id) }
+                .filter { node -> node.marks.any { it.startsWith("_awakener_split_") } }.toList()
+            assertTrue(marked.isEmpty(), "round $round: a split holding the user's window is marked awakener's: ${marked.map { it.marks }}")
+        }
+    }
+
+    /**
      * #270's review: a user window resized by hand while the dock is hidden keeps the width the
      * user chose. The show across splits used to take the dock's width out of whatever width the
      * old split's windows had, the user's choice included: 383 px chosen ended at 306, 683 at 546.
@@ -523,6 +578,9 @@ open class SwayCrowdedDockTest {
         const val NARROW_PX = 102
 
         const val ROUNDS = 12
+
+        /** Rounds of hiding every dock and then showing every dock. */
+        const val ALL_ROUNDS = 3
 
         /** Each of the plan's widths is a rounding of a fraction sway holds; a few px is that. */
         const val ROUND_TRIP_PX = 4
