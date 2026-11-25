@@ -85,8 +85,11 @@ data class WindowEvent(val change: String, val container: Node? = null)
 @Serializable
 data class CommandResult(val success: Boolean = false, val error: String? = null)
 
-/** The part of a `GET_VERSION` reply anything here reads. */
+/**
+ * The part of a `GET_VERSION` reply anything here reads. Null where the reply leaves a field out,
+ * so a short reply is something a reader can decide about rather than a decoding failure.
+ */
 @Serializable
-internal data class SwayVersion(val major: Int, val minor: Int)
+internal data class SwayVersion(val major: Int? = null, val minor: Int? = null)
 
 internal val swayJson: Json = Json { ignoreUnknownKeys = true }

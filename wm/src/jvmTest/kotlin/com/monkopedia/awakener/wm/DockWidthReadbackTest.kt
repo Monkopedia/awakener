@@ -101,6 +101,23 @@ class DockWidthReadbackTest {
         assertEquals(NEIGHBOURS, ResizeShare.of(SwayVersion(1, 11)))
         assertEquals(ALL, ResizeShare.of(SwayVersion(1, 12)))
         assertEquals(ALL, ResizeShare.of(SwayVersion(2, 0)))
+        assertEquals(NEIGHBOURS, ResizeShare.of("""{"human_readable":"1.11","major":1,"minor":11,"patch":0}"""))
+        assertEquals(ALL, ResizeShare.of("""{"human_readable":"1.12","major":1,"minor":12,"patch":0}"""))
+    }
+
+    /**
+     * A version that cannot be read is the newest rule, stated as [ResizeShare.UNKNOWN_VERSION],
+     * and never an exception out of the show that asked.
+     */
+    @Test
+    fun `a version that cannot be read is the stated default`() {
+        assertEquals(ALL, ResizeShare.UNKNOWN_VERSION)
+        assertEquals(ALL, ResizeShare.of(SwayVersion(0, 0)), "sway's own unparseable version string")
+        assertEquals(ALL, ResizeShare.of("""{"human_readable":"1.11"}"""), "no major or minor")
+        assertEquals(ALL, ResizeShare.of("""{"major":1}"""), "no minor")
+        assertEquals(ALL, ResizeShare.of("""{"major":"one","minor":11}"""), "not a number")
+        assertEquals(ALL, ResizeShare.of("""[]"""), "not an object")
+        assertEquals(ALL, ResizeShare.of(""), "empty")
     }
 
     private fun split(width: Int, vararg children: Pair<Long, Int>, layout: String = "splith"): Node {

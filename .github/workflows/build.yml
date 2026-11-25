@@ -427,8 +427,19 @@ jobs:
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # Its own copy, because this job runs ./gradlew without waiting on `build`: the wrapper jar
-      # has to be checked before it executes here too, not merely somewhere in the same run.
+      # Both wrapper checks again, because this job runs ./gradlew without waiting on `build`, so
+      # a check that only `build` makes has not been made before anything executes here. The pin
+      # first, for `build`'s reason: the wrapper rejects a wrong `distributionSha256Sum` and
+      # accepts a missing one, and with the line deleted this job would download and run an
+      # unverified distribution while `build` went red beside it, stopping nothing. The matrix
+      # with it, as in `build`, so the guard is shown able to fail in this container too.
+      - name: Check the distribution is pinned at all
+        run: |
+          set -eu
+          .github/scripts/check-wrapper-pin-matrix.sh
+          .github/scripts/check-wrapper-pin.sh
+
+      # The jar, for the same reason.
       - uses: gradle/actions/wrapper-validation@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
 
       # No setup-gradle, so no build cache and no restored distribution: the wrapper downloads

@@ -3413,14 +3413,46 @@ internal enum class ResizeShare {
     ;
 
     companion object {
-        fun of(version: SwayVersion): ResizeShare =
-            if (version.major > 1 || version.major == 1 && version.minor >= 12) EVERY_SIBLING else NEIGHBOURS
+        /**
+         * What a compositor whose version cannot be read is taken to do: the rule of the sway the
+         * hosts run, and of every release since. A wrong guess costs a show that throws on a short
+         * dock sway refused, or one that excuses a dock sway would have resized; the guess most
+         * likely to be right is the newest rule.
+         */
+        val UNKNOWN_VERSION = EVERY_SIBLING
+
+        /**
+         * The rule sway [version] applies. sway fills `major` and `minor` by `sscanf`ing its own
+         * version string (`sway/ipc-json.c`), so a release candidate reads as its release:
+         * `1.12-rc1` is 1.12, and swaywm/sway@340505bb is already in it. Three cases read wrong
+         * or not at all, and are stated rather than guessed at:
+         *
+         * - A `1.12-dev` git build from before swaywm/sway@340505bb reports 1.12 and still has the
+         *   old rule. Only a development build between the version bump and that commit is there;
+         *   no release is.
+         * - A version string sway could not parse reaches IPC as 0.0. That says nothing about the
+         *   build, so it is [UNKNOWN_VERSION] rather than "older than 1.12".
+         * - A reply without `major` or `minor`, or one that is not a version object at all
+         *   ([of] taking the raw reply), is [UNKNOWN_VERSION] too. A show does not fail over it.
+         */
+        fun of(version: SwayVersion): ResizeShare {
+            val major = version.major ?: return UNKNOWN_VERSION
+            val minor = version.minor ?: return UNKNOWN_VERSION
+            return when {
+                major == 0 -> UNKNOWN_VERSION
+                major > 1 || major == 1 && minor >= 12 -> EVERY_SIBLING
+                else -> NEIGHBOURS
+            }
+        }
+
+        /** [of] the raw `GET_VERSION` [reply], or [UNKNOWN_VERSION] where it is not one. */
+        fun of(reply: String): ResizeShare =
+            runCatching { swayJson.decodeFromString<SwayVersion>(reply) }.map(::of).getOrDefault(UNKNOWN_VERSION)
     }
 }
 
 /** The [ResizeShare] of the compositor at the other end of this connection, from its version. */
-internal suspend fun SwayConnection.resizeShare(): ResizeShare =
-    ResizeShare.of(swayJson.decodeFromString<SwayVersion>(request(I3Ipc.Request.GET_VERSION)))
+internal suspend fun SwayConnection.resizeShare(): ResizeShare = ResizeShare.of(request(I3Ipc.Request.GET_VERSION))
 
 /**
  * How many pixels short of [sizePpt] sway leaves the window [dock] because it refused the
