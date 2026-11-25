@@ -404,7 +404,13 @@ jobs:
   # drives sway, but through :wm, and needs spanreed and the shells besides; `build` keeps it.
   wm-sway-arch:
     runs-on: ubuntu-latest
-    container: archlinux:base
+    # `--init`, because the job's PID 1 is otherwise the `tail -f` GitHub keeps the container
+    # alive with, which reaps nothing. SwayHarnessReapTest asserts a session leaves no process
+    # behind, and an unreaped orphan is still in /proc: both of its cases went red that way in
+    # a container without an init (measured under docker, sway 1.11) and green with one.
+    container:
+      image: archlinux:base
+      options: --init
     steps:
       # Arch ships sway with `cap_sys_nice=ep` as a file capability, and a container's bounding
       # set does not hold CAP_SYS_NICE, so the kernel refuses to exec it at all ("Operation not
