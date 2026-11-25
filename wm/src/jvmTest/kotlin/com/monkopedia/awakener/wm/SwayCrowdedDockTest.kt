@@ -170,12 +170,28 @@ open class SwayCrowdedDockTest {
      * leaves the split it shares with it (#256). One of those shows lands in a split too narrow
      * to narrow the dock to 30% without taking the dock itself under the floor, which sway
      * refuses too, and the readback took for a misplaced dock: `94c57c8` threw "33.3% … rather
-     * than the configured 30%". The surface pays for each dock's move into its own split once,
-     * which is #256's, so only the rounds after it are held to the surface's width.
+     * than the configured 30%".
+     *
+     * #267: that first show, into a split of the surface's own inside the user's, used to take
+     * the dock's width from the surface alone while the user's window kept what the hide gave it
+     * — 268 px to 116 here on 1.12. Held from round 1 now, as every [rounds] case is.
      */
     @Test
     fun `twelve rounds of four docks and a user window that joined after them`() =
         rounds(docks = 4, userWindow = true, joinsAfter = true)
+
+    /** #267's table, the rows not already above. */
+    @Test
+    fun `twelve rounds of three docks and a user window that joined after them`() =
+        rounds(docks = 3, userWindow = true, joinsAfter = true)
+
+    @Test
+    fun `twelve rounds of two docks and a user window that joined after them`() =
+        rounds(docks = 2, userWindow = true, joinsAfter = true)
+
+    @Test
+    fun `twelve rounds of two docks and a user window leave the surface where it was`() =
+        rounds(docks = 2, userWindow = true)
 
     /**
      * wm.dock.show_width: a dock the user widened by hand comes back at that width under
@@ -204,15 +220,18 @@ open class SwayCrowdedDockTest {
     /**
      * Stands [docks] docks on one surface as [crowded] does — the user's window moved in after the
      * last of them instead when [joinsAfter] — and hides and shows each in turn for twelve rounds.
-     * Every show must succeed, and every hide and show of a dock that came back into the split it
-     * was hidden from must leave the surface no more than [ROUND_TRIP_PX] narrower than it was
-     * before the hide; across all of them, no more than [DRIFT_PX] narrower than where the first
-     * such one found it. Counted, so a run in which no dock ever came back to its own split
-     * cannot pass.
+     * Every show must succeed, and every hide and show must leave the surface no more than
+     * [ROUND_TRIP_PX] narrower than it was before the hide; across all of them, no more than
+     * [DRIFT_PX] narrower than before the first. That includes a show into a different split from
+     * the one the dock was hidden from, which a window of the user's in the old one causes (#256),
+     * and which used to take the dock's whole width from the surface (#267).
      *
      * The user's window, where there is one, is held to the same per-round bound: #264 was filed
      * as the user's window being squeezed, and a show that widened the surface out of it would
-     * pass a check on the surface alone.
+     * pass a check on the surface alone. It is never narrower than it was before the first hide,
+     * and never more than [DRIFT_PX] wider either: the hide
+     * gives it a share of the dock's width, and #267 was the show not taking that back. And no
+     * container holding it carries a split mark of awakener's, which is #256's rule.
      *
      * Narrower only, because that is #264: a surface already at sway's floor leaves the
      * proportional plan no room, and the show then falls back to `resize set width`, whose
@@ -227,32 +246,33 @@ open class SwayCrowdedDockTest {
         if (mine != null && !joinsAfter) moveBeside(mine, app)
         repeat(docks - 1) { handles += wm.attach(app, dockSpec(), AGENT) }
         if (mine != null && joinsAfter) moveBeside(mine, app)
-        var held = 0
-        var first: Int? = null
-        var last = 0
+        val start = wm.tree()
+        val first = assertNotNull(start.find(app.raw)?.rect?.width, "the surface")
+        val joined = mine?.let { assertNotNull(start.find(it.raw)?.rect?.width, "the user's window") }
+        var last = first
         for (round in 1..ROUNDS) {
             for ((index, dock) in handles.withIndex()) {
                 val stage = "round $round, dock ${index + 1} of $docks"
                 val tree = wm.tree()
-                val split = tree.parentOf(dock.dockId.raw)?.id
                 val surface = assertNotNull(tree.find(app.raw)?.rect?.width, stage)
                 val theirs = mine?.let { assertNotNull(tree.find(it.raw)?.rect?.width, stage) }
                 assertEquals(true, dock.hide(), "$stage: the hide")
                 assertEquals(true, dock.show(), "$stage: the show")
                 val after = wm.tree()
-                if (after.parentOf(dock.dockId.raw)?.id != split) continue
                 last = assertNotNull(after.find(app.raw)?.rect?.width, stage)
                 assertTrue(surface - last <= ROUND_TRIP_PX, "$stage: the surface went from $surface to $last px: ${describe()}")
                 if (mine != null) {
                     val now = assertNotNull(after.find(mine.raw)?.rect?.width, stage)
                     assertTrue(theirs!! - now <= ROUND_TRIP_PX, "$stage: the user's window went from $theirs to $now px: ${describe()}")
+                    assertTrue(joined!! - now <= ROUND_TRIP_PX, "$stage: the user's window went from $joined to $now px: ${describe()}")
+                    assertTrue(now - joined <= DRIFT_PX, "$stage: the user's window kept the dock's width, $joined to $now px: ${describe()}")
+                    val marked = generateSequence(after.parentOf(mine.raw)) { after.parentOf(it.id) }
+                        .filter { node -> node.marks.any { it.startsWith("_awakener_split_") } }.toList()
+                    assertTrue(marked.isEmpty(), "$stage: a split holding the user's window is marked awakener's: ${marked.map { it.marks }}")
                 }
-                if (first == null) first = surface
-                held++
             }
         }
-        assertTrue(held >= (ROUNDS - 1) * docks, "only $held of ${ROUNDS * docks} shows came back to their own split")
-        assertTrue(first!! - last <= DRIFT_PX, "the surface drifted from $first to $last px: ${describe()}")
+        assertTrue(first - last <= DRIFT_PX, "the surface drifted from $first to $last px: ${describe()}")
     }
 
     /**

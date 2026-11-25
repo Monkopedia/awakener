@@ -1340,20 +1340,30 @@ class SwayWindowManager(
             // reason: a split made here and marked by a later call is one a failure between the
             // two leaves unmarked, and so standing for good.
             val wraps = splitWraps(before, surface)
+            val dockFirst = cfg[WmFlags.dockSide] == DockSide.LEFT
+            // #267. Coming back into a split of the surface's own inside the one it was hidden
+            // from, which the user's window took over (#256): that one is widened by the dock's
+            // width first, taken back from every window the hide gave it to.
+            val across = hidden?.takeIf { asHidden && floating == null }
+                ?.let { acrossSplits(before, it, surface, usable, resplit && wraps, dockFirst) }
             // #264. The share the dock was hidden at, where it is coming back into the split it
             // was hidden from.
-            val sizePpt = hiddenWidthOf(hidden, usable)?.takeIf { asHidden } ?: cfg[WmFlags.dockSizePpt]
+            val sizePpt = across?.ppt ?: hiddenWidthOf(hidden, usable)?.takeIf { asHidden } ?: cfg[WmFlags.dockSizePpt]
             // Only into a split the dock shares with something besides the surface: beside
             // the surface alone, sway's equal share is the surface's whole share, and the plain
             // resize below is already exact.
-            val proportional = usable?.takeIf { asHidden && floating == null && it.nodes.size > 1 }
-                ?.proportionalRestore(surface.raw, dock.raw, sizePpt, cfg[WmFlags.dockSide] == DockSide.LEFT)
+            val proportional = across?.size ?: usable?.takeIf { asHidden && floating == null && it.nodes.size > 1 }
+                ?.let { it.proportionalRestore(surface.raw, dock.raw, (it.rect?.width ?: 0) * sizePpt / 100, dockFirst) }
             val restore = buildList {
                 // Read above; gone before anything can fail, so no later show finds it stale.
                 widthMarksOn(hidden).forEach { add("[con_id=${dock.raw}] unmark $it") }
                 add("[con_id=${dock.raw}] scratchpad show")
                 // Before `floating disable`, because that re-tiles beside the focused node.
                 add("[con_id=${surface.raw}] focus")
+                // Before the split, so that where the batch makes one around the surface it
+                // inherits the surface's widened share, and before the dock is tiled in, which
+                // is what [acrossSplits] planned the inner split from.
+                across?.let { addAll(it.grow) }
                 if (floating == null) {
                     // After the focus, because `split` applies to the focused node — the same
                     // order attach uses, and inside the batch for #172's reason: one message,
@@ -1382,7 +1392,7 @@ class SwayWindowManager(
                 // dock's geometry back: the scratchpad keeps neither side nor width. The width is
                 // the share it was hidden at under wm.dock.show_width=AS_HIDDEN, and beside other
                 // docks it is walked in proportionally rather than set (#264).
-                if (cfg[WmFlags.dockSide] == DockSide.LEFT) add("[con_id=${dock.raw}] move left")
+                if (dockFirst) add("[con_id=${dock.raw}] move left")
                 if (proportional != null) addAll(proportional) else add("[con_id=${dock.raw}] resize set width $sizePpt ppt")
             }.joinToString("; ")
             val claimed = if (floating == null) (resplit && wraps) || wrapAfter else floating.id == surface.raw
@@ -1398,7 +1408,7 @@ class SwayWindowManager(
             // report "nothing wrong" for the run that just failed.
             var fault: String? = null
             val landed = pollTree(cfg[WmFlags.unmapWaitMs]) {
-                fault = restoreFault(surface, dock, sizePpt)
+                fault = restoreFault(surface, dock, sizePpt, across?.dockWidth)
                 if (fault == null) true else null
             } == true
             check(landed) {
@@ -1436,8 +1446,11 @@ class SwayWindowManager(
          * short of its width in a split sway *would* have resized still fails the readback. And
          * only in [surface]'s own split: a dock that ended up in some other crowded split is
          * misplaced, however reasonable sway's refusal there was.
+         *
+         * The width asked for is [dockWidth] px of the dock's split where the show gave it one
+         * ([acrossSplits], #267), and [sizePpt] of it otherwise.
          */
-        private suspend fun restoreFault(surface: SurfaceId, dock: SurfaceId, sizePpt: Int): String? {
+        private suspend fun restoreFault(surface: SurfaceId, dock: SurfaceId, sizePpt: Int, dockWidth: Int?): String? {
             val tree = tree()
             val node = tree.find(dock.raw) ?: return "it is not in the tree at all"
             if (tree.workspace(SCRATCH_WORKSPACE)?.find(dock.raw) != null) {
@@ -1448,8 +1461,10 @@ class SwayWindowManager(
             }
             val percent = node.percent
                 ?: return "sway reports no width fraction for it, so it is in no tiled container"
-            val wanted = sizePpt / 100.0
-            val excused = tree.parentOf(dock.raw)?.id == tree.parentOf(surface.raw)?.id &&
+            val parent = tree.parentOf(dock.raw)
+            val wanted = dockWidth?.let { px -> parent?.rect?.width?.takeIf { it > 0 }?.let { px.toDouble() / it } }
+                ?: (sizePpt / 100.0)
+            val excused = parent?.id == tree.parentOf(surface.raw)?.id &&
                 tree.refusedResize(dock.raw, sizePpt) != null
             if (abs(percent - wanted) > PPT_TOLERANCE && !excused) {
                 return "it is ${percent * 100}% of its container wide rather than the " +
@@ -2920,13 +2935,79 @@ class SwayWindowManager(
          * the same split: [split], the surface's own one it is coming back into, or null where it
          * gets a new one beside the surface alone. A share of some other split is no width to
          * come back to, which is where a show lands after a window of the user's took the old one
-         * over (#256).
+         * over (#256); [acrossSplits] is how that show gets the dock's width back.
          */
-        private fun hiddenWidthOf(node: Node?, split: Node?): Int? = widthMarksOn(node).firstNotNullOfOrNull { mark ->
+        private fun hiddenWidthOf(node: Node?, split: Node?): Int? = recordedWidthOf(node)?.let { (from, ppt) ->
+            val same = if (from == ALONE) split == null || split.nodes.size == 1 else from.toLongOrNull() == split?.id
+            ppt.takeIf { same }
+        }
+
+        /** What the width mark on [node] says: the split it was a share of, or [ALONE], and the share. */
+        private fun recordedWidthOf(node: Node?): Pair<String, Int>? = widthMarksOn(node).firstNotNullOfOrNull { mark ->
             val (from, ppt) = mark.substringAfter("$WIDTH_MARK_PREFIX${node?.id}_").split('_')
                 .takeIf { it.size == 2 } ?: return@firstNotNullOfOrNull null
-            val same = if (from == ALONE) split == null || split.nodes.size == 1 else from.toLongOrNull() == split?.id
-            ppt.toIntOrNull()?.takeIf { same }
+            ppt.toIntOrNull()?.let { from to it }
+        }
+
+        /**
+         * What [acrossSplits] plans: [grow] widens the surface's side of the split the dock was
+         * hidden from, [size] then sizes the dock inside the surface's own, at [dockWidth] px,
+         * which is [ppt] of it.
+         */
+        private class AcrossSplits(val grow: List<String>, val size: List<String>, val dockWidth: Int, val ppt: Int)
+
+        /**
+         * The restore of [hidden] when it is coming back into a different split from the one it
+         * was hidden from, which the user's window took over (#256), or null where the show
+         * sizes it as before (#267).
+         *
+         * The hide gave the dock's width to every window left in that split in proportion, the
+         * user's included, and the show puts the dock one level down: into [usable], the
+         * surface's own split inside the old one, or into the split the batch makes around the
+         * surface where [wraps]. A width taken in there alone comes out of the surface and its
+         * other docks, once per dock, while the user's window keeps what it was given — 268 px
+         * of surface down to 116 over the first round of four docks on 1.12. So the surface's
+         * side of the old split is widened by the dock's width first ([grownBy]), and the dock
+         * then takes exactly that width inside, which leaves every window where it was before
+         * the hide. Nothing is shown back into the old split, and nothing marks it: it is the
+         * user's.
+         *
+         * Only where the old split is directly around the surface's side of it, since a width
+         * given to anything further down is shared out again on the way; and only where the
+         * widening keeps every window off sway's floor.
+         */
+        private fun acrossSplits(
+            tree: Node,
+            hidden: Node,
+            surface: SurfaceId,
+            usable: Node?,
+            wraps: Boolean,
+            dockFirst: Boolean,
+        ): AcrossSplits? {
+            val (from, ppt) = recordedWidthOf(hidden) ?: return null
+            val outer = from.toLongOrNull()?.let { tree.find(it) }?.takeIf { it.id != usable?.id } ?: return null
+            val side = when {
+                usable != null -> usable.takeIf { tree.parentOf(it.id)?.id == outer.id }
+                wraps -> tree.find(surface.raw)?.takeIf { tree.parentOf(it.id)?.id == outer.id }
+                else -> null
+            } ?: return null
+            val dockWidth = (outer.rect?.width ?: return null) * ppt / 100
+            val growth = outer.grownBy(side.id, dockWidth) ?: return null
+            if (growth.width - dockWidth < MIN_SANE_WIDTH + PREDICTION_SLACK) return null
+            // Planned from the split as the widening leaves it: sway keeps every child's fraction
+            // of a split it resizes. Beside the surface alone sway's equal share is the surface's
+            // whole share, so the plain resize is exact; beside docks too narrow for the walk it
+            // is the fallback #264's is, and the split's windows still get back together what
+            // the widening gave them.
+            val walked = side.rect?.takeIf { side.nodes.size > 1 && it.width > 0 }?.let { rect ->
+                val scale = growth.width.toDouble() / rect.width
+                side.copy(
+                    rect = rect.copy(width = growth.width),
+                    nodes = side.nodes.map { it.copy(rect = it.rect?.let { r -> r.copy(width = (r.width * scale).roundToInt()) }) },
+                ).proportionalRestore(surface.raw, hidden.id, dockWidth, dockFirst)
+            }
+            val size = walked ?: listOf("[con_id=${hidden.id}] resize set width $dockWidth px")
+            return AcrossSplits(growth.commands, size, dockWidth, (dockWidth * 100.0 / growth.width).roundToInt())
         }
 
         /**
@@ -3427,8 +3508,8 @@ internal fun Node.refusedResize(dock: Long, sizePpt: Int): Int? {
 private const val PREDICTION_SLACK = 2
 
 /**
- * The `resize` commands that bring a dock back into the horizontal split [this] at [sizePpt] of
- * it, with every window already there giving up width in proportion to its own (#264); or null
+ * The `resize` commands that bring a dock back into the horizontal split [this] at [dockWidth] px
+ * of it, with every window already there giving up width in proportion to its own (#264); or null
  * where that cannot be planned, and the caller falls back to `resize set width`.
  *
  * [this] is the split as it stands before the show, the dock still in the scratchpad. The dock
@@ -3454,15 +3535,13 @@ private const val PREDICTION_SLACK = 2
  * refuses while reporting failure, makes the plan null rather than a command that would fail the
  * batch.
  */
-internal fun Node.proportionalRestore(surface: Long, dock: Long, sizePpt: Int, dockFirst: Boolean): List<String>? {
+internal fun Node.proportionalRestore(surface: Long, dock: Long, dockWidth: Int, dockFirst: Boolean): List<String>? {
     if (layout != "splith") return null
-    val splitWidth = rect?.width ?: return null
     val before = nodes.map { node -> node.id to (node.rect?.width ?: return null) }
     val total = before.sumOf { it.second }
     val surfaceAt = before.indexOfFirst { it.first == surface }
     if (surfaceAt < 0 || total <= 0) return null
     val count = before.size
-    val dockWidth = splitWidth * sizePpt / 100
     val ids = before.map { it.first }.toMutableList().apply { add(if (dockFirst) surfaceAt else surfaceAt + 1, dock) }
     val index = before.toMap()
     fun widths(dockShare: Int, share: (Int) -> Int): List<Int> {
@@ -3474,6 +3553,16 @@ internal fun Node.proportionalRestore(surface: Long, dock: Long, sizePpt: Int, d
         (it.toDouble() * count / (count + 1)).roundToInt()
     }
     val target = widths(dockWidth) { (it.toDouble() * (total - dockWidth) / total).roundToInt() }
+    return walk(ids, current, target)
+}
+
+/**
+ * The boundary walk taking the children [ids] of a horizontal split from [current] widths to
+ * [target] ones, left to right, or null where a step would take a window under the floor: each
+ * `resize grow|shrink right` moves one window's right edge against its right neighbour alone, so
+ * the boundary after window i moves by the sum of the changes the windows up to i need.
+ */
+private fun walk(ids: List<Long>, current: List<Int>, target: List<Int>): List<String>? {
     if (target.any { it < MIN_SANE_WIDTH + PREDICTION_SLACK }) return null
     var moved = 0
     return ids.dropLast(1).mapIndexedNotNull { i, id ->
@@ -3485,4 +3574,33 @@ internal fun Node.proportionalRestore(surface: Long, dock: Long, sizePpt: Int, d
             else -> null
         }
     }
+}
+
+/** What [grownBy] plans: the walk, and the width the grown child ends at. */
+internal class Growth(val commands: List<String>, val width: Int)
+
+/**
+ * The `resize` commands that widen [child], one of this horizontal split's children, by [width]
+ * px, every other child giving up width in proportion to its own; or null where that cannot be
+ * planned (#267).
+ *
+ * This is the hide's distribution run backwards one split up. A dock hidden out of a split that
+ * holds a window of the user's leaves that split to the user (#256), and sway hands the dock's
+ * width to every window left in it in proportion, the user's included. The show then brings the
+ * dock back into a split of the surface's own one level down — the surface's own [child] of the
+ * old split — and a width taken inside that split alone comes out of the surface and its other
+ * docks while the user's window keeps what the hide gave it. Widening [child] first takes it
+ * back from where it went. Unlike [proportionalRestore] nothing here is predicted: no window is
+ * tiled into this split, so the widths are the ones the tree reports.
+ */
+internal fun Node.grownBy(child: Long, width: Int): Growth? {
+    if (layout != "splith" || width <= 0) return null
+    val ids = nodes.map { it.id }
+    val current = nodes.map { it.rect?.width ?: return null }
+    val total = current.sum()
+    val at = ids.indexOf(child)
+    if (at < 0 || nodes.size < 2 || total <= width) return null
+    val target = current.map { (it.toDouble() * (total - width) / total).roundToInt() }.toMutableList()
+    target[at] = total - (target.sum() - target[at])
+    return walk(ids, current, target)?.let { Growth(it, target[at]) }
 }
