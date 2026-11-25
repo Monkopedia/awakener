@@ -29,7 +29,8 @@ import kotlinx.coroutines.yield
  * Several docks on one surface, each hidden and shown (#261).
  *
  * sway 1.12's `resize set width` on a tiled window takes the growth from **every** sibling in an
- * equal share, and does nothing — while reporting success — when any one of them would end
+ * equal share (1.11 from its neighbours alone, [ResizeShare]), and does nothing — while
+ * reporting success — when any one of them would end
  * narrower than 100 px. With three or four docks in a split the oldest is squeezed towards that
  * floor, so the restore's resize is refused and the dock stays at the share `floating disable`
  * gave it: 25% of a split of four, 20% of a split of five. The show's width readback took that
@@ -178,6 +179,77 @@ open class SwayCrowdedDockTest {
         rounds(docks = 4, userWindow = true, joinsAfter = true)
 
     /**
+     * #269: under wm.dock.show_width=CONFIGURED every show asks for wm.dock.size_ppt again, so
+     * every round re-runs the restore's `resize set width` against a split the last round left
+     * more crowded, and the readback has to tell a refusal from a misplacement each time. The
+     * refusal rule is the compositor's and it changed in sway 1.12: 1.11 takes the growth from the
+     * dock's neighbours alone, 1.12 from every sibling. A model of one version's rule passes a
+     * single show on the other and throws within three rounds, which is why these are rounds.
+     */
+    @Test
+    fun `under CONFIGURED twelve rounds of four docks and a user window each show`() = configuredRounds(docks = 4, userWindow = true)
+
+    @Test
+    fun `under CONFIGURED twelve rounds of three docks and a user window each show`() = configuredRounds(docks = 3, userWindow = true)
+
+    @Test
+    fun `under CONFIGURED twelve rounds of four docks each show`() = configuredRounds(docks = 4, userWindow = false)
+
+    @Test
+    fun `under CONFIGURED twelve rounds of three docks each show`() = configuredRounds(docks = 3, userWindow = false)
+
+    @Test
+    fun `under CONFIGURED twelve rounds of four docks and a user window that joined after them each show`() =
+        configuredRounds(docks = 4, userWindow = true, joinsAfter = true)
+
+    @Test
+    fun `under CONFIGURED and FROM_SURFACE twelve rounds of four docks and a user window each show`() {
+        store.put(WmFlags.crowdedWidth, CrowdedWidth.FROM_SURFACE)
+        configuredRounds(docks = 4, userWindow = true)
+    }
+
+    private fun configuredRounds(docks: Int, userWindow: Boolean, joinsAfter: Boolean = false) {
+        store.put(WmFlags.showWidth, ShowWidth.CONFIGURED)
+        crowded(docks, userWindow, shown = List(ROUNDS) { 0 until docks }.flatten(), joinsAfter = joinsAfter)
+    }
+
+    /**
+     * #269, against the compositor rather than a model of it: four plain windows in a split, and
+     * a `resize set width` on the third in two trees where 1.11's rule and 1.12's disagree — a
+     * narrow first window, beyond the third's neighbours, which only 1.12 asks for a share; and a
+     * narrow second window, which can spare 1.12's third of the growth but not 1.11's half.
+     * Whichever sway this is, [refusedResize] under the [ResizeShare] it reports must say what
+     * sway then did. The trees are made with edge resizes, which both versions apply alike, so
+     * the two runs start from the same widths.
+     */
+    @Test
+    fun `the refusal rule read from the version is the one sway applies`() = swayTest {
+        val share = sway.connection().use { it.resizeShare() }
+        val cases = listOf("resize shrink right ${QUARTER_PX - NARROW_PX} px" to 0, "resize shrink left ${QUARTER_PX - 130} px" to 1)
+        for ((index, case) in cases.withIndex()) {
+            val (narrowing, narrowed) = case
+            val workspace = "${3 + index}"
+            command("workspace $workspace")
+            val first = openSurface("aw-rule-$index-0")
+            command("[con_id=${first.raw}] layout splith")
+            val windows = listOf(first) + (1..3).map { openSurface("aw-rule-$index-$it") }
+            command("[con_id=${windows[narrowed].raw}] $narrowing")
+            val target = windows[2].raw
+            val before = wm.tree()
+            val stage = "$narrowing on window ${narrowed + 1}: ${describe(before.workspace(workspace))}"
+            assertTrue(
+                (before.refusedResize(target, RULE_PPT, ResizeShare.NEIGHBOURS) == null) !=
+                    (before.refusedResize(target, RULE_PPT, ResizeShare.EVERY_SIBLING) == null),
+                "the two rules must disagree here, or this tells them apart from nothing: $stage",
+            )
+            val refused = before.refusedResize(target, RULE_PPT, share) != null
+            command("[con_id=$target] resize set width $RULE_PPT ppt")
+            val moved = wm.tree().find(target)?.rect?.width != before.find(target)?.rect?.width
+            assertEquals(!refused, moved, "under $share, refused=$refused but sway moved=$moved: $stage")
+        }
+    }
+
+    /**
      * wm.dock.show_width: a dock the user widened by hand comes back at that width under
      * AS_HIDDEN, at wm.dock.size_ppt under CONFIGURED, and either way without the mark that
      * carried the width across the hide.
@@ -300,7 +372,7 @@ open class SwayCrowdedDockTest {
             )
             val tree = wm.tree()
             assertNotNull(
-                tree.refusedResize(dock.dockId.raw, 30),
+                tree.refusedResize(dock.dockId.raw, 30, sway.connection().use { it.resizeShare() }),
                 "the foreign split is one sway refuses the dock 30% in, or this tests nothing: ${describe(tree.workspace("2"))}",
             )
         }
@@ -346,19 +418,26 @@ open class SwayCrowdedDockTest {
      * as #260's review did, when [userWindow] — then hides and shows each of [shown] in order.
      * Every show must succeed and leave its dock tiled in the surface's own split.
      */
-    private fun crowded(docks: Int, userWindow: Boolean, shown: List<Int>, exact: Boolean = false) = swayTest {
+    private fun crowded(
+        docks: Int,
+        userWindow: Boolean,
+        shown: List<Int>,
+        exact: Boolean = false,
+        joinsAfter: Boolean = false,
+    ) = swayTest {
         openSurface("aw-other")
         val app = openSurface("aw-app")
         val mine = if (userWindow) openSurface("aw-mine") else null
         val handles = mutableListOf(wm.attach(app, dockSpec(), AGENT))
-        if (mine != null) moveBeside(mine, app)
+        if (mine != null && !joinsAfter) moveBeside(mine, app)
         repeat(docks - 1) {
             handles += wm.attach(app, dockSpec(), AGENT)
             if (exact) assertAtWidth(handles.last(), "attach ${handles.size} of $docks")
         }
-        for (index in shown) {
+        if (mine != null && joinsAfter) moveBeside(mine, app)
+        for ((step, index) in shown.withIndex()) {
             val dock = handles[index]
-            val stage = "dock ${index + 1} of $docks"
+            val stage = "show ${step + 1} of ${shown.size}, dock ${index + 1} of $docks"
             assertEquals(true, dock.hide(), "$stage: the hide")
             assertEquals(true, dock.show(), "$stage: the show")
             val tree = wm.tree()
@@ -462,6 +541,12 @@ open class SwayCrowdedDockTest {
         const val NARROW_PX = 102
 
         const val ROUNDS = 12
+
+        /** A quarter of the 1280 px a split of four on the test output starts at. */
+        const val QUARTER_PX = 320
+
+        /** 31% of 1280 is 396, so the third window asks for 76 px: 26 a sibling on 1.12, 38 on 1.11. */
+        const val RULE_PPT = 31
 
         /** Each of the plan's widths is a rounding of a fraction sway holds; a few px is that. */
         const val ROUND_TRIP_PX = 4

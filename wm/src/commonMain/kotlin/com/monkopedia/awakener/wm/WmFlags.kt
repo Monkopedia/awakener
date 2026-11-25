@@ -100,7 +100,10 @@ enum class ShowWidth {
      */
     AS_HIDDEN,
 
-    /** [WmFlags.dockSizePpt], taken by sway in an equal share from every window in the split. */
+    /**
+     * [WmFlags.dockSizePpt], taken by sway from the other windows in the split: every one in an
+     * equal share from sway 1.12, the dock's neighbours alone before it (#269).
+     */
     CONFIGURED,
 }
 
@@ -471,7 +474,8 @@ object WmFlags {
         "What a dock gets when sway will not give it the width an attach or a show asks for " +
             "(#261): wm.dock.size_ppt, or the share it was hidden at under " +
             "wm.dock.show_width=AS_HIDDEN. sway takes a " +
-            "resize from every window in the split at once and refuses it outright when any one " +
+            "resize from every window in the split at once (from the dock's neighbours alone " +
+            "before sway 1.12) and refuses it outright when any one of them " +
             "would end under 100 px, which several docks on one surface reach: the oldest is " +
             "squeezed towards that floor. AS_SWAY_LEAVES: the dock keeps the share sway gave it " +
             "on tiling — 25% of a split of four, 20% of five — and nothing else moves. " +
@@ -492,7 +496,8 @@ object WmFlags {
             "comes back into a different split from the one it was hidden from (#256) gets " +
             "wm.dock.size_ppt. Otherwise wm.dock.size_ppt reaches only a dock's first placement, " +
             "and a dock resized by hand comes back at that width. CONFIGURED: wm.dock.size_ppt, which sway takes in an " +
-            "equal share from every window in the split. With several docks on one surface that " +
+            "equal share from every window in the split (from the dock's neighbours alone before " +
+            "sway 1.12). With several docks on one surface that " +
             "takes more from the surface on each show than the hide gave it, until it is down to " +
             "sway's 100 px floor.",
     )

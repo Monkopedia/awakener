@@ -85,4 +85,8 @@ data class WindowEvent(val change: String, val container: Node? = null)
 @Serializable
 data class CommandResult(val success: Boolean = false, val error: String? = null)
 
+/** The part of a `GET_VERSION` reply anything here reads. */
+@Serializable
+internal data class SwayVersion(val major: Int, val minor: Int)
+
 internal val swayJson: Json = Json { ignoreUnknownKeys = true }

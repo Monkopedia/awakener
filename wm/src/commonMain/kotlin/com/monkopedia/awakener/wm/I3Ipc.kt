@@ -21,6 +21,7 @@ object I3Ipc {
         const val SUBSCRIBE: Int = 2
         const val GET_TREE: Int = 4
         const val GET_MARKS: Int = 5
+        const val GET_VERSION: Int = 7
     }
 
     /**
