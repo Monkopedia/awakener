@@ -104,7 +104,15 @@ class SwayWindowManager(
      * connections are otherwise indistinguishable to anybody reading a message, and "this handle is
      * from a session that ended" leaves a reader unable to tell one boundary from three.
      */
-    private class Session(val connection: SwayConnection, val generation: Long)
+    private class Session(val connection: SwayConnection, val generation: Long) {
+        /**
+         * How this compositor shares out a `resize set width`, read the first time a show or an
+         * attach needs it and kept for the session: the rule is a fact about the build, and a
+         * successor session may be a different build (#269).
+         */
+        @Volatile
+        var resizeShare: ResizeShare? = null
+    }
 
     /**
      * The live session, or null before the first command and after a boundary nothing has yet
@@ -741,6 +749,10 @@ class SwayWindowManager(
          * from a successor connection would be reasoning about one session's ids against another's.
          */
         suspend fun tree(): Node = tree(session)
+
+        /** [Session.resizeShare], asked of the compositor once per session. */
+        suspend fun resizeShare(): ResizeShare =
+            session.resizeShare ?: session.connection.resizeShare().also { session.resizeShare = it }
 
         suspend fun run(command: String) {
             val failure = attempt(command)
@@ -1407,8 +1419,9 @@ class SwayWindowManager(
             // deadline has expired races a tree that may have settled in the meantime, and would
             // report "nothing wrong" for the run that just failed.
             var fault: String? = null
+            val share = resizeShare()
             val landed = pollTree(cfg[WmFlags.unmapWaitMs]) {
-                fault = restoreFault(surface, dock, sizePpt, across?.dockWidth)
+                fault = restoreFault(surface, dock, sizePpt, share, across?.dockWidth)
                 if (fault == null) true else null
             } == true
             check(landed) {
@@ -1450,7 +1463,13 @@ class SwayWindowManager(
          * The width asked for is [dockWidth] px of the dock's split where the show gave it one
          * ([acrossSplits], #267), and [sizePpt] of it otherwise.
          */
-        private suspend fun restoreFault(surface: SurfaceId, dock: SurfaceId, sizePpt: Int, dockWidth: Int?): String? {
+        private suspend fun restoreFault(
+            surface: SurfaceId,
+            dock: SurfaceId,
+            sizePpt: Int,
+            share: ResizeShare,
+            dockWidth: Int?,
+        ): String? {
             val tree = tree()
             val node = tree.find(dock.raw) ?: return "it is not in the tree at all"
             if (tree.workspace(SCRATCH_WORKSPACE)?.find(dock.raw) != null) {
@@ -1465,7 +1484,7 @@ class SwayWindowManager(
             val wanted = dockWidth?.let { px -> parent?.rect?.width?.takeIf { it > 0 }?.let { px.toDouble() / it } }
                 ?: (sizePpt / 100.0)
             val excused = parent?.id == tree.parentOf(surface.raw)?.id &&
-                tree.refusedResize(dock.raw, sizePpt) != null
+                tree.refusedResize(dock.raw, sizePpt, share) != null
             if (abs(percent - wanted) > PPT_TOLERANCE && !excused) {
                 return "it is ${percent * 100}% of its container wide rather than the " +
                     (dockWidth?.let { "$it px" } ?: "$sizePpt%") + " the show gave it"
@@ -1485,7 +1504,7 @@ class SwayWindowManager(
         suspend fun takeRefusedWidthFromSurface(surface: SurfaceId, dock: SurfaceId, sizePpt: Int) {
             if (config[WmFlags.crowdedWidth] != CrowdedWidth.FROM_SURFACE) return
             val tree = tree()
-            val shortfall = tree.refusedResize(dock.raw, sizePpt)?.takeIf { it > 0 } ?: return
+            val shortfall = tree.refusedResize(dock.raw, sizePpt, resizeShare())?.takeIf { it > 0 } ?: return
             val siblings = tree.parentOf(dock.raw)?.nodes ?: return
             val index = siblings.indexOfFirst { it.id == dock.raw }
             val edge = when (surface.raw) {
@@ -3529,10 +3548,71 @@ class SwayWindowManager(
 }
 
 /**
- * sway's floor on a tiled window's width, `MIN_SANE_W` in sway 1.12's `include/sway/tree/node.h`.
+ * sway's floor on a tiled window's width, `MIN_SANE_W` in `include/sway/tree/node.h` (100 in both
+ * 1.11 and 1.12).
  * A resize that would take any window under it is not made.
  */
 internal const val MIN_SANE_WIDTH = 100
+
+/**
+ * Which windows sway takes a `resize set width` from, which is the one thing about the rule that
+ * changed between the two sways awakener runs on (#269). `container_resize_tiled` in
+ * `sway/commands/resize.c`, as rewritten by swaywm/sway@340505bb ("make resize consider all
+ * siblings"), first released in 1.12. Edge resizes (`resize grow|shrink left|right`) take from
+ * the one neighbour on that side under both, so only this differs.
+ */
+internal enum class ResizeShare {
+    /**
+     * Before 1.12: from the window's neighbours alone, half each rounded up, or all of it from the
+     * one neighbour a window at either end of the split has. CI's sway, Ubuntu's 1.11.
+     */
+    NEIGHBOURS,
+
+    /** 1.12 on: from every other window in the split, an equal share each rounded up. */
+    EVERY_SIBLING,
+    ;
+
+    companion object {
+        /**
+         * What a compositor whose version cannot be read is taken to do: the rule of the sway the
+         * hosts run, and of every release since. A wrong guess costs a show that throws on a short
+         * dock sway refused, or one that excuses a dock sway would have resized; the guess most
+         * likely to be right is the newest rule.
+         */
+        val UNKNOWN_VERSION = EVERY_SIBLING
+
+        /**
+         * The rule sway [version] applies. sway fills `major` and `minor` by `sscanf`ing its own
+         * version string (`sway/ipc-json.c`), so a release candidate reads as its release:
+         * `1.12-rc1` is 1.12, and swaywm/sway@340505bb is already in it. Three cases read wrong
+         * or not at all, and are stated rather than guessed at:
+         *
+         * - A `1.12-dev` git build from before swaywm/sway@340505bb reports 1.12 and still has the
+         *   old rule. Only a development build between the version bump and that commit is there;
+         *   no release is.
+         * - A version string sway could not parse reaches IPC as 0.0. That says nothing about the
+         *   build, so it is [UNKNOWN_VERSION] rather than "older than 1.12".
+         * - A reply without `major` or `minor`, or one that is not a version object at all
+         *   ([of] taking the raw reply), is [UNKNOWN_VERSION] too. A show does not fail over it.
+         */
+        fun of(version: SwayVersion): ResizeShare {
+            val major = version.major ?: return UNKNOWN_VERSION
+            val minor = version.minor ?: return UNKNOWN_VERSION
+            return when {
+                major == 0 -> UNKNOWN_VERSION
+                major > 1 || major == 1 && minor >= 12 -> EVERY_SIBLING
+                else -> NEIGHBOURS
+            }
+        }
+
+        /** [of] the raw `GET_VERSION` [reply], or [UNKNOWN_VERSION] where it is not one. */
+        fun of(reply: String): ResizeShare =
+            runCatching { swayJson.decodeFromString<SwayVersion>(reply) }.map(::of).getOrDefault(UNKNOWN_VERSION)
+    }
+}
+
+/** The [ResizeShare] of the compositor at the other end of this connection, from its version. */
+internal suspend fun SwayConnection.resizeShare(): ResizeShare = ResizeShare.of(request(I3Ipc.Request.GET_VERSION))
 
 /**
  * How many pixels short of [sizePpt] sway leaves the window [dock] because it refused the
@@ -3540,13 +3620,13 @@ internal const val MIN_SANE_WIDTH = 100
  * have put the dock itself under the floor — or null when sway would have made that resize
  * (#261).
  *
- * This is sway 1.12's own decision, recomputed from the tree it acted on rather than allowed
- * for with slack. `resize set width` on a tiled window converts the percentage to pixels of the
- * nearest horizontal split, then takes the growth from **every** sibling in that split in an
- * equal share, rounded up — and when any one of them would end under [MIN_SANE_WIDTH], it
- * changes nothing and still reports success (`resize_set_tiled` and `container_resize_tiled`
- * in `sway/commands/resize.c`). A refused resize leaves the tree exactly as it was, so the tree
- * read afterwards is the one sway judged.
+ * This is sway's own decision, recomputed from the tree it acted on rather than allowed for with
+ * slack. `resize set width` on a tiled window converts the percentage to pixels of the nearest
+ * horizontal split, then takes the growth from the windows [share] names — and when any one of
+ * them, or the dock, would end under [MIN_SANE_WIDTH], it changes nothing and still reports
+ * success (`resize_set_tiled` and `container_resize_tiled` in `sway/commands/resize.c`). A
+ * refused resize leaves the tree exactly as it was, so the tree read afterwards is the one sway
+ * judged.
  *
  * Several docks on one surface is what reaches it: each new one is tiled beside the surface and
  * the oldest is squeezed towards the floor, so the restore's resize is refused and the dock
@@ -3554,23 +3634,28 @@ internal const val MIN_SANE_WIDTH = 100
  * four and 20% of a split of five, against 30 configured.
  *
  * Null for anything sway would have resized, so a dock short of its width in a split with room
- * to give it — the resize never sent, or undone by another client — is still a fault.
+ * to give it — the resize never sent, or undone by another client — is still a fault. That is
+ * why [share] is the running compositor's and not the union of both rules: either rule alone
+ * refuses resizes the other makes (#269).
  */
-internal fun Node.refusedResize(dock: Long, sizePpt: Int): Int? {
+internal fun Node.refusedResize(dock: Long, sizePpt: Int, share: ResizeShare): Int? {
     val split = parentOf(dock)?.takeIf { it.layout == "splith" } ?: return null
-    val node = split.nodes.firstOrNull { it.id == dock } ?: return null
-    val siblings = split.nodes - node
+    val index = split.nodes.indexOfFirst { it.id == dock }.takeIf { it >= 0 } ?: return null
+    if (split.nodes.size < 2) return null
     val splitWidth = split.rect?.width ?: return null
-    val width = node.rect?.width ?: return null
-    if (siblings.isEmpty()) return null
+    val width = split.nodes[index].rect?.width ?: return null
     val growth = splitWidth * sizePpt / 100 - width
     // The dock is in sway's check too: one that would be *narrowed* under the floor is refused
     // the same way, which a show into a narrow split reaches (#264's map, four docks and a
     // window of the user's).
     if (width + growth < MIN_SANE_WIDTH) return growth
     if (growth <= 0) return null
-    val share = (growth + siblings.size - 1) / siblings.size
-    val refused = siblings.any { (it.rect?.width ?: return null) - share < MIN_SANE_WIDTH }
+    val givers = when (share) {
+        ResizeShare.EVERY_SIBLING -> split.nodes.filterIndexed { i, _ -> i != index }
+        ResizeShare.NEIGHBOURS -> listOfNotNull(split.nodes.getOrNull(index - 1), split.nodes.getOrNull(index + 1))
+    }
+    val each = (growth + givers.size - 1) / givers.size
+    val refused = givers.any { (it.rect?.width ?: return null) - each < MIN_SANE_WIDTH }
     return growth.takeIf { refused }
 }
 
@@ -3599,7 +3684,8 @@ private const val UNTOUCHED_SLACK = 4
  * Proportional because that is how the hide handed the dock's width out: sway keeps each
  * window's fraction of the split and scales the rest up to fill it. So taking it back the same
  * way, at the share the dock was hidden at, puts every window where it was before the hide.
- * `resize set width` cannot: it takes the growth from every sibling in an *equal* share, so each
+ * `resize set width` cannot: it takes the growth from every sibling in an *equal* share (sway
+ * 1.12; before it, from the dock's neighbours alone — [ResizeShare]), so each
  * show takes more from a window narrower than the average than the hide gave it, and with several
  * docks on one surface the surface is walked down to sway's floor (measured on headless 1.12,
  * 217 px to 100 over twelve rounds of four docks).

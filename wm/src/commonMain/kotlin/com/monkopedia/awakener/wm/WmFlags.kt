@@ -100,7 +100,10 @@ enum class ShowWidth {
      */
     AS_HIDDEN,
 
-    /** [WmFlags.dockSizePpt], taken by sway in an equal share from every window in the split. */
+    /**
+     * [WmFlags.dockSizePpt], taken by sway from the other windows in the split: every one in an
+     * equal share from sway 1.12, the dock's neighbours alone before it (#269).
+     */
     CONFIGURED,
 }
 
@@ -472,7 +475,8 @@ object WmFlags {
         "What a dock gets when sway will not give it the width an attach or a show asks for " +
             "(#261): wm.dock.size_ppt, or the share it was hidden at under " +
             "wm.dock.show_width=AS_HIDDEN. sway takes a " +
-            "resize from every window in the split at once and refuses it outright when any one " +
+            "resize from every window in the split at once (from the dock's neighbours alone " +
+            "before sway 1.12) and refuses it outright when any one of them " +
             "would end under 100 px, which several docks on one surface reach: the oldest is " +
             "squeezed towards that floor. AS_SWAY_LEAVES: the dock keeps the share sway gave it " +
             "on tiling — 25% of a split of four, 20% of five — and nothing else moves. " +
@@ -492,14 +496,16 @@ object WmFlags {
             "floor, the show falls back to resizing the dock as CONFIGURED does; and a dock that " +
             "comes back into a different split from the one it was hidden from, because a window " +
             "of the user's took that one over (#256), gets its width back by widening the " +
-            "surface's side of the old split first, taken from every other window there in " +
-            "proportion, the user's included (#267) — and wm.dock.size_ppt where the old split " +
-            "is not directly around the surface's, where that would take a window under the " +
-            "floor, or where a window there was resized, opened or closed since the hide, so a " +
-            "width the user set by hand is never taken back. " +
+            "surface's side of the old split first, every other window there giving back what " +
+            "the hides of docks out of it gave it, the user's included (#267) — and " +
+            "wm.dock.size_ppt where the old split is not directly around the surface's, where " +
+            "that would take a window under the floor, or where a window there was resized, " +
+            "opened or closed since the hide by anything but awakener's own hides and shows, so " +
+            "a width the user set by hand is never taken back. " +
             "Otherwise wm.dock.size_ppt reaches only a dock's first placement, " +
             "and a dock resized by hand comes back at that width. CONFIGURED: wm.dock.size_ppt, which sway takes in an " +
-            "equal share from every window in the split. With several docks on one surface that " +
+            "equal share from every window in the split (from the dock's neighbours alone before " +
+            "sway 1.12). With several docks on one surface that " +
             "takes more from the surface on each show than the hide gave it, until it is down to " +
             "sway's 100 px floor.",
     )

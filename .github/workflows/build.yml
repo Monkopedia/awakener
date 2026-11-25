@@ -381,3 +381,97 @@ jobs:
           XML: ${{ needs.build.outputs.xml-upload }}
           HTML: ${{ needs.build.outputs.html-upload }}
         run: .github/scripts/upload-outcome.sh
+
+  # :wm again, against the sway the hosts run rather than the one Ubuntu packages (#269).
+  #
+  # `build` above gets whatever sway ubuntu-latest's apt serves — 1.11 on ubuntu-26.04 — while
+  # kaladin and adolin are Arch and run 1.12. Those two differ in a rule :wm models:
+  # `resize set width` takes its growth from a window's neighbours on 1.11 and from every sibling
+  # on 1.12 (swaywm/sway@340505bb). A suite run on one version says nothing about the other, and
+  # until this job the one CI ran was not the one the code is deployed against. So the suite
+  # runs on both, and the version each job saw is printed in its log.
+  #
+  # Arch in a container because that is the hosts' distribution, and 1.12 cannot be had on
+  # Ubuntu without building wlroots 0.20 as well. **The version is not pinned, deliberately.**
+  # The pin that exists — the Arch Linux Archive's dated snapshot — failed to serve its package
+  # databases to kaladin in three attempts on 2026-11-25 (two timeouts, one stall past ten
+  # minutes), and a job that fails for want of a mirror is a red about nothing. Unpinned, this tracks what an up-to-date host runs, which is
+  # the question the job exists to answer; a sway that changes the rule again reddens
+  # `the refusal rule read from the version is the one sway applies`, which confronts the model
+  # with the compositor rather than with a version number.
+  #
+  # :wm only: it is the module whose results depend on the compositor's rules. :cli's suite also
+  # drives sway, but through :wm, and needs spanreed and the shells besides; `build` keeps it.
+  wm-sway-arch:
+    runs-on: ubuntu-latest
+    # `--init`, because the job's PID 1 is otherwise the `tail -f` GitHub keeps the container
+    # alive with, which reaps nothing. SwayHarnessReapTest asserts a session leaves no process
+    # behind, and an unreaped orphan is still in /proc: both of its cases went red that way in
+    # a container without an init (measured under docker, sway 1.11) and green with one.
+    container:
+      image: archlinux:base
+      options: --init
+    steps:
+      # Arch ships sway with `cap_sys_nice=ep` as a file capability, and a container's bounding
+      # set does not hold CAP_SYS_NICE, so the kernel refuses to exec it at all ("Operation not
+      # permitted", measured in archlinux:base under docker). sway only uses it to raise its own
+      # scheduling priority, which nothing here measures, so the capability is dropped rather than
+      # the container widened.
+      - name: Install sway, foot, grim and JDK 21
+        run: |
+          set -eu
+          pacman -Syu --noconfirm --needed sway foot grim jdk21-openjdk ttf-dejavu git
+          setcap -r /usr/bin/sway
+          sway --version
+          foot --version
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Both wrapper checks again, because this job runs ./gradlew without waiting on `build`, so
+      # a check that only `build` makes has not been made before anything executes here. The pin
+      # first, for `build`'s reason: the wrapper rejects a wrong `distributionSha256Sum` and
+      # accepts a missing one, and with the line deleted this job would download and run an
+      # unverified distribution while `build` went red beside it, stopping nothing. The matrix
+      # with it, as in `build`, so the guard is shown able to fail in this container too.
+      - name: Check the distribution is pinned at all
+        run: |
+          set -eu
+          .github/scripts/check-wrapper-pin-matrix.sh
+          .github/scripts/check-wrapper-pin.sh
+
+      # The jar, for the same reason.
+      - uses: gradle/actions/wrapper-validation@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
+
+      # No setup-gradle, so no build cache and no restored distribution: the wrapper downloads
+      # and checks `distributionSha256Sum` on every run, and nothing can replay another job's
+      # results into this one.
+      #
+      # As a user, not as the container's root. Two SwayBindingTest cases make a residue
+      # disposal fail by taking write permission off its directory, which root ignores, and
+      # they went red under root (measured, archlinux:base under docker, sway 1.12) for a reason
+      # that has nothing to do with the code. ubuntu-latest's `build` runs as a user already.
+      - name: Test :wm
+        run: |
+          set -eu
+          useradd --create-home builder
+          chown -R builder: "$GITHUB_WORKSPACE"
+          runuser -u builder -- env AWAKENER_REQUIRE_SWAY=1 ./gradlew :wm:jvmTest --stacktrace
+
+      # The same counts and the same floor gate as `build`, over the one module this job runs.
+      - name: Summarise test counts
+        if: always()
+        env:
+          AWAKENER_TEST_MODULES: wm
+        run: |
+          grep '^wm ' .github/scripts/test-floors > "$RUNNER_TEMP/wm-floor"
+          AWAKENER_TEST_FLOORS="$RUNNER_TEMP/wm-floor" .github/scripts/test-summary.sh
+
+      - name: Upload JUnit XML
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-results-xml-sway-arch
+          path: 'wm/build/test-results/*/*.xml'
+          if-no-files-found: warn
+          retention-days: 90
