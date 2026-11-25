@@ -7,6 +7,7 @@ import com.monkopedia.awakener.registry.FileBindingStore
 import java.nio.file.Path
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.io.path.absolutePathString
+import kotlin.math.abs
 import kotlin.io.path.createTempDirectory
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
@@ -192,6 +193,46 @@ open class SwayCrowdedDockTest {
     @Test
     fun `twelve rounds of two docks and a user window leave the surface where it was`() =
         rounds(docks = 2, userWindow = true)
+
+    /**
+     * #270's review: a user window resized by hand while the dock is hidden keeps the width the
+     * user chose. The show across splits used to take the dock's width out of whatever width the
+     * old split's windows had, the user's choice included: 383 px chosen ended at 306, 683 at 546.
+     */
+    @Test
+    fun `a user window narrowed while one dock is hidden keeps its width`() = handResizedWhileHidden(docks = 1, by = -150)
+
+    @Test
+    fun `a user window widened while one dock is hidden keeps its width`() = handResizedWhileHidden(docks = 1, by = 150)
+
+    @Test
+    fun `a user window narrowed while one of two docks is hidden keeps its width`() =
+        handResizedWhileHidden(docks = 2, by = -150)
+
+    @Test
+    fun `a user window widened while one of two docks is hidden keeps its width`() =
+        handResizedWhileHidden(docks = 2, by = 150)
+
+    private fun handResizedWhileHidden(docks: Int, by: Int) = swayTest {
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        val mine = openSurface("aw-mine")
+        val handles = List(docks) { wm.attach(app, dockSpec(), AGENT) }
+        moveBeside(mine, app)
+        val dock = handles.first()
+        assertEquals(true, dock.hide(), "the hide")
+        val hidden = assertNotNull(wm.tree().find(mine.raw)?.rect?.width, "the user's window")
+        command("[con_id=${mine.raw}] resize set width ${hidden + by} px")
+        val chosen = assertNotNull(wm.tree().find(mine.raw)?.rect?.width, "the user's window")
+        assertTrue(abs(chosen - (hidden + by)) <= ROUND_TRIP_PX, "the hand resize took: $hidden to $chosen px: ${describe()}")
+        assertEquals(true, dock.show(), "the show")
+        val after = wm.tree()
+        val now = assertNotNull(after.find(mine.raw)?.rect?.width, "the user's window")
+        assertTrue(abs(now - chosen) <= ROUND_TRIP_PX, "the user chose $chosen px and the show left $now: ${describe()}")
+        val marked = generateSequence(after.parentOf(mine.raw)) { after.parentOf(it.id) }
+            .filter { node -> node.marks.any { it.startsWith("_awakener_split_") } }.toList()
+        assertTrue(marked.isEmpty(), "a split holding the user's window is marked awakener's: ${marked.map { it.marks }}")
+    }
 
     /**
      * wm.dock.show_width: a dock the user widened by hand comes back at that width under

@@ -494,7 +494,9 @@ object WmFlags {
             "of the user's took that one over (#256), gets its width back by widening the " +
             "surface's side of the old split first, taken from every other window there in " +
             "proportion, the user's included (#267) — and wm.dock.size_ppt where the old split " +
-            "is not directly around the surface's or that would take a window under the floor. " +
+            "is not directly around the surface's, where that would take a window under the " +
+            "floor, or where a window there was resized, opened or closed since the hide, so a " +
+            "width the user set by hand is never taken back. " +
             "Otherwise wm.dock.size_ppt reaches only a dock's first placement, " +
             "and a dock resized by hand comes back at that width. CONFIGURED: wm.dock.size_ppt, which sway takes in an " +
             "equal share from every window in the split. With several docks on one surface that " +

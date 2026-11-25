@@ -1468,7 +1468,7 @@ class SwayWindowManager(
                 tree.refusedResize(dock.raw, sizePpt) != null
             if (abs(percent - wanted) > PPT_TOLERANCE && !excused) {
                 return "it is ${percent * 100}% of its container wide rather than the " +
-                    "$sizePpt% the show gave it"
+                    (dockWidth?.let { "$it px" } ?: "$sizePpt%") + " the show gave it"
             }
             return null
         }
@@ -2923,7 +2923,13 @@ class SwayWindowManager(
             val floor = split.rect?.width?.takeIf { it > 0 }?.let { ceil(MIN_SANE_WIDTH * 100.0 / it).toInt() } ?: 1
             val ppt = (percent * 100).roundToInt().coerceAtLeast(floor).coerceIn(1, 99)
             val alone = split.nodes.size == 2 && split.nodes.any { it.id == surface.raw }
-            return "$WIDTH_MARK_PREFIX${dock.raw}_${if (alone) ALONE else split.id}_$ppt"
+            if (alone) return "$WIDTH_MARK_PREFIX${dock.raw}_${ALONE}_$ppt"
+            // #270's review: what every other window in the split stood at, so a show coming back
+            // across splits can tell the width the hide hands them from width the user set since.
+            val others = split.nodes.filter { it.id != dock.raw }.map { it.id to it.rect?.width }
+            val sizes = others.takeIf { list -> list.all { it.second != null } }
+                ?.joinToString(".", prefix = "_") { (id, width) -> "${id}x$width" }.orEmpty()
+            return "$WIDTH_MARK_PREFIX${dock.raw}_${split.id}_$ppt$sizes"
         }
 
         /** The width marks on [node], from [widthMarkFor]. */
@@ -2937,16 +2943,42 @@ class SwayWindowManager(
          * come back to, which is where a show lands after a window of the user's took the old one
          * over (#256); [acrossSplits] is how that show gets the dock's width back.
          */
-        private fun hiddenWidthOf(node: Node?, split: Node?): Int? = recordedWidthOf(node)?.let { (from, ppt) ->
+        private fun hiddenWidthOf(node: Node?, split: Node?): Int? = recordedWidthOf(node)?.let { recorded ->
+            val from = recorded.from
             val same = if (from == ALONE) split == null || split.nodes.size == 1 else from.toLongOrNull() == split?.id
-            ppt.takeIf { same }
+            recorded.ppt.takeIf { same }
         }
 
-        /** What the width mark on [node] says: the split it was a share of, or [ALONE], and the share. */
-        private fun recordedWidthOf(node: Node?): Pair<String, Int>? = widthMarksOn(node).firstNotNullOfOrNull { mark ->
-            val (from, ppt) = mark.substringAfter("$WIDTH_MARK_PREFIX${node?.id}_").split('_')
-                .takeIf { it.size == 2 } ?: return@firstNotNullOfOrNull null
-            ppt.toIntOrNull()?.let { from to it }
+        /**
+         * What a width mark says: the split the dock was a share of, or [ALONE]; the share; and
+         * the px every other window in that split stood at, where the mark recorded them.
+         */
+        private class RecordedWidth(val from: String, val ppt: Int, val others: Map<Long, Int>?)
+
+        /** The width mark on [node], read. */
+        private fun recordedWidthOf(node: Node?): RecordedWidth? = widthMarksOn(node).firstNotNullOfOrNull { mark ->
+            val parts = mark.substringAfter("$WIDTH_MARK_PREFIX${node?.id}_").split('_')
+            if (parts.size !in 2..3) return@firstNotNullOfOrNull null
+            val others = parts.getOrNull(2)?.split('.')?.associate { entry ->
+                val (id, px) = entry.split('x').takeIf { it.size == 2 } ?: return@firstNotNullOfOrNull null
+                (id.toLongOrNull() ?: return@firstNotNullOfOrNull null) to (px.toIntOrNull() ?: return@firstNotNullOfOrNull null)
+            }
+            parts[1].toIntOrNull()?.let { RecordedWidth(parts[0], it, others) }
+        }
+
+        /**
+         * Whether every window in [split] is where the hide left it: the same windows as [before],
+         * the widths they stood at beside the dock, each scaled up as sway does when the dock
+         * leaves — every fraction renormalised, so every width by the same factor — to within
+         * [UNTOUCHED_SLACK] px for sway's rounding. A window resized, opened or closed in there
+         * since is a change of the user's, and the show then leaves the split alone.
+         */
+        private fun untouchedSince(split: Node, before: Map<Long, Int>): Boolean {
+            val now = split.nodes.associate { it.id to (it.rect?.width ?: return false) }
+            val total = before.values.sum()
+            if (now.keys != before.keys || total <= 0) return false
+            val scale = now.values.sum().toDouble() / total
+            return now.all { (id, width) -> abs(width - before.getValue(id) * scale) <= UNTOUCHED_SLACK }
         }
 
         /**
@@ -2973,8 +3005,12 @@ class SwayWindowManager(
          * user's.
          *
          * Only where the old split is directly around the surface's side of it, since a width
-         * given to anything further down is shared out again on the way; and only where the
-         * widening keeps every window off sway's floor.
+         * given to anything further down is shared out again on the way; only where the
+         * widening keeps every window off sway's floor; and only where the old split is as the
+         * hide left it ([untouchedSince]). Its current widths are then the hide's hand-out and
+         * nothing else, whereas a window the user has resized since holds a width they chose,
+         * and a show that took the dock's width out of it would undo that (#255's lesson, #270's
+         * review: a user window narrowed by hand to 383 px ended at 306).
          */
         private fun acrossSplits(
             tree: Node,
@@ -2984,8 +3020,10 @@ class SwayWindowManager(
             wraps: Boolean,
             dockFirst: Boolean,
         ): AcrossSplits? {
-            val (from, ppt) = recordedWidthOf(hidden) ?: return null
-            val outer = from.toLongOrNull()?.let { tree.find(it) }?.takeIf { it.id != usable?.id } ?: return null
+            val recorded = recordedWidthOf(hidden) ?: return null
+            val ppt = recorded.ppt
+            val outer = recorded.from.toLongOrNull()?.let { tree.find(it) }
+                ?.takeIf { it.id != usable?.id && untouchedSince(it, recorded.others ?: return null) } ?: return null
             val side = when {
                 usable != null -> usable.takeIf { tree.parentOf(it.id)?.id == outer.id }
                 wraps -> tree.find(surface.raw)?.takeIf { tree.parentOf(it.id)?.id == outer.id }
@@ -3506,6 +3544,13 @@ internal fun Node.refusedResize(dock: Long, sizePpt: Int): Int? {
  * of a fraction sway holds and the tree does not show, and a boundary sits after several.
  */
 private const val PREDICTION_SLACK = 2
+
+/**
+ * How far a window in a split a dock was hidden from may be from where the hide's proportional
+ * hand-out put it and still count as untouched: each width is a rounding of a fraction, twice —
+ * once beside the dock, once after it — and a hand resize is tens of px, not a few.
+ */
+private const val UNTOUCHED_SLACK = 4
 
 /**
  * The `resize` commands that bring a dock back into the horizontal split [this] at [dockWidth] px
