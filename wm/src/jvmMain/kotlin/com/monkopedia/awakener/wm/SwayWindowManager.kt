@@ -3531,9 +3531,10 @@ private const val PREDICTION_SLACK = 2
  * it walks from are predicted, because the plan has to go out in the same message as the
  * `floating disable` (#172): sway gives the window it tiles in the mean of the existing
  * fractions, so with n windows already there the dock gets 1/(n+1) of the split and every other
- * window keeps its share of the rest. A boundary that would take either window beside it under [MIN_SANE_WIDTH], which sway
- * refuses while reporting failure, makes the plan null rather than a command that would fail the
- * batch.
+ * window keeps its share of the rest. A window that stood under the floor before the hide comes
+ * back at it instead ([floored]). A boundary that would take either window beside it under
+ * [MIN_SANE_WIDTH], which sway refuses while reporting failure, makes the plan null rather than a
+ * command that would fail the batch.
  */
 internal fun Node.proportionalRestore(surface: Long, dock: Long, dockWidth: Int, dockFirst: Boolean): List<String>? {
     if (layout != "splith") return null
@@ -3553,7 +3554,33 @@ internal fun Node.proportionalRestore(surface: Long, dock: Long, dockWidth: Int,
         (it.toDouble() * count / (count + 1)).roundToInt()
     }
     val target = widths(dockWidth) { (it.toDouble() * (total - dockWidth) / total).roundToInt() }
-    return walk(ids, current, target)
+    return floored(target, keep = ids.indexOf(dock))?.let { walk(ids, current, it) }
+}
+
+/**
+ * [target] with every width but [keep]'s raised to the least a walk can leave a window at, the
+ * difference taken from the others in proportion to their own; or null where they cannot spare
+ * it.
+ *
+ * A window can stand under sway's floor — `floating disable` tiles a window in at the mean share
+ * whatever that leaves the others, and several docks on one surface reach it — and a plan putting
+ * it back there is one sway refuses. Measured on CI's sway 1.11 (#267): four docks beside the
+ * surface, the oldest at 97 px, so the walk was not planned and the show fell back to `resize set
+ * width`, whose equal share took 13 px of the surface to the narrow docks.
+ */
+private fun floored(target: List<Int>, keep: Int): List<Int>? {
+    val floor = MIN_SANE_WIDTH + PREDICTION_SLACK
+    val short = target.indices.filter { it != keep && target[it] < floor }
+    if (short.isEmpty()) return target
+    val donors = target.indices.filter { it != keep && it !in short }
+    val pool = donors.sumOf { target[it] }
+    val deficit = short.sumOf { floor - target[it] }
+    if (donors.isEmpty() || pool - deficit < donors.size * floor) return null
+    val out = target.toMutableList()
+    short.forEach { out[it] = floor }
+    donors.forEach { out[it] = target[it] - (deficit.toDouble() * target[it] / pool).roundToInt() }
+    out[donors.last()] += target.sum() - out.sum()
+    return out
 }
 
 /**

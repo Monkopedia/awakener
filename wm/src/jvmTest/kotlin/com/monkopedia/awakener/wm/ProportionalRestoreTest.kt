@@ -36,10 +36,23 @@ class ProportionalRestoreTest {
         assertTrue(kotlin.math.abs(after.getValue(APP) - 450) <= 1, "$after")
     }
 
+    /**
+     * The surface would come back at 72 px, which sway refuses, so it comes back at the floor and
+     * the docks beside it give up the difference (#267).
+     */
+    @Test
+    fun `a window that would come back under the floor comes back at it`() {
+        val split = split(721, APP to 120, 21L to 300, 22L to 301)
+        val after = apply(split, assertNotNull(split.proportionalRestore(APP, DOCK, 288, dockFirst = false)), at = 1)
+        assertEquals(288, after.getValue(DOCK), "$after")
+        assertEquals(MIN_SANE_WIDTH + 2, after.getValue(APP), "$after")
+        assertEquals(721, after.values.sum(), "$after")
+    }
+
     /** sway would refuse the boundary, and a refused command fails the whole restore batch. */
     @Test
-    fun `a plan that would take a window under the floor is not made`() {
-        assertNull(split(721, APP to 120, 21L to 300, 22L to 301).proportionalRestore(APP, DOCK, 288, dockFirst = false))
+    fun `a plan the other windows cannot spare the floor for is not made`() {
+        assertNull(split(400, APP to 130, 21L to 135, 22L to 135).proportionalRestore(APP, DOCK, 150, dockFirst = false))
     }
 
     @Test
