@@ -19,7 +19,7 @@ class ProportionalRestoreTest {
     @Test
     fun `every window gives the dock back its width in proportion to its own`() {
         val split = split(721, APP to 200, 21L to 149, 22L to 147, 23L to 225)
-        val after = apply(split, assertNotNull(split.proportionalRestore(APP, DOCK, 21, dockFirst = false)), at = 1)
+        val after = apply(split, assertNotNull(split.proportionalRestore(APP, DOCK, 721 * 21 / 100, dockFirst = false)), at = 1)
         val dock = 721 * 21 / 100
         assertEquals(dock, after.getValue(DOCK), "$after")
         listOf(APP to 200, 21L to 149, 22L to 147, 23L to 225).forEach { (id, width) ->
@@ -31,20 +31,72 @@ class ProportionalRestoreTest {
     @Test
     fun `a dock that comes back before the surface is walked from there`() {
         val split = split(1280, 21L to 300, APP to 600, 22L to 380)
-        val after = apply(split, assertNotNull(split.proportionalRestore(APP, DOCK, 25, dockFirst = true)), at = 1)
+        val after = apply(split, assertNotNull(split.proportionalRestore(APP, DOCK, 320, dockFirst = true)), at = 1)
         assertEquals(320, after.getValue(DOCK), "$after")
         assertTrue(kotlin.math.abs(after.getValue(APP) - 450) <= 1, "$after")
     }
 
+    /**
+     * The surface would come back at 72 px, which sway refuses, so it comes back at the floor and
+     * the docks beside it give up the difference (#267).
+     */
+    @Test
+    fun `a window that would come back under the floor comes back at it`() {
+        val split = split(721, APP to 120, 21L to 300, 22L to 301)
+        val after = apply(split, assertNotNull(split.proportionalRestore(APP, DOCK, 288, dockFirst = false)), at = 1)
+        assertEquals(288, after.getValue(DOCK), "$after")
+        assertEquals(MIN_SANE_WIDTH + 2, after.getValue(APP), "$after")
+        assertEquals(721, after.values.sum(), "$after")
+    }
+
     /** sway would refuse the boundary, and a refused command fails the whole restore batch. */
     @Test
-    fun `a plan that would take a window under the floor is not made`() {
-        assertNull(split(721, APP to 120, 21L to 300, 22L to 301).proportionalRestore(APP, DOCK, 40, dockFirst = false))
+    fun `a plan the other windows cannot spare the floor for is not made`() {
+        assertNull(split(400, APP to 130, 21L to 135, 22L to 135).proportionalRestore(APP, DOCK, 150, dockFirst = false))
     }
 
     @Test
     fun `a split that is not horizontal gets no plan`() {
-        assertNull(split(721, APP to 360, 21L to 361, layout = "splitv").proportionalRestore(APP, DOCK, 30, dockFirst = false))
+        assertNull(split(721, APP to 360, 21L to 361, layout = "splitv").proportionalRestore(APP, DOCK, 216, dockFirst = false))
+    }
+
+    /**
+     * #267's shape: the surface's side of the user's split, beside the user's window and a
+     * second dock, widened as every other window walks back to its target.
+     */
+    @Test
+    fun `every other window is walked to its target and the side takes the rest`() {
+        val split = split(1235, 21L to 300, APP to 535, 22L to 400)
+        val growth = assertNotNull(split.walkedTo(APP, mapOf(21L to 240, 22L to 320)))
+        val after = walked(split, growth.commands)
+        assertEquals(mapOf(21L to 240, APP to 675, 22L to 320), after)
+        assertEquals(675, growth.width)
+    }
+
+    @Test
+    fun `a walk that would take a window under the floor is not made`() {
+        assertNull(split(721, APP to 400, 21L to 150, 22L to 171).walkedTo(APP, mapOf(21L to 88, 22L to 100)))
+    }
+
+    @Test
+    fun `a walk missing a target is not made`() {
+        assertNull(split(721, APP to 400, 21L to 150, 22L to 171).walkedTo(APP, mapOf(21L to 140)))
+    }
+
+    /** The widths sway arrives at from [split] once [plan] runs, nothing tiled in. */
+    private fun walked(split: Node, plan: List<String>): Map<Long, Int> {
+        val ids = split.nodes.map { it.id }
+        val widths = split.nodes.map { it.rect!!.width }.toMutableList()
+        val step = Regex("""\[con_id=(\d+)] resize (grow|shrink) right (\d+) px""")
+        plan.forEach { command ->
+            val (id, verb, px) = assertNotNull(step.matchEntire(command), command).destructured
+            val i = ids.indexOf(id.toLong())
+            val amount = if (verb == "grow") px.toInt() else -px.toInt()
+            widths[i] += amount
+            widths[i + 1] -= amount
+            assertTrue(widths[i] >= MIN_SANE_WIDTH && widths[i + 1] >= MIN_SANE_WIDTH, "sway refuses '$command': $widths")
+        }
+        return ids.zip(widths).toMap()
     }
 
     /** The widths sway arrives at from [split] once the dock is tiled in at [at] and [plan] runs. */

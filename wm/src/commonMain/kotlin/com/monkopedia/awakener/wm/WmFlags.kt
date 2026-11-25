@@ -465,7 +465,8 @@ object WmFlags {
         30,
         "Dock width as a percentage of the tab, applied when an attach places the dock. A " +
             "show applies it only under wm.dock.show_width=CONFIGURED, or under AS_HIDDEN when " +
-            "the hide recorded no share or the dock comes back into a different split.",
+            "the hide recorded no share, or the dock comes back into a different split that " +
+            "its old one cannot be widened around (see wm.dock.show_width).",
     )
 
     val crowdedWidth = Flags.enum(
@@ -493,8 +494,15 @@ object WmFlags {
             "handed it out, so a hide and a show leave the surface where they found it. Two " +
             "exceptions: where that would take some window in the split under sway's 100 px " +
             "floor, the show falls back to resizing the dock as CONFIGURED does; and a dock that " +
-            "comes back into a different split from the one it was hidden from (#256) gets " +
-            "wm.dock.size_ppt. Otherwise wm.dock.size_ppt reaches only a dock's first placement, " +
+            "comes back into a different split from the one it was hidden from, because a window " +
+            "of the user's took that one over (#256), gets its width back by widening the " +
+            "surface's side of the old split first, every other window there giving back what " +
+            "the hides of docks out of it gave it, the user's included (#267) — and " +
+            "wm.dock.size_ppt where the old split is not directly around the surface's, where " +
+            "that would take a window under the floor, or where a window there was resized, " +
+            "opened or closed since the hide by anything but awakener's own hides and shows, so " +
+            "a width the user set by hand is never taken back. " +
+            "Otherwise wm.dock.size_ppt reaches only a dock's first placement, " +
             "and a dock resized by hand comes back at that width. CONFIGURED: wm.dock.size_ppt, which sway takes in an " +
             "equal share from every window in the split (from the dock's neighbours alone before " +
             "sway 1.12). With several docks on one surface that " +
