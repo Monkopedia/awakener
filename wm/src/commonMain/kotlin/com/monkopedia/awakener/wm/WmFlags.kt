@@ -1401,7 +1401,15 @@ object WmFlags {
             "'${TabTitle.TITLE_PLACEHOLDER} [agent]' marks which tabs hold a woken agent, at " +
             "the cost of the tab no longer looking like a plain one. sway's own %title and its " +
             "siblings do not expand in here: the whole rendered string is escaped as one " +
-            "compositor argument, because the half of it the window supplied has to be. A " +
+            "compositor argument, because the half of it the window supplied has to be. For " +
+            "the same reason the format cannot carry Pango markup: every < and & in the " +
+            "rendered string is neutralised with a zero-width space, the template's own " +
+            "included, so '<b>* ${TabTitle.TITLE_PLACEHOLDER}</b>' shows the angle brackets " +
+            "literally rather than bold text. That is what stops a page's title styling or " +
+            "hiding the tab strip, and it is applied to the whole result rather than only the " +
+            "window's half so that a tab renders the same text whether or not the user's " +
+            "font pango: line turns markup on, which awakener cannot read. " +
+            "A \" in the format likewise renders with a visible backslash before it. A " +
             "format that never mentions the placeholder is refused rather than accepted — it " +
             "would put one fixed string on every woken tab, which loses more than it could be " +
             "meant to gain.",
