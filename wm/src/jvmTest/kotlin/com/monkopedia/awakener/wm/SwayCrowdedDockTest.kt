@@ -200,53 +200,119 @@ open class SwayCrowdedDockTest {
      * panel from inside each. A check for the user's hand that counted awakener's own hide of a
      * second dock, or show of the first, as a change turned #267's fix off: back to 268 → 197 px
      * of surface and 213 → 567 of the user's window with four docks on 1.12.
+     *
+     * And #272: from round 2 on — and from round 1 with no user window — every dock leaves and
+     * re-enters the surface's own split, and a share recorded of a split the others had already
+     * left, or one the last dock's hide collapsed, gave the surface's width to the docks: 619 →
+     * 556 px with two docks in reverse, 322 → 202 with four, 268 → 169 with four and a user
+     * window, on 1.12.
      */
     @Test
-    fun `two docks hidden together and shown in order give the user window back what the hides gave it`() = hideAllShowAll(docks = 2, reversed = false)
+    fun `two docks hidden together and shown in order come back where they were`() = hideAllShowAll(docks = 2, reversed = false, userWindow = false)
 
     @Test
-    fun `two docks hidden together and shown in reverse give the user window back what the hides gave it`() = hideAllShowAll(docks = 2, reversed = true)
+    fun `two docks hidden together and shown in reverse come back where they were`() = hideAllShowAll(docks = 2, reversed = true, userWindow = false)
 
     @Test
-    fun `four docks hidden together and shown in order give the user window back what the hides gave it`() = hideAllShowAll(docks = 4, reversed = false)
+    fun `three docks hidden together and shown in order come back where they were`() = hideAllShowAll(docks = 3, reversed = false, userWindow = false)
 
     @Test
-    fun `four docks hidden together and shown in reverse give the user window back what the hides gave it`() = hideAllShowAll(docks = 4, reversed = true)
+    fun `three docks hidden together and shown in reverse come back where they were`() = hideAllShowAll(docks = 3, reversed = true, userWindow = false)
+
+    @Test
+    fun `four docks hidden together and shown in order come back where they were`() = hideAllShowAll(docks = 4, reversed = false, userWindow = false)
+
+    @Test
+    fun `four docks hidden together and shown in reverse come back where they were`() = hideAllShowAll(docks = 4, reversed = true, userWindow = false)
+
+    @Test
+    fun `two docks hidden together and shown in order beside a user window come back where they were`() = hideAllShowAll(docks = 2, reversed = false, userWindow = true)
+
+    @Test
+    fun `two docks hidden together and shown in reverse beside a user window come back where they were`() = hideAllShowAll(docks = 2, reversed = true, userWindow = true)
+
+    @Test
+    fun `three docks hidden together and shown in order beside a user window come back where they were`() = hideAllShowAll(docks = 3, reversed = false, userWindow = true)
+
+    @Test
+    fun `three docks hidden together and shown in reverse beside a user window come back where they were`() = hideAllShowAll(docks = 3, reversed = true, userWindow = true)
+
+    @Test
+    fun `four docks hidden together and shown in order beside a user window come back where they were`() = hideAllShowAll(docks = 4, reversed = false, userWindow = true)
+
+    @Test
+    fun `four docks hidden together and shown in reverse beside a user window come back where they were`() = hideAllShowAll(docks = 4, reversed = true, userWindow = true)
 
     /**
-     * Stands [docks] docks with the user's window moved in after them, then hides every dock and
-     * shows every dock — in the order they were hidden, or [reversed] — for [ALL_ROUNDS] rounds.
-     * After each, the user's window is within [ROUND_TRIP_PX] of where it started either way,
-     * with no split mark of awakener's above it.
-     *
-     * The surface is held only after round 1, where every show comes back across splits, which
-     * is #267's. From round 2 every dock leaves and re-enters the surface's own split, and with
-     * several hidden at once that path loses the surface width with no user window anywhere:
-     * 619 → 556 px with two docks, 322 → 307 with four, on base `12971a7` as on this branch.
-     * That belongs to #264's restore and is filed separately.
+     * #275's review: the dock hidden last is the one whose hide finds the surface beside it
+     * alone, and in every shape above it stands at wm.dock.size_ppt, which is also what a show
+     * without its home widths falls back to. Widened by hand first, it has to come back at the
+     * width the user gave it: without the `alone` mark's home widths, 500 px came back as 384.
      */
-    private fun hideAllShowAll(docks: Int, reversed: Boolean) = swayTest {
+    @Test
+    fun `two docks hidden together and shown in order after the newest was widened by hand come back where they were`() =
+        hideAllShowAll(docks = 2, reversed = false, userWindow = false, widenNewest = true)
+
+    @Test
+    fun `two docks hidden together and shown in reverse after the newest was widened by hand come back where they were`() =
+        hideAllShowAll(docks = 2, reversed = true, userWindow = false, widenNewest = true)
+
+    @Test
+    fun `four docks hidden together and shown in order after the newest was widened by hand come back where they were`() =
+        hideAllShowAll(docks = 4, reversed = false, userWindow = false, widenNewest = true)
+
+    @Test
+    fun `four docks hidden together and shown in reverse after the newest was widened by hand come back where they were`() =
+        hideAllShowAll(docks = 4, reversed = true, userWindow = false, widenNewest = true)
+
+    /**
+     * Stands [docks] docks, with the user's window moved in after them where [userWindow], then
+     * hides every dock and shows every dock — in the order they were hidden, or [reversed] — for
+     * [ALL_ROUNDS] rounds. After **every** round the surface and every dock are within
+     * [ROUND_TRIP_PX] of where the round started and within [DRIFT_PX] of where the first
+     * started, and the user's window is within [ROUND_TRIP_PX] of where it started, with no split
+     * mark of awakener's above it. Where [widenNewest], the newest dock is first widened by hand
+     * to [WIDENED_PX], out of the dock beside it.
+     */
+    private fun hideAllShowAll(docks: Int, reversed: Boolean, userWindow: Boolean, widenNewest: Boolean = false) = swayTest {
         openSurface("aw-other")
         val app = openSurface("aw-app")
-        val mine = openSurface("aw-mine")
+        val mine = if (userWindow) openSurface("aw-mine") else null
         val handles = List(docks) { wm.attach(app, dockSpec(), AGENT) }
-        moveBeside(mine, app)
+        if (mine != null) moveBeside(mine, app)
+        if (widenNewest) {
+            val newest = handles.last().dockId
+            val width = assertNotNull(wm.tree().find(newest.raw)?.rect?.width, "the newest dock")
+            command("[con_id=${newest.raw}] resize grow left ${WIDENED_PX - width} px")
+            val widened = assertNotNull(wm.tree().find(newest.raw)?.rect?.width, "the newest dock")
+            assertTrue(abs(widened - WIDENED_PX) <= ROUND_TRIP_PX, "the newest dock was widened to $widened px, not $WIDENED_PX: ${describe()}")
+        }
+        val windows = listOf(app) + handles.map { it.dockId }
+        fun widths(tree: Node) = windows.map { assertNotNull(tree.find(it.raw)?.rect?.width, "window ${it.raw}") }
         val start = wm.tree()
-        val surface = assertNotNull(start.find(app.raw)?.rect?.width, "the surface")
-        val joined = assertNotNull(start.find(mine.raw)?.rect?.width, "the user's window")
+        val first = widths(start)
+        val joined = mine?.let { assertNotNull(start.find(it.raw)?.rect?.width, "the user's window") }
+        var previous = first
         for (round in 1..ALL_ROUNDS) {
             handles.forEachIndexed { i, dock -> assertEquals(true, dock.hide(), "round $round: hide ${i + 1}") }
             (if (reversed) handles.reversed() else handles).forEach { dock ->
                 assertEquals(true, dock.show(), "round $round: show ${handles.indexOf(dock) + 1}")
             }
             val after = wm.tree()
-            val now = assertNotNull(after.find(app.raw)?.rect?.width, "the surface")
-            val theirs = assertNotNull(after.find(mine.raw)?.rect?.width, "the user's window")
-            if (round == 1) assertTrue(surface - now <= ROUND_TRIP_PX, "round $round: the surface went from $surface to $now px: ${describe()}")
-            assertTrue(abs(theirs - joined) <= ROUND_TRIP_PX, "round $round: the user's window went from $joined to $theirs px: ${describe()}")
-            val marked = generateSequence(after.parentOf(mine.raw)) { after.parentOf(it.id) }
-                .filter { node -> node.marks.any { it.startsWith("_awakener_split_") } }.toList()
-            assertTrue(marked.isEmpty(), "round $round: a split holding the user's window is marked awakener's: ${marked.map { it.marks }}")
+            val now = widths(after)
+            windows.indices.forEach { i ->
+                val name = if (i == 0) "the surface" else "dock $i of $docks"
+                assertTrue(abs(previous[i] - now[i]) <= ROUND_TRIP_PX, "round $round: $name went from ${previous[i]} to ${now[i]} px: ${describe()}")
+                assertTrue(abs(first[i] - now[i]) <= DRIFT_PX, "round $round: $name drifted from ${first[i]} to ${now[i]} px: ${describe()}")
+            }
+            previous = now
+            if (mine != null) {
+                val theirs = assertNotNull(after.find(mine.raw)?.rect?.width, "the user's window")
+                assertTrue(abs(theirs - joined!!) <= ROUND_TRIP_PX, "round $round: the user's window went from $joined to $theirs px: ${describe()}")
+                val marked = generateSequence(after.parentOf(mine.raw)) { after.parentOf(it.id) }
+                    .filter { node -> node.marks.any { it.startsWith("_awakener_split_") } }.toList()
+                assertTrue(marked.isEmpty(), "round $round: a split holding the user's window is marked awakener's: ${marked.map { it.marks }}")
+            }
         }
     }
 
@@ -525,7 +591,9 @@ open class SwayCrowdedDockTest {
             valve.release()
             assertEquals(docks > 1, walked, "the restore is the one this case is for")
             val failure = assertNotNull(show.await().exceptionOrNull(), "the show must fail: ${describe()}")
-            assertContains(assertNotNull(failure.message), "rather than the 30% the show gave it")
+            // In px since #272: the show gives the dock its home width's share of the split, and
+            // the readback names what it asked for.
+            assertContains(assertNotNull(failure.message), "rather than the $CONFIGURED_PX px the show gave it")
         }
     }
 
@@ -660,6 +728,12 @@ open class SwayCrowdedDockTest {
 
         /** Rounds of hiding every dock and then showing every dock. */
         const val ALL_ROUNDS = 3
+
+        /** 30%, wm.dock.size_ppt's default, of the 1280 px the test output is wide at either scale. */
+        const val CONFIGURED_PX = 384
+
+        /** What a hand resize takes the newest dock to: anything but the 384 px of wm.dock.size_ppt. */
+        const val WIDENED_PX = 500
 
         /** A quarter of the 1280 px a split of four on the test output starts at. */
         const val QUARTER_PX = 320

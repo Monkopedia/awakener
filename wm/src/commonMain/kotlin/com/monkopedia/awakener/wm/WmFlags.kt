@@ -502,6 +502,10 @@ object WmFlags {
             "that would take a window under the floor, or where a window there was resized, " +
             "opened or closed since the hide by anything but awakener's own hides and shows, so " +
             "a width the user set by hand is never taken back. " +
+            "Where several docks were hidden at once and come back into the surface's own split, " +
+            "in either order, each gets its share of the windows it meets there as they all " +
+            "stood before the hides, which the hides record on the docks too, so it holds after " +
+            "the last hide has collapsed the split (#272). " +
             "Otherwise wm.dock.size_ppt reaches only a dock's first placement, " +
             "and a dock resized by hand comes back at that width. CONFIGURED: wm.dock.size_ppt, which sway takes in an " +
             "equal share from every window in the split (from the dock's neighbours alone before " +
