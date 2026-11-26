@@ -1360,13 +1360,14 @@ class SwayWindowManager(
                 ?.let { acrossSplits(before, it, surface, usable, resplit && wraps, dockFirst) }
             // #272. Coming back into the surface's own split, at the dock's home width's share
             // of the windows it meets there.
-            val homeWidth = hidden?.takeIf { asHidden && floating == null && across == null }
+            val home = hidden?.takeIf { asHidden && floating == null && across == null }
                 ?.let { homeWidthOf(before, it, surface, usable) }
+            val homeWidth = home?.dockWidth
             val dockWidth = across?.dockWidth ?: homeWidth
             // #264. The share the dock was hidden at, where it is coming back into the split it
             // was hidden from.
             val sizePpt = across?.ppt
-                ?: homeWidth?.let { px -> (usable ?: before.find(surface.raw))?.rect?.width?.takeIf { it > 0 }?.let { (px * 100.0 / it).roundToInt() } }
+                ?: home?.ppt
                 ?: hiddenWidthOf(hidden, usable)?.takeIf { asHidden }
                 ?: cfg[WmFlags.dockSizePpt]
             // Only into a split the dock shares with something besides the surface: beside
@@ -2992,7 +2993,7 @@ class SwayWindowManager(
         }
 
         /**
-         * The width in px [hidden] comes back at in the surface's own split (#272): its home width's
+         * The width [hidden] comes back at in the surface's own split (#272): its home width's
          * share of what the windows it will stand beside there — [usable]'s, or the surface alone
          * where the batch makes a split around it — are at home, taken of that split's width now.
          * Null where the hide did not record the home width of every one of them.
@@ -3009,7 +3010,7 @@ class SwayWindowManager(
          * Not where the split it was hidden from is another one still standing: that is a split
          * the user's window took over (#256), and [acrossSplits]'s to plan or decline.
          */
-        private fun homeWidthOf(tree: Node, hidden: Node, surface: SurfaceId, usable: Node?): Int? {
+        private fun homeWidthOf(tree: Node, hidden: Node, surface: SurfaceId, usable: Node?): HomeWidth? {
             val recorded = recordedWidthOf(hidden) ?: return null
             val home = recorded.home ?: return null
             if (recorded.from.toLongOrNull()?.takeIf { it != usable?.id }?.let { tree.find(it) } != null) return null
@@ -3018,8 +3019,12 @@ class SwayWindowManager(
             val members = (usable?.nodes?.map { it.id } ?: listOf(surface.raw)) + hidden.id
             val shares = members.map { home[it] ?: return null }
             val total = shares.sum().takeIf { it > 0 } ?: return null
-            return (width.toDouble() * shares.last() / total).roundToInt().coerceAtLeast(MIN_SANE_WIDTH + PREDICTION_SLACK)
+            val px = (width.toDouble() * shares.last() / total).roundToInt().coerceAtLeast(MIN_SANE_WIDTH + PREDICTION_SLACK)
+            return HomeWidth(px, (px * 100.0 / width).roundToInt())
         }
+
+        /** What [homeWidthOf] gives the dock: [dockWidth] px, which is [ppt] of the split it comes back into. */
+        private class HomeWidth(val dockWidth: Int, val ppt: Int)
 
         /**
          * What a width mark says: the split the dock was a share of, or [ALONE]; the share; and
