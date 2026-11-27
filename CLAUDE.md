@@ -285,15 +285,18 @@ each says where its function went:
   talking to.** The i3-ipc wire format is a 14-byte little-endian header plus a JSON payload;
   hand-roll it rather than taking a dependency.
 - `:registry` — surface→agent binding, persisted.
-- `:bus` — spanreed adapter. **Not a module, and not planned to be one:** the adapter was
-  written inside `:registry`, as `AgentBus` and `SpanreedCli`.
+- `:bus` — spanreed adapter. **Not a module.** The adapter was written inside `:registry`, as
+  `AgentBus` and `SpanreedCli` — an observation of where the code went, not a decision that
+  `:bus` will never exist.
 - `:pairing-mcp` — read-on-demand surface tools, via the official Kotlin MCP SDK. **Not a
   module.** How an agent is handed a tool for its own window is now `:connector`'s: a tool, MCP
   server or otherwise, arrives as files in a connector directory, not as code here.
 - `:chrome` — CDP client; needs a dedicated Chrome profile, because anything that can reach
-  the debugging port can drive a logged-in browser. **Still planned, not built.** CDP target
-  discovery already ships without it, as `connectors/chromium/cdp.sh`; driving a page over the
-  WebSocket is what is left for `:chrome`.
+  the debugging port can drive a logged-in browser. **Still planned, not built — but the reach
+  already ships without it.** `connectors/chromium/cdp.sh` drives nothing itself, yet its `match`
+  and `targets` hand the agent each page's `webSocketDebuggerUrl` (`targets` for every page in
+  the browser, not just the bound window's), and the agent has a shell, so driving a page is
+  available today. What is left for `:chrome` is awakener's own client, not the capability.
 - `:connector` — a **connector** is a named directory of data describing how an agent reaches
   its own window: the tool to make available, a skill/markdown telling it how, and the surface
   facts the tool needs to be pointed at that window. Definitions are discovered at runtime from
