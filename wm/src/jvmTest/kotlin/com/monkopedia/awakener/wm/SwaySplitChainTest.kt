@@ -414,6 +414,15 @@ class SwaySplitChainTest {
                 assertContains(assertNotNull(failure.message, stage), "stacked in a vertical split", message = stage)
                 assertTrue(wm.tree().windows.none { it.appId == "aw-dock" }, "$stage: the unwind took the dock down: ${describe()}")
             }
+            // And one that attached stands beside the surface: base reported success for the dock
+            // stacked under it, which is what the readback now refuses.
+            dock.getOrNull()?.let { handle ->
+                assertEquals(
+                    "splith",
+                    wm.tree().parentOf(handle.dockId.raw)?.layout,
+                    "$stage: a dock that attached stands beside the surface: ${describe()}",
+                )
+            }
             dock.getOrNull()?.detach()
             val tree = wm.tree()
             if (users != null) {
