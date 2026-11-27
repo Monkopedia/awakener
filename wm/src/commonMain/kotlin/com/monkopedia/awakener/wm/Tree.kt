@@ -28,7 +28,7 @@ data class Node(
      * Null in two cases that both matter here: a window in the scratchpad has no parent to be a
      * fraction of, and a `floating_con` reports whatever fraction it last had rather than one that
      * means anything. So this is never on its own enough to say a dock is docked — see
-     * [SwayWindowManager] `restoreFault`, which asks about the scratchpad and about [type] first.
+     * [SwayWindowManager] `dockFault`, which asks about the scratchpad and about [type] first.
      */
     val percent: Double? = null,
     val marks: List<String> = emptyList(),

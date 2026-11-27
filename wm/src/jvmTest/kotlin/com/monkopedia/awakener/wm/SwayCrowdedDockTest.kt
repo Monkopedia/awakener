@@ -561,6 +561,102 @@ open class SwayCrowdedDockTest {
     }
 
     /**
+     * #265: attach reads its dock's width back as show does. A fourth dock beside a user's window
+     * attaches either at 30% or short of it where sway refused the resize, which is excused: the
+     * attach succeeds, beside the surface. Which one is the version's: 1.12's every-sibling share
+     * is refused here, so that run exercises the excuse (the dock lands at 25%), and 1.11's
+     * neighbours-only share is not (30%).
+     */
+    @Test
+    fun `a fourth dock beside a user window attaches at its width or where sway refused it`() = swayTest {
+        openSurface("aw-other")
+        val app = openSurface("aw-app")
+        val mine = openSurface("aw-mine")
+        val handles = mutableListOf(wm.attach(app, dockSpec(), AGENT))
+        moveBeside(mine, app)
+        repeat(3) { handles += wm.attach(app, dockSpec(), AGENT) }
+        val tree = wm.tree()
+        val fourth = handles.last().dockId.raw
+        assertEquals(tree.parentOf(app.raw)?.id, tree.parentOf(fourth)?.id, "beside the surface: ${describe()}")
+        val percent = assertNotNull(tree.find(fourth)?.percent, "a width fraction")
+        val refused = tree.refusedResize(fourth, 30, sway.connection().use { it.resizeShare() })
+        if (refused == null) {
+            assertEquals(0.30, percent, 0.005, "at the configured width: ${describe()}")
+        } else {
+            assertTrue(percent < 0.29, "short of the configured width where sway refused it: ${describe()}")
+        }
+    }
+
+    /**
+     * #265: the attach's readback still fires on a real misplacement. The first tree read after
+     * the attach's resize is held while another client narrows the dock in a split with room; the
+     * attach must fail and unwind to the tree it started from.
+     */
+    @Test
+    fun `a dock narrowed during its attach fails the attach and leaves nothing behind`() =
+        misplacedDuringAttach { dock -> command("[con_id=$dock] resize set width 15 ppt") }
+
+    /** And a dock moved into a crowded split elsewhere, which sway would refuse 30% there too. */
+    @Test
+    fun `a dock moved into a crowded split elsewhere during its attach fails the attach and leaves nothing behind`() {
+        var narrow = SurfaceId(0)
+        misplacedDuringAttach(
+            prepare = {
+                command("workspace 2")
+                narrow = openSurface("aw-narrow")
+                command("[con_id=${narrow.raw}] layout splith")
+                openSurface("aw-wide1")
+                openSurface("aw-wide2")
+                command("[con_id=${narrow.raw}] resize set width $NARROW_PX px")
+                command("workspace 1")
+            },
+        ) { dock ->
+            command(
+                "[con_id=${narrow.raw}] mark --add _test_foreign; " +
+                    "[con_id=$dock] move window to mark _test_foreign; unmark _test_foreign",
+            )
+            val tree = wm.tree()
+            assertNotNull(
+                tree.refusedResize(dock, 30, sway.connection().use { it.resizeShare() }),
+                "the foreign split is one sway refuses the dock 30% in, or this tests nothing: ${describe(tree.workspace("2"))}",
+            )
+        }
+    }
+
+    /**
+     * One dock attached to a surface alone, with the first tree read after the attach's resize
+     * held at the valve while [misplace] puts the dock wrong. The attach must fail on its width,
+     * and its unwind must leave no dock window, no split and no awakener mark anywhere.
+     */
+    private fun misplacedDuringAttach(prepare: suspend () -> Unit = {}, misplace: suspend (Long) -> Unit) = swayTest {
+        store.put(WmFlags.unmapWaitMs, MISPLACED_WAIT_MS)
+        prepare()
+        SwayValve.open(sway.socket).use { valve ->
+            val valved = valvedCommands(valve)
+            val app = openSurface("aw-app")
+            val before = describe()
+            var resized = false
+            valve.holdNext { type, payload ->
+                if (type == I3Ipc.Request.RUN_COMMAND && "resize set width" in payload) resized = true
+                resized && type == I3Ipc.Request.GET_TREE
+            }
+            val attach = scope.async { runCatching { valved.attach(app, dockSpec(), AGENT) } }
+            valve.awaitHeld(WAIT_MS)
+            val dock = assertNotNull(wm.tree().windows.firstOrNull { it.appId == "aw-dock" }, "the dock mapped").id
+            misplace(dock)
+            valve.release()
+            val failure = assertNotNull(attach.await().exceptionOrNull(), "the attach must fail: ${describe()}")
+            assertContains(assertNotNull(failure.message), "rather than the 30% the attach gave it")
+            val after = wm.tree()
+            assertTrue(after.windows.none { it.appId == "aw-dock" }, "no dock window is left: ${describe()}")
+            fun all(node: Node): Sequence<Node> = sequenceOf(node) + node.children.asSequence().flatMap { all(it) }
+            val marked = all(after).filter { node -> node.marks.any { "awakener" in it } }.map { it.id to it.marks }.toList()
+            assertTrue(marked.isEmpty(), "no awakener mark is left: $marked")
+            assertEquals(before, describe(), "the surface's workspace is as it was before the attach")
+        }
+    }
+
+    /**
      * One dock beside its surface, hidden, and shown with the first tree read after the restore
      * held at the valve while [misplace] puts the dock wrong. The show must fail on its width.
      */

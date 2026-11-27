@@ -11,9 +11,11 @@ import kotlin.io.path.createTempDirectory
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
+import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -394,13 +396,34 @@ class SwaySplitChainTest {
                     "[con_id=${app.raw}] split vertical; [con_id=${app.raw}] focus; focus parent; " +
                     "mark --add user_after; [con_id=${app.raw}] focus",
             )
-            val dock = attach.await()
+            // Read before the attach ends, because an unwind's flatten takes `user_after` with
+            // it where that mark is on awakener's own split; a user's split it took would then
+            // fail the survival check below, as a detach's would.
             val users = wm.tree().let { tree ->
                 val after = tree.find(assertNotNull(tree.holderOf("user_after"), stage))
                 after?.id?.takeUnless { after.holdsMark("user_before") }
             }
             if (users != null) made++
-            dock.detach()
+            // #265: a `split vertical` that lands on the surface after attach's own split and
+            // before the dock maps re-lays that split, so the dock is moved in *under* the
+            // surface; the attach's readback refuses that and unwinds. Most rounds here, since
+            // the dock takes far longer to map than the sweep's 10 ms. Either outcome must leave
+            // the same tree.
+            val dock = runCatching { attach.await() }
+            dock.exceptionOrNull()?.let { failure ->
+                assertContains(assertNotNull(failure.message, stage), "stacked in a vertical split", message = stage)
+                assertTrue(wm.tree().windows.none { it.appId == "aw-dock" }, "$stage: the unwind took the dock down: ${describe()}")
+            }
+            // And one that attached stands beside the surface: base reported success for the dock
+            // stacked under it, which is what the readback now refuses.
+            dock.getOrNull()?.let { handle ->
+                assertEquals(
+                    "splith",
+                    wm.tree().parentOf(handle.dockId.raw)?.layout,
+                    "$stage: a dock that attached stands beside the surface: ${describe()}",
+                )
+            }
+            dock.getOrNull()?.detach()
             val tree = wm.tree()
             if (users != null) {
                 assertNotNull(tree.find(users), "$stage: the user's split $users survives: ${describe()}")
