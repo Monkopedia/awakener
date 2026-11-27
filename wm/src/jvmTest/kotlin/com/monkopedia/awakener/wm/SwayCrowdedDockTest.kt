@@ -562,12 +562,13 @@ open class SwayCrowdedDockTest {
 
     /**
      * #265: attach reads its dock's width back as show does. A fourth dock beside a user's window
-     * attaches short of 30% because sway refused the resize, and that is excused: the attach
-     * succeeds, beside the surface. Asserted short and refused, so the excuse is what this
-     * exercises rather than a dock that happened to fit.
+     * attaches either at 30% or short of it where sway refused the resize, which is excused: the
+     * attach succeeds, beside the surface. Which one is the version's: 1.12's every-sibling share
+     * is refused here, so that run exercises the excuse (the dock lands at 25%), and 1.11's
+     * neighbours-only share is not (30%).
      */
     @Test
-    fun `a fourth dock beside a user window attaches where sway refused it its width`() = swayTest {
+    fun `a fourth dock beside a user window attaches at its width or where sway refused it`() = swayTest {
         openSurface("aw-other")
         val app = openSurface("aw-app")
         val mine = openSurface("aw-mine")
@@ -578,11 +579,12 @@ open class SwayCrowdedDockTest {
         val fourth = handles.last().dockId.raw
         assertEquals(tree.parentOf(app.raw)?.id, tree.parentOf(fourth)?.id, "beside the surface: ${describe()}")
         val percent = assertNotNull(tree.find(fourth)?.percent, "a width fraction")
-        assertTrue(percent < 0.29, "the fourth dock is short of 30%, or this tests nothing: ${describe()}")
-        assertNotNull(
-            tree.refusedResize(fourth, 30, sway.connection().use { it.resizeShare() }),
-            "sway refused it the width: ${describe()}",
-        )
+        val refused = tree.refusedResize(fourth, 30, sway.connection().use { it.resizeShare() })
+        if (refused == null) {
+            assertEquals(0.30, percent, 0.005, "at the configured width: ${describe()}")
+        } else {
+            assertTrue(percent < 0.29, "short of the configured width where sway refused it: ${describe()}")
+        }
     }
 
     /**
