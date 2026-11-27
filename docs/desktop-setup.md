@@ -813,8 +813,10 @@ On adolin the `~/.asoundrc` route took `arecord` from `unable to open slave` to 
 So the first hour is not spent looking for something that does not exist.
 
 **`:bus`, `:pairing-mcp` and `:chrome` are not modules.** The build is `:config`, `:registry`,
-`:wm` and `:cli`. Agents talk to spanreed directly through its CLI; there is no MCP surface-tool
-layer and no Chrome attachment.
+`:wm`, `:connector` and `:cli`. Agents talk to spanreed directly through its CLI. There is no
+MCP surface-tool layer: a connector definition could declare one, and none of the shipped ones
+does. There is no Chrome attachment: the `chromium` connector's `cdp.sh` finds a window's CDP
+target over the HTTP endpoints and stops short of the WebSocket that would drive it.
 
 **One agent per app, not per window.** `SurfaceKey` is derived from facts that outlive the
 window — under the default `registry.key.window_identity=APP_ID`, the `app_id`. So every window

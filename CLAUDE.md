@@ -276,17 +276,24 @@ check that reads back the artefact you are making a claim about.
 `commonMain` free of JVM-only APIs so a Native target stays open if per-hotkey startup
 latency ever matters.
 
-Planned module boundaries, from `docs/design.md`:
+Module boundaries, planned from `docs/design.md` and amended by what was actually built. The
+build is what `settings.gradle.kts` includes; three of the names below are **not** in it, and
+each says where its function went:
 
 - `:wm` — the three-call compositor interface (`resolve`, `attach`, change notification) and
   its sway IPC implementation. **Nothing above this module may learn which compositor it is
   talking to.** The i3-ipc wire format is a 14-byte little-endian header plus a JSON payload;
   hand-roll it rather than taking a dependency.
 - `:registry` — surface→agent binding, persisted.
-- `:bus` — spanreed adapter.
-- `:pairing-mcp` — read-on-demand surface tools, via the official Kotlin MCP SDK.
+- `:bus` — spanreed adapter. **Not a module, and not planned to be one:** the adapter was
+  written inside `:registry`, as `AgentBus` and `SpanreedCli`.
+- `:pairing-mcp` — read-on-demand surface tools, via the official Kotlin MCP SDK. **Not a
+  module.** How an agent is handed a tool for its own window is now `:connector`'s: a tool, MCP
+  server or otherwise, arrives as files in a connector directory, not as code here.
 - `:chrome` — CDP client; needs a dedicated Chrome profile, because anything that can reach
-  the debugging port can drive a logged-in browser.
+  the debugging port can drive a logged-in browser. **Still planned, not built.** CDP target
+  discovery already ships without it, as `connectors/chromium/cdp.sh`; driving a page over the
+  WebSocket is what is left for `:chrome`.
 - `:connector` — a **connector** is a named directory of data describing how an agent reaches
   its own window: the tool to make available, a skill/markdown telling it how, and the surface
   facts the tool needs to be pointed at that window. Definitions are discovered at runtime from
@@ -517,13 +524,29 @@ From `docs/design.md`; these bind agent work here:
   direct instruction and it is the current default; the reviewer still `request_changes` on
   anything not clean, so the bar is unchanged — only the gate moved.
 
-  **Revisit before any of these lands, not on a date:** `:chrome` gaining the ability to
-  attach to a real browser profile, `:pairing-mcp` gaining a way for one agent to address
-  another's surface, `:bus` gaining an inbound path a local process could inject on, or
-  anything running as a daemon against Jason's live desktop. Those are the reaches the tier-3
-  rule was written for, and suspending the rule is only free while they are absent — which is
-  why it stops being free the moment one arrives. Say so and re-tier rather than letting the
-  suspension become the permanent state by inertia.
+  **Revisit before any of these lands, not on a date** — and each is a *capability*, so it
+  fires in whatever module, connector directory or script the code lands in:
+
+  1. **Reach over a real browser profile** — anything that attaches to, reads from or drives a
+     browser running a real profile, over CDP, an extension, or whatever replaces them, or that
+     hands an agent the means to. Planned as `:chrome`; today's CDP discovery is
+     `connectors/chromium/cdp.sh`.
+  2. **One agent addressing another's surface** — any path, a tool handed to an agent included,
+     by which an agent can name, read, act on or impersonate a surface other than the one it is
+     bound to, or another agent's binding. Planned as `:pairing-mcp`; today an agent's tools
+     arrive through `:connector` definitions, and the entry points are in `:cli`.
+  3. **An inbound path a local process could inject on** — the product gaining anything that
+     receives rather than only sends: reading from the bus (`spanreed recv`, an inbox watch), a
+     listening socket, or any other channel through which a local process can deliver messages
+     to it or drive `:wm`. Planned as `:bus`; the spanreed adapter is `SpanreedCli` in
+     `:registry`.
+  4. **Anything running as a daemon against Jason's live desktop.**
+
+  Those are the reaches the tier-3 rule was written for, and suspending the rule is only free
+  while they are absent — which is why it stops being free the moment one arrives. The module
+  names are where each was *expected* to land, not what the trigger asks about: a reviewer who
+  checks for a `:bus` module has checked the wrong thing. Say so and re-tier rather than letting
+  the suspension become the permanent state by inertia.
 
   **The `:chrome` trigger fired on 2026-08-23** — CDP is the adapter, by owner decision
   (`docs/design.md` Open #6 and `docs/findings/2026-08-23-chromium-cdp-pipe.md`, merged as
@@ -534,8 +557,8 @@ From `docs/design.md`; these bind agent work here:
   word and it is load-bearing: the tier-3 rule is not retired and the trigger is not spent, so
   raise it again when `:chrome` work makes the reach concrete rather than treating this line as
   the question having been settled once. **The other three are unfired and unchanged** —
-  `:pairing-mcp` cross-surface addressing, a `:bus` inbound path, a daemon against the live
-  desktop — and each still gets the same treatment on arrival.
+  cross-surface addressing, an inbound path, a daemon against the live desktop — and each still
+  gets the same treatment on arrival.
 - **Review tiers when the suspension lifts** (re-tiered 2026-07-30 against the real stack; see
   `review-policy.md` in the urithiru fleet config, which is authoritative). `public_api` and
   `breaking_change` are **tier 2** — this is an application, not a published library, so module
@@ -544,12 +567,15 @@ From `docs/design.md`; these bind agent work here:
   stubs, and docs are not gated. `security` is **tier 3**.
 - **What counts as `security` here is wider than it looks**, and these will arrive framed as
   features. Classify all of the following as `security`, not `feature_internal`:
-  - `:pairing-mcp` — how a surface proves it is the surface it claims to be; anything where
-    one agent could address or impersonate another's surface.
-  - `:chrome` — attaching to a browser is reach over live sessions, cookies, and page
-    content. *Widening* what may be attached to, read, or executed is security-relevant.
-  - `:bus` / IPC trust boundaries — anything letting an unintended local process inject
-    messages or drive `:wm`.
+  These are capabilities too, wherever they land; the module names are the ones each was
+  planned under.
+  - Surface pairing (planned as `:pairing-mcp`) — how a surface proves it is the surface it
+    claims to be; anything where one agent could address or impersonate another's surface.
+  - Browser reach (planned as `:chrome`) — attaching to a browser is reach over live sessions,
+    cookies, and page content. *Widening* what may be attached to, read, or executed is
+    security-relevant.
+  - The bus and IPC trust boundaries (planned as `:bus`) — anything letting an unintended local
+    process inject messages or drive `:wm`.
 
   Hotkey/window binding that can raise or move arbitrary windows is worth flagging in the
   verdict too.
