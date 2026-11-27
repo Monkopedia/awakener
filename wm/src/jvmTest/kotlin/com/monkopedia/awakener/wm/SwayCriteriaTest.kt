@@ -88,6 +88,10 @@ class SwayCriteriaTest {
         )
 
         hostile.forEachIndexed { index, appId ->
+            // A workspace each. Focus stays on the last surface, so on one workspace each surface
+            // opened inside the last one's dock split, and by the sixth the surface and its dock
+            // were 0 px wide: a dock attach's readback cannot find a width for, and refuses (#265).
+            sway.connection().use { it.request(I3Ipc.Request.RUN_COMMAND, "workspace ${index + 1}") }
             val app = openSurface("aw-app$index")
             val dock = wm.attach(app, fileNamedDock(appId, index), AgentId("agent-$index"))
 

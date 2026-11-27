@@ -1305,7 +1305,7 @@ class SwayWindowManager(
          * `a restore lands beside its own surface and not beside whatever is focused` covers.
          *
          * **The wait that used to sit mid-sequence cannot survive that, so it is now a readback of
-         * the outcome** — see [restoreFault]. It asks a strictly stronger question than the poll
+         * the outcome** — see [dockFault]. It asks a strictly stronger question than the poll
          * it replaces: that one established only that the window had left the scratchpad and said
          * nothing about where it landed, so a `floating disable` that never took would have passed
          * it. The two focus flags stay outside the batch, and only they: [settleFocus] is *defined*
@@ -1428,19 +1428,7 @@ class SwayWindowManager(
                 if (claimed) settleSplitMarks()
             }
 
-            // Held from inside the poll rather than re-read after it: a diagnosis taken once the
-            // deadline has expired races a tree that may have settled in the meantime, and would
-            // report "nothing wrong" for the run that just failed.
-            var fault: String? = null
-            val share = resizeShare()
-            val landed = pollTree(cfg[WmFlags.unmapWaitMs]) {
-                fault = restoreFault(surface, dock, sizePpt, share, dockWidth)
-                if (fault == null) true else null
-            } == true
-            check(landed) {
-                "dock ${dock.raw} was not docked beside surface ${surface.raw} " +
-                    "${cfg[WmFlags.unmapWaitMs]}ms after the restore went out: $fault"
-            }
+            checkDocked(surface, dock, sizePpt, dockWidth, "show", cfg[WmFlags.unmapWaitMs])
             takeRefusedWidthFromSurface(surface, dock, sizePpt)
 
             // Re-issued rather than relied upon. Under wm.dock.flatten_on_hide the hide collapsed
@@ -1455,9 +1443,39 @@ class SwayWindowManager(
         }
 
         /**
-         * What is wrong with [dock] as a restored dock, or null when nothing is.
+         * Fails unless [dock] stands beside [surface] at the width [action] gave it, naming what
+         * is wrong — see [dockFault]. Polled for up to [waitMs] where that is given, and read
+         * once where it is not.
          *
-         * Three questions in the order that makes each one's answer mean something, because sway
+         * Held from inside the poll rather than re-read after it: a diagnosis taken once the
+         * deadline has expired races a tree that may have settled in the meantime, and would
+         * report "nothing wrong" for the run that just failed.
+         */
+        suspend fun checkDocked(
+            surface: SurfaceId,
+            dock: SurfaceId,
+            sizePpt: Int,
+            dockWidth: Int?,
+            action: String,
+            waitMs: Long? = null,
+        ) {
+            var fault: String? = null
+            val share = resizeShare()
+            val read: suspend () -> Boolean? = {
+                fault = dockFault(surface, dock, sizePpt, share, dockWidth, action)
+                if (fault == null) true else null
+            }
+            val landed = (if (waitMs == null) read() else pollTree(waitMs, read)) == true
+            check(landed) {
+                "dock ${dock.raw} was not docked beside surface ${surface.raw} " +
+                    (waitMs?.let { "${it}ms " } ?: "") + "after the $action went out: $fault"
+            }
+        }
+
+        /**
+         * What is wrong with [dock] as a dock placed by [action], or null when nothing is.
+         *
+         * Four questions in the order that makes each one's answer mean something, because sway
          * reports a `percent` for a floating window too — 0.37 for a panel hovering over the
          * surface, measured on 1.12 — and none at all for one in the scratchpad. So a width test
          * on its own would pass a dock that never re-tiled.
@@ -1476,12 +1494,13 @@ class SwayWindowManager(
          * The width asked for is [dockWidth] px of the dock's split where the show gave it one
          * ([acrossSplits], #267), and [sizePpt] of it otherwise.
          */
-        private suspend fun restoreFault(
+        private suspend fun dockFault(
             surface: SurfaceId,
             dock: SurfaceId,
             sizePpt: Int,
             share: ResizeShare,
             dockWidth: Int?,
+            action: String,
         ): String? {
             val tree = tree()
             val node = tree.find(dock.raw) ?: return "it is not in the tree at all"
@@ -1494,13 +1513,17 @@ class SwayWindowManager(
             val percent = node.percent
                 ?: return "sway reports no width fraction for it, so it is in no tiled container"
             val parent = tree.parentOf(dock.raw)
+            // A dock stacked over or under its surface — another client's `split vertical`
+            // around the surface re-laid the split it is in (#265) — reports a *height* fraction,
+            // which no width can be compared with.
+            if (parent?.layout == "splitv") return "it is stacked in a vertical split rather than beside the surface"
             val wanted = dockWidth?.let { px -> parent?.rect?.width?.takeIf { it > 0 }?.let { px.toDouble() / it } }
                 ?: (sizePpt / 100.0)
             val excused = parent?.id == tree.parentOf(surface.raw)?.id &&
                 tree.refusedResize(dock.raw, sizePpt, share) != null
             if (abs(percent - wanted) > PPT_TOLERANCE && !excused) {
                 return "it is ${percent * 100}% of its container wide rather than the " +
-                    (dockWidth?.let { "$it px" } ?: "$sizePpt%") + " the show gave it"
+                    (dockWidth?.let { "$it px" } ?: "$sizePpt%") + " the $action gave it"
             }
             return null
         }
@@ -2109,6 +2132,13 @@ class SwayWindowManager(
                         run("[con_id=${dockId.raw}] move left")
                     }
                     run("[con_id=${dockId.raw}] resize set width ${cfg[WmFlags.dockSizePpt]} ppt")
+                    // #265. Read back as a show's restore is, with the same excuse for a width
+                    // sway refused in the surface's own split: a dock another client put wrong
+                    // meanwhile fails the attach, and the unwind below takes it down. Read once
+                    // rather than polled: the dock has mapped, and sway applies a command before
+                    // it replies, so nothing is left to settle and a fault is one waiting cannot
+                    // cure — only stretch, by wm.wait.unmap_ms, before the unwind starts.
+                    checkDocked(surface, dockId, cfg[WmFlags.dockSizePpt], null, "attach")
                     takeRefusedWidthFromSurface(surface, dockId, cfg[WmFlags.dockSizePpt])
 
                     // After the dock is in its final place, so the container this names is the one
