@@ -1940,12 +1940,21 @@ class SwayBindingTest {
      * the same moment, as one issuing thirty. [SwayValve] is the only place they can be seen, so
      * it counts them.
      *
-     * Both halves run here rather than one, because an absolute bound would be a number this
-     * machine happened to produce. The spin is the control: same wait, same failing attach, same
-     * unwind, with `wm.wait.poll_spin_ms` raised past the deadline so no read is ever paced.
-     * Measured on headless sway 1.12 the two differ by more than two orders of magnitude — a
-     * paced wait of this length is about `wait / interval` reads plus the unwind's handful, and
-     * the spin is several thousand.
+     * The criterion is a ceiling derived from the configuration, not from a measurement: a
+     * paced wait can issue at most about `wait / interval` reads plus the unwind's handful,
+     * however fast the runner is, and a slower runner only lands further under it. The spin is
+     * the negative control, and it goes through the **same** ceiling: same wait, same failing
+     * attach, same unwind, with `wm.wait.poll_spin_ms` raised past the deadline so no read is
+     * ever paced, and it has to break the ceiling the paced wait kept. That is what shows the
+     * ceiling can fail the way the claim could — the valve is counting, and the wait really
+     * spanned the window — and it is exactly what a spinning implementation would cost.
+     *
+     * A ratio of the two was the control until #278, and it measured the runner: the paced count
+     * is a stable 43–47, while the spin is however many reads fit in a second — 2,879–6,212 on
+     * headless sway 1.12 on kaladin, 563–868 on sway 1.11 at half a CPU, where twenty times the
+     * paced count is out of reach. Against the ceiling of 60 the half-CPU spin still clears it
+     * ninefold, and a pacing removed outright breaks it at least fivefold: 325–529 reads there,
+     * 3,019–4,474 at full speed.
      */
     @Test
     fun `a dock that never maps costs a paced poll, not a spin`() = swayTest {
@@ -1970,18 +1979,18 @@ class SwayBindingTest {
             }
             val spun = valve.requestCount(I3Ipc.Request.GET_TREE)
 
+            val ceiling = POLL_PROOF_WAIT_MS / POLL_PROOF_INTERVAL_MS + POLL_PROOF_SLACK
             assertTrue(
-                paced <= POLL_PROOF_WAIT_MS / POLL_PROOF_INTERVAL_MS + POLL_PROOF_SLACK,
+                paced <= ceiling,
                 "a ${POLL_PROOF_WAIT_MS}ms wait paced at ${POLL_PROOF_INTERVAL_MS}ms cannot cost " +
                     "more than about ${POLL_PROOF_WAIT_MS / POLL_PROOF_INTERVAL_MS} tree reads " +
                     "plus the unwind's; it cost $paced",
             )
             assertTrue(
-                spun > paced * POLL_PROOF_RATIO,
-                "and the control has to show the reads were real: spinning the same wait cost " +
-                    "$spun tree reads against the paced $paced, which is not the order of " +
-                    "magnitude #49 measured — if these are close, the pacing is not what is " +
-                    "being exercised",
+                spun > ceiling,
+                "and the control has to break the ceiling the paced wait kept: spinning the same " +
+                    "wait cost $spun tree reads against the paced $paced — if it fits under the " +
+                    "ceiling too, the ceiling cannot tell a spin from a poll on this runner",
             )
         }
     }
@@ -2543,13 +2552,5 @@ class SwayBindingTest {
          * runs measured; twenty so that a scheduler hiccup is not a failure.
          */
         const val POLL_PROOF_SLACK = 20L
-
-        /**
-         * How much dearer the spinning control has to be before the paced count is evidence
-         * rather than a coincidence. Measured against headless sway 1.12 the true ratio is two
-         * orders of magnitude; twenty is the floor below which this test would be asserting
-         * nothing.
-         */
-        const val POLL_PROOF_RATIO = 20L
     }
 }
