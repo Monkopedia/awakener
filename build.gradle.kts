@@ -318,6 +318,31 @@ val wrapperPinMatrixTest = tasks.register<Exec>("wrapperPinMatrixTest") {
 
 tasks.named("check") { dependsOn(wrapperPinMatrixTest) }
 
+// The results-freshness check's suite (#121), wired to `check` for the siblings' reason.
+//
+// No tool fingerprint: no row is gated on a tool being present — a missing `sed`, `grep` or
+// `expr` reddens rows rather than skipping them — so there is no reduced-coverage run for the
+// cache to replay, the bar `wrapperPinMatrixTest` records above.
+val resultsFreshMatrixTest = tasks.register<Exec>("resultsFreshMatrixTest") {
+    group = LifecycleBasePlugin.VERIFICATION_GROUP
+    description = "Runs .github/scripts/check-results-fresh.sh against its case and mutant matrix."
+    val matrix = layout.projectDirectory.file(".github/scripts/check-results-fresh-matrix.sh")
+    val script = layout.projectDirectory.file(".github/scripts/check-results-fresh.sh")
+    val report = layout.buildDirectory.file("reports/check-results-fresh-matrix.txt")
+    inputs.file(matrix)
+    inputs.file(script)
+    outputs.file(report)
+    commandLine(
+        "sh",
+        matrix.asFile.absolutePath,
+        script.asFile.absolutePath,
+        layout.buildDirectory.dir("check-results-fresh-matrix").get().asFile.absolutePath,
+        report.get().asFile.absolutePath,
+    )
+}
+
+tasks.named("check") { dependsOn(resultsFreshMatrixTest) }
+
 // What this build should have run, checked against what it did run.
 //
 // `.github/scripts/test-summary.sh` holds the comparison and CI runs it as a step after the
@@ -335,8 +360,11 @@ tasks.named("check") { dependsOn(wrapperPinMatrixTest) }
 //
 // One honest limit, and it is the reason the CI step is not redundant: this reads the XML that is
 // on disk, so on a repeat build without `clean` a module whose tests stopped running keeps
-// satisfying its floor from the previous run's results. `clean build` — the command the doctrine
-// names — has no stale XML, and CI checks out fresh. Nothing here can tell a stale file from a
+// satisfying its floor from the previous run's results. `clean build --no-build-cache` — the
+// command the doctrine names — has no stale XML. A fresh checkout alone is not enough: with the
+// build cache live, CI restored `:config` and `:connector`'s XML from an earlier run on every
+// build measured in #121, which is why CI now passes `--no-build-cache` and checks every suite's
+// timestamp afterwards (`check-results-fresh.sh`). Nothing here can tell a stale file from a
 // current one, which is the same reason `git status` cannot tell a stale checkout from a current
 // one, and it is worth stating rather than papering over: an mtime rule would red every legitimate
 // up-to-date test task, trading a narrow blind spot for a broad false alarm.
