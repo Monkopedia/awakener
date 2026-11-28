@@ -38,6 +38,11 @@ echo 1764229350 >"$F/bad-since"
 suite "$F/fresh.xml" 2026-11-27T07:51:16.323Z
 suite "$F/same-second.xml" 2026-11-27T07:42:30.001Z
 suite "$F/stale.xml" 2026-11-19T06:12:51.805Z
+# One millisecond before the start, on the same day and in the same hour and minute. A same-day
+# replay is the realistic one — all six `:wm` hits in #121 were a PR's results replayed into its
+# own merge run — and only this fixture stops a comparison coarsened to the day, hour or minute
+# from passing the whole matrix.
+suite "$F/just-before.xml" 2026-11-27T07:42:29.999Z
 suite "$F/no-zone.xml" 2026-11-27T07:51:16.323
 printf '<testsuite name="x" tests="1">\n</testsuite>\n' >"$F/no-stamp.xml"
 
@@ -87,6 +92,7 @@ row 0 -        "$F/since" "$F/fresh.xml"
 row 0 -        "$F/since" "$F/same-second.xml" "$F/fresh.xml"
 row 1 stale    "$F/since" "$F/stale.xml"
 row 1 stale    "$F/since" "$F/fresh.xml" "$F/stale.xml"
+row 1 stale    "$F/since" "$F/just-before.xml"
 row 1 nofiles  "$F/since"
 # Unguarded by a line of their own: with the timestamp guard removed, an empty timestamp still
 # sorts before any start time and reddens as a replay. Rows, so a change that greens them shows.
