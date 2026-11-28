@@ -112,7 +112,13 @@ check that reads back the artefact you are making a claim about.
   replay a run that skipped everything into a `clean build` that demanded the tools. That is a
   property each such build script has to hold for itself; there is no list of them here,
   because a list is one more thing to forget to update when a module gains its first gated
-  test.
+  test. **A fresh checkout does not exempt CI**: setup-gradle restores the Gradle home, which
+  holds the build cache, and before #121 `:config:jvmTest` and `:connector:jvmTest` came out
+  FROM-CACHE on every one of 38 measured runs, with `:wm:jvmTest` on 6 — each counted by
+  `Summarise test counts` as executed. Declared inputs make such a hit *consistent*; they cannot
+  make it *this run*, since nothing outside Gradle's inputs (the workflow, the runner image,
+  libwlroots, a flake) is in the key. So both CI jobs pass `--no-build-cache`, and
+  `check-results-fresh.sh` reddens on any suite whose XML `timestamp` predates the run.
 - **A run measures one tree, and `main` moves under you.** Every count above describes the
   tree the run ran against. Counts from a branch that `main` has since left describe a tree
   that will not exist after the merge, and nothing in the output says so. A PR's numbers are

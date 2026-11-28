@@ -255,7 +255,33 @@ jobs:
           # re-run their whole harness under the same two shells, for the same reason — a
           # `#!/bin/sh` header nothing exercises renders identically whether it is true or false.
           AWAKENER_REQUIRE_SHELLS: '1'
-        run: ./gradlew build --stacktrace
+        # ⚠️ `--no-build-cache`, because the cache was replaying test suites into this step (#121).
+        #
+        # setup-gradle restores the Gradle home, `org.gradle.caching=true` is set, and the build
+        # cache lives in that home — so a fresh checkout did not make this a fresh run. Measured
+        # over the 39 most recent non-cancelled runs up to `ad62f4b`, 38 of which reached Gradle:
+        # `:config:jvmTest` and `:connector:jvmTest` were FROM-CACHE on **all 38**, and
+        # `:wm:jvmTest` on 6, including the `main` pushes for `0f95a7f` (#262) and `701318d`
+        # (#276), so those two merges have no `:wm` run of their own. On `ad62f4b`'s own run both
+        # modules' XML carried 2026-11-19, eight days earlier, and `Summarise test counts`
+        # reported every one of those tests as this run's.
+        #
+        # Every one of those hits was valid as Gradle defines it, and the six `:wm` ones were the
+        # PR and merge runs of #262 and #276, whose diffs were docs and comments. #28/#29 put tool presence, the sway, foot and
+        # grim binaries' path, size and mtime, and the REQUIRE flags into each gated task's key, so
+        # no hit could have come from a run with a tool missing or a different sway binary. But the
+        # key holds Gradle's inputs and nothing else: not this workflow, not the runner image, not
+        # libwlroots — a library sway loads, whose upgrade moves no byte of the sway binary — and
+        # not a flake that passed once and is then served green for as long as the inputs hold. An
+        # argument that a hit is safe has to list everything a suite reads, and stays true only
+        # while every build script keeps its list complete. Disabling the cache here needs neither.
+        #
+        # The Gradle home is still restored, which is what the cache is for here: dependencies
+        # resolve locally. Only task outputs stop crossing runs. The start time is recorded first,
+        # so `Confirm every suite ran in this run` can check it against the XML.
+        run: |
+          date -u +%Y-%m-%dT%H:%M:%S > "$RUNNER_TEMP/build-started"
+          ./gradlew build --no-build-cache --stacktrace
 
       # A red `build` now means the build is red, but it still does not say *which* phase went
       # red, and "the runner could not be provisioned" is a different thing to read than "a
@@ -301,6 +327,14 @@ jobs:
       - name: Summarise test counts
         if: always()
         run: .github/scripts/test-summary.sh
+
+      # The counts above cannot tell a suite that ran from one restored out of a cache — both
+      # report the same number — so this reads each suite's own execution time and reddens on any
+      # older than this run's start (#121). It is what makes `--no-build-cache` above a checked
+      # property rather than a remembered one, and it holds against routes that flag does not
+      # cover, such as a later step restoring project build directories.
+      - name: Confirm every suite ran in this run
+        run: .github/scripts/check-results-fresh.sh "$RUNNER_TEMP/build-started" */build/test-results/*/TEST-*.xml
 
       # Two artifacts rather than one, because the two want different answers to
       # if-no-files-found, and because the XML is kilobytes where the HTML is megabytes — the
@@ -442,20 +476,50 @@ jobs:
       # The jar, for the same reason.
       - uses: gradle/actions/wrapper-validation@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
 
-      # No setup-gradle, so no build cache and no restored distribution: the wrapper downloads
-      # and checks `distributionSha256Sum` on every run, and nothing can replay another job's
-      # results into this one.
-      #
       # As a user, not as the container's root. Two SwayBindingTest cases make a residue
       # disposal fail by taking write permission off its directory, which root ignores, and
       # they went red under root (measured, archlinux:base under docker, sway 1.12) for a reason
       # that has nothing to do with the code. ubuntu-latest's `build` runs as a user already.
+      # Created before the cache step so the restored directory lands in a home that exists.
+      - name: Create the build user
+        run: useradd --create-home builder
+
+      # Downloaded dependencies only, and that boundary is the point. Without it this job
+      # resolved every plugin and library from the network on every run, and on 2026-11-27 it
+      # failed twice on that alone — Maven Central answering 429, the plugin portal "not found" —
+      # reds that say nothing about the code.
+      #
+      # `modules-2` holds artifacts and their metadata, keyed by coordinates and checked against
+      # the build scripts that request them. It holds no task output: test results live in the
+      # checkout's `build/`, which is fresh, and the build cache in `caches/build-cache-1`, which
+      # is not restored here and is disabled by `--no-build-cache` below besides. So a result
+      # recorded against one sway cannot stand in for a run against another; `Confirm every suite
+      # ran in this run` checks that from the XML rather than from this argument. Not
+      # `wrapper/dists` either, for `build`'s reason: a restored distribution skips
+      # `distributionSha256Sum`. Same trust as `build`'s setup-gradle, which restores the same
+      # directory — a pull request's entry is scoped to its own ref and cannot reach `main`'s.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            /home/builder/.gradle/caches/modules-2
+            !/home/builder/.gradle/caches/modules-2/*.lock
+            !/home/builder/.gradle/caches/modules-2/gc.properties
+          key: gradle-modules-arch-${{ hashFiles('gradle/libs.versions.toml', '**/*.gradle.kts', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-modules-arch-
+
+      # No setup-gradle, so no restored distribution: the wrapper downloads and checks
+      # `distributionSha256Sum` on every run. The file counts either side of the build say whether
+      # anything was fetched — equal means every dependency resolved from the restored cache.
       - name: Test :wm
         run: |
           set -eu
-          useradd --create-home builder
-          chown -R builder: "$GITHUB_WORKSPACE"
-          runuser -u builder -- env AWAKENER_REQUIRE_SWAY=1 ./gradlew :wm:jvmTest --stacktrace
+          chown -R builder: "$GITHUB_WORKSPACE" /home/builder
+          files=/home/builder/.gradle/caches/modules-2/files-2.1
+          echo "dependency files before the build: $(find "$files" -type f 2>/dev/null | wc -l)"
+          date -u +%Y-%m-%dT%H:%M:%S > "$RUNNER_TEMP/build-started"
+          runuser -u builder -- env AWAKENER_REQUIRE_SWAY=1 \
+            ./gradlew :wm:jvmTest --no-build-cache --stacktrace
+          echo "dependency files after the build: $(find "$files" -type f | wc -l)"
 
       # The same counts and the same floor gate as `build`, over the one module this job runs.
       - name: Summarise test counts
@@ -465,6 +529,9 @@ jobs:
         run: |
           grep '^wm ' .github/scripts/test-floors > "$RUNNER_TEMP/wm-floor"
           AWAKENER_TEST_FLOORS="$RUNNER_TEMP/wm-floor" .github/scripts/test-summary.sh
+
+      - name: Confirm every suite ran in this run
+        run: .github/scripts/check-results-fresh.sh "$RUNNER_TEMP/build-started" wm/build/test-results/*/TEST-*.xml
 
       - name: Upload JUnit XML
         if: always()
